@@ -1,0 +1,87 @@
+{
+  "name": "shapeitup-vscode",
+  "displayName": "ShapeItUp",
+  "description": "Scripted CAD for VS Code — write TypeScript, see 3D, export STEP/STL. AI-powered with Claude Code MCP integration.",
+  "version": "0.1.0",
+  "publisher": "shapeitup",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/asbis/ShapeItUp"
+  },
+  "homepage": "https://github.com/asbis/ShapeItUp#readme",
+  "bugs": {
+    "url": "https://github.com/asbis/ShapeItUp/issues"
+  },
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": ["Visualization", "Programming Languages", "Other"],
+  "keywords": ["cad", "3d", "replicad", "opencascade", "step", "stl", "parametric", "mechanical", "engineering", "ai", "mcp"],
+  "activationEvents": [
+    "onLanguage:typescript",
+    "workspaceContains:**/*.shape.ts"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "shapeitup.preview",
+        "title": "ShapeItUp: Preview Shape",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "shapeitup.exportSTEP",
+        "title": "ShapeItUp: Export as STEP"
+      },
+      {
+        "command": "shapeitup.exportSTL",
+        "title": "ShapeItUp: Export as STL"
+      },
+      {
+        "command": "shapeitup.newShape",
+        "title": "ShapeItUp: New Shape File"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "shapeitup-sidebar",
+          "title": "ShapeItUp",
+          "icon": "$(symbol-misc)"
+        }
+      ]
+    },
+    "views": {
+      "shapeitup-sidebar": [
+        {
+          "type": "webview",
+          "id": "shapeitup.viewer",
+          "name": "3D Preview"
+        }
+      ]
+    },
+    "menus": {
+      "editor/title": [
+        {
+          "command": "shapeitup.preview",
+          "when": "resourceFilename =~ /\\.shape\\.ts$/",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "shapeitup.preview",
+        "key": "ctrl+shift+v",
+        "when": "resourceFilename =~ /\\.shape\\.ts$/"
+      }
+    ]
+  },
+  "dependencies": {
+    "esbuild": "^0.24.0"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.95.0"
+  }
+}

@@ -1,0 +1,20 @@
+node_modules/
+dist/
+*.vsix
+.vscode-test/
+out/
+*.js.map
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+
+# Build artifacts
+*.stl
+*.step
+
+# Claude Code local state
+.claude/plans/

@@ -1,0 +1,11 @@
+{
+  "name": "@shapeitup/viewer",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.170.0"
+  }
+}

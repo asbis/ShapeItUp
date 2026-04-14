@@ -1,0 +1,26 @@
+{
+  "name": "shapeitup",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Scripted CAD for VSCode — TypeScript + Replicad + Three.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs --watch",
+    "build": "node esbuild.config.mjs",
+    "lint": "tsc --noEmit -p packages/extension/tsconfig.json && tsc --noEmit -p packages/mcp-server/tsconfig.json",
+    "package": "pnpm build && cd packages/extension && vsce package --no-dependencies"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "@esbuild/win32-x64"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "replicad": "^0.23.0"
+  }
+}

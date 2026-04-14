@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "shapeitup": {
+      "command": "node",
+      "args": [
+        "C:/Users/rorvi/code/ShapeItUp/packages/mcp-server/dist/index.js"
+      ]
+    }
+  }
+}

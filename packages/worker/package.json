@@ -1,0 +1,9 @@
+{
+  "name": "@shapeitup/worker",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "replicad": "^0.23.0",
+    "replicad-opencascadejs": "^0.23.0"
+  }
+}
