@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "icon-preview",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["serve", "."],
+      "port": 3000
+    }
+  ]
+}
