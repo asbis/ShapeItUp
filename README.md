@@ -1,6 +1,16 @@
-# ShapeItUp
+<p align="center">
+  <img src="logo.svg" alt="ShapeItUp" width="400">
+</p>
 
-**Scripted CAD for VS Code** -- write TypeScript, see 3D, export to STEP/STL.
+<p align="center">
+  <strong>Scripted CAD for VS Code</strong> — write TypeScript, see 3D, export to STEP/STL.
+</p>
+
+<p align="center">
+  <a href="https://github.com/asbis/ShapeItUp/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+</p>
+
+---
 
 ShapeItUp is a VS Code extension that turns TypeScript files into 3D CAD models using the [Replicad](https://replicad.xyz) library (OpenCascade WASM). It includes an MCP server so AI assistants like Claude Code can create, modify, and visually verify CAD models.
 

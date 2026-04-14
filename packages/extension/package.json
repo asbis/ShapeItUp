@@ -5,6 +5,7 @@
   "version": "0.1.0",
   "publisher": "shapeitup",
   "license": "MIT",
+  "icon": "icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/asbis/ShapeItUp"
@@ -48,7 +49,7 @@
         {
           "id": "shapeitup-sidebar",
           "title": "ShapeItUp",
-          "icon": "$(symbol-misc)"
+          "icon": "media/icon-sidebar.svg"
         }
       ]
     },

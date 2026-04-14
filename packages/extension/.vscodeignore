@@ -2,4 +2,6 @@
 **/tsconfig.json
 src/**
 !dist/**
+!icon.png
+!media/**
 .gitignore

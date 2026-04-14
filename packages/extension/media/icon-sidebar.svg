@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!-- Monochrome { cube } icon for VSCode activity bar -->
+  <!-- Left bracket { -->
+  <path d="M7,4 L9,4 L9,9 L5,12 L9,15 L9,20 L7,20 L7,15 L3,12 L7,9 Z" fill="#C5C5C5"/>
+  <!-- Cube -->
+  <polygon points="12,8 16,10 12,12 8,10" fill="#C5C5C5"/>
+  <polygon points="8,10 12,12 12,16 8,14" fill="#888"/>
+  <polygon points="12,12 16,10 16,14 12,16" fill="#A0A0A0"/>
+  <!-- Right bracket } -->
+  <path d="M17,4 L15,4 L15,9 L19,12 L15,15 L15,20 L17,20 L17,15 L21,12 L17,9 Z" fill="#C5C5C5"/>
+</svg>
