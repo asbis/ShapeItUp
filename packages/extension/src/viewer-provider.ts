@@ -7,11 +7,7 @@ let esbuildInitialized = false;
 
 async function ensureEsbuild() {
   if (!esbuildInitialized) {
-    const wasmPath = path.join(
-      path.dirname(require.resolve("esbuild-wasm/package.json")),
-      "esbuild.wasm"
-    );
-    await esbuild.initialize({ wasmURL: vscode.Uri.file(wasmPath).toString() });
+    await esbuild.initialize({});
     esbuildInitialized = true;
   }
 }
