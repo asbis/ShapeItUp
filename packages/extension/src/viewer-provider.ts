@@ -22,6 +22,7 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
   private isReady = false;
   private pendingScript?: { js: string; fileName: string };
   private lastScreenshotPath?: string;
+  private lastExecutedFile?: string;
 
   constructor(context: vscode.ExtensionContext, output: vscode.OutputChannel) {
     this.context = context;
@@ -354,12 +355,13 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         this.output.appendLine(`[error] ${msg.message}`);
         this.output.show(true);
         vscode.window.showErrorMessage(`ShapeItUp: ${msg.message}`);
-        this.writeStatusFile({ success: false, error: msg.message, fileName: msg.fileName });
+        this.writeStatusFile({ success: false, error: msg.message, fileName: this.lastExecutedFile || msg.fileName });
         break;
       case "render-success":
         this.output.appendLine(`[render] ${msg.stats}`);
         this.writeStatusFile({
           success: true,
+          fileName: this.lastExecutedFile,
           stats: msg.stats,
           partCount: msg.partCount,
           partNames: msg.partNames,
@@ -420,6 +422,8 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
 
       const js = result.outputFiles[0].text;
       const msg = { js, fileName: document.fileName };
+
+      this.lastExecutedFile = document.fileName;
 
       if (this.isReady) {
         this.output.appendLine(`[exec] Sending to viewer (${js.length} chars)`);

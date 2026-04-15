@@ -115,7 +115,14 @@ export function activate(context: vscode.ExtensionContext) {
     try {
       const data = await vscode.workspace.fs.readFile(vscode.Uri.file(commandFile));
       const cmd = JSON.parse(Buffer.from(data).toString("utf-8"));
-      if (cmd.command === "render-preview") {
+      if (cmd.command === "open-shape") {
+        // Open a .shape.ts file and render it
+        outputChannel.appendLine(`[ai] Opening ${cmd.filePath}`);
+        const doc = await vscode.workspace.openTextDocument(cmd.filePath);
+        await vscode.window.showTextDocument(doc, { preview: false });
+        viewerProvider.executeScript(doc);
+
+      } else if (cmd.command === "render-preview") {
         // Combined command: switch mode, toggle dims, wait, screenshot, restore
         outputChannel.appendLine(`[ai] render-preview: mode=${cmd.renderMode}, dims=${cmd.showDimensions}`);
 
@@ -271,6 +278,8 @@ function provideReplicadTypes(
 
   const tsconfigPath = path.join(folderPath, "tsconfig.json");
 
+  const replicadTypePath = path.join(typingsPath, "replicad");
+
   if (!fs.existsSync(tsconfigPath)) {
     // No tsconfig.json — create one for .shape.ts files
     const tsconfig = {
@@ -284,7 +293,7 @@ function provideReplicadTypes(
         noEmit: true,
         typeRoots: [typingsPath],
         paths: {
-          replicad: [path.join(typingsPath, "replicad")],
+          replicad: [replicadTypePath],
         },
       },
       include: ["**/*.shape.ts"],
@@ -292,16 +301,18 @@ function provideReplicadTypes(
     fs.writeFileSync(tsconfigPath, JSON.stringify(tsconfig, null, 2) + "\n");
     output.appendLine("[setup] Created tsconfig.json with replicad types from extension");
   } else {
-    // tsconfig.json exists — check if it already has replicad paths
+    // tsconfig.json exists — always update the replicad path to current extension version
     try {
       const existing = JSON.parse(fs.readFileSync(tsconfigPath, "utf-8"));
-      if (!existing.compilerOptions?.paths?.replicad) {
-        // Add paths to existing tsconfig without overwriting other settings
-        existing.compilerOptions = existing.compilerOptions || {};
-        existing.compilerOptions.paths = existing.compilerOptions.paths || {};
-        existing.compilerOptions.paths.replicad = [path.join(typingsPath, "replicad")];
+      existing.compilerOptions = existing.compilerOptions || {};
+      existing.compilerOptions.paths = existing.compilerOptions.paths || {};
+      const currentPath = existing.compilerOptions.paths.replicad?.[0];
+
+      if (currentPath !== replicadTypePath) {
+        existing.compilerOptions.typeRoots = [typingsPath];
+        existing.compilerOptions.paths.replicad = [replicadTypePath];
         fs.writeFileSync(tsconfigPath, JSON.stringify(existing, null, 2) + "\n");
-        output.appendLine("[setup] Added replicad type paths to existing tsconfig.json");
+        output.appendLine("[setup] Updated replicad type paths in tsconfig.json to current extension version");
       }
     } catch {
       // Can't parse existing tsconfig — leave it alone

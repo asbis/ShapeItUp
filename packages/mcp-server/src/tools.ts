@@ -38,7 +38,7 @@ function readExtensionResult(): any {
 export function registerTools(server: McpServer) {
   server.tool(
     "create_shape",
-    "Create a new .shape.ts CAD script file",
+    "Create a new .shape.ts CAD script file. Fails if file already exists — use modify_shape to update existing files.",
     {
       name: z.string().describe("File name without extension (e.g., 'bracket')"),
       code: z.string().describe("TypeScript source code using Replicad API"),
@@ -46,18 +46,47 @@ export function registerTools(server: McpServer) {
         .string()
         .optional()
         .describe("Directory to create the file in (defaults to cwd)"),
+      overwrite: z.boolean().optional().describe("Set to true to overwrite an existing file (default: false)"),
     },
-    async ({ name, code, directory }) => {
+    async ({ name, code, directory, overwrite }) => {
       const dir = directory || process.cwd();
       const filePath = join(dir, `${name}.shape.ts`);
+
+      if (existsSync(filePath) && !overwrite) {
+        return {
+          content: [{ type: "text" as const, text: `File already exists: ${filePath}\nUse modify_shape to update it, or pass overwrite: true to replace it.` }],
+          isError: true,
+        };
+      }
+
       writeFileSync(filePath, code, "utf-8");
+
+      // Tell VS Code to open and render the file
+      sendExtensionCommand("open-shape", { filePath });
+
       return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Created ${filePath}`,
-          },
-        ],
+        content: [{ type: "text" as const, text: `Created ${filePath}\nThe file will auto-render in the viewer. Use get_render_status to check for errors.` }],
+      };
+    }
+  );
+
+  server.tool(
+    "open_shape",
+    "Open a .shape.ts file in VS Code and render it in the 3D viewer. Use this after create_shape or modify_shape to see the result.",
+    {
+      filePath: z.string().describe("Path to the .shape.ts file to open and render"),
+    },
+    async ({ filePath }) => {
+      const resolved = resolve(filePath);
+      if (!existsSync(resolved)) {
+        return {
+          content: [{ type: "text" as const, text: `File not found: ${resolved}` }],
+          isError: true,
+        };
+      }
+      sendExtensionCommand("open-shape", { filePath: resolved });
+      return {
+        content: [{ type: "text" as const, text: `Opening ${resolved} in viewer. Wait ~2 seconds then use get_render_status to check if it rendered.` }],
       };
     }
   );
@@ -78,8 +107,12 @@ export function registerTools(server: McpServer) {
         };
       }
       writeFileSync(resolved, code, "utf-8");
+
+      // Tell VS Code to re-render the file
+      sendExtensionCommand("open-shape", { filePath: resolved });
+
       return {
-        content: [{ type: "text" as const, text: `Updated ${resolved}` }],
+        content: [{ type: "text" as const, text: `Updated ${resolved}\nThe file will auto-render in the viewer. Use get_render_status to check for errors.` }],
       };
     }
   );
@@ -139,13 +172,19 @@ export function registerTools(server: McpServer) {
     },
     async ({ code }) => {
       try {
-        // Strip type annotations for basic syntax validation
-        // (full TS validation would need esbuild which can't be bundled)
-        const stripped = code
-          .replace(/:\s*typeof\s+\w+/g, "")
-          .replace(/:\s*\w+(\[\])?/g, "")
-          .replace(/import\s+type\s+/g, "// ")
-          .replace(/as\s+\w+/g, "");
+        // Strip TypeScript and ESM syntax to validate as plain JS
+        let stripped = code;
+        // Remove import statements entirely
+        stripped = stripped.replace(/^import\s+.*$/gm, "");
+        // Remove export keywords
+        stripped = stripped.replace(/^export\s+(default\s+)?/gm, "");
+        // Remove type annotations: `: Type`, `: typeof X`, `as Type`
+        stripped = stripped.replace(/:\s*typeof\s+\w+/g, "");
+        stripped = stripped.replace(/:\s*[\w.<>,\s|&\[\]]+(?=[,)\s={])/g, "");
+        stripped = stripped.replace(/\bas\s+\w+/g, "");
+        // Remove interface/type declarations
+        stripped = stripped.replace(/^(interface|type)\s+\w+.*$/gm, "");
+        // Try parsing
         new Function(stripped);
         return {
           content: [{ type: "text" as const, text: "Script syntax looks valid" }],
@@ -288,7 +327,7 @@ export function registerTools(server: McpServer) {
           return {
             content: [{
               type: "text" as const,
-              text: `Render SUCCESS\nStats: ${status.stats}${parts}\nTime: ${status.timestamp}`,
+              text: `Render SUCCESS\nFile: ${status.fileName || "unknown"}\nStats: ${status.stats}${parts}\nTime: ${status.timestamp}`,
             }],
           };
         } else {
