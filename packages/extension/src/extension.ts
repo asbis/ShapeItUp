@@ -63,12 +63,31 @@ export function activate(context: vscode.ExtensionContext) {
   const movedKey = "shapeitup.movedToSecondarySideBar";
   if (!context.globalState.get(movedKey)) {
     vscode.commands.executeCommand("shapeitup.viewer.focus").then(() => {
+      // Try different command names across VS Code versions
       vscode.commands
-        .executeCommand("workbench.action.moveViewToSecondarySideBar", "shapeitup.viewer")
-        .then(() => {
-          context.globalState.update(movedKey, true);
-          outputChannel.appendLine("[init] Moved viewer to secondary side bar");
-        });
+        .executeCommand("workbench.action.moveViewToSecondarySideBar")
+        .then(
+          () => {
+            context.globalState.update(movedKey, true);
+            outputChannel.appendLine("[init] Moved viewer to secondary side bar");
+          },
+          () => {
+            // Fallback: try the auxiliary bar command (older VS Code versions)
+            vscode.commands
+              .executeCommand("workbench.action.moveViewToAuxiliaryBar")
+              .then(
+                () => {
+                  context.globalState.update(movedKey, true);
+                  outputChannel.appendLine("[init] Moved viewer to auxiliary bar");
+                },
+                () => {
+                  // Neither command exists — just mark as done, user can move it manually
+                  context.globalState.update(movedKey, true);
+                  outputChannel.appendLine("[init] Could not auto-move viewer — drag it to the right side manually");
+                }
+              );
+          }
+        );
     });
   }
 
