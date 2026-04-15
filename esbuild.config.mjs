@@ -52,11 +52,22 @@ const workerConfig = {
   },
 };
 
-// 4. MCP Server (Node.js, ESM)
+// 4. MCP Server (Node.js, ESM) — standalone
 const mcpServerConfig = {
   ...sharedConfig,
   entryPoints: [resolve(__dirname, "packages/mcp-server/src/index.ts")],
   outfile: resolve(__dirname, "packages/mcp-server/dist/index.js"),
+  platform: "node",
+  format: "esm",
+  banner: { js: "#!/usr/bin/env node\nimport { createRequire } from 'module'; const require = createRequire(import.meta.url);" },
+  external: ["esbuild"],
+};
+
+// 5. MCP Server copy bundled into extension dist (for auto-discovery)
+const mcpServerExtConfig = {
+  ...sharedConfig,
+  entryPoints: [resolve(__dirname, "packages/mcp-server/src/index.ts")],
+  outfile: resolve(__dirname, "packages/extension/dist/mcp-server.js"),
   platform: "node",
   format: "esm",
   banner: { js: "#!/usr/bin/env node\nimport { createRequire } from 'module'; const require = createRequire(import.meta.url);" },
@@ -99,6 +110,7 @@ async function build() {
       esbuild.context(viewerConfig),
       esbuild.context(workerConfig),
       esbuild.context(mcpServerConfig),
+      esbuild.context(mcpServerExtConfig),
     ]);
     await Promise.all(contexts.map((ctx) => ctx.watch()));
     console.log("Watching for changes...");
@@ -108,6 +120,7 @@ async function build() {
       esbuild.build(viewerConfig),
       esbuild.build(workerConfig),
       esbuild.build(mcpServerConfig),
+      esbuild.build(mcpServerExtConfig),
     ]);
     console.log("Build complete.");
   }

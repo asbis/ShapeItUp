@@ -33,9 +33,14 @@ self.onmessage = async (event: MessageEvent) => {
     }
   } catch (err: any) {
     executing = false;
+    // OCCT throws integer error codes (WASM pointers) — translate to useful messages
+    let message = err.message || String(err);
+    if (/^\d+$/.test(message)) {
+      message = `OpenCascade operation failed (error code ${message}). This usually means a geometry operation like fillet, chamfer, or boolean failed. Try reducing fillet radii, simplifying geometry, or checking for zero-thickness walls.`;
+    }
     self.postMessage({
       type: "error",
-      message: err.message || String(err),
+      message,
       stack: err.stack,
     });
   }

@@ -23,6 +23,9 @@ export function activate(context: vscode.ExtensionContext) {
   registerCommands(context, viewerProvider);
   createFileWatcher(context, viewerProvider);
 
+  // Register MCP server so Claude Code / Copilot can discover it automatically
+  registerMcpServer(context, outputChannel);
+
   // Manual preview command (still useful for opening the panel tab)
   context.subscriptions.push(
     vscode.commands.registerCommand("shapeitup.preview", () => {
@@ -133,6 +136,47 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {}
+
+/**
+ * Register the ShapeItUp MCP server via the VS Code API.
+ * This allows Claude Code and GitHub Copilot to discover it automatically —
+ * no manual settings.json editing needed.
+ */
+function registerMcpServer(
+  context: vscode.ExtensionContext,
+  output: vscode.OutputChannel
+) {
+  // Check if the VS Code MCP API is available (requires VS Code 1.99+)
+  if (!vscode.lm?.registerMcpServerDefinitionProvider) {
+    output.appendLine("[mcp] VS Code MCP API not available — manual setup required");
+    return;
+  }
+
+  const mcpServerPath = path.join(
+    context.extensionPath,
+    "dist",
+    "mcp-server.js"
+  );
+
+  try {
+    const provider = vscode.lm.registerMcpServerDefinitionProvider("shapeitup-mcp", {
+      provideMcpServerDefinitions: () => {
+        return [
+          new vscode.McpStdioServerDefinition(
+            "shapeitup",
+            "ShapeItUp CAD",
+            "node",
+            [mcpServerPath]
+          ),
+        ];
+      },
+    });
+    context.subscriptions.push(provider);
+    output.appendLine("[mcp] MCP server registered via VS Code API");
+  } catch (e: any) {
+    output.appendLine(`[mcp] Failed to register MCP server: ${e.message}`);
+  }
+}
 
 /**
  * Ensure .shape.ts files get replicad type checking and autocomplete
