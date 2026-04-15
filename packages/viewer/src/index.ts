@@ -217,7 +217,14 @@ function handleWorkerMessage(msg: WorkerToWebview) {
         const totalVerts = msg.parts.reduce((s: number, p: TessellatedPart) => s + p.vertices.length / 3, 0);
         const totalTris = msg.parts.reduce((s: number, p: TessellatedPart) => s + p.triangles.length / 3, 0);
         const partLabel = msg.parts.length > 1 ? ` | ${msg.parts.length} parts` : "";
-        statusEl.textContent = `${totalVerts} verts, ${totalTris} tris${partLabel} — ${msg.execTimeMs}ms + ${msg.tessTimeMs}ms`;
+        const statusText = `${totalVerts} verts, ${totalTris} tris${partLabel} — ${msg.execTimeMs}ms + ${msg.tessTimeMs}ms`;
+        statusEl.textContent = statusText;
+        postToExtension({
+          type: "render-success",
+          stats: statusText,
+          partCount: msg.parts.length,
+          partNames: msg.parts.map((p: TessellatedPart) => p.name),
+        });
       } catch (err: any) {
         const errMsg = `Render error: ${err.message}`;
         postToExtension({ type: "error", message: errMsg });

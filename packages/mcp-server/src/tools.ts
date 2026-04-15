@@ -279,6 +279,48 @@ export function registerTools(server: McpServer) {
       };
     }
   );
+
+  server.tool(
+    "get_render_status",
+    "Get the result of the last shape render — shows whether it succeeded or failed, with error messages and render stats. Call this after creating or modifying a .shape.ts file to check if it rendered correctly.",
+    {},
+    async () => {
+      const statusFile = join(GLOBAL_STORAGE, "shapeitup-status.json");
+      if (!existsSync(statusFile)) {
+        return {
+          content: [{ type: "text" as const, text: "No render status available. Make sure a .shape.ts file is open in VS Code and the ShapeItUp viewer is active." }],
+        };
+      }
+
+      try {
+        const status = JSON.parse(readFileSync(statusFile, "utf-8"));
+        if (status.success) {
+          const parts = status.partNames?.length
+            ? `\nParts: ${status.partNames.join(", ")}`
+            : "";
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Render SUCCESS\nStats: ${status.stats}${parts}\nTime: ${status.timestamp}`,
+            }],
+          };
+        } else {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Render FAILED\nError: ${status.error}\nFile: ${status.fileName || "unknown"}\nTime: ${status.timestamp}`,
+            }],
+            isError: true,
+          };
+        }
+      } catch {
+        return {
+          content: [{ type: "text" as const, text: "Could not read render status." }],
+          isError: true,
+        };
+      }
+    }
+  );
 }
 
 function findShapeFiles(dir: string, depth = 3): string[] {

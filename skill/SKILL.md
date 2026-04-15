@@ -10,10 +10,11 @@ globs: ["**/*.shape.ts"]
 
 When creating or modifying shapes, follow this workflow:
 1. Create/modify the `.shape.ts` file using the Replicad API below
-2. Call `render_preview` to capture a screenshot (auto-switches to high-contrast AI mode with dimensions)
-3. Use the Read tool on the returned PNG path to visually verify the shape is correct
-4. Check that dimensions match the requirements (X/Y/Z shown in the screenshot)
-5. If anything is wrong, modify the code and repeat from step 2
+2. Call `get_render_status` to check if it rendered successfully or has errors
+3. If there are errors, fix the code and repeat from step 1
+4. Call `render_preview` to capture a screenshot for visual verification
+5. Use the Read tool on the returned PNG path to verify the shape looks correct
+6. If dimensions are wrong or the shape looks off, modify and repeat
 
 ### Available MCP Tools
 
@@ -25,6 +26,7 @@ When creating or modifying shapes, follow this workflow:
 - `validate_script` — check TypeScript syntax without executing
 
 **Visual review:**
+- `get_render_status` — check if the last render succeeded or failed (returns error messages). Call this after every create/modify.
 - `render_preview` — capture a PNG screenshot (auto-enables AI render mode + dimensions). Returns file path to Read.
 - `set_render_mode` — switch between `"ai"` (white bg, vivid colors) and `"dark"` (user's dark mode)
 - `toggle_dimensions` — show/hide X/Y/Z bounding box measurements on the 3D view

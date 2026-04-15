@@ -354,6 +354,16 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         this.output.appendLine(`[error] ${msg.message}`);
         this.output.show(true);
         vscode.window.showErrorMessage(`ShapeItUp: ${msg.message}`);
+        this.writeStatusFile({ success: false, error: msg.message, fileName: msg.fileName });
+        break;
+      case "render-success":
+        this.output.appendLine(`[render] ${msg.stats}`);
+        this.writeStatusFile({
+          success: true,
+          stats: msg.stats,
+          partCount: msg.partCount,
+          partNames: msg.partNames,
+        });
         break;
       case "status":
         this.output.appendLine(`[status] ${msg.message}`);
@@ -422,6 +432,7 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     } catch (e: any) {
       this.output.appendLine(`[error] Bundle failed: ${e.message}`);
       vscode.window.showErrorMessage(`ShapeItUp bundle error: ${e.message}`);
+      this.writeStatusFile({ success: false, error: e.message, fileName: document.fileName });
     }
   }
 
@@ -486,6 +497,25 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     const webview = this.getActiveWebview();
     if (webview) {
       webview.postMessage({ type: "viewer-command", command, ...params });
+    }
+  }
+
+  /** Write render status to a file the MCP server can read */
+  private writeStatusFile(status: any) {
+    try {
+      const fs = require("fs");
+      const dir = this.context.globalStorageUri.fsPath;
+      fs.mkdirSync(dir, { recursive: true });
+      const statusPath = path.join(dir, "shapeitup-status.json");
+      fs.writeFileSync(
+        statusPath,
+        JSON.stringify({
+          ...status,
+          timestamp: new Date().toISOString(),
+        })
+      );
+    } catch {
+      // Ignore write failures
     }
   }
 }
