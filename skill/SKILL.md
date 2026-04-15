@@ -321,9 +321,10 @@ Each part gets its own color in the viewer and is exported as a named component 
 import { drawRectangle, sketchCircle } from "replicad";
 
 export default function main() {
-  const box = drawRectangle(60, 40).sketchOnPlane("XY").extrude(20);
+  let box = drawRectangle(60, 40).sketchOnPlane("XY").extrude(20);
+  box = box.fillet(2); // Fillet BEFORE cutting holes
   const hole = sketchCircle(8).extrude(20);
-  return box.cut(hole).fillet(2);
+  return box.cut(hole);
 }
 ```
 
@@ -339,7 +340,8 @@ export default function main() {
   const h2 = makeCylinder(3, 30, [15, 0, 2.5], [0, 1, 0]);
   const h3 = makeCylinder(3, 30, [2.5, 0, 25], [0, 1, 0]);
   bracket = bracket.cut(h1).cut(h2).cut(h3);
-  return bracket.fillet(2, e => e.inDirection("Y"));
+  try { bracket = bracket.fillet(2, e => e.inDirection("Y")); } catch { /* skip fillet if geometry too complex */ }
+  return bracket;
 }
 ```
 
@@ -350,8 +352,9 @@ import { sketchCircle } from "replicad";
 export default function main() {
   const base = sketchCircle(30).extrude(5);
   const body = sketchCircle(15).extrude(50).translateZ(5);
+  let shape = base.fuse(body).fillet(3); // Fillet BEFORE cutting interior
   const interior = sketchCircle(12).extrude(52);
-  return base.fuse(body).cut(interior).fillet(3);
+  return shape.cut(interior);
 }
 ```
 
@@ -391,6 +394,7 @@ export default function main() {
     wheel = wheel.cut(slot);
   }
 
-  return wheel.fillet(1);
+  try { wheel = wheel.fillet(1); } catch { /* skip fillet if geometry too complex */ }
+  return wheel;
 }
 ```

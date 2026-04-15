@@ -753,7 +753,8 @@ export default function main() {
   const hole3 = makeCylinder(3, 30, [2.5, 0, 25], [0, 1, 0]);
 
   bracket = bracket.cut(hole1).cut(hole2).cut(hole3);
-  return bracket.fillet(2, e => e.inDirection("Y"));
+  try { bracket = bracket.fillet(2, e => e.inDirection("Y")); } catch { /* skip fillet if geometry too complex */ }
+  return bracket;
 }
 \`\`\`
 
@@ -764,8 +765,9 @@ import { sketchCircle, drawCircle } from "replicad";
 export default function main() {
   const base = sketchCircle(30).extrude(5);
   const tube = sketchCircle(15).extrude(40).translateZ(5);
+  let shape = base.fuse(tube).fillet(3); // Fillet BEFORE cutting interior
   const innerHole = sketchCircle(12).extrude(45);
-  return base.fuse(tube).cut(innerHole).fillet(3);
+  return shape.cut(innerHole);
 }
 \`\`\`
 

@@ -278,7 +278,7 @@ onMessage("request-export", (msg) => {
 onMessage("request-screenshot", () => {
   // Set camera to isometric angle that shows all 3 dimensions clearly
   if (modelGroup.children.length > 0) {
-    setCameraAngle([1, -0.8, 0.7]);
+    setCameraAngle([1, -1.2, 0.8]);
   }
   // Wait one frame for the render to complete
   controls.update();
@@ -695,18 +695,18 @@ function updateDimensions() {
     dimColor, textColor
   );
 
-  // Y dimension (along bottom left — separated from Z)
+  // Y dimension (along bottom right — visible from default camera angle)
   addDimensionLine(
-    [min.x - offset, min.y, min.z],
-    [min.x - offset, max.y, min.z],
+    [max.x + offset, min.y, min.z],
+    [max.x + offset, max.y, min.z],
     `Y: ${size.y.toFixed(1)}mm`,
     dimColor, textColor
   );
 
-  // Z dimension (along right front — separated from Y)
+  // Z dimension (along right front — further out to not overlap with Y)
   addDimensionLine(
-    [max.x + offset, min.y, min.z],
-    [max.x + offset, min.y, max.z],
+    [max.x + offset * 1.8, min.y, min.z],
+    [max.x + offset * 1.8, min.y, max.z],
     `Z: ${size.z.toFixed(1)}mm`,
     dimColor, textColor
   );
