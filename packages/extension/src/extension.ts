@@ -51,7 +51,7 @@ export function activate(context: vscode.ExtensionContext) {
           viewerProvider.executeScript(editor.document);
         }, 500);
 
-        // Offer to set up project if replicad types are missing
+        // Auto-install replicad types if missing (silent, no prompt)
         if (!setupPromptShown) {
           const fs = require("fs");
           const p = require("path");
@@ -61,17 +61,8 @@ export function activate(context: vscode.ExtensionContext) {
             !fs.existsSync(p.join(folder, "node_modules", "replicad"))
           ) {
             setupPromptShown = true;
-            vscode.window
-              .showInformationMessage(
-                "Install replicad types to fix editor errors in .shape.ts files?",
-                "Install",
-                "Dismiss"
-              )
-              .then((choice) => {
-                if (choice === "Install") {
-                  vscode.commands.executeCommand("shapeitup.setupProject");
-                }
-              });
+            outputChannel.appendLine("[setup] Replicad types missing, installing...");
+            autoInstallReplicad(folder, outputChannel);
           }
         }
       }
@@ -164,3 +155,59 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {}
+
+/**
+ * Silently install replicad in a project so .shape.ts files get proper types.
+ * Runs in the background — no terminal, no prompt.
+ */
+function autoInstallReplicad(folderPath: string, output: vscode.OutputChannel) {
+  const fs = require("fs");
+  const cp = require("child_process");
+
+  // Create package.json if missing
+  const pkgPath = path.join(folderPath, "package.json");
+  if (!fs.existsSync(pkgPath)) {
+    fs.writeFileSync(
+      pkgPath,
+      JSON.stringify({ private: true, dependencies: { replicad: "^0.23.0" } }, null, 2) + "\n"
+    );
+  } else {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
+      if (!pkg.dependencies?.replicad && !pkg.devDependencies?.replicad) {
+        pkg.dependencies = pkg.dependencies || {};
+        pkg.dependencies.replicad = "^0.23.0";
+        fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
+      }
+    } catch {
+      return;
+    }
+  }
+
+  // Create tsconfig.json if missing
+  const tsconfigPath = path.join(folderPath, "tsconfig.json");
+  if (!fs.existsSync(tsconfigPath)) {
+    const tsconfig = {
+      compilerOptions: {
+        target: "ES2022",
+        module: "ESNext",
+        moduleResolution: "bundler",
+        strict: false,
+        esModuleInterop: true,
+        skipLibCheck: true,
+        noEmit: true,
+      },
+      include: ["**/*.shape.ts"],
+    };
+    fs.writeFileSync(tsconfigPath, JSON.stringify(tsconfig, null, 2) + "\n");
+  }
+
+  // Run npm install silently in the background
+  cp.exec("npm install --save replicad", { cwd: folderPath }, (err: any) => {
+    if (err) {
+      output.appendLine(`[setup] Failed to install replicad: ${err.message}`);
+    } else {
+      output.appendLine("[setup] Replicad types installed successfully");
+    }
+  });
+}
