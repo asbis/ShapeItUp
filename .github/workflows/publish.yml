@@ -25,8 +25,8 @@ jobs:
       - name: Build
         run: pnpm build
 
-      - name: Install esbuild in extension (runtime dependency)
-        run: cd packages/extension && npm install esbuild
+      - name: Install runtime dependencies in extension
+        run: cd packages/extension && npm install
 
       - name: Publish to VS Marketplace
         run: cd packages/extension && npx @vscode/vsce publish

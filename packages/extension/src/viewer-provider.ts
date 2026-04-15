@@ -1,7 +1,20 @@
 import * as vscode from "vscode";
-import * as esbuild from "esbuild";
+import * as esbuild from "esbuild-wasm";
 import * as path from "path";
 import type { ExportFormat } from "@shapeitup/shared";
+
+let esbuildInitialized = false;
+
+async function ensureEsbuild() {
+  if (!esbuildInitialized) {
+    const wasmPath = path.join(
+      path.dirname(require.resolve("esbuild-wasm/package.json")),
+      "esbuild.wasm"
+    );
+    await esbuild.initialize({ wasmURL: vscode.Uri.file(wasmPath).toString() });
+    esbuildInitialized = true;
+  }
+}
 
 export class ViewerProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
@@ -387,6 +400,7 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     this.output.appendLine(`[exec] Bundling ${document.fileName}`);
 
     try {
+      await ensureEsbuild();
       // Use esbuild.build (not transform) to resolve local imports between .shape.ts files
       const result = await esbuild.build({
         entryPoints: [document.fileName],

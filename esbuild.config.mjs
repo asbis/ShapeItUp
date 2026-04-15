@@ -19,7 +19,7 @@ const extensionConfig = {
   outfile: resolve(__dirname, "packages/extension/dist/extension.js"),
   platform: "node",
   format: "cjs",
-  external: ["vscode", "esbuild"],
+  external: ["vscode", "esbuild-wasm"],
 };
 
 // 2. Viewer (browser, IIFE)
