@@ -115,9 +115,40 @@ export function activate(context: vscode.ExtensionContext) {
     try {
       const data = await vscode.workspace.fs.readFile(vscode.Uri.file(commandFile));
       const cmd = JSON.parse(Buffer.from(data).toString("utf-8"));
-      if (cmd.command === "screenshot") {
+      if (cmd.command === "render-preview") {
+        // Combined command: switch mode, toggle dims, wait, screenshot, restore
+        outputChannel.appendLine(`[ai] render-preview: mode=${cmd.renderMode}, dims=${cmd.showDimensions}`);
+
+        // Step 1: Switch render mode
+        viewerProvider.sendViewerCommand("set-render-mode", { mode: cmd.renderMode || "ai" });
+
+        // Step 2: Toggle dimensions
+        if (cmd.showDimensions) {
+          viewerProvider.sendViewerCommand("toggle-dimensions", { show: true });
+        }
+
+        // Step 3: Wait for viewer to update (render frame + dimension sprites)
+        await new Promise((r) => setTimeout(r, 800));
+
+        // Step 4: Capture screenshot
+        const screenshotPath = await viewerProvider.captureScreenshot();
+
+        // Step 5: Restore dark mode
+        viewerProvider.sendViewerCommand("set-render-mode", { mode: "dark" });
+        if (cmd.showDimensions) {
+          viewerProvider.sendViewerCommand("toggle-dimensions", { show: false });
+        }
+
+        // Step 6: Write result
+        const resultFile = path.join(context.globalStorageUri.fsPath, "mcp-result.json");
+        await vscode.workspace.fs.writeFile(
+          vscode.Uri.file(resultFile),
+          Buffer.from(JSON.stringify({ screenshotPath }), "utf-8")
+        );
+        outputChannel.appendLine(`[ai] Screenshot saved: ${screenshotPath}`);
+
+      } else if (cmd.command === "screenshot") {
         const screenshotPath = await viewerProvider.captureScreenshot(cmd.outputDir);
-        // Write result back
         const resultFile = path.join(context.globalStorageUri.fsPath, "mcp-result.json");
         await vscode.workspace.fs.writeFile(
           vscode.Uri.file(resultFile),

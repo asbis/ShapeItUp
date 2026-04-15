@@ -202,33 +202,17 @@ export function registerTools(server: McpServer) {
       renderMode: z.enum(["ai", "dark"]).optional().describe("Render mode: 'ai' for high-contrast light background (default), 'dark' for user's dark mode"),
     },
     async ({ showDimensions, renderMode }) => {
-      // Switch to AI mode for better visibility
-      sendExtensionCommand("set-render-mode", { mode: renderMode || "ai" });
+      // Send a single combined command to avoid file watcher race conditions
+      sendExtensionCommand("render-preview", {
+        renderMode: renderMode || "ai",
+        showDimensions: showDimensions !== false,
+      });
 
-      // Show dimensions by default
-      if (showDimensions !== false) {
-        sendExtensionCommand("toggle-dimensions", { show: true });
-      }
-
-      // Wait a moment for the viewer to update
-      await new Promise((r) => setTimeout(r, 500));
-
-      // Request screenshot
-      sendExtensionCommand("screenshot");
-
-      // Wait for the extension to save the screenshot
-      await new Promise((r) => setTimeout(r, 2000));
+      // Wait for the extension to process all steps and save the screenshot
+      await new Promise((r) => setTimeout(r, 3000));
 
       const result = readExtensionResult();
       const screenshotPath = result?.screenshotPath;
-
-      // Switch back to dark mode
-      if (!renderMode || renderMode === "ai") {
-        sendExtensionCommand("set-render-mode", { mode: "dark" });
-        if (showDimensions !== false) {
-          sendExtensionCommand("toggle-dimensions", { show: false });
-        }
-      }
 
       if (screenshotPath && existsSync(screenshotPath)) {
         return {

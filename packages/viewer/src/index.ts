@@ -267,6 +267,12 @@ onMessage("request-export", (msg) => {
 });
 
 onMessage("request-screenshot", () => {
+  // Set camera to isometric angle that shows all 3 dimensions clearly
+  if (modelGroup.children.length > 0) {
+    setCameraAngle([1, -0.8, 0.7]);
+  }
+  // Wait one frame for the render to complete
+  controls.update();
   renderer.render(scene, camera);
   const dataUrl = renderer.domElement.toDataURL("image/png");
   postToExtension({ type: "screenshot-data", dataUrl });
@@ -632,7 +638,7 @@ function updateDimensions() {
   dimensionGroup.add(boxHelper);
 
   // Dimension lines with labels using sprites
-  const offset = Math.max(size.x, size.y, size.z) * 0.12;
+  const offset = Math.max(size.x, size.y, size.z) * 0.2;
 
   // X dimension (along bottom front)
   addDimensionLine(
