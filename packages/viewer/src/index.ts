@@ -219,11 +219,20 @@ function handleWorkerMessage(msg: WorkerToWebview) {
         const partLabel = msg.parts.length > 1 ? ` | ${msg.parts.length} parts` : "";
         const statusText = `${totalVerts} verts, ${totalTris} tris${partLabel} — ${msg.execTimeMs}ms + ${msg.tessTimeMs}ms`;
         statusEl.textContent = statusText;
+        // Compute bounding box for AI dimension verification
+        const bbox = new THREE.Box3().setFromObject(modelGroup);
+        const bboxSize = bbox.getSize(new THREE.Vector3());
+
         postToExtension({
           type: "render-success",
           stats: statusText,
           partCount: msg.parts.length,
           partNames: msg.parts.map((p: TessellatedPart) => p.name),
+          boundingBox: {
+            x: parseFloat(bboxSize.x.toFixed(1)),
+            y: parseFloat(bboxSize.y.toFixed(1)),
+            z: parseFloat(bboxSize.z.toFixed(1)),
+          },
         });
       } catch (err: any) {
         const errMsg = `Render error: ${err.message}`;
@@ -565,12 +574,20 @@ function setRenderMode(mode: string) {
 
   if (mode === "ai") {
     scene.background = new THREE.Color(0xf5f5f5);
-    // Re-color all parts with high-contrast AI colors
+    // Re-color parts: use custom colors if set (brightened), or AI palette
     let i = 0;
     modelGroup.traverse((child) => {
       if (child instanceof THREE.Mesh) {
         const mat = child.material as THREE.MeshPhongMaterial;
-        mat.color.setHex(AI_COLORS[i % AI_COLORS.length]);
+        const partInfo = currentParts[i];
+        if (partInfo?.color && partInfo.color !== "#8899aa") {
+          // User set a custom color — use it but make it brighter for white bg
+          const c = new THREE.Color(partInfo.color);
+          c.offsetHSL(0, 0.1, 0.15); // slightly brighter/more saturated
+          mat.color.copy(c);
+        } else {
+          mat.color.setHex(AI_COLORS[i % AI_COLORS.length]);
+        }
         mat.specular.setHex(0x222222);
         mat.shininess = 30;
         i++;

@@ -102,7 +102,7 @@ export function registerTools(server: McpServer) {
       if (status?.success) {
         const parts = status.partNames?.length ? `\nParts: ${status.partNames.join(", ")}` : "";
         return {
-          content: [{ type: "text" as const, text: `Render SUCCESS\nFile: ${resolved}\nStats: ${status.stats}${parts}` }],
+          content: [{ type: "text" as const, text: `Render SUCCESS\nFile: ${resolved}\nStats: ${status.stats}${parts}${status.boundingBox ? `\nBounding box: ${status.boundingBox.x} x ${status.boundingBox.y} x ${status.boundingBox.z} mm` : ""}` }],
         };
       } else if (status?.error) {
         return {
@@ -160,6 +160,34 @@ export function registerTools(server: McpServer) {
       const content = readFileSync(resolved, "utf-8");
       return {
         content: [{ type: "text" as const, text: content }],
+      };
+    }
+  );
+
+  server.tool(
+    "delete_shape",
+    "Delete a .shape.ts file",
+    {
+      filePath: z.string().describe("Path to the .shape.ts file to delete"),
+    },
+    async ({ filePath }) => {
+      const resolved = resolve(filePath);
+      if (!existsSync(resolved)) {
+        return {
+          content: [{ type: "text" as const, text: `File not found: ${resolved}` }],
+          isError: true,
+        };
+      }
+      if (!resolved.endsWith(".shape.ts")) {
+        return {
+          content: [{ type: "text" as const, text: `Refusing to delete non-.shape.ts file: ${resolved}` }],
+          isError: true,
+        };
+      }
+      const { unlinkSync } = require("fs");
+      unlinkSync(resolved);
+      return {
+        content: [{ type: "text" as const, text: `Deleted ${resolved}` }],
       };
     }
   );
@@ -378,7 +406,7 @@ export function registerTools(server: McpServer) {
           return {
             content: [{
               type: "text" as const,
-              text: `Render SUCCESS\nFile: ${status.fileName || "unknown"}\nStats: ${status.stats}${parts}\nTime: ${status.timestamp}`,
+              text: `Render SUCCESS\nFile: ${status.fileName || "unknown"}\nStats: ${status.stats}${parts}${status.boundingBox ? `\nBounding box: ${status.boundingBox.x} x ${status.boundingBox.y} x ${status.boundingBox.z} mm` : ""}\nTime: ${status.timestamp}`,
             }],
           };
         } else {

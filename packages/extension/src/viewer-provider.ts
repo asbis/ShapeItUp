@@ -363,6 +363,7 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           success: true,
           fileName: this.lastExecutedFile,
           stats: msg.stats,
+          boundingBox: msg.boundingBox,
           partCount: msg.partCount,
           partNames: msg.partNames,
         });
