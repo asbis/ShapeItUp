@@ -1,0 +1,5 @@
+{
+  "name": "replicad",
+  "version": "0.23.0",
+  "types": "./index.d.ts"
+}

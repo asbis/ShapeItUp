@@ -1,4 +1,5 @@
 **/*.ts
+!typings/**/*.ts
 **/tsconfig.json
 src/**
 .gitignore

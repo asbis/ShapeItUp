@@ -51,18 +51,13 @@ export function activate(context: vscode.ExtensionContext) {
           viewerProvider.executeScript(editor.document);
         }, 500);
 
-        // Auto-install replicad types if missing (silent, no prompt)
+        // Provide replicad types for editor autocomplete (no npm install)
         if (!setupPromptShown) {
           const fs = require("fs");
-          const p = require("path");
           const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-          if (
-            folder &&
-            !fs.existsSync(p.join(folder, "node_modules", "replicad"))
-          ) {
+          if (folder) {
             setupPromptShown = true;
-            outputChannel.appendLine("[setup] Replicad types missing, installing...");
-            autoInstallReplicad(folder, outputChannel);
+            provideReplicadTypes(folder, context.extensionPath, outputChannel);
           }
         }
       }
@@ -157,57 +152,44 @@ export function activate(context: vscode.ExtensionContext) {
 export function deactivate() {}
 
 /**
- * Silently install replicad in a project so .shape.ts files get proper types.
- * Runs in the background — no terminal, no prompt.
+ * Ensure .shape.ts files get replicad type checking and autocomplete
+ * by creating a tsconfig that points to our bundled type definitions.
+ * No npm install, no node_modules, no package.json modifications.
  */
-function autoInstallReplicad(folderPath: string, output: vscode.OutputChannel) {
+function provideReplicadTypes(
+  folderPath: string,
+  extensionPath: string,
+  output: vscode.OutputChannel
+) {
   const fs = require("fs");
-  const cp = require("child_process");
 
-  // Create package.json if missing
-  const pkgPath = path.join(folderPath, "package.json");
-  if (!fs.existsSync(pkgPath)) {
-    fs.writeFileSync(
-      pkgPath,
-      JSON.stringify({ private: true, dependencies: { replicad: "^0.23.0" } }, null, 2) + "\n"
-    );
-  } else {
-    try {
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
-      if (!pkg.dependencies?.replicad && !pkg.devDependencies?.replicad) {
-        pkg.dependencies = pkg.dependencies || {};
-        pkg.dependencies.replicad = "^0.23.0";
-        fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n");
-      }
-    } catch {
-      return;
-    }
-  }
+  // Path to our bundled replicad types inside the extension
+  const typingsPath = path.join(extensionPath, "typings");
 
-  // Create tsconfig.json if missing
-  const tsconfigPath = path.join(folderPath, "tsconfig.json");
-  if (!fs.existsSync(tsconfigPath)) {
-    const tsconfig = {
-      compilerOptions: {
-        target: "ES2022",
-        module: "ESNext",
-        moduleResolution: "bundler",
-        strict: false,
-        esModuleInterop: true,
-        skipLibCheck: true,
-        noEmit: true,
+  // Only create tsconfig.shapeitup.json — never modify existing tsconfig.json
+  const shapeTsconfig = path.join(folderPath, "tsconfig.shapeitup.json");
+  if (fs.existsSync(shapeTsconfig)) return;
+
+  // Check if the project already has replicad installed (no need for our types)
+  if (fs.existsSync(path.join(folderPath, "node_modules", "replicad"))) return;
+
+  const tsconfig = {
+    compilerOptions: {
+      target: "ES2022",
+      module: "ESNext",
+      moduleResolution: "bundler",
+      strict: false,
+      esModuleInterop: true,
+      skipLibCheck: true,
+      noEmit: true,
+      typeRoots: [typingsPath],
+      paths: {
+        replicad: [path.join(typingsPath, "replicad")],
       },
-      include: ["**/*.shape.ts"],
-    };
-    fs.writeFileSync(tsconfigPath, JSON.stringify(tsconfig, null, 2) + "\n");
-  }
+    },
+    include: ["**/*.shape.ts"],
+  };
 
-  // Run npm install silently in the background
-  cp.exec("npm install --save replicad", { cwd: folderPath }, (err: any) => {
-    if (err) {
-      output.appendLine(`[setup] Failed to install replicad: ${err.message}`);
-    } else {
-      output.appendLine("[setup] Replicad types installed successfully");
-    }
-  });
+  fs.writeFileSync(shapeTsconfig, JSON.stringify(tsconfig, null, 2) + "\n");
+  output.appendLine(`[setup] Created tsconfig.shapeitup.json → replicad types from extension`);
 }
