@@ -573,7 +573,22 @@ function setRenderMode(mode: string) {
   currentRenderMode = mode as "dark" | "ai";
 
   if (mode === "ai") {
-    scene.background = new THREE.Color(0xf5f5f5);
+    scene.background = new THREE.Color(0xf0f0f0);
+
+    // Boost lighting for AI mode — much brighter, more diffuse
+    scene.traverse((child) => {
+      if (child instanceof THREE.AmbientLight) {
+        child.intensity = 0.8;
+        child.color.setHex(0xffffff);
+      }
+      if (child instanceof THREE.DirectionalLight) {
+        child.intensity = 1.0;
+      }
+      if (child instanceof THREE.HemisphereLight) {
+        child.intensity = 0.6;
+      }
+    });
+
     // Re-color parts: use custom colors if set (brightened), or AI palette
     let i = 0;
     modelGroup.traverse((child) => {
@@ -581,9 +596,9 @@ function setRenderMode(mode: string) {
         const mat = child.material as THREE.MeshPhongMaterial;
         const partInfo = currentParts[i];
         if (partInfo?.color && partInfo.color !== "#8899aa") {
-          // User set a custom color — use it but make it brighter for white bg
+          // User set a custom color — brighten significantly for white bg
           const c = new THREE.Color(partInfo.color);
-          c.offsetHSL(0, 0.1, 0.15); // slightly brighter/more saturated
+          c.offsetHSL(0, 0.15, 0.25);
           mat.color.copy(c);
         } else {
           mat.color.setHex(AI_COLORS[i % AI_COLORS.length]);
@@ -598,6 +613,21 @@ function setRenderMode(mode: string) {
     });
   } else {
     scene.background = new THREE.Color(0x1e1e1e);
+
+    // Restore dark mode lighting
+    scene.traverse((child) => {
+      if (child instanceof THREE.AmbientLight) {
+        child.intensity = 0.5;
+        child.color.setHex(0x404050);
+      }
+      if (child instanceof THREE.DirectionalLight) {
+        child.intensity = (child as any)._originalIntensity || 0.8;
+      }
+      if (child instanceof THREE.HemisphereLight) {
+        child.intensity = 0.4;
+      }
+    });
+
     let i = 0;
     modelGroup.traverse((child) => {
       if (child instanceof THREE.Mesh) {

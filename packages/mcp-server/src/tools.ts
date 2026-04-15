@@ -102,7 +102,7 @@ export function registerTools(server: McpServer) {
       if (status?.success) {
         const parts = status.partNames?.length ? `\nParts: ${status.partNames.join(", ")}` : "";
         return {
-          content: [{ type: "text" as const, text: `Render SUCCESS\nFile: ${resolved}\nStats: ${status.stats}${parts}${status.boundingBox ? `\nBounding box: ${status.boundingBox.x} x ${status.boundingBox.y} x ${status.boundingBox.z} mm` : ""}` }],
+          content: [{ type: "text" as const, text: `Opened in editor and rendered.\nRender SUCCESS\nFile: ${resolved}\nStats: ${status.stats}${parts}${status.boundingBox ? `\nBounding box: ${status.boundingBox.x} x ${status.boundingBox.y} x ${status.boundingBox.z} mm` : ""}` }],
         };
       } else if (status?.error) {
         return {
