@@ -68,11 +68,27 @@ export function registerTools(server: McpServer) {
 
       writeFileSync(filePath, code, "utf-8");
 
-      // Tell VS Code to open and render the file
+      // Tell VS Code to open and render the file, wait for result
+      const resultFile = join(GLOBAL_STORAGE, "mcp-result.json");
+      try { writeFileSync(resultFile, "{}"); } catch {}
       sendExtensionCommand("open-shape", { filePath });
 
+      // Wait for render result (up to 10s)
+      await new Promise((r) => setTimeout(r, 10000));
+      const result = readExtensionResult();
+      const status = result?.renderStatus;
+
+      let statusText = "";
+      if (status?.success) {
+        statusText = `\nRender: SUCCESS | ${status.stats}`;
+        if (status.boundingBox) statusText += `\nBounding box: ${status.boundingBox.x} x ${status.boundingBox.y} x ${status.boundingBox.z} mm`;
+      } else if (status?.error) {
+        statusText = `\nRender: FAILED | ${status.error}`;
+      }
+
       return {
-        content: [{ type: "text" as const, text: `Created ${filePath}\nThe file will auto-render in the viewer. Use get_render_status to check for errors.` }],
+        content: [{ type: "text" as const, text: `Created ${filePath}${statusText}` }],
+        isError: status?.error ? true : undefined,
       };
     }
   );
@@ -141,11 +157,27 @@ export function registerTools(server: McpServer) {
       }
       writeFileSync(resolved, code, "utf-8");
 
-      // Tell VS Code to re-render the file
+      // Tell VS Code to re-render the file and wait for result
+      const resultFile = join(GLOBAL_STORAGE, "mcp-result.json");
+      try { writeFileSync(resultFile, "{}"); } catch {}
       sendExtensionCommand("open-shape", { filePath: resolved });
 
+      // Wait for render result
+      await new Promise((r) => setTimeout(r, 10000));
+      const result = readExtensionResult();
+      const status = result?.renderStatus;
+
+      let statusText = "";
+      if (status?.success) {
+        statusText = `\nRender: SUCCESS | ${status.stats}`;
+        if (status.boundingBox) statusText += `\nBounding box: ${status.boundingBox.x} x ${status.boundingBox.y} x ${status.boundingBox.z} mm`;
+      } else if (status?.error) {
+        statusText = `\nRender: FAILED | ${status.error}`;
+      }
+
       return {
-        content: [{ type: "text" as const, text: `Updated ${resolved}\nThe file will auto-render in the viewer. Use get_render_status to check for errors.` }],
+        content: [{ type: "text" as const, text: `Updated ${resolved}${statusText}` }],
+        isError: status?.error ? true : undefined,
       };
     }
   );
@@ -201,16 +233,35 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "export_shape",
-    "Export the currently rendered shape to STEP or STL file. The shape must be open and rendered in the viewer first (use open_shape).",
+    "Export the currently rendered shape to STEP or STL file. Provide outputPath to save directly (no dialog). The shape must be rendered in the viewer first.",
     {
       format: z.enum(["step", "stl"]).describe("Export format: 'step' for CNC/manufacturing, 'stl' for 3D printing"),
-      outputPath: z.string().optional().describe("Output file path (default: same directory as the shape file with .step/.stl extension)"),
+      outputPath: z.string().optional().describe("Output file path. If provided, saves directly without a dialog. If omitted, generates a default path next to the shape file."),
     },
     async ({ format, outputPath }) => {
-      sendExtensionCommand("export-shape", { format, outputPath });
+      // If no outputPath, generate one based on the last rendered file
+      let savePath = outputPath;
+      if (!savePath) {
+        const statusFile = join(GLOBAL_STORAGE, "shapeitup-status.json");
+        try {
+          const status = JSON.parse(readFileSync(statusFile, "utf-8"));
+          if (status.fileName) {
+            savePath = status.fileName.replace(/\.shape\.ts$/, `.${format}`);
+          }
+        } catch {}
+      }
+      if (!savePath) {
+        savePath = join(process.cwd(), `export.${format}`);
+      }
 
-      // Wait for export to complete
-      await new Promise((r) => setTimeout(r, 3000));
+      // Clear old result
+      const resultFile = join(GLOBAL_STORAGE, "mcp-result.json");
+      try { writeFileSync(resultFile, "{}"); } catch {}
+
+      sendExtensionCommand("export-shape", { format, outputPath: savePath });
+
+      // Wait for export
+      await new Promise((r) => setTimeout(r, 5000));
 
       const result = readExtensionResult();
       if (result?.exportPath && existsSync(result.exportPath)) {
@@ -218,8 +269,14 @@ export function registerTools(server: McpServer) {
           content: [{ type: "text" as const, text: `Exported to: ${result.exportPath}\nFormat: ${format.toUpperCase()}` }],
         };
       }
+      if (result?.error) {
+        return {
+          content: [{ type: "text" as const, text: `Export failed: ${result.error}` }],
+          isError: true,
+        };
+      }
       return {
-        content: [{ type: "text" as const, text: `Export command sent. The VS Code save dialog should appear — the user needs to choose the save location.` }],
+        content: [{ type: "text" as const, text: `Export may still be in progress. Check: ${savePath}` }],
       };
     }
   );

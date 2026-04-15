@@ -205,11 +205,33 @@ export function activate(context: vscode.ExtensionContext) {
           Buffer.from(JSON.stringify({ screenshotPath }), "utf-8")
         );
       } else if (cmd.command === "export-shape") {
-        outputChannel.appendLine(`[ai] Export: ${cmd.format}`);
-        if (cmd.format === "step") {
-          vscode.commands.executeCommand("shapeitup.exportSTEP");
+        outputChannel.appendLine(`[ai] Export: ${cmd.format} → ${cmd.outputPath || "dialog"}`);
+        const resultFile = path.join(context.globalStorageUri.fsPath, "mcp-result.json");
+
+        if (cmd.outputPath) {
+          // Direct save — no dialog (for AI workflows)
+          const data = await viewerProvider.requestExport(cmd.format);
+          if (data) {
+            const fs = require("fs");
+            fs.writeFileSync(cmd.outputPath, Buffer.from(data));
+            await vscode.workspace.fs.writeFile(
+              vscode.Uri.file(resultFile),
+              Buffer.from(JSON.stringify({ exportPath: cmd.outputPath }), "utf-8")
+            );
+            outputChannel.appendLine(`[ai] Exported to ${cmd.outputPath}`);
+          } else {
+            await vscode.workspace.fs.writeFile(
+              vscode.Uri.file(resultFile),
+              Buffer.from(JSON.stringify({ error: "No shape to export" }), "utf-8")
+            );
+          }
         } else {
-          vscode.commands.executeCommand("shapeitup.exportSTL");
+          // Interactive — show save dialog
+          if (cmd.format === "step") {
+            vscode.commands.executeCommand("shapeitup.exportSTEP");
+          } else {
+            vscode.commands.executeCommand("shapeitup.exportSTL");
+          }
         }
 
       } else if (cmd.command === "set-render-mode") {
