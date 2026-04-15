@@ -39,6 +39,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Auto-preview when switching to a .shape.ts file (debounced)
   let autoPreviewTimer: ReturnType<typeof setTimeout> | undefined;
+  let setupPromptShown = false;
   context.subscriptions.push(
     vscode.window.onDidChangeActiveTextEditor((editor) => {
       if (editor && editor.document.fileName.endsWith(".shape.ts")) {
@@ -49,6 +50,30 @@ export function activate(context: vscode.ExtensionContext) {
           );
           viewerProvider.executeScript(editor.document);
         }, 500);
+
+        // Offer to set up project if replicad types are missing
+        if (!setupPromptShown) {
+          const fs = require("fs");
+          const p = require("path");
+          const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+          if (
+            folder &&
+            !fs.existsSync(p.join(folder, "node_modules", "replicad"))
+          ) {
+            setupPromptShown = true;
+            vscode.window
+              .showInformationMessage(
+                "Install replicad types to fix editor errors in .shape.ts files?",
+                "Install",
+                "Dismiss"
+              )
+              .then((choice) => {
+                if (choice === "Install") {
+                  vscode.commands.executeCommand("shapeitup.setupProject");
+                }
+              });
+          }
+        }
       }
     })
   );
