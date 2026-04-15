@@ -52,6 +52,13 @@ export function registerTools(server: McpServer) {
       const dir = directory || process.cwd();
       const filePath = join(dir, `${name}.shape.ts`);
 
+      if (!code.trim() || !code.includes("function")) {
+        return {
+          content: [{ type: "text" as const, text: `Invalid code: must contain at least a function definition. Example:\nimport { drawRectangle } from "replicad";\nexport default function main() { return drawRectangle(50,30).sketchOnPlane("XY").extrude(10); }` }],
+          isError: true,
+        };
+      }
+
       if (existsSync(filePath) && !overwrite) {
         return {
           content: [{ type: "text" as const, text: `File already exists: ${filePath}\nUse modify_shape to update it, or pass overwrite: true to replace it.` }],
@@ -188,6 +195,31 @@ export function registerTools(server: McpServer) {
       unlinkSync(resolved);
       return {
         content: [{ type: "text" as const, text: `Deleted ${resolved}` }],
+      };
+    }
+  );
+
+  server.tool(
+    "export_shape",
+    "Export the currently rendered shape to STEP or STL file. The shape must be open and rendered in the viewer first (use open_shape).",
+    {
+      format: z.enum(["step", "stl"]).describe("Export format: 'step' for CNC/manufacturing, 'stl' for 3D printing"),
+      outputPath: z.string().optional().describe("Output file path (default: same directory as the shape file with .step/.stl extension)"),
+    },
+    async ({ format, outputPath }) => {
+      sendExtensionCommand("export-shape", { format, outputPath });
+
+      // Wait for export to complete
+      await new Promise((r) => setTimeout(r, 3000));
+
+      const result = readExtensionResult();
+      if (result?.exportPath && existsSync(result.exportPath)) {
+        return {
+          content: [{ type: "text" as const, text: `Exported to: ${result.exportPath}\nFormat: ${format.toUpperCase()}` }],
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: `Export command sent. The VS Code save dialog should appear — the user needs to choose the save location.` }],
       };
     }
   );
@@ -337,7 +369,7 @@ export function registerTools(server: McpServer) {
           content: [
             {
               type: "text" as const,
-              text: `Screenshot saved to: ${screenshotPath}${fileInfo}\nUse the Read tool to view this image and verify the shape is correct.`,
+              text: `Screenshot saved to: ${screenshotPath}\nRender mode: ${renderMode || "ai"}, Dimensions: ${showDimensions !== false ? "ON" : "OFF"}${fileInfo}\nUse the Read tool to view this image and verify the shape is correct.`,
             },
           ],
         };
@@ -640,9 +672,10 @@ STL is mesh-based (best for 3D printing).`,
 import { drawRectangle, sketchCircle } from "replicad";
 
 export default function main() {
-  const box = drawRectangle(60, 40).sketchOnPlane("XY").extrude(20);
+  let shape = drawRectangle(60, 40).sketchOnPlane("XY").extrude(20);
+  shape = shape.fillet(2); // Fillet BEFORE cutting holes
   const hole = sketchCircle(8, { plane: "XY" }).extrude(20);
-  return box.cut(hole).fillet(2);
+  return shape.cut(hole);
 }
 \`\`\`
 

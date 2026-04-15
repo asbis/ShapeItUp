@@ -204,6 +204,14 @@ export function activate(context: vscode.ExtensionContext) {
           vscode.Uri.file(resultFile),
           Buffer.from(JSON.stringify({ screenshotPath }), "utf-8")
         );
+      } else if (cmd.command === "export-shape") {
+        outputChannel.appendLine(`[ai] Export: ${cmd.format}`);
+        if (cmd.format === "step") {
+          vscode.commands.executeCommand("shapeitup.exportSTEP");
+        } else {
+          vscode.commands.executeCommand("shapeitup.exportSTL");
+        }
+
       } else if (cmd.command === "set-render-mode") {
         viewerProvider.sendViewerCommand("set-render-mode", { mode: cmd.mode });
       } else if (cmd.command === "toggle-dimensions") {
