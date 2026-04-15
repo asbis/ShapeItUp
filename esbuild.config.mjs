@@ -64,14 +64,13 @@ const mcpServerConfig = {
 };
 
 // 5. MCP Server copy bundled into extension dist (for auto-discovery)
+// This must be fully self-contained — no external dependencies
 const mcpServerExtConfig = {
   ...sharedConfig,
   entryPoints: [resolve(__dirname, "packages/mcp-server/src/index.ts")],
   outfile: resolve(__dirname, "packages/extension/dist/mcp-server.js"),
   platform: "node",
-  format: "esm",
-  banner: { js: "#!/usr/bin/env node\nimport { createRequire } from 'module'; const require = createRequire(import.meta.url);" },
-  external: ["esbuild"],
+  format: "cjs",
 };
 
 function copyWasmFiles() {

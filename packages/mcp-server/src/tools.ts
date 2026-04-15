@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync } from "fs";
 import { join, resolve, basename } from "path";
-import { transform } from "esbuild";
+// Note: no esbuild dependency — this server must be fully self-contained
 import { homedir } from "os";
 
 // Path where the extension stores command files for IPC
@@ -139,13 +139,16 @@ export function registerTools(server: McpServer) {
     },
     async ({ code }) => {
       try {
-        await transform(code, {
-          loader: "ts",
-          format: "esm",
-          target: "es2022",
-        });
+        // Strip type annotations for basic syntax validation
+        // (full TS validation would need esbuild which can't be bundled)
+        const stripped = code
+          .replace(/:\s*typeof\s+\w+/g, "")
+          .replace(/:\s*\w+(\[\])?/g, "")
+          .replace(/import\s+type\s+/g, "// ")
+          .replace(/as\s+\w+/g, "");
+        new Function(stripped);
         return {
-          content: [{ type: "text" as const, text: "Valid TypeScript syntax" }],
+          content: [{ type: "text" as const, text: "Script syntax looks valid" }],
         };
       } catch (e: any) {
         return {
