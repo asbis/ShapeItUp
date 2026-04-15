@@ -29,7 +29,7 @@ importers:
         version: 0.28.0
     devDependencies:
       '@types/vscode':
-        specifier: ^1.95.0
+        specifier: ^1.106.0
         version: 1.115.0
 
   packages/mcp-server:

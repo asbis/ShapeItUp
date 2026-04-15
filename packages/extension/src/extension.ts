@@ -138,19 +138,18 @@ export function activate(context: vscode.ExtensionContext) {
 export function deactivate() {}
 
 /**
- * Register the ShapeItUp MCP server via the VS Code API.
- * This allows Claude Code and GitHub Copilot to discover it automatically —
- * no manual settings.json editing needed.
+ * Register the ShapeItUp MCP server for Claude Code.
+ *
+ * Claude Code reads MCP servers from ~/.claude.json (NOT ~/.claude/settings.json).
+ * The VS Code lm.registerMcpServerDefinitionProvider API only works for GitHub Copilot.
+ * So we write directly to ~/.claude.json if Claude Code is installed.
  */
 function registerMcpServer(
   context: vscode.ExtensionContext,
   output: vscode.OutputChannel
 ) {
-  // Check if the VS Code MCP API is available (requires VS Code 1.99+)
-  if (!vscode.lm?.registerMcpServerDefinitionProvider) {
-    output.appendLine("[mcp] VS Code MCP API not available — manual setup required");
-    return;
-  }
+  const fs = require("fs");
+  const os = require("os");
 
   const mcpServerPath = path.join(
     context.extensionPath,
@@ -158,23 +157,66 @@ function registerMcpServer(
     "mcp-server.js"
   );
 
+  // Also register via VS Code API for GitHub Copilot compatibility
   try {
-    const provider = vscode.lm.registerMcpServerDefinitionProvider("shapeitup-mcp", {
-      provideMcpServerDefinitions: () => {
-        return [
-          new vscode.McpStdioServerDefinition(
-            "shapeitup",
-            "ShapeItUp CAD",
-            "node",
-            [mcpServerPath]
-          ),
-        ];
-      },
-    });
-    context.subscriptions.push(provider);
-    output.appendLine("[mcp] MCP server registered via VS Code API");
+    if (vscode.lm?.registerMcpServerDefinitionProvider) {
+      const provider = (vscode.lm as any).registerMcpServerDefinitionProvider("shapeitup-mcp", {
+        provideMcpServerDefinitions: () => {
+          return [
+            new (vscode as any).McpStdioServerDefinition(
+              "shapeitup",
+              "ShapeItUp CAD",
+              "node",
+              [mcpServerPath]
+            ),
+          ];
+        },
+      });
+      context.subscriptions.push(provider);
+      output.appendLine("[mcp] Registered MCP server via VS Code API (Copilot)");
+    }
+  } catch {
+    // API not available — that's fine
+  }
+
+  // Register for Claude Code by writing to ~/.claude.json
+  const claudeCode = vscode.extensions.getExtension("anthropic.claude-code");
+  if (!claudeCode) {
+    output.appendLine("[mcp] Claude Code not installed — skipping MCP setup");
+    return;
+  }
+
+  const claudeJsonPath = path.join(os.homedir(), ".claude.json");
+
+  try {
+    let config: any = {};
+    if (fs.existsSync(claudeJsonPath)) {
+      config = JSON.parse(fs.readFileSync(claudeJsonPath, "utf-8"));
+    }
+
+    config.mcpServers = config.mcpServers || {};
+
+    // Check if already configured with the correct path
+    const existing = config.mcpServers.shapeitup;
+    if (
+      existing &&
+      existing.args?.[0] === mcpServerPath
+    ) {
+      output.appendLine("[mcp] Claude Code MCP server already configured");
+      return;
+    }
+
+    // Add or update the ShapeItUp MCP server
+    config.mcpServers.shapeitup = {
+      type: "stdio",
+      command: "node",
+      args: [mcpServerPath],
+    };
+
+    fs.writeFileSync(claudeJsonPath, JSON.stringify(config, null, 2) + "\n");
+    output.appendLine(`[mcp] Registered MCP server in ~/.claude.json → ${mcpServerPath}`);
   } catch (e: any) {
-    output.appendLine(`[mcp] Failed to register MCP server: ${e.message}`);
+    output.appendLine(`[mcp] Failed to configure Claude Code MCP: ${e.message}`);
   }
 }
 

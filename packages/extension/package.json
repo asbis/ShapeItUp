@@ -2,7 +2,7 @@
   "name": "shapeitup-vscode",
   "displayName": "ShapeItUp",
   "description": "Scripted CAD for VS Code — write TypeScript, see 3D, export STEP/STL. AI-powered with Claude Code MCP integration.",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "publisher": "shapeitup",
   "license": "MIT",
   "icon": "icon.png",
@@ -15,7 +15,7 @@
     "url": "https://github.com/asbis/ShapeItUp/issues"
   },
   "engines": {
-    "vscode": "^1.96.0"
+    "vscode": "^1.106.0"
   },
   "categories": [
     "Visualization",
@@ -72,7 +72,7 @@
           "icon": "media/icon-sidebar.svg"
         }
       ],
-      "secondarySideBar": [
+      "secondarySidebar": [
         {
           "id": "shapeitup-secondary",
           "title": "ShapeItUp",
@@ -116,6 +116,6 @@
     "esbuild-wasm": "^0.28.0"
   },
   "devDependencies": {
-    "@types/vscode": "^1.95.0"
+    "@types/vscode": "^1.106.0"
   }
 }
