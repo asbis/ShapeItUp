@@ -166,30 +166,45 @@ function provideReplicadTypes(
   // Path to our bundled replicad types inside the extension
   const typingsPath = path.join(extensionPath, "typings");
 
-  // Only create tsconfig.shapeitup.json — never modify existing tsconfig.json
-  const shapeTsconfig = path.join(folderPath, "tsconfig.shapeitup.json");
-  if (fs.existsSync(shapeTsconfig)) return;
-
   // Check if the project already has replicad installed (no need for our types)
   if (fs.existsSync(path.join(folderPath, "node_modules", "replicad"))) return;
 
-  const tsconfig = {
-    compilerOptions: {
-      target: "ES2022",
-      module: "ESNext",
-      moduleResolution: "bundler",
-      strict: false,
-      esModuleInterop: true,
-      skipLibCheck: true,
-      noEmit: true,
-      typeRoots: [typingsPath],
-      paths: {
-        replicad: [path.join(typingsPath, "replicad")],
-      },
-    },
-    include: ["**/*.shape.ts"],
-  };
+  const tsconfigPath = path.join(folderPath, "tsconfig.json");
 
-  fs.writeFileSync(shapeTsconfig, JSON.stringify(tsconfig, null, 2) + "\n");
-  output.appendLine(`[setup] Created tsconfig.shapeitup.json → replicad types from extension`);
+  if (!fs.existsSync(tsconfigPath)) {
+    // No tsconfig.json — create one for .shape.ts files
+    const tsconfig = {
+      compilerOptions: {
+        target: "ES2022",
+        module: "ESNext",
+        moduleResolution: "bundler",
+        strict: false,
+        esModuleInterop: true,
+        skipLibCheck: true,
+        noEmit: true,
+        typeRoots: [typingsPath],
+        paths: {
+          replicad: [path.join(typingsPath, "replicad")],
+        },
+      },
+      include: ["**/*.shape.ts"],
+    };
+    fs.writeFileSync(tsconfigPath, JSON.stringify(tsconfig, null, 2) + "\n");
+    output.appendLine("[setup] Created tsconfig.json with replicad types from extension");
+  } else {
+    // tsconfig.json exists — check if it already has replicad paths
+    try {
+      const existing = JSON.parse(fs.readFileSync(tsconfigPath, "utf-8"));
+      if (!existing.compilerOptions?.paths?.replicad) {
+        // Add paths to existing tsconfig without overwriting other settings
+        existing.compilerOptions = existing.compilerOptions || {};
+        existing.compilerOptions.paths = existing.compilerOptions.paths || {};
+        existing.compilerOptions.paths.replicad = [path.join(typingsPath, "replicad")];
+        fs.writeFileSync(tsconfigPath, JSON.stringify(existing, null, 2) + "\n");
+        output.appendLine("[setup] Added replicad type paths to existing tsconfig.json");
+      }
+    } catch {
+      // Can't parse existing tsconfig — leave it alone
+    }
+  }
 }
