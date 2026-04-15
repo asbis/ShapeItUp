@@ -37,17 +37,22 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Auto-preview when switching to a .shape.ts file (debounced)
+  // Auto-preview when switching to a .shape.ts file (debounced, deduplicated)
   let autoPreviewTimer: ReturnType<typeof setTimeout> | undefined;
   let setupPromptShown = false;
+  let lastPreviewedFile = "";
   context.subscriptions.push(
     vscode.window.onDidChangeActiveTextEditor((editor) => {
       if (editor && editor.document.fileName.endsWith(".shape.ts")) {
+        const fileName = editor.document.fileName;
+
+        // Skip if same file already previewed (avoid spam on panel focus changes)
+        if (fileName === lastPreviewedFile) return;
+
         if (autoPreviewTimer) clearTimeout(autoPreviewTimer);
         autoPreviewTimer = setTimeout(() => {
-          outputChannel.appendLine(
-            `[auto] Switched to ${editor.document.fileName}`
-          );
+          lastPreviewedFile = fileName;
+          outputChannel.appendLine(`[auto] Switched to ${fileName}`);
           viewerProvider.executeScript(editor.document);
         }, 500);
 
@@ -64,42 +69,20 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // Re-preview on save (even if same file)
+  context.subscriptions.push(
+    vscode.workspace.onDidSaveTextDocument((doc) => {
+      if (doc.fileName.endsWith(".shape.ts")) {
+        lastPreviewedFile = ""; // allow re-render
+        viewerProvider.executeScript(doc);
+      }
+    })
+  );
+
   // Also auto-preview the currently open file on activation
   const activeEditor = vscode.window.activeTextEditor;
   if (activeEditor && activeEditor.document.fileName.endsWith(".shape.ts")) {
     viewerProvider.executeScript(activeEditor.document);
-  }
-
-  // Move the ShapeItUp view to the secondary side bar (right side) on first run
-  const movedKey = "shapeitup.movedToSecondarySideBar";
-  if (!context.globalState.get(movedKey)) {
-    vscode.commands.executeCommand("shapeitup.viewer.focus").then(() => {
-      // Try different command names across VS Code versions
-      vscode.commands
-        .executeCommand("workbench.action.moveViewToSecondarySideBar")
-        .then(
-          () => {
-            context.globalState.update(movedKey, true);
-            outputChannel.appendLine("[init] Moved viewer to secondary side bar");
-          },
-          () => {
-            // Fallback: try the auxiliary bar command (older VS Code versions)
-            vscode.commands
-              .executeCommand("workbench.action.moveViewToAuxiliaryBar")
-              .then(
-                () => {
-                  context.globalState.update(movedKey, true);
-                  outputChannel.appendLine("[init] Moved viewer to auxiliary bar");
-                },
-                () => {
-                  // Neither command exists — just mark as done, user can move it manually
-                  context.globalState.update(movedKey, true);
-                  outputChannel.appendLine("[init] Could not auto-move viewer — drag it to the right side manually");
-                }
-              );
-          }
-        );
-    });
   }
 
   // AI-facing commands (triggered by MCP server via command files)
