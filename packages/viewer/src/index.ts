@@ -548,14 +548,14 @@ renderer.domElement.addEventListener("click", (event) => {
 // --- AI Render Mode ---
 // High-contrast light background with vivid colors for AI screenshot analysis
 const AI_COLORS = [
-  0x2196f3, // blue
-  0xff5722, // deep orange
-  0x4caf50, // green
-  0x9c27b0, // purple
-  0xff9800, // orange
-  0x00bcd4, // cyan
-  0xe91e63, // pink
-  0x8bc34a, // light green
+  0x4499dd, // bright blue (default — lighter for visibility)
+  0xff6633, // orange
+  0x44bb66, // green
+  0xbb55dd, // purple
+  0xffaa22, // golden
+  0x22ccdd, // cyan
+  0xff5588, // pink
+  0x88cc44, // lime
 ];
 
 let currentRenderMode: "dark" | "ai" = "dark";
@@ -648,15 +648,15 @@ function updateDimensions() {
     dimColor, textColor
   );
 
-  // Y dimension (along bottom right)
+  // Y dimension (along bottom left — separated from Z)
   addDimensionLine(
-    [max.x + offset, min.y, min.z],
-    [max.x + offset, max.y, min.z],
+    [min.x - offset, min.y, min.z],
+    [min.x - offset, max.y, min.z],
     `Y: ${size.y.toFixed(1)}mm`,
     dimColor, textColor
   );
 
-  // Z dimension (along right front)
+  // Z dimension (along right front — separated from Y)
   addDimensionLine(
     [max.x + offset, min.y, min.z],
     [max.x + offset, min.y, max.z],

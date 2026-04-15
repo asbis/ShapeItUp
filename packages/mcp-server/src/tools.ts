@@ -84,10 +84,36 @@ export function registerTools(server: McpServer) {
           isError: true,
         };
       }
+
+      // Clear previous result
+      const resultFile = join(GLOBAL_STORAGE, "mcp-result.json");
+      try { writeFileSync(resultFile, "{}"); } catch {}
+
+      // Send command to extension (it will wait for render and write result)
       sendExtensionCommand("open-shape", { filePath: resolved });
-      return {
-        content: [{ type: "text" as const, text: `Opening ${resolved} in viewer. Wait ~2 seconds then use get_render_status to check if it rendered.` }],
-      };
+
+      // Wait for the extension to complete (it blocks up to 8s for render)
+      await new Promise((r) => setTimeout(r, 10000));
+
+      // Read back the result
+      const result = readExtensionResult();
+      const status = result?.renderStatus;
+
+      if (status?.success) {
+        const parts = status.partNames?.length ? `\nParts: ${status.partNames.join(", ")}` : "";
+        return {
+          content: [{ type: "text" as const, text: `Render SUCCESS\nFile: ${resolved}\nStats: ${status.stats}${parts}` }],
+        };
+      } else if (status?.error) {
+        return {
+          content: [{ type: "text" as const, text: `Render FAILED\nFile: ${resolved}\nError: ${status.error}` }],
+          isError: true,
+        };
+      } else {
+        return {
+          content: [{ type: "text" as const, text: `File opened: ${resolved}\nRender status unknown — the viewer may still be loading. Use get_render_status to check.` }],
+        };
+      }
     }
   );
 
@@ -241,24 +267,49 @@ export function registerTools(server: McpServer) {
       renderMode: z.enum(["ai", "dark"]).optional().describe("Render mode: 'ai' for high-contrast light background (default), 'dark' for user's dark mode"),
     },
     async ({ showDimensions, renderMode }) => {
-      // Send a single combined command to avoid file watcher race conditions
+      // Clear old result
+      const resultFile = join(GLOBAL_STORAGE, "mcp-result.json");
+      try { writeFileSync(resultFile, "{}"); } catch {}
+
+      // Send a single combined command
       sendExtensionCommand("render-preview", {
         renderMode: renderMode || "ai",
         showDimensions: showDimensions !== false,
       });
 
-      // Wait for the extension to process all steps and save the screenshot
-      await new Promise((r) => setTimeout(r, 3000));
+      // Retry: poll for the screenshot file with increasing delays
+      let screenshotPath: string | undefined;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        await new Promise((r) => setTimeout(r, attempt === 0 ? 2000 : 1500));
+        const result = readExtensionResult();
+        if (result?.screenshotPath && existsSync(result.screenshotPath)) {
+          screenshotPath = result.screenshotPath;
+          break;
+        }
+        // Re-send command on retry in case file watcher missed it
+        if (attempt > 0) {
+          sendExtensionCommand("render-preview", {
+            renderMode: renderMode || "ai",
+            showDimensions: showDimensions !== false,
+          });
+        }
+      }
 
-      const result = readExtensionResult();
-      const screenshotPath = result?.screenshotPath;
+      if (screenshotPath) {
+        // Read render status to include file info
+        const statusFile = join(GLOBAL_STORAGE, "shapeitup-status.json");
+        let fileInfo = "";
+        try {
+          const status = JSON.parse(readFileSync(statusFile, "utf-8"));
+          if (status.fileName) fileInfo = `\nFile: ${status.fileName}`;
+          if (status.stats) fileInfo += `\nStats: ${status.stats}`;
+        } catch {}
 
-      if (screenshotPath && existsSync(screenshotPath)) {
         return {
           content: [
             {
               type: "text" as const,
-              text: `Screenshot saved to: ${screenshotPath}\nUse the Read tool to view this image and verify the shape is correct.`,
+              text: `Screenshot saved to: ${screenshotPath}${fileInfo}\nUse the Read tool to view this image and verify the shape is correct.`,
             },
           ],
         };
@@ -498,7 +549,15 @@ shape.shell({ thickness, filter }) → Shape3D
   e.g. shape.shell({ thickness: 2, filter: f => f.inPlane("XY", 10) })
 
 ## Draft (taper walls)
-shape.draft(angle, faceFinder, neutralPlane?)`,
+shape.draft(angle, faceFinder, neutralPlane?)
+
+## IMPORTANT: Fillet/Chamfer Best Practices
+- Apply fillets BEFORE boolean cuts when possible
+- Avoid .fillet(r, e => e.inPlane("XY", z)) after many boolean cuts — tiny edges from cutouts crash OpenCascade
+- Prefer .fillet(r, e => e.inDirection("Z")) to select outer vertical edges only
+- Use small radii (0.3-0.5mm) on complex geometry, larger (1-3mm) only on simple shapes
+- Wrap fillets in try/catch — if it fails, skip or reduce the radius
+- If fillet crashes, try: reduce radius, fillet fewer edges, or fillet before cutting holes`,
 
     transforms: `# Transformations
 

@@ -116,11 +116,54 @@ export function activate(context: vscode.ExtensionContext) {
       const data = await vscode.workspace.fs.readFile(vscode.Uri.file(commandFile));
       const cmd = JSON.parse(Buffer.from(data).toString("utf-8"));
       if (cmd.command === "open-shape") {
-        // Open a .shape.ts file and render it
+        // Open a .shape.ts file, render it, and wait for the result
         outputChannel.appendLine(`[ai] Opening ${cmd.filePath}`);
-        const doc = await vscode.workspace.openTextDocument(cmd.filePath);
-        await vscode.window.showTextDocument(doc, { preview: false });
-        viewerProvider.executeScript(doc);
+        try {
+          const doc = await vscode.workspace.openTextDocument(cmd.filePath);
+          await vscode.window.showTextDocument(doc, { preview: false });
+
+          // Force re-render by clearing the dedup check
+          viewerProvider.executeScript(doc);
+
+          // Wait for render to complete (poll status file for up to 8 seconds)
+          const fs = require("fs");
+          const statusPath = path.join(context.globalStorageUri.fsPath, "shapeitup-status.json");
+          const startTime = Date.now();
+          let renderDone = false;
+
+          // Clear old status so we know when new one arrives
+          try { fs.unlinkSync(statusPath); } catch {}
+
+          // Poll for new status (render writes it on success or error)
+          while (Date.now() - startTime < 8000) {
+            await new Promise((r) => setTimeout(r, 500));
+            if (fs.existsSync(statusPath)) {
+              try {
+                const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+                if (status.timestamp && new Date(status.timestamp).getTime() > startTime) {
+                  renderDone = true;
+                  // Write result for the MCP server to read
+                  const resultFile = path.join(context.globalStorageUri.fsPath, "mcp-result.json");
+                  await vscode.workspace.fs.writeFile(
+                    vscode.Uri.file(resultFile),
+                    Buffer.from(JSON.stringify({ renderStatus: status }), "utf-8")
+                  );
+                  break;
+                }
+              } catch {}
+            }
+          }
+
+          if (!renderDone) {
+            const resultFile = path.join(context.globalStorageUri.fsPath, "mcp-result.json");
+            await vscode.workspace.fs.writeFile(
+              vscode.Uri.file(resultFile),
+              Buffer.from(JSON.stringify({ renderStatus: { success: false, error: "Render timed out after 8 seconds", fileName: cmd.filePath } }), "utf-8")
+            );
+          }
+        } catch (e: any) {
+          outputChannel.appendLine(`[ai] open-shape error: ${e.message}`);
+        }
 
       } else if (cmd.command === "render-preview") {
         // Combined command: switch mode, toggle dims, wait, screenshot, restore

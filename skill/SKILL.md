@@ -203,6 +203,14 @@ shape.shell({ thickness: 2, filter: f => f.inPlane("XY", height) })
 ### Draft (taper walls)
 ```typescript
 shape.draft(angleDeg, faceFinder, neutralPlane?)
+
+### Fillet/Chamfer Best Practices
+- Apply fillets BEFORE boolean cuts when possible
+- Avoid `.fillet(r, e => e.inPlane("XY", z))` after many boolean cuts — tiny edges crash OpenCascade
+- Prefer `.fillet(r, e => e.inDirection("Z"))` for outer vertical edges only
+- Use small radii (0.3-0.5mm) on complex geometry
+- Wrap fillets in try/catch: `try { shape = shape.fillet(0.5); } catch { /* skip */ }`
+- If fillet crashes: reduce radius, fillet fewer edges, or fillet before cutting holes
 ```
 
 ---
