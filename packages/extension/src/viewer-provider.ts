@@ -504,7 +504,7 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       ? path.basename(this.lastExecutedFile, '.shape.ts')
       : 'unknown';
     // Include camera angle in filename to avoid parallel call collisions
-    const angleSuffix = cameraAngle && cameraAngle !== "isometric" ? `-${cameraAngle}` : "";
+    const angleSuffix = cameraAngle ? `-${cameraAngle}` : "";
     const filePath = path.join(dir, `shapeitup-preview-${shapeName}${angleSuffix}.png`);
     const latestPath = path.join(dir, "shapeitup-preview.png");
 

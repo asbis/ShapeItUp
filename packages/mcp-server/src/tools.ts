@@ -301,18 +301,22 @@ export function registerTools(server: McpServer) {
       try {
         // Strip TypeScript and ESM syntax to validate as plain JS
         let stripped = code;
-        // Remove import statements entirely
-        stripped = stripped.replace(/^import\s+.*$/gm, "");
+        // Remove import statements entirely (including multi-line)
+        stripped = stripped.replace(/^import\s+[\s\S]*?from\s*["'][^"']*["']\s*;?\s*$/gm, "");
+        stripped = stripped.replace(/^import\s+["'][^"']*["']\s*;?\s*$/gm, "");
         // Remove export keywords
         stripped = stripped.replace(/^export\s+(default\s+)?/gm, "");
-        // Remove `: typeof X` type annotations (common params pattern)
+        // Remove `: typeof X` annotations
         stripped = stripped.replace(/:\s*typeof\s+\w+/g, "");
-        // Remove `: Type` annotations but not ternary colons or object keys
-        stripped = stripped.replace(/(\w|\)|\])\s*:\s*[\w.<>,\s|&\[\]{}]+(?=\s*[,)\n={])/g, "$1");
+        // Remove function parameter type annotations: (x: Type, y: Type)
+        // Only match `: Type` after a parameter name followed by , or )
+        stripped = stripped.replace(/(\w)\s*:\s*(?:string|number|boolean|any|void|never|unknown|null|undefined)(?:\[\])?\s*(?=[,)])/g, "$1");
         // Remove `as Type` casts
         stripped = stripped.replace(/\bas\s+\w+/g, "");
         // Remove interface/type declarations (whole line)
         stripped = stripped.replace(/^(interface|type)\s+\w+[^=].*$/gm, "");
+        // Remove generic type params <T> from function declarations
+        stripped = stripped.replace(/(<\w[\w,\s]*>)\s*\(/g, "(");
         // Try parsing
         new Function(stripped);
         return {
