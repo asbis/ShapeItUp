@@ -188,7 +188,17 @@ function clearWorkerResponseTimer() {
   }
 }
 
+let lastRespawnTime = 0;
+
 function respawnWorker() {
+  // Prevent rapid respawn loops — at most once every 5 seconds
+  const now = Date.now();
+  if (now - lastRespawnTime < 5000) {
+    statusEl.textContent = "Renderer crashed — waiting before retry...";
+    return;
+  }
+  lastRespawnTime = now;
+
   clearWorkerResponseTimer();
   statusEl.textContent = "Restarting renderer...";
   if (worker) {
@@ -273,17 +283,18 @@ function handleWorkerMessage(msg: WorkerToWebview) {
 
     case "error":
       clearWorkerResponseTimer();
-      // Detect WASM memory crash — message contains "memory access out of bounds"
-      // or is a bare numeric pointer (e.g. "1234567") from a WASM abort
+      // Only respawn on actual WASM memory crashes — NOT on script errors like "X is not a function"
       if (
         msg.message.includes("memory access out of bounds") ||
-        msg.message.includes("is not a function") ||
-        msg.message.includes("Failed to fetch WASM") ||
-        /^\d+$/.test(msg.message.trim())
+        msg.message.includes("RuntimeError:") ||
+        /^(\d{6,})$/.test(msg.message.trim()) // bare WASM pointer (6+ digits only)
       ) {
-        workerCrashed = true;
-        postToExtension({ type: "error", message: `WASM crash detected, restarting worker: ${msg.message}` });
-        respawnWorker();
+        if (!workerCrashed) { // prevent respawn loop
+          workerCrashed = true;
+          postToExtension({ type: "error", message: `WASM crash — restarting renderer. Cause: ${msg.message}` });
+          // Delay respawn to let any in-flight fetches settle
+          setTimeout(() => respawnWorker(), 2000);
+        }
         return;
       }
       postToExtension({ type: "error", message: msg.message });

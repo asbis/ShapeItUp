@@ -120,9 +120,10 @@ export function activate(context: vscode.ExtensionContext) {
         outputChannel.appendLine(`[ai] Opening ${cmd.filePath}`);
         try {
           const doc = await vscode.workspace.openTextDocument(cmd.filePath);
+          // Set lastPreviewedFile BEFORE showing doc to prevent auto-preview from doubling
+          lastPreviewedFile = doc.fileName;
           await vscode.window.showTextDocument(doc, { preview: false });
 
-          // Force re-render by clearing the dedup check
           viewerProvider.executeScript(doc);
 
           // Wait for render to complete (poll status file for up to 8 seconds)

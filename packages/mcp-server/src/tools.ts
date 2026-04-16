@@ -321,12 +321,14 @@ export function registerTools(server: McpServer) {
         stripped = stripped.replace(/^import\s+.*$/gm, "");
         // Remove export keywords
         stripped = stripped.replace(/^export\s+(default\s+)?/gm, "");
-        // Remove type annotations: `: Type`, `: typeof X`, `as Type`
+        // Remove `: typeof X` type annotations (common params pattern)
         stripped = stripped.replace(/:\s*typeof\s+\w+/g, "");
-        stripped = stripped.replace(/:\s*[\w.<>,\s|&\[\]]+(?=[,)\s={])/g, "");
+        // Remove `: Type` annotations but not ternary colons or object keys
+        stripped = stripped.replace(/(\w|\)|\])\s*:\s*[\w.<>,\s|&\[\]{}]+(?=\s*[,)\n={])/g, "$1");
+        // Remove `as Type` casts
         stripped = stripped.replace(/\bas\s+\w+/g, "");
-        // Remove interface/type declarations
-        stripped = stripped.replace(/^(interface|type)\s+\w+.*$/gm, "");
+        // Remove interface/type declarations (whole line)
+        stripped = stripped.replace(/^(interface|type)\s+\w+[^=].*$/gm, "");
         // Try parsing
         new Function(stripped);
         return {
