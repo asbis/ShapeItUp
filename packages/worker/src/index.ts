@@ -47,9 +47,17 @@ self.onmessage = async (event: MessageEvent) => {
 };
 
 async function initOCCT(wasmLoaderUrl: string, wasmUrl: string) {
-  const response = await fetch(wasmLoaderUrl);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch WASM loader: ${response.status} ${response.statusText}`);
+  // Retry fetch up to 3 times (handles 408 timeouts on rapid reloads)
+  let response: Response | null = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      response = await fetch(wasmLoaderUrl);
+      if (response.ok) break;
+    } catch {}
+    if (attempt < 2) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+  }
+  if (!response || !response.ok) {
+    throw new Error(`Failed to fetch WASM loader after 3 attempts: ${response?.status || "network error"}`);
   }
   let loaderCode = await response.text();
   loaderCode = loaderCode.replace(/export\s+default\s+Module\s*;?\s*$/, "");

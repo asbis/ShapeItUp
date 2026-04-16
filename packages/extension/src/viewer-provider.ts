@@ -419,7 +419,7 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         target: "es2022",
         external: ["replicad"], // worker handles replicad imports
         platform: "browser",
-        absWorkingDir: path.dirname(document.fileName), // fix: use file's dir, not VS Code install dir
+        absWorkingDir: path.dirname(document.fileName).replace(/\\/g, "/"), // normalize Windows backslashes for esbuild-wasm
       });
 
       const js = result.outputFiles[0].text;

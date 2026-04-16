@@ -277,6 +277,8 @@ function handleWorkerMessage(msg: WorkerToWebview) {
       // or is a bare numeric pointer (e.g. "1234567") from a WASM abort
       if (
         msg.message.includes("memory access out of bounds") ||
+        msg.message.includes("is not a function") ||
+        msg.message.includes("Failed to fetch WASM") ||
         /^\d+$/.test(msg.message.trim())
       ) {
         workerCrashed = true;
