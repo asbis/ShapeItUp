@@ -27,9 +27,9 @@ When creating or modifying shapes, follow this workflow:
 
 **Visual review:**
 - `get_render_status` — check if the last render succeeded or failed (returns error messages + bounding box). Call after every create/modify.
-- `render_preview` — capture a PNG screenshot. Params: `renderMode` ("ai"/"dark"), `showDimensions` (bool), `cameraAngle` ("isometric"/"top"/"front"/"right"/"back"/"left"). Each screenshot gets a unique timestamped filename.
-- `set_render_mode` — switch between `"ai"` (white bg, vivid colors) and `"dark"` (user's dark mode)
-- `toggle_dimensions` — show/hide X/Y/Z bounding box measurements on the 3D view
+- `render_preview` — capture a PNG screenshot. Params: `renderMode` ("ai"/"dark"), `showDimensions` (bool), `cameraAngle` ("isometric"/"top"/"front"/"right"/"back"/"left"). Saved as `shapeitup-preview-{shape}-{angle}.png` (overwrites per shape+angle combo). These params override the interactive viewer state for the screenshot only.
+- `set_render_mode` — switch the interactive viewer between "ai" and "dark" (render_preview has its own param)
+- `toggle_dimensions` — show/hide dimensions on the interactive viewer (render_preview has its own param)
 
 **Export & Reference:**
 - `export_shape` — export to STEP or STL. Provide `outputPath` for direct save.

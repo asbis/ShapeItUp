@@ -372,7 +372,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "render_preview",
-    "Capture a screenshot of the current 3D preview. Returns the file path to a PNG image you can read to verify the shape looks correct. Switches to high-contrast AI render mode with dimensions automatically.",
+    "Capture a screenshot of the current 3D preview. Temporarily switches to the specified render mode and camera angle for the screenshot, then restores the viewer to dark mode. Screenshots are saved per shape name + camera angle (e.g. shapeitup-preview-bracket-top.png). The params here override set_render_mode/toggle_dimensions for the screenshot only.",
     {
       showDimensions: z.boolean().optional().describe("Show dimension overlay (default: true)"),
       renderMode: z.enum(["ai", "dark"]).optional().describe("Render mode: 'ai' for high-contrast light background (default), 'dark' for user's dark mode"),
@@ -443,7 +443,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "set_render_mode",
-    "Switch the 3D viewer between dark mode (user) and AI mode (high-contrast light background with vivid colors, better for AI analysis)",
+    "Switch the interactive 3D viewer between dark and AI mode. Note: render_preview has its own renderMode param that overrides this for screenshots.",
     {
       mode: z.enum(["ai", "dark"]).describe("'ai' for high-contrast light mode, 'dark' for normal dark mode"),
     },
@@ -458,7 +458,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "toggle_dimensions",
-    "Show or hide dimension measurements (bounding box X/Y/Z) on the 3D preview. Useful for verifying sizes are correct.",
+    "Show or hide dimension measurements on the interactive viewer. Note: render_preview has its own showDimensions param that overrides this for screenshots.",
     {
       show: z.boolean().describe("true to show dimensions, false to hide"),
     },
