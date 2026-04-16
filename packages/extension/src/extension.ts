@@ -108,6 +108,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Watch for MCP command files (allows MCP server to trigger extension actions)
   const commandFile = path.join(context.globalStorageUri.fsPath, "mcp-command.json");
+  let lastCommandId = "";
   const commandWatcher = vscode.workspace.createFileSystemWatcher(
     new vscode.RelativePattern(context.globalStorageUri, "mcp-command.json")
   );
@@ -115,6 +116,12 @@ export function activate(context: vscode.ExtensionContext) {
     try {
       const data = await vscode.workspace.fs.readFile(vscode.Uri.file(commandFile));
       const cmd = JSON.parse(Buffer.from(data).toString("utf-8"));
+
+      // Dedup: file watcher fires multiple times per write
+      const cmdId = JSON.stringify(cmd);
+      if (cmdId === lastCommandId) return;
+      lastCommandId = cmdId;
+      setTimeout(() => { lastCommandId = ""; }, 2000); // allow same command after 2s
       if (cmd.command === "open-shape") {
         // Open a .shape.ts file, render it, and wait for the result
         outputChannel.appendLine(`[ai] Opening ${cmd.filePath}`);

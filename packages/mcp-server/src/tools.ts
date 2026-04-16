@@ -13,11 +13,14 @@ const GLOBAL_STORAGE = join(
     : ".config/Code/User/globalStorage/shapeitup.shapeitup-vscode"
 );
 
+let commandCounter = 0;
+
 function sendExtensionCommand(command: string, params: Record<string, any> = {}): boolean {
   try {
     mkdirSync(GLOBAL_STORAGE, { recursive: true });
     const cmdFile = join(GLOBAL_STORAGE, "mcp-command.json");
-    writeFileSync(cmdFile, JSON.stringify({ command, ...params }));
+    // Include unique ID so the extension can dedup file watcher double-fires
+    writeFileSync(cmdFile, JSON.stringify({ command, _id: ++commandCounter, ...params }));
     return true;
   } catch {
     return false;
