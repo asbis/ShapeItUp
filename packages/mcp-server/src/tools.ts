@@ -275,6 +275,12 @@ export function registerTools(server: McpServer) {
     },
     async ({ directory, recursive }) => {
       const dir = resolve(directory || process.cwd());
+      if (!existsSync(dir)) {
+        return {
+          content: [{ type: "text" as const, text: `Directory not found: ${dir}` }],
+          isError: true,
+        };
+      }
       const depth = recursive === false ? 1 : 3;
       const files = findShapeFiles(dir, depth);
       return {
@@ -284,7 +290,7 @@ export function registerTools(server: McpServer) {
             text:
               files.length > 0
                 ? files.join("\n")
-                : "No .shape.ts files found",
+                : `No .shape.ts files found in ${dir}`,
           },
         ],
       };
@@ -319,6 +325,38 @@ export function registerTools(server: McpServer) {
         stripped = stripped.replace(/(<\w[\w,\s]*>)\s*\(/g, "(");
         // Try parsing
         new Function(stripped);
+
+        // Check for unknown method calls
+        const knownMethods = new Set([
+          "drawRectangle", "drawRoundedRectangle", "drawCircle", "drawEllipse", "drawPolysides", "drawText", "draw",
+          "sketchCircle", "sketchRectangle", "makeCylinder", "makeSphere", "makeBox",
+          "extrude", "revolve", "loftWith", "sweepSketch",
+          "fuse", "cut", "intersect",
+          "fillet", "chamfer", "shell", "draft",
+          "translate", "translateX", "translateY", "translateZ", "rotate", "mirror", "scale",
+          "sketchOnPlane", "sketchOnFace",
+          "mesh", "meshEdges",
+          "close", "hLine", "vLine", "lineTo", "line", "sagittaArcTo", "tangentArcTo", "threePointsArcTo",
+          "cubicBezierCurveTo", "smoothSplineTo", "closeWithMirror", "done",
+          "localGC", "exportSTEP",
+        ]);
+        const methodCallPattern = /\.(\w+)\s*\(/g;
+        const unknownMethods = new Set<string>();
+        let match;
+        while ((match = methodCallPattern.exec(code)) !== null) {
+          const methodName = match[1];
+          if (!knownMethods.has(methodName)) {
+            unknownMethods.add(methodName);
+          }
+        }
+
+        if (unknownMethods.size > 0) {
+          const methodList = Array.from(unknownMethods).map(m => `.${m}()`).join(", ");
+          return {
+            content: [{ type: "text" as const, text: `Syntax OK. Warning: unknown method(s) found: ${methodList} — these may cause runtime errors. Use get_render_status after create/modify for full validation.` }],
+          };
+        }
+
         return {
           content: [{ type: "text" as const, text: "Syntax OK (imports and runtime not checked — use get_render_status after create/modify for full validation)" }],
         };
@@ -383,6 +421,15 @@ export function registerTools(server: McpServer) {
       cameraAngle: z.enum(["isometric", "top", "front", "right", "back", "left"]).optional().describe("Camera angle preset (default: 'isometric')"),
     },
     async ({ showDimensions, renderMode, cameraAngle }) => {
+      // Check if last render succeeded before attempting screenshot
+      const statusFile = join(GLOBAL_STORAGE, "shapeitup-status.json");
+      try {
+        const status = JSON.parse(readFileSync(statusFile, "utf-8"));
+        if (!status.success) {
+          return { content: [{ type: "text" as const, text: `Cannot preview: last render failed.\nError: ${status.error}\nFix the shape code and call get_render_status to verify before previewing.` }] };
+        }
+      } catch {}
+
       // Clear old result
       const resultFile = join(GLOBAL_STORAGE, "mcp-result.json");
       try { writeFileSync(resultFile, "{}"); } catch {}
