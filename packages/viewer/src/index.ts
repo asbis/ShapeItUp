@@ -331,11 +331,15 @@ onMessage("request-export", (msg) => {
   }
 });
 
+// Track if a custom camera angle was set (by set-camera-angle command)
+let customCameraAngleSet = false;
+
 onMessage("request-screenshot", () => {
-  // Set camera to isometric angle that shows all 3 dimensions clearly
-  if (modelGroup.children.length > 0) {
+  // Only set default isometric if no custom angle was explicitly set
+  if (!customCameraAngleSet && modelGroup.children.length > 0) {
     setCameraAngle([1, -1.2, 0.8]);
   }
+  customCameraAngleSet = false; // reset for next screenshot
   // Wait one frame for the render to complete
   controls.update();
   renderer.render(scene, camera);
@@ -365,6 +369,7 @@ onMessage("viewer-command", (msg) => {
       const preset = CAMERA_ANGLE_PRESETS[msg.angle];
       if (preset && modelGroup.children.length > 0) {
         setCameraAngle(preset);
+        customCameraAngleSet = true;
       }
       break;
     }
