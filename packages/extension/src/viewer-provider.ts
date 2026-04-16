@@ -503,18 +503,14 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     const shapeName = this.lastExecutedFile
       ? path.basename(this.lastExecutedFile, '.shape.ts')
       : 'unknown';
-    const timestamp = Math.floor(Date.now() / 1000); // seconds, not ms
-    const filePath = path.join(dir, `shapeitup-preview-${shapeName}-${timestamp}.png`);
-
-    // Also keep stable paths for quick access (latest overall + latest per shape)
+    // Two files: one per shape name (for comparing different shapes), one global latest
+    const filePath = path.join(dir, `shapeitup-preview-${shapeName}.png`);
     const latestPath = path.join(dir, "shapeitup-preview.png");
-    const latestShapePath = path.join(dir, `shapeitup-preview-${shapeName}.png`);
 
     await vscode.workspace.fs.createDirectory(vscode.Uri.file(dir));
     const bufferArr = new Uint8Array(buffer);
     await vscode.workspace.fs.writeFile(vscode.Uri.file(filePath), bufferArr);
     await vscode.workspace.fs.writeFile(vscode.Uri.file(latestPath), bufferArr);
-    await vscode.workspace.fs.writeFile(vscode.Uri.file(latestShapePath), bufferArr);
 
     this.lastScreenshotPath = filePath;
     this.output.appendLine(`[screenshot] Saved to ${filePath}`);
