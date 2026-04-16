@@ -71,27 +71,11 @@ export function registerTools(server: McpServer) {
 
       writeFileSync(filePath, code, "utf-8");
 
-      // Tell VS Code to open and render the file, wait for result
-      const resultFile = join(GLOBAL_STORAGE, "mcp-result.json");
-      try { writeFileSync(resultFile, "{}"); } catch {}
+      // Tell VS Code to open and render the file
       sendExtensionCommand("open-shape", { filePath });
 
-      // Wait for render result (up to 10s)
-      await new Promise((r) => setTimeout(r, 10000));
-      const result = readExtensionResult();
-      const status = result?.renderStatus;
-
-      let statusText = "";
-      if (status?.success) {
-        statusText = `\nRender: SUCCESS | ${status.stats}`;
-        if (status.boundingBox) statusText += `\nBounding box: ${status.boundingBox.x} x ${status.boundingBox.y} x ${status.boundingBox.z} mm`;
-      } else if (status?.error) {
-        statusText = `\nRender: FAILED | ${status.error}`;
-      }
-
-      // File creation is always a success — render failure is informational, not an error
       return {
-        content: [{ type: "text" as const, text: `${overwrite ? "Overwrote" : "Created"} ${filePath}${statusText}` }],
+        content: [{ type: "text" as const, text: `${overwrite ? "Overwrote" : "Created"} ${filePath}\nFile is rendering in the viewer. Call get_render_status to check the result.` }],
       };
     }
   );
@@ -160,27 +144,11 @@ export function registerTools(server: McpServer) {
       }
       writeFileSync(resolved, code, "utf-8");
 
-      // Tell VS Code to re-render the file and wait for result
-      const resultFile = join(GLOBAL_STORAGE, "mcp-result.json");
-      try { writeFileSync(resultFile, "{}"); } catch {}
+      // Tell VS Code to re-render the file
       sendExtensionCommand("open-shape", { filePath: resolved });
 
-      // Wait for render result
-      await new Promise((r) => setTimeout(r, 10000));
-      const result = readExtensionResult();
-      const status = result?.renderStatus;
-
-      let statusText = "";
-      if (status?.success) {
-        statusText = `\nRender: SUCCESS | ${status.stats}`;
-        if (status.boundingBox) statusText += `\nBounding box: ${status.boundingBox.x} x ${status.boundingBox.y} x ${status.boundingBox.z} mm`;
-      } else if (status?.error) {
-        statusText = `\nRender: FAILED | ${status.error}`;
-      }
-
-      // File update is always a success — render failure is informational
       return {
-        content: [{ type: "text" as const, text: `Updated ${resolved}${statusText}` }],
+        content: [{ type: "text" as const, text: `Updated ${resolved}\nFile is rendering in the viewer. Call get_render_status to check the result.` }],
       };
     }
   );

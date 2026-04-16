@@ -9,11 +9,12 @@ globs: ["**/*.shape.ts"]
 ## AI Workflow
 
 When creating or modifying shapes, follow this workflow:
-1. `create_shape` or `modify_shape` — returns render status + bounding box inline (no separate get_render_status needed)
-2. If render failed, fix code and repeat step 1
-3. `render_preview` — captures AI-mode screenshot with dimensions. Read the PNG to visually verify.
-4. If the shape looks wrong, modify and repeat
-5. `export_shape` — export to STEP or STL when done
+1. `create_shape` or `modify_shape` — creates/updates the file and triggers rendering
+2. `get_render_status` — check if render succeeded (returns bounding box + stats) or failed (returns error message)
+3. If render failed, fix code with `modify_shape` and repeat from step 2
+4. `render_preview` — captures AI-mode screenshot with dimensions. Read the PNG to visually verify.
+5. If the shape looks wrong, modify and repeat
+6. `export_shape` — export to STEP or STL when done
 
 ### Available MCP Tools
 

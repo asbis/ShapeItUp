@@ -416,10 +416,11 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         .split(path.sep).join("/")
         .replace(/^([a-z]):/, (_, l) => l.toUpperCase() + ":");
 
+      const resolveDir = path.dirname(normalizedPath);
       const result = await esbuild.build({
         stdin: {
           contents: code,
-          resolveDir: path.dirname(normalizedPath),
+          resolveDir,
           sourcefile: path.basename(document.fileName),
           loader: "ts",
         },
@@ -429,6 +430,7 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         target: "es2022",
         external: ["replicad"],
         platform: "browser",
+        absWorkingDir: resolveDir,
       });
 
       const js = result.outputFiles[0].text;
