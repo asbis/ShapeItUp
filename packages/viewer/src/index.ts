@@ -373,6 +373,21 @@ onMessage("viewer-command", (msg) => {
       }
       break;
     }
+    case "prepare-screenshot": {
+      // Atomic: apply render mode + dimensions + camera angle all at once
+      setRenderMode(msg.renderMode || "ai");
+      if (msg.showDimensions) toggleDimensions(true);
+      else toggleDimensions(false);
+      const camPreset = CAMERA_ANGLE_PRESETS[msg.cameraAngle || "isometric"];
+      if (camPreset && modelGroup.children.length > 0) {
+        setCameraAngle(camPreset);
+        customCameraAngleSet = true;
+      }
+      // Force render two frames to ensure everything is updated
+      controls.update();
+      renderer.render(scene, camera);
+      break;
+    }
   }
 });
 

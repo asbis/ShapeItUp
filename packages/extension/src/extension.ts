@@ -175,32 +175,27 @@ export function activate(context: vscode.ExtensionContext) {
 
       } else if (cmd.command === "render-preview") {
         // Combined command: switch mode, toggle dims, wait, screenshot, restore
-        outputChannel.appendLine(`[ai] render-preview: mode=${cmd.renderMode}, dims=${cmd.showDimensions}`);
+        outputChannel.appendLine(`[ai] render-preview: mode=${cmd.renderMode}, dims=${cmd.showDimensions}, camera=${cmd.cameraAngle || "isometric"}`);
 
-        // Step 1: Switch render mode
-        viewerProvider.sendViewerCommand("set-render-mode", { mode: cmd.renderMode || "ai" });
+        // Send all render settings as a single atomic command to the viewer
+        viewerProvider.sendViewerCommand("prepare-screenshot", {
+          renderMode: cmd.renderMode || "ai",
+          showDimensions: !!cmd.showDimensions,
+          cameraAngle: cmd.cameraAngle || "isometric",
+        });
 
-        // Step 2: Toggle dimensions
-        if (cmd.showDimensions) {
-          viewerProvider.sendViewerCommand("toggle-dimensions", { show: true });
-        }
-
-        // Step 3: Set camera angle
-        if (cmd.cameraAngle) {
-          viewerProvider.sendViewerCommand("set-camera-angle", { angle: cmd.cameraAngle });
-        }
-
-        // Step 4: Wait for viewer to update (render frame + dimension sprites)
-        await new Promise((r) => setTimeout(r, 800));
+        // Wait for viewer to process all settings + render a frame
+        await new Promise((r) => setTimeout(r, 1000));
 
         // Step 4: Capture screenshot
         const screenshotPath = await viewerProvider.captureScreenshot();
 
-        // Step 5: Restore dark mode
-        viewerProvider.sendViewerCommand("set-render-mode", { mode: "dark" });
-        if (cmd.showDimensions) {
-          viewerProvider.sendViewerCommand("toggle-dimensions", { show: false });
-        }
+        // Step 5: Restore user's dark mode + hide dimensions
+        viewerProvider.sendViewerCommand("prepare-screenshot", {
+          renderMode: "dark",
+          showDimensions: false,
+          cameraAngle: "isometric",
+        });
 
         // Step 6: Write result
         const resultFile = path.join(context.globalStorageUri.fsPath, "mcp-result.json");
