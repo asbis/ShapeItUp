@@ -410,18 +410,25 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
 
     try {
       await ensureEsbuild();
-      // Use esbuild.build (not transform) to resolve local imports between .shape.ts files
+      // Use esbuild.build to resolve local imports between .shape.ts files
+      // Normalize the path: resolve, forward slashes, uppercase drive letter
+      const normalizedPath = path.resolve(document.fileName)
+        .split(path.sep).join("/")
+        .replace(/^([a-z]):/, (_, l) => l.toUpperCase() + ":");
+
       const result = await esbuild.build({
-        entryPoints: [document.fileName],
+        stdin: {
+          contents: code,
+          resolveDir: path.dirname(normalizedPath),
+          sourcefile: path.basename(document.fileName),
+          loader: "ts",
+        },
         bundle: true,
         write: false,
         format: "esm",
         target: "es2022",
-        external: ["replicad"], // worker handles replicad imports
+        external: ["replicad"],
         platform: "browser",
-        absWorkingDir: path.resolve(path.dirname(document.fileName))
-          .split(path.sep).join("/") // forward slashes for esbuild-wasm
-          .replace(/^([a-z]):/, (_, l) => l.toUpperCase() + ":"), // uppercase drive letter
       });
 
       const js = result.outputFiles[0].text;
