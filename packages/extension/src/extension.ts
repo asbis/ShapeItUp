@@ -26,6 +26,9 @@ export function activate(context: vscode.ExtensionContext) {
   // Register MCP server so Claude Code / Copilot can discover it automatically
   registerMcpServer(context, outputChannel);
 
+  // Install the `/shapeitup` Claude Code skill (Replicad API reference)
+  installClaudeSkill(context, outputChannel);
+
   // Manual preview command (still useful for opening the panel tab)
   context.subscriptions.push(
     vscode.commands.registerCommand("shapeitup.preview", () => {
@@ -344,6 +347,61 @@ function registerMcpServer(
     output.appendLine(`[mcp] Registered MCP server in ~/.claude.json → ${mcpServerPath}`);
   } catch (e: any) {
     output.appendLine(`[mcp] Failed to configure Claude Code MCP: ${e.message}`);
+  }
+}
+
+/**
+ * Install the `/shapeitup` Claude Code skill into ~/.claude/skills/shapeitup/.
+ *
+ * Claude Code auto-discovers user-level skills at ~/.claude/skills/<name>/SKILL.md.
+ * The bundled SKILL.md is copied there on activation so users don't have to run
+ * any manual `cp` command. We only write if the source is newer than the
+ * destination (by mtime) to avoid pointless I/O on every activation.
+ */
+function installClaudeSkill(
+  context: vscode.ExtensionContext,
+  output: vscode.OutputChannel
+) {
+  const fs = require("fs");
+  const os = require("os");
+
+  const src = path.join(context.extensionPath, "dist", "skill", "SKILL.md");
+  if (!fs.existsSync(src)) {
+    output.appendLine("[skill] Bundled SKILL.md not found — skipping skill install");
+    return;
+  }
+
+  // Only install if the user has Claude Code (VS Code extension OR CLI install).
+  const hasClaudeVscode = !!vscode.extensions.getExtension("anthropic.claude-code");
+  const home = os.homedir();
+  const hasClaudeCli =
+    fs.existsSync(path.join(home, ".claude.json")) ||
+    fs.existsSync(path.join(home, ".claude")) ||
+    fs.existsSync(path.join(home, ".local", "bin", "claude")) ||
+    fs.existsSync("/usr/local/bin/claude") ||
+    fs.existsSync("/opt/homebrew/bin/claude");
+
+  if (!hasClaudeVscode && !hasClaudeCli) {
+    output.appendLine("[skill] Claude Code not detected — skipping skill install");
+    return;
+  }
+
+  try {
+    const skillDir = path.join(home, ".claude", "skills", "shapeitup");
+    const dest = path.join(skillDir, "SKILL.md");
+
+    const srcMtime = fs.statSync(src).mtimeMs;
+    const destMtime = fs.existsSync(dest) ? fs.statSync(dest).mtimeMs : 0;
+    if (destMtime >= srcMtime) {
+      output.appendLine("[skill] /shapeitup skill already up-to-date");
+      return;
+    }
+
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.copyFileSync(src, dest);
+    output.appendLine(`[skill] Installed /shapeitup skill → ${dest}`);
+  } catch (e: any) {
+    output.appendLine(`[skill] Failed to install /shapeitup skill: ${e.message}`);
   }
 }
 

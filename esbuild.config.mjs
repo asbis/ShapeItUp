@@ -100,8 +100,23 @@ function copyWasmFiles() {
   }
 }
 
+function copySkillFiles() {
+  // Bundle the Claude Code skill with the extension so it can be installed
+  // on activation (~/.claude/skills/shapeitup/SKILL.md).
+  const src = resolve(__dirname, "skill/SKILL.md");
+  const destDir = resolve(__dirname, "packages/extension/dist/skill");
+  if (existsSync(src)) {
+    mkdirSync(destDir, { recursive: true });
+    cpSync(src, resolve(destDir, "SKILL.md"));
+    console.log("Copied skill/SKILL.md to dist/skill/");
+  } else {
+    console.warn("Warning: skill/SKILL.md not found — skill will not be installable.");
+  }
+}
+
 async function build() {
   copyWasmFiles();
+  copySkillFiles();
 
   if (watch) {
     const contexts = await Promise.all([
