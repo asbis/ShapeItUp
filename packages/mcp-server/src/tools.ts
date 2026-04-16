@@ -316,7 +316,7 @@ export function registerTools(server: McpServer) {
         // Try parsing
         new Function(stripped);
         return {
-          content: [{ type: "text" as const, text: "Script syntax looks valid" }],
+          content: [{ type: "text" as const, text: "Syntax OK (imports and runtime not checked — use get_render_status after create/modify for full validation)" }],
         };
       } catch (e: any) {
         return {

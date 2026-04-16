@@ -478,7 +478,7 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
   }
 
   /** Capture a screenshot and save to disk. Returns the file path. */
-  async captureScreenshot(outputDir?: string): Promise<string | undefined> {
+  async captureScreenshot(outputDir?: string, cameraAngle?: string): Promise<string | undefined> {
     const webview = this.getActiveWebview();
     if (!webview) return undefined;
 
@@ -503,8 +503,9 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     const shapeName = this.lastExecutedFile
       ? path.basename(this.lastExecutedFile, '.shape.ts')
       : 'unknown';
-    // Two files: one per shape name (for comparing different shapes), one global latest
-    const filePath = path.join(dir, `shapeitup-preview-${shapeName}.png`);
+    // Include camera angle in filename to avoid parallel call collisions
+    const angleSuffix = cameraAngle && cameraAngle !== "isometric" ? `-${cameraAngle}` : "";
+    const filePath = path.join(dir, `shapeitup-preview-${shapeName}${angleSuffix}.png`);
     const latestPath = path.join(dir, "shapeitup-preview.png");
 
     await vscode.workspace.fs.createDirectory(vscode.Uri.file(dir));

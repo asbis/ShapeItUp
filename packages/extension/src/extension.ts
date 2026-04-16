@@ -188,14 +188,11 @@ export function activate(context: vscode.ExtensionContext) {
         await new Promise((r) => setTimeout(r, 1000));
 
         // Step 4: Capture screenshot
-        const screenshotPath = await viewerProvider.captureScreenshot();
+        const screenshotPath = await viewerProvider.captureScreenshot(undefined, cmd.cameraAngle);
 
-        // Step 5: Restore user's dark mode + hide dimensions
-        viewerProvider.sendViewerCommand("prepare-screenshot", {
-          renderMode: "dark",
-          showDimensions: false,
-          cameraAngle: "isometric",
-        });
+        // Step 5: Restore user's dark mode + hide dimensions (don't reset camera)
+        viewerProvider.sendViewerCommand("set-render-mode", { mode: "dark" });
+        viewerProvider.sendViewerCommand("toggle-dimensions", { show: false });
 
         // Step 6: Write result
         const resultFile = path.join(context.globalStorageUri.fsPath, "mcp-result.json");
