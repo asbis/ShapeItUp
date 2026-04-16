@@ -286,7 +286,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "validate_script",
-    "Check if a .shape.ts script has valid TypeScript syntax (does not execute it)",
+    "Check syntax of a .shape.ts script (syntax only — does not verify imports or runtime behavior). Use get_render_status after create/modify to catch runtime errors.",
     {
       code: z.string().describe("TypeScript source code to validate"),
     },
@@ -327,7 +327,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "get_api_reference",
-    "Get Replicad API reference for a specific category",
+    "Get Replicad API reference. Call without category to list available categories, or with a category name for detailed docs.",
     {
       category: z
         .enum([
@@ -343,10 +343,18 @@ export function registerTools(server: McpServer) {
           "examples",
         ])
         .optional()
-        .describe("API category (defaults to overview)"),
+        .describe("API category. Omit to see the list of available categories."),
     },
     async ({ category }) => {
-      const ref = getApiReference(category || "overview");
+      if (!category) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: "Available API reference categories:\n- overview (start here)\n- drawing (2D shapes)\n- sketching (2D → 3D)\n- solids (3D operations)\n- booleans (cut, fuse, intersect)\n- modifications (fillet, chamfer, shell)\n- transforms (translate, rotate, mirror)\n- finders (edge/face selection)\n- export (STEP, STL)\n- examples (complete worked examples)\n\nCall get_api_reference with a category name for detailed docs.",
+          }],
+        };
+      }
+      const ref = getApiReference(category);
       return {
         content: [{ type: "text" as const, text: ref }],
       };
@@ -361,8 +369,9 @@ export function registerTools(server: McpServer) {
     {
       showDimensions: z.boolean().optional().describe("Show dimension overlay (default: true)"),
       renderMode: z.enum(["ai", "dark"]).optional().describe("Render mode: 'ai' for high-contrast light background (default), 'dark' for user's dark mode"),
+      cameraAngle: z.enum(["isometric", "top", "front", "right", "back", "left"]).optional().describe("Camera angle preset (default: 'isometric')"),
     },
-    async ({ showDimensions, renderMode }) => {
+    async ({ showDimensions, renderMode, cameraAngle }) => {
       // Clear old result
       const resultFile = join(GLOBAL_STORAGE, "mcp-result.json");
       try { writeFileSync(resultFile, "{}"); } catch {}
@@ -371,6 +380,7 @@ export function registerTools(server: McpServer) {
       sendExtensionCommand("render-preview", {
         renderMode: renderMode || "ai",
         showDimensions: showDimensions !== false,
+        cameraAngle: cameraAngle || "isometric",
       });
 
       // Retry: poll for the screenshot file with increasing delays
@@ -387,6 +397,7 @@ export function registerTools(server: McpServer) {
           sendExtensionCommand("render-preview", {
             renderMode: renderMode || "ai",
             showDimensions: showDimensions !== false,
+            cameraAngle: cameraAngle || "isometric",
           });
         }
       }
@@ -405,7 +416,7 @@ export function registerTools(server: McpServer) {
           content: [
             {
               type: "text" as const,
-              text: `Screenshot saved to: ${screenshotPath}\nRender mode: ${renderMode || "ai"}, Dimensions: ${showDimensions !== false ? "ON" : "OFF"}${fileInfo}\nUse the Read tool to view this image and verify the shape is correct.`,
+              text: `Screenshot saved to: ${screenshotPath}\nRender mode: ${renderMode || "ai"}, Dimensions: ${showDimensions !== false ? "ON" : "OFF"}, Camera: ${cameraAngle || "isometric"}${fileInfo}\nUse the Read tool to view this image and verify the shape is correct.`,
             },
           ],
         };

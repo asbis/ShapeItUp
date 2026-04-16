@@ -26,13 +26,14 @@ When creating or modifying shapes, follow this workflow:
 - `validate_script` — check TypeScript syntax without executing
 
 **Visual review:**
-- `get_render_status` — check if the last render succeeded or failed (returns error messages). Call this after every create/modify.
-- `render_preview` — capture a PNG screenshot (auto-enables AI render mode + dimensions). Returns file path to Read.
+- `get_render_status` — check if the last render succeeded or failed (returns error messages + bounding box). Call after every create/modify.
+- `render_preview` — capture a PNG screenshot. Params: `renderMode` ("ai"/"dark"), `showDimensions` (bool), `cameraAngle` ("isometric"/"top"/"front"/"right"/"back"/"left"). Each screenshot gets a unique timestamped filename.
 - `set_render_mode` — switch between `"ai"` (white bg, vivid colors) and `"dark"` (user's dark mode)
 - `toggle_dimensions` — show/hide X/Y/Z bounding box measurements on the 3D view
 
-**Export:**
-- `get_api_reference` — get Replicad API docs by category
+**Export & Reference:**
+- `export_shape` — export to STEP or STL. Provide `outputPath` for direct save.
+- `get_api_reference` — get Replicad API docs. Call without `category` to list all categories.
 
 ### Best Practices for AI
 - Always use `export const params = { ... }` so the user gets live sliders in the viewer

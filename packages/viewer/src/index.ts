@@ -343,6 +343,16 @@ onMessage("request-screenshot", () => {
   postToExtension({ type: "screenshot-data", dataUrl });
 });
 
+// Camera angle presets: name → [x, y, z] direction vector
+const CAMERA_ANGLE_PRESETS: Record<string, [number, number, number]> = {
+  isometric: [1, -1.2, 0.8],
+  top: [0, 0, 1],
+  front: [0, -1, 0.3],
+  right: [1, 0, 0.3],
+  back: [0, 1, 0.3],
+  left: [-1, 0, 0.3],
+};
+
 onMessage("viewer-command", (msg) => {
   switch (msg.command) {
     case "set-render-mode":
@@ -351,6 +361,13 @@ onMessage("viewer-command", (msg) => {
     case "toggle-dimensions":
       toggleDimensions(msg.show);
       break;
+    case "set-camera-angle": {
+      const preset = CAMERA_ANGLE_PRESETS[msg.angle];
+      if (preset && modelGroup.children.length > 0) {
+        setCameraAngle(preset);
+      }
+      break;
+    }
   }
 });
 

@@ -185,7 +185,12 @@ export function activate(context: vscode.ExtensionContext) {
           viewerProvider.sendViewerCommand("toggle-dimensions", { show: true });
         }
 
-        // Step 3: Wait for viewer to update (render frame + dimension sprites)
+        // Step 3: Set camera angle
+        if (cmd.cameraAngle) {
+          viewerProvider.sendViewerCommand("set-camera-angle", { angle: cmd.cameraAngle });
+        }
+
+        // Step 4: Wait for viewer to update (render frame + dimension sprites)
         await new Promise((r) => setTimeout(r, 800));
 
         // Step 4: Capture screenshot

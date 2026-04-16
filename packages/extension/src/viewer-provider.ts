@@ -500,13 +500,16 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     const buffer = Buffer.from(base64, "base64");
 
     const dir = outputDir || this.context.globalStorageUri.fsPath;
-    const filePath = path.join(dir, "shapeitup-preview.png");
+    const timestamp = Date.now();
+    const filePath = path.join(dir, `shapeitup-preview-${timestamp}.png`);
+
+    // Also keep a stable "latest" path for quick access
+    const latestPath = path.join(dir, "shapeitup-preview.png");
 
     await vscode.workspace.fs.createDirectory(vscode.Uri.file(dir));
-    await vscode.workspace.fs.writeFile(
-      vscode.Uri.file(filePath),
-      new Uint8Array(buffer)
-    );
+    const bufferArr = new Uint8Array(buffer);
+    await vscode.workspace.fs.writeFile(vscode.Uri.file(filePath), bufferArr);
+    await vscode.workspace.fs.writeFile(vscode.Uri.file(latestPath), bufferArr);
 
     this.lastScreenshotPath = filePath;
     this.output.appendLine(`[screenshot] Saved to ${filePath}`);
