@@ -500,8 +500,10 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     const buffer = Buffer.from(base64, "base64");
 
     const dir = outputDir || this.context.globalStorageUri.fsPath;
-    const timestamp = Date.now();
-    const filePath = path.join(dir, `shapeitup-preview-${timestamp}.png`);
+    const shapeName = this.lastExecutedFile
+      ? path.basename(this.lastExecutedFile, '.shape.ts')
+      : 'unknown';
+    const filePath = path.join(dir, `shapeitup-preview-${shapeName}.png`);
 
     // Also keep a stable "latest" path for quick access
     const latestPath = path.join(dir, "shapeitup-preview.png");

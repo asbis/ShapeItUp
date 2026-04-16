@@ -82,7 +82,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "open_shape",
-    "Open a .shape.ts file in VS Code and render it in the 3D viewer. Use this after create_shape or modify_shape to see the result.",
+    "Open an existing .shape.ts file in VS Code and render it in the 3D viewer. Use this to switch the viewer to a different file. Not needed after create_shape or modify_shape (they auto-render).",
     {
       filePath: z.string().describe("Path to the .shape.ts file to open and render"),
     },
@@ -236,6 +236,8 @@ export function registerTools(server: McpServer) {
 
       const result = readExtensionResult();
       if (result?.exportPath && existsSync(result.exportPath)) {
+        const fileSize = statSync(result.exportPath).size;
+        const sizeStr = fileSize > 1024*1024 ? `${(fileSize/1024/1024).toFixed(1)}MB` : `${Math.round(fileSize/1024)}KB`;
         let sourceInfo = "";
         try {
           const statusFile = join(GLOBAL_STORAGE, "shapeitup-status.json");
@@ -243,7 +245,7 @@ export function registerTools(server: McpServer) {
           if (s.fileName) sourceInfo = `\nSource: ${s.fileName}`;
         } catch {}
         return {
-          content: [{ type: "text" as const, text: `Exported to: ${result.exportPath}\nFormat: ${format.toUpperCase()}${sourceInfo}` }],
+          content: [{ type: "text" as const, text: `Exported to: ${result.exportPath}\nFormat: ${format.toUpperCase()}\nSize: ${sizeStr}${sourceInfo}` }],
         };
       }
       if (result?.error) {
@@ -266,10 +268,15 @@ export function registerTools(server: McpServer) {
         .string()
         .optional()
         .describe("Directory to search (defaults to cwd)"),
+      recursive: z
+        .boolean()
+        .optional()
+        .describe("Search subdirectories recursively (default: true). Set to false for top-level only."),
     },
-    async ({ directory }) => {
+    async ({ directory, recursive }) => {
       const dir = resolve(directory || process.cwd());
-      const files = findShapeFiles(dir);
+      const depth = recursive === false ? 1 : 3;
+      const files = findShapeFiles(dir, depth);
       return {
         content: [
           {
