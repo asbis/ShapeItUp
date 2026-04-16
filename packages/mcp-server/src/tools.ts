@@ -86,9 +86,9 @@ export function registerTools(server: McpServer) {
         statusText = `\nRender: FAILED | ${status.error}`;
       }
 
+      // File creation is always a success — render failure is informational, not an error
       return {
         content: [{ type: "text" as const, text: `Created ${filePath}${statusText}` }],
-        isError: status?.error ? true : undefined,
       };
     }
   );
@@ -175,9 +175,9 @@ export function registerTools(server: McpServer) {
         statusText = `\nRender: FAILED | ${status.error}`;
       }
 
+      // File update is always a success — render failure is informational
       return {
         content: [{ type: "text" as const, text: `Updated ${resolved}${statusText}` }],
-        isError: status?.error ? true : undefined,
       };
     }
   );

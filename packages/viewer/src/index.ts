@@ -178,6 +178,26 @@ function setCameraAngle(position: [number, number, number]) {
 // --- Worker setup ---
 const config = (globalThis as any).__SHAPEITUP_CONFIG__;
 let worker: Worker | null = null;
+let workerCrashed = false;
+let workerResponseTimer: ReturnType<typeof setTimeout> | undefined;
+
+function clearWorkerResponseTimer() {
+  if (workerResponseTimer) {
+    clearTimeout(workerResponseTimer);
+    workerResponseTimer = undefined;
+  }
+}
+
+function respawnWorker() {
+  clearWorkerResponseTimer();
+  statusEl.textContent = "Restarting renderer...";
+  if (worker) {
+    try { worker.terminate(); } catch {}
+  }
+  worker = null;
+  workerCrashed = false;
+  initWorker();
+}
 
 function initWorker() {
   fetch(config.workerUrl)
@@ -188,7 +208,8 @@ function initWorker() {
       worker = new Worker(url);
       worker.onmessage = (e) => handleWorkerMessage(e.data);
       worker.onerror = (e) => {
-        postToExtension({ type: "error", message: `Worker error: ${e.message}` });
+        postToExtension({ type: "error", message: `Worker crashed: ${e.message}` });
+        respawnWorker();
       };
       worker.postMessage({
         type: "init",
@@ -204,12 +225,14 @@ function initWorker() {
 function handleWorkerMessage(msg: WorkerToWebview) {
   switch (msg.type) {
     case "ready":
+      clearWorkerResponseTimer();
       loadingEl.style.display = "none";
       postToExtension({ type: "ready" });
       statusEl.textContent = "Ready";
       break;
 
     case "mesh-result":
+      clearWorkerResponseTimer();
       try {
         renderParts(msg.parts);
         updateParamsUI(msg.params || []);
@@ -243,11 +266,24 @@ function handleWorkerMessage(msg: WorkerToWebview) {
       break;
 
     case "export-result":
+      clearWorkerResponseTimer();
       postToExtension({ type: "export-data", format: msg.format, data: msg.data });
       statusEl.textContent = `Exported ${msg.format.toUpperCase()}`;
       break;
 
     case "error":
+      clearWorkerResponseTimer();
+      // Detect WASM memory crash — message contains "memory access out of bounds"
+      // or is a bare numeric pointer (e.g. "1234567") from a WASM abort
+      if (
+        msg.message.includes("memory access out of bounds") ||
+        /^\d+$/.test(msg.message.trim())
+      ) {
+        workerCrashed = true;
+        postToExtension({ type: "error", message: `WASM crash detected, restarting worker: ${msg.message}` });
+        respawnWorker();
+        return;
+      }
       postToExtension({ type: "error", message: msg.message });
       statusEl.textContent = `Error: ${msg.message}`;
       break;
@@ -265,6 +301,13 @@ onMessage("execute-script", (msg) => {
     const name = msg.fileName.replace(/.*[\/\\]/, "");
     filenameEl.textContent = name;
     worker.postMessage({ type: "execute", js: msg.js });
+
+    // If the worker doesn't respond within 15s, assume it's dead and respawn
+    clearWorkerResponseTimer();
+    workerResponseTimer = setTimeout(() => {
+      postToExtension({ type: "error", message: "Worker unresponsive (15s timeout), restarting..." });
+      respawnWorker();
+    }, 15_000);
   }
 });
 
