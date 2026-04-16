@@ -37,6 +37,10 @@ self.onmessage = async (event: MessageEvent) => {
     let message = err.message || String(err);
     if (/^\d+$/.test(message)) {
       message = `OpenCascade operation failed (error code ${message}). This usually means a geometry operation like fillet, chamfer, or boolean failed. Try reducing fillet radii, simplifying geometry, or checking for zero-thickness walls.`;
+    } else if (/deleted|disposed|invalid\s+object/i.test(message)) {
+      message = `${message}\n\nThis usually means a shape was used after it was consumed by another operation. Common causes:\n- loftWith() consumes (deletes) its input sketches — recreate them if needed after lofting\n- Shapes from a previous execution were cleaned up — store intermediate results in variables\n- A boolean or fillet operation destroyed the shape internally`;
+    } else if (/memory\s+access\s+out\s+of\s+bounds|RuntimeError:/i.test(message)) {
+      message = `${message}\n\nWASM memory error — the OpenCascade kernel crashed. Common causes:\n- Fillet on complex geometry (many bezier segments)\n- Boolean operation on incompatible/degenerate geometry\n- Too many intermediate shapes without cleanup (use localGC)`;
     }
     self.postMessage({
       type: "error",

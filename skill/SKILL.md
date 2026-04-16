@@ -95,7 +95,7 @@ The `params` object is auto-detected by the viewer and generates slider controls
 | `drawRectangle(w, h)` | Drawing | Rectangle centered at origin |
 | `drawRoundedRectangle(w, h, r)` | Drawing | Rounded rectangle |
 | `drawCircle(radius)` | Drawing | Circle centered at origin |
-| `drawEllipse(majorR, minorR)` | Drawing | Ellipse |
+| `drawEllipse(majorR, minorR)` | Drawing | Ellipse (majorR along X, minorR along Y in drawing plane) |
 | `drawPolysides(radius, numSides)` | Drawing | Regular polygon |
 | `drawText(text, config?)` | Drawing | Text outline |
 
@@ -157,17 +157,49 @@ const sketch = new Sketcher("XZ")
 |--------|-------------|
 | `sketch.extrude(distance, config?)` | Linear extrusion |
 | `sketch.revolve(axis?, config?)` | Revolution (default 360°) |
-| `sketch.loftWith(otherSketch, config?)` | Loft between profiles |
-| `sketch.sweepSketch(profileFn, config?)` | Sweep along path |
+| `sketch.loftWith(otherSketches, config?)` | Loft between profiles |
+| `sketch.sweepSketch(profileFn, config?)` | Sweep profile along sketch path |
 
 **Extrude config**: `{ extrusionDirection?: [x,y,z], twistAngle?: number }`
 **Revolve config**: `{ origin?: [x,y,z], angle?: number }`
+
+**Loft config**: `{ ruled?: boolean, startPoint?: [x,y,z], endPoint?: [x,y,z] }`
+- `otherSketches` can be a single Sketch or array of Sketches
+- `ruled`: true for flat ruled surfaces (default), false for smooth interpolation
+- `startPoint`/`endPoint`: taper to a point before/after the profiles
+- **WARNING**: Loft CONSUMES (deletes) input sketches. If you need a sketch after lofting, recreate it — don't reuse the variable.
+- Profiles should have similar topology (same number of segments) for best results. Mismatched segment counts may produce unexpected geometry.
+
+**Sweep config**: `{ frenet?: boolean, transitionMode?: "right"|"transformed"|"round" }`
+- `profileFn`: `(plane: Plane, origin: Point) => Sketch` — receives the local coordinate frame at each point along the path. Return a Sketch positioned on that plane.
+- `frenet`: use Frenet frame for orientation (recommended for 3D curves)
+- `transitionMode`: how to handle corners — "round" smooths them out
+
+**Sweep example — circle along a bezier path:**
+```typescript
+import { draw, drawCircle, sketchCircle } from "replicad";
+
+export default function main() {
+  // Draw an open wire path (the spine)
+  const path = draw()
+    .cubicBezierCurveTo([0, 40], [20, 10], [-10, 30])
+    .done()  // .done() for open wire, NOT .close()
+    .sketchOnPlane("XZ");
+
+  // Sweep a circular cross-section along the path
+  return path.sweepSketch(
+    (plane, origin) => sketchCircle(3, { plane, origin }),
+    { frenet: true }
+  );
+}
+```
 
 ### Primitive Solids
 ```typescript
 makeCylinder(radius, height, location?, direction?)
 makeSphere(radius)
 makeBox(corner1, corner2)  // e.g., makeBox([0,0,0], [10,20,30])
+makeEllipsoid(rx, ry, rz)  // semi-axis lengths along X, Y, Z
 ```
 
 ---
@@ -179,6 +211,69 @@ shape.fuse(other)       // union
 shape.cut(tool)         // subtraction
 shape.intersect(other)  // intersection
 ```
+
+### Boolean Best Practices
+- `fuse()` and `cut()` are generally reliable on all geometry
+- `intersect()` on two complex curved solids (bezier extrusions, spline surfaces) is **fragile** — it may return empty or incorrect geometry silently
+- **Prefer 2D booleans** when possible: do `drawing.fuse(other)`, `drawing.cut(other)` on 2D Drawings, then extrude the result. 2D booleans are far more robust than 3D.
+- If `intersect()` fails, use the **mold-cut workaround**: `bigBox.cut(tool)` then `shape.cut(mold)` (see Organic Shapes section)
+- Wrap complex boolean chains in try/catch when combining many parts
+
+---
+
+## Organic / Sculptural Shapes
+
+For curved, organic shapes (animals, figurines, ergonomic grips, etc.), **do NOT use extrude + fillet**. Extruding a complex bezier profile creates a flat slab, and filleting complex geometry almost always fails in OpenCascade.
+
+### Recommended Approaches (in order of reliability)
+
+**1. Sweep a cross-section along a profile path** (best for tube-like organic forms)
+```typescript
+// Draw the silhouette as an open wire, sweep a circle along it
+const spine = draw()
+  .cubicBezierCurveTo([0, 40], [15, 10], [-5, 30])
+  .cubicBezierCurveTo([5, 60], [10, 45], [5, 55])
+  .done()  // open wire — use .done(), NOT .close()
+  .sketchOnPlane("XZ");
+return spine.sweepSketch(
+  (plane, origin) => sketchCircle(5, { plane, origin }),
+  { frenet: true }
+);
+```
+
+**2. Loft between cross-section profiles** (best for shapes that vary in cross-section)
+```typescript
+// Define cross-sections at different heights, loft between them
+const bottom = drawCircle(15).sketchOnPlane("XY");
+const middle = drawEllipse(20, 12).sketchOnPlane("XY", [0, 0, 20]);
+const top = drawCircle(8).sketchOnPlane("XY", [0, 0, 40]);
+return bottom.loftWith([middle, top], { ruled: false });
+```
+
+**3. Revolve a profile** (best for rotationally symmetric shapes)
+```typescript
+const profile = draw()
+  .vLine(30)
+  .smoothSplineTo([10, 20])
+  .smoothSplineTo([5, 10])
+  .smoothSplineTo([8, 0])
+  .close();
+return profile.sketchOnPlane("XZ").revolve();
+```
+
+**4. Mold-cut for shaping** (workaround when intersect() fails on complex curves)
+```typescript
+// Instead of shape.intersect(ellipsoid) which may fail:
+// Use the "inverse mold" approach
+const mold = makeBox([-50,-50,-50],[50,50,50]).cut(makeEllipsoid(25, 15, 30));
+const shaped = rawShape.cut(mold);  // cuts away everything outside the ellipsoid
+```
+
+### What to AVOID for organic shapes
+- **Don't** extrude a complex bezier profile and try to fillet the flat faces — fillet will fail on 16+ segment profiles
+- **Don't** use `intersect()` between two complex curved solids — it often produces empty/wrong results
+- **Don't** rely on non-uniform scale — `scale()` only takes a single number (uniform). Use `makeEllipsoid(rx, ry, rz)` for ellipsoidal shapes instead.
+- **Prefer 2D booleans** (fuse, cut, intersect on Drawings) before extruding — 2D booleans are far more robust than 3D
 
 ---
 
@@ -204,6 +299,7 @@ shape.shell({ thickness: 2, filter: f => f.inPlane("XY", height) })
 ### Draft (taper walls)
 ```typescript
 shape.draft(angleDeg, faceFinder, neutralPlane?)
+```
 
 ### Fillet/Chamfer Best Practices
 - Apply fillets BEFORE boolean cuts when possible
@@ -223,8 +319,10 @@ shape.translate(x, y, z)
 shape.translateX(d)  /  .translateY(d)  /  .translateZ(d)
 shape.rotate(angleDeg, position?, direction?)
 shape.mirror(plane?, origin?)
-shape.scale(factor, center?)
+shape.scale(factor, center?)   // UNIFORM only — single number, not per-axis
 ```
+
+**Note**: `scale()` only supports uniform scaling (same factor for all axes). For non-uniform shapes, use `makeEllipsoid(rx, ry, rz)` or draw the desired shape directly in 2D.
 
 ---
 
@@ -368,6 +466,49 @@ export default function main() {
   const inner = drawRoundedRectangle(76, 46, 3)
     .sketchOnPlane("XY", [0, 0, 2]).extrude(30);
   return outer.cut(inner);
+}
+```
+
+### Organic Vase (Loft Between Profiles)
+```typescript
+import { drawCircle, drawEllipse } from "replicad";
+
+export const params = { baseR: 20, midR: 25, neckR: 10, topR: 12, height: 60 };
+
+export default function main({ baseR, midR, neckR, topR, height }: typeof params) {
+  const base = drawCircle(baseR).sketchOnPlane("XY");
+  const belly = drawEllipse(midR, midR * 0.8).sketchOnPlane("XY", [0, 0, height * 0.4]);
+  const neck = drawCircle(neckR).sketchOnPlane("XY", [0, 0, height * 0.75]);
+  const top = drawCircle(topR).sketchOnPlane("XY", [0, 0, height]);
+
+  let vase = base.loftWith([belly, neck, top], { ruled: false });
+
+  // Hollow out
+  try {
+    vase = vase.shell({ thickness: 2, filter: (f: any) => f.inPlane("XY", height) });
+  } catch { /* skip shell if geometry too complex */ }
+
+  return vase;
+}
+```
+
+### Swept Tube (Sweep Along Bezier Path)
+```typescript
+import { draw, sketchCircle } from "replicad";
+
+export const params = { radius: 4, height: 50 };
+
+export default function main({ radius, height }: typeof params) {
+  const path = draw()
+    .cubicBezierCurveTo([15, height * 0.5], [0, height * 0.2], [20, height * 0.3])
+    .cubicBezierCurveTo([0, height], [-10, height * 0.7], [0, height * 0.9])
+    .done()
+    .sketchOnPlane("XZ");
+
+  return path.sweepSketch(
+    (plane, origin) => sketchCircle(radius, { plane, origin }),
+    { frenet: true }
+  );
 }
 ```
 

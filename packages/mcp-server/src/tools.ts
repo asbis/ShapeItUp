@@ -329,7 +329,7 @@ export function registerTools(server: McpServer) {
         // Check for unknown method calls
         const knownMethods = new Set([
           "drawRectangle", "drawRoundedRectangle", "drawCircle", "drawEllipse", "drawPolysides", "drawText", "draw",
-          "sketchCircle", "sketchRectangle", "makeCylinder", "makeSphere", "makeBox",
+          "sketchCircle", "sketchRectangle", "makeCylinder", "makeSphere", "makeBox", "makeEllipsoid",
           "extrude", "revolve", "loftWith", "sweepSketch",
           "fuse", "cut", "intersect",
           "fillet", "chamfer", "shell", "draft",
@@ -639,7 +639,7 @@ Categories: drawing, sketching, solids, booleans, modifications, transforms, fin
 - drawRectangle(width, height) → Drawing
 - drawRoundedRectangle(width, height, radius) → Drawing
 - drawCircle(radius) → Drawing
-- drawEllipse(majorR, minorR) → Drawing
+- drawEllipse(majorR, minorR) → Drawing (majorR along X axis, minorR along Y axis of drawing plane)
 - drawPolysides(radius, numSides) → Drawing
 - drawText(text, { fontSize?, fontFamily? }) → Drawing
 
@@ -679,15 +679,24 @@ sketch.extrude(distance, config?) → Shape3D
   config: { extrusionDirection?, twistAngle? }
 sketch.revolve(axis?, config?) → Shape3D
   config: { origin?, angle? } (default 360°)
-sketch.loftWith(otherSketch, config?) → Shape3D
-  config: { ruled? }
+sketch.loftWith(otherSketches, config?) → Shape3D
+  otherSketches: single Sketch or Sketch[]
+  config: { ruled?, startPoint?, endPoint? }
+  WARNING: loft CONSUMES input sketches — recreate if needed after lofting
+  Profiles should have similar segment counts for best results
 sketch.sweepSketch(profileFn, config?) → Shape3D
+  profileFn: (plane, origin) => Sketch — return a sketch on the given plane
+  config: { frenet?, transitionMode?: "right"|"transformed"|"round" }
+  Use .done() (not .close()) for the path wire when sweeping along an open curve
 
 ## Primitive Solids
 makeCylinder(radius, height, location?, direction?) → Shape3D
 makeSphere(radius) → Shape3D
 makeBox(corner1, corner2) → Shape3D
-  e.g. makeBox([0,0,0], [10,20,30])`,
+  e.g. makeBox([0,0,0], [10,20,30])
+makeEllipsoid(rx, ry, rz) → Solid
+  Semi-axis lengths along X, Y, Z. Use instead of scale() for non-uniform shapes.
+  e.g. makeEllipsoid(20, 10, 15) — 40mm wide, 20mm deep, 30mm tall`,
 
     booleans: `# Boolean Operations
 
@@ -696,7 +705,14 @@ shape.cut(tool) → Shape3D            (subtraction)
 shape.intersect(other) → Shape3D     (intersection)
 
 Works on both 2D (Drawing) and 3D (Shape3D).
-For 2D: fuse2D, cut2D, intersect2D`,
+For 2D: fuse2D, cut2D, intersect2D
+
+## Best Practices
+- fuse() and cut() are reliable on most geometry
+- intersect() on two complex curved solids is FRAGILE — may silently return empty/wrong geometry
+- PREFER 2D booleans: do drawing.fuse(other) / drawing.cut(other) on 2D Drawings, then extrude. 2D booleans are far more robust.
+- If intersect() fails, use the mold-cut workaround: bigBox.cut(tool) then shape.cut(mold)
+- Wrap complex boolean chains in try/catch`,
 
     modifications: `# Shape Modifications
 
@@ -731,6 +747,8 @@ shape.translateX(d), .translateY(d), .translateZ(d)
 shape.rotate(angleDeg, position?, direction?) → Shape3D
 shape.mirror(plane?, origin?) → Shape3D
 shape.scale(factor, center?) → Shape3D
+  UNIFORM only — factor is a single number (same for all axes)
+  For non-uniform shapes, use makeEllipsoid(rx, ry, rz) or draw the shape directly in 2D
 
 All return new shapes (immutable).`,
 
@@ -816,6 +834,36 @@ export default function main() {
   let shape = base.fuse(tube).fillet(3); // Fillet BEFORE cutting interior
   const innerHole = sketchCircle(12).extrude(45);
   return shape.cut(innerHole);
+}
+\`\`\`
+
+## Organic Vase (Loft Between Profiles)
+\`\`\`typescript
+import { drawCircle, drawEllipse } from "replicad";
+export default function main() {
+  const base = drawCircle(20).sketchOnPlane("XY");
+  const belly = drawEllipse(25, 20).sketchOnPlane("XY", [0, 0, 25]);
+  const neck = drawCircle(10).sketchOnPlane("XY", [0, 0, 45]);
+  const top = drawCircle(12).sketchOnPlane("XY", [0, 0, 60]);
+  let vase = base.loftWith([belly, neck, top], { ruled: false });
+  try { vase = vase.shell({ thickness: 2, filter: f => f.inPlane("XY", 60) }); } catch {}
+  return vase;
+}
+\`\`\`
+
+## Swept Tube Along Bezier Path
+\`\`\`typescript
+import { draw, sketchCircle } from "replicad";
+export default function main() {
+  const path = draw()
+    .cubicBezierCurveTo([15, 25], [0, 10], [20, 15])
+    .cubicBezierCurveTo([0, 50], [-10, 35], [0, 45])
+    .done()
+    .sketchOnPlane("XZ");
+  return path.sweepSketch(
+    (plane, origin) => sketchCircle(4, { plane, origin }),
+    { frenet: true }
+  );
 }
 \`\`\`
 
