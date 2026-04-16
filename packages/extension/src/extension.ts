@@ -256,9 +256,14 @@ export function deactivate() {}
 /**
  * Register the ShapeItUp MCP server for Claude Code.
  *
- * Claude Code reads MCP servers from ~/.claude.json (NOT ~/.claude/settings.json).
- * The VS Code lm.registerMcpServerDefinitionProvider API only works for GitHub Copilot.
- * So we write directly to ~/.claude.json if Claude Code is installed.
+ * Claude Code reads user-scope MCP servers from ~/.claude.json. We write there
+ * directly, which works for both the Claude Code VS Code extension and the
+ * standalone native CLI install (e.g. `~/.local/bin/claude` on macOS). We do
+ * NOT gate on `vscode.extensions.getExtension("anthropic.claude-code")` because
+ * many users install Claude Code as a CLI only — gating on the VS Code
+ * extension silently skips MCP setup for them.
+ *
+ * For GitHub Copilot, we also register via the lm API when available.
  */
 function registerMcpServer(
   context: vscode.ExtensionContext,
@@ -273,7 +278,7 @@ function registerMcpServer(
     "mcp-server.js"
   );
 
-  // Also register via VS Code API for GitHub Copilot compatibility
+  // Register via VS Code API for GitHub Copilot compatibility
   try {
     if (vscode.lm?.registerMcpServerDefinitionProvider) {
       const provider = (vscode.lm as any).registerMcpServerDefinitionProvider("shapeitup-mcp", {
@@ -295,34 +300,40 @@ function registerMcpServer(
     // API not available — that's fine
   }
 
-  // Register for Claude Code by writing to ~/.claude.json
-  const claudeCode = vscode.extensions.getExtension("anthropic.claude-code");
-  if (!claudeCode) {
-    output.appendLine("[mcp] Claude Code not installed — skipping MCP setup");
+  // Detect Claude Code (VS Code extension OR native CLI install).
+  const hasClaudeVscode = !!vscode.extensions.getExtension("anthropic.claude-code");
+  const claudeJsonPath = path.join(os.homedir(), ".claude.json");
+  const hasClaudeCli =
+    fs.existsSync(claudeJsonPath) ||
+    fs.existsSync(path.join(os.homedir(), ".claude")) ||
+    fs.existsSync(path.join(os.homedir(), ".local", "bin", "claude")) ||
+    fs.existsSync("/usr/local/bin/claude") ||
+    fs.existsSync("/opt/homebrew/bin/claude");
+
+  if (!hasClaudeVscode && !hasClaudeCli) {
+    output.appendLine("[mcp] Claude Code not detected — skipping ~/.claude.json registration");
     return;
   }
-
-  const claudeJsonPath = path.join(os.homedir(), ".claude.json");
 
   try {
     let config: any = {};
     if (fs.existsSync(claudeJsonPath)) {
-      config = JSON.parse(fs.readFileSync(claudeJsonPath, "utf-8"));
+      try {
+        config = JSON.parse(fs.readFileSync(claudeJsonPath, "utf-8"));
+      } catch (parseErr: any) {
+        output.appendLine(`[mcp] ~/.claude.json is not valid JSON — aborting to avoid data loss: ${parseErr.message}`);
+        return;
+      }
     }
 
     config.mcpServers = config.mcpServers || {};
 
-    // Check if already configured with the correct path
     const existing = config.mcpServers.shapeitup;
-    if (
-      existing &&
-      existing.args?.[0] === mcpServerPath
-    ) {
+    if (existing && existing.args?.[0] === mcpServerPath) {
       output.appendLine("[mcp] Claude Code MCP server already configured");
       return;
     }
 
-    // Add or update the ShapeItUp MCP server
     config.mcpServers.shapeitup = {
       type: "stdio",
       command: "node",
