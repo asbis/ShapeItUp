@@ -419,7 +419,9 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         target: "es2022",
         external: ["replicad"], // worker handles replicad imports
         platform: "browser",
-        absWorkingDir: path.resolve(path.dirname(document.fileName)).split(path.sep).join("/"), // forward slashes for esbuild-wasm on Windows
+        absWorkingDir: path.resolve(path.dirname(document.fileName))
+          .split(path.sep).join("/") // forward slashes for esbuild-wasm
+          .replace(/^([a-z]):/, (_, l) => l.toUpperCase() + ":"), // uppercase drive letter
       });
 
       const js = result.outputFiles[0].text;

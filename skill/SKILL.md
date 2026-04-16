@@ -9,12 +9,11 @@ globs: ["**/*.shape.ts"]
 ## AI Workflow
 
 When creating or modifying shapes, follow this workflow:
-1. Create/modify the `.shape.ts` file using the Replicad API below
-2. Call `get_render_status` to check if it rendered successfully or has errors
-3. If there are errors, fix the code and repeat from step 1
-4. Call `render_preview` to capture a screenshot for visual verification
-5. Use the Read tool on the returned PNG path to verify the shape looks correct
-6. If dimensions are wrong or the shape looks off, modify and repeat
+1. `create_shape` or `modify_shape` — returns render status + bounding box inline (no separate get_render_status needed)
+2. If render failed, fix code and repeat step 1
+3. `render_preview` — captures AI-mode screenshot with dimensions. Read the PNG to visually verify.
+4. If the shape looks wrong, modify and repeat
+5. `export_shape` — export to STEP or STL when done
 
 ### Available MCP Tools
 

@@ -91,7 +91,7 @@ export function registerTools(server: McpServer) {
 
       // File creation is always a success — render failure is informational, not an error
       return {
-        content: [{ type: "text" as const, text: `Created ${filePath}${statusText}` }],
+        content: [{ type: "text" as const, text: `${overwrite ? "Overwrote" : "Created"} ${filePath}${statusText}` }],
       };
     }
   );
@@ -268,8 +268,14 @@ export function registerTools(server: McpServer) {
 
       const result = readExtensionResult();
       if (result?.exportPath && existsSync(result.exportPath)) {
+        let sourceInfo = "";
+        try {
+          const statusFile = join(GLOBAL_STORAGE, "shapeitup-status.json");
+          const s = JSON.parse(readFileSync(statusFile, "utf-8"));
+          if (s.fileName) sourceInfo = `\nSource: ${s.fileName}`;
+        } catch {}
         return {
-          content: [{ type: "text" as const, text: `Exported to: ${result.exportPath}\nFormat: ${format.toUpperCase()}` }],
+          content: [{ type: "text" as const, text: `Exported to: ${result.exportPath}\nFormat: ${format.toUpperCase()}${sourceInfo}` }],
         };
       }
       if (result?.error) {
@@ -509,7 +515,7 @@ export function registerTools(server: McpServer) {
               type: "text" as const,
               text: `Render FAILED\nError: ${status.error}\nFile: ${status.fileName || "unknown"}\nTime: ${status.timestamp}`,
             }],
-            isError: true,
+            // Not isError — render failure is an expected state, not a tool error
           };
         }
       } catch {
