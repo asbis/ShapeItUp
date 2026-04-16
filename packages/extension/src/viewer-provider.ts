@@ -3,13 +3,13 @@ import * as esbuild from "esbuild-wasm";
 import * as path from "path";
 import type { ExportFormat } from "@shapeitup/shared";
 
-let esbuildInitialized = false;
+let esbuildInitPromise: Promise<void> | null = null;
 
 async function ensureEsbuild() {
-  if (!esbuildInitialized) {
-    await esbuild.initialize({});
-    esbuildInitialized = true;
+  if (!esbuildInitPromise) {
+    esbuildInitPromise = esbuild.initialize({});
   }
+  await esbuildInitPromise;
 }
 
 export class ViewerProvider implements vscode.WebviewViewProvider {
@@ -398,12 +398,18 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     return this.panel?.webview ?? this.view?.webview;
   }
 
+  private executing = false;
+
   async executeScript(document: vscode.TextDocument) {
     const webview = this.getActiveWebview();
     if (!webview) {
       this.output.appendLine("[warn] No active webview to send script to");
       return;
     }
+
+    // Prevent concurrent executions (IPC + auto-preview can both trigger)
+    if (this.executing) return;
+    this.executing = true;
 
     const code = document.getText();
     this.output.appendLine(`[exec] Bundling ${document.fileName}`);
@@ -450,6 +456,8 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       this.output.appendLine(`[error] Bundle failed: ${e.message}`);
       vscode.window.showErrorMessage(`ShapeItUp bundle error: ${e.message}`);
       this.writeStatusFile({ success: false, error: e.message, fileName: document.fileName });
+    } finally {
+      this.executing = false;
     }
   }
 
