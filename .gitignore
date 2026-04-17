@@ -15,6 +15,7 @@ Thumbs.db
 # Build artifacts
 *.stl
 *.step
+*.tsbuildinfo
 
 # Claude Code local state
 .claude/plans/
