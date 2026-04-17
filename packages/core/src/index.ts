@@ -18,6 +18,7 @@ import {
   getTimings,
   instrumentReplicadExports,
 } from "./instrumentation";
+import { shapeitupStdlib } from "./stdlib";
 
 export type { PartInput, TessellatedPart } from "./tessellate";
 export { exportShapes } from "./exporter";
@@ -119,7 +120,7 @@ export async function initCore(loadOcct: OcctLoader): Promise<Core> {
     let params: ParamDef[];
     let material: { density: number; name?: string } | undefined;
     try {
-      const execResult = executeScript(js, replicadExports, paramOverrides);
+      const execResult = executeScript(js, replicadExports, shapeitupStdlib, paramOverrides);
       result = execResult.result;
       params = execResult.params;
       material = execResult.material;

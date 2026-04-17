@@ -13,6 +13,7 @@ import type { ParamDef } from "@shapeitup/shared";
 export function executeScript(
   js: string,
   replicadExports: Record<string, any>,
+  shapeitupExports: Record<string, any>,
   paramOverrides?: Record<string, number>
 ): { result: any; params: ParamDef[]; material?: { density: number; name?: string } } {
   let code = js;
@@ -33,6 +34,27 @@ export function executeScript(
   code = code.replace(
     /import\s+(\w+)\s+from\s*["']replicad["']\s*;?/g,
     (_, name) => `const ${name} = __replicad__.default || __replicad__;`
+  );
+
+  // ShapeItUp stdlib: `import { holes, screws } from "shapeitup"` →
+  // destructure from the injected __shapeitup__ object. Same three forms as
+  // the replicad rewriter above (named, namespace, default).
+  code = code.replace(
+    /import\s*\{([^}]+)\}\s*from\s*["']shapeitup["']\s*;?/g,
+    (_, imports) => {
+      const fixed = imports.replace(/(\w+)\s+as\s+(\w+)/g, "$1: $2");
+      return `const {${fixed}} = __shapeitup__;`;
+    }
+  );
+
+  code = code.replace(
+    /import\s*\*\s*as\s+(\w+)\s+from\s*["']shapeitup["']\s*;?/g,
+    (_, name) => `const ${name} = __shapeitup__;`
+  );
+
+  code = code.replace(
+    /import\s+(\w+)\s+from\s*["']shapeitup["']\s*;?/g,
+    (_, name) => `const ${name} = __shapeitup__.default || __shapeitup__;`
   );
 
   code = code.replace(
@@ -63,7 +85,7 @@ export function executeScript(
   code = code.replace(/export\s+/g, "");
 
   const wrapped = `
-    return (function(__replicad__, __paramOverrides__) {
+    return (function(__replicad__, __shapeitup__, __paramOverrides__) {
       function highlightFinder(__shape__, __finder__, __opts__) {
         __opts__ = __opts__ || {};
         var matches = __finder__.find(__shape__);
@@ -134,11 +156,20 @@ export function executeScript(
       var __material__ = typeof material !== "undefined" ? material : undefined;
 
       return { result: __result__, params: __params__, material: __material__ };
-    })(__replicadExports__, __paramOverrides__);
+    })(__replicadExports__, __shapeitupExports__, __paramOverrides__);
   `;
 
-  const fn = new Function("__replicadExports__", "__paramOverrides__", wrapped);
-  const { result, params, material: rawMaterial } = fn(replicadExports, paramOverrides || null);
+  const fn = new Function(
+    "__replicadExports__",
+    "__shapeitupExports__",
+    "__paramOverrides__",
+    wrapped
+  );
+  const { result, params, material: rawMaterial } = fn(
+    replicadExports,
+    shapeitupExports,
+    paramOverrides || null
+  );
 
   // Validate: only surface a material object when density is strictly a
   // finite positive number. Strings, 0, negatives, NaN all get dropped so
