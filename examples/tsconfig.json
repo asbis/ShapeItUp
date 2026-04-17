@@ -3,7 +3,24 @@
   "compilerOptions": {
     "noEmit": true,
     "strict": false,
-    "lib": ["ES2022"]
+    "lib": [
+      "ES2022",
+      "DOM"
+    ],
+    "paths": {
+      "replicad": [
+        "c:\\Users\\rorvi\\code\\ShapeItUp\\packages\\extension\\typings\\replicad"
+      ],
+      "shapeitup": [
+        "c:\\Users\\rorvi\\code\\ShapeItUp\\packages\\extension\\typings\\shapeitup"
+      ]
+    },
+    "typeRoots": [
+      "c:\\Users\\rorvi\\code\\ShapeItUp\\packages\\extension\\typings"
+    ]
   },
-  "include": ["*.shape.ts"]
+  "include": [
+    "*.shape.ts",
+    "stdlib/*.shape.ts"
+  ]
 }

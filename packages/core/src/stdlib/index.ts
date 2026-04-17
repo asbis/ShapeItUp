@@ -14,6 +14,12 @@ import { screws, nuts, washers, inserts } from "./fasteners";
 
 export * as standards from "./standards";
 
+// Top-level named re-exports — user scripts type
+// `import { holes, screws } from "shapeitup"` and the TypeScript service
+// needs these to resolve. The runtime executor separately rewrites that
+// import to destructure from `shapeitupStdlib` below.
+export { holes, printHints, bearings, extrusions, screws, nuts, washers, inserts };
+
 /**
  * The single runtime object that user scripts destructure from. Keep keys
  * stable — they become the namespace the user types (`holes.through(...)`).
