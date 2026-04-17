@@ -5,7 +5,151 @@
  * bearing pocket. `bearings.body("608")` returns a representative solid for
  * visualization/assembly.
  *
- * Implementation: see agent-B worktree.
+ * All seats are axis-aligned with Z: the top of the pocket lies at Z=0 and
+ * the cavity extends into -Z. Users translate/rotate the cut tool to the
+ * target location before calling `.cut()` on their part.
  */
 
-export {}; // placeholder — agent B fills this module
+import { makeCylinder, type Shape3D } from "replicad";
+import { BALL_BEARING, FIT, LINEAR_BEARING } from "./standards";
+
+/** Clearance behind the bearing back so the cut-tool doesn't coplanar-fail. */
+const POCKET_BACK_CLEARANCE = 0.2;
+/** Default straight-through depth when the caller wants a through-hole. */
+const DEFAULT_THROUGH_DEPTH = 50;
+/** Shoulder width: the radial lip that stops the bearing from going deeper.
+ *  3mm (per side) matches the common "bearing sits on a 3mm shelf" rule. */
+const SHOULDER_WIDTH = 3;
+
+function ballBearing(designation: string) {
+  const spec = BALL_BEARING[designation];
+  if (!spec) {
+    const avail = Object.keys(BALL_BEARING).join(", ");
+    throw new Error(
+      `Unknown ball bearing "${designation}". Available: ${avail}`
+    );
+  }
+  return spec;
+}
+
+function linearBearing(designation: string) {
+  const spec = LINEAR_BEARING[designation];
+  if (!spec) {
+    const avail = Object.keys(LINEAR_BEARING).join(", ");
+    throw new Error(
+      `Unknown linear bearing "${designation}". Available: ${avail}`
+    );
+  }
+  return spec;
+}
+
+/**
+ * Cut-tool for a press-fit ball-bearing pocket. Axis is Z; pocket top at Z=0,
+ * cavity extends into -Z. Designation like "608", "625".
+ *
+ * With `throughHole: false` (default) the pocket has a shoulder step at
+ * `depth = bearing width` so the bearing's back rests against the shelf; a
+ * narrower relief bore (OD − 2·SHOULDER_WIDTH mm) runs deeper to clear the
+ * shaft. With `throughHole: true` the pocket is a straight cylinder all the
+ * way through.
+ *
+ * The pocket diameter is `od + 2 · FIT.press` — a slight interference fit so
+ * the bearing is gripped when pressed in. Tune `FIT.press` for your printer
+ * if needed.
+ *
+ * @param designation Bearing code from BALL_BEARING (e.g. `"608"`, `"625"`).
+ * @param opts.throughHole When true, the pocket is a straight cylinder with
+ *   no shoulder. Default false.
+ * @param opts.depth Override the straight-through depth (mm). Used as the
+ *   through-hole height when `throughHole: true`, and as the relief-bore
+ *   length when `throughHole: false`. Default 50mm.
+ * @returns Shape3D cut-tool positioned at the origin with axis +Z.
+ */
+export function seat(
+  designation: string,
+  opts?: { throughHole?: boolean; depth?: number }
+): Shape3D {
+  const spec = ballBearing(designation);
+  const pocketRadius = (spec.od + FIT.press * 2) / 2;
+
+  if (opts?.throughHole) {
+    const depth = opts.depth ?? DEFAULT_THROUGH_DEPTH;
+    // Cylinder axis +Z; translate so top face sits at Z=0 → cavity into -Z.
+    return makeCylinder(pocketRadius, depth, [0, 0, -depth], [0, 0, 1]);
+  }
+
+  // Stepped pocket: full-width pocket at the seat, fused with a narrower
+  // relief bore extending deeper. The "shoulder" is the resulting step.
+  const seatHeight = spec.width + POCKET_BACK_CLEARANCE;
+  const pocket = makeCylinder(
+    pocketRadius,
+    seatHeight,
+    [0, 0, -seatHeight],
+    [0, 0, 1]
+  );
+
+  const reliefRadius = Math.max(pocketRadius - SHOULDER_WIDTH, spec.id / 2);
+  const reliefDepth = opts?.depth ?? DEFAULT_THROUGH_DEPTH;
+  const relief = makeCylinder(
+    reliefRadius,
+    reliefDepth,
+    [0, 0, -reliefDepth],
+    [0, 0, 1]
+  );
+
+  return pocket.fuse(relief);
+}
+
+/**
+ * Positive visualization of a deep-groove ball bearing — a ring-shaped solid
+ * with outer race, inner race, and a thin web between them (no ball detail).
+ *
+ * Placed upright: centered at the origin with the bore along +Z, occupying
+ * Z ∈ [0, width]. Color is the caller's responsibility.
+ *
+ * @param designation Bearing code from BALL_BEARING (e.g. `"608"`).
+ * @returns Shape3D ring (solid with a central bore).
+ */
+export function body(designation: string): Shape3D {
+  const spec = ballBearing(designation);
+  const outer = makeCylinder(spec.od / 2, spec.width, [0, 0, 0], [0, 0, 1]);
+  const bore = makeCylinder(spec.id / 2, spec.width, [0, 0, 0], [0, 0, 1]);
+  return outer.cut(bore);
+}
+
+/**
+ * Cut-tool for a linear bearing (LMxUU) pocket. Axis Z; pocket top at Z=0,
+ * cavity extends into -Z for `length` mm (from LINEAR_BEARING).
+ *
+ * No shoulder — linear bearings are typically held by retaining rings or
+ * press-fit at both ends, so the pocket is a straight bore of
+ * `od + 2 · FIT.press` (press fit).
+ *
+ * @param designation Bearing code from LINEAR_BEARING (e.g. `"LM8UU"`).
+ * @returns Shape3D cut-tool for the bearing pocket.
+ */
+export function linearSeat(designation: string): Shape3D {
+  const spec = linearBearing(designation);
+  const pocketRadius = (spec.od + FIT.press * 2) / 2;
+  return makeCylinder(
+    pocketRadius,
+    spec.length,
+    [0, 0, -spec.length],
+    [0, 0, 1]
+  );
+}
+
+/**
+ * Positive visualization of a linear bearing (LMxUU) — a cylindrical outer
+ * shell with an axial bore sized for the rod. Placed upright with the bore
+ * along +Z, occupying Z ∈ [0, length].
+ *
+ * @param designation Bearing code from LINEAR_BEARING (e.g. `"LM8UU"`).
+ * @returns Shape3D tube (outer cylinder minus rod bore).
+ */
+export function linearBody(designation: string): Shape3D {
+  const spec = linearBearing(designation);
+  const outer = makeCylinder(spec.od / 2, spec.length, [0, 0, 0], [0, 0, 1]);
+  const bore = makeCylinder(spec.id / 2, spec.length, [0, 0, 0], [0, 0, 1]);
+  return outer.cut(bore);
+}
