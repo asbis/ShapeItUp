@@ -26,7 +26,10 @@ jobs:
         run: pnpm build
 
       - name: Install runtime dependencies in extension
-        run: cd packages/extension && npm install
+        # --omit=dev: skip devDependencies so npm doesn't try to resolve
+        # workspace: protocol entries (only esbuild-wasm is actually needed
+        # at runtime; everything else is bundled by esbuild at build time).
+        run: cd packages/extension && npm install --omit=dev
 
       - name: Publish to VS Marketplace
         run: cd packages/extension && npx @vscode/vsce publish
