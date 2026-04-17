@@ -27,14 +27,10 @@ export function createFileWatcher(
   watcher.onDidChange(onFileChange);
   watcher.onDidCreate(onFileChange);
 
-  // Also trigger on document save
-  context.subscriptions.push(
-    vscode.workspace.onDidSaveTextDocument((doc) => {
-      if (doc.fileName.endsWith(".shape.ts")) {
-        viewer.executeScript(doc);
-      }
-    })
-  );
+  // NOTE: onDidSaveTextDocument is handled in extension.ts — registering it
+  // here too caused every save to fire executeScript twice (and the status
+  // file to be written twice). Keep only the watcher-based change detection
+  // here; saves are covered by the sibling handler.
 
   context.subscriptions.push(watcher);
 }
