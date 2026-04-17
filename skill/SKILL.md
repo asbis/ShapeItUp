@@ -586,6 +586,21 @@ plate.cut(holes.counterbore("M3", { plateThickness: 4 }).translate(10, 10, 4))
 
 **Positive-shape convention** (screws, nuts, bearings bodies) — top at Z=0, body/shaft extends into -Z.
 
+**Back-face cuts** — wrap a cut tool in `fromBack()` to flip it so it opens upward from Z=0. Useful for heat-set insert pockets / through-features on the bottom face of a plate whose underside sits at Z=0:
+
+```typescript
+import { inserts, fromBack } from "shapeitup";
+plate.cut(fromBack(inserts.pocket("M3")).translate(x, y, 0))
+```
+
+**Shape3D type-narrowing** — replicad's `.extrude()` returns an overly-wide union. Wrap the chain in `shape3d()` instead of sprinkling `as Shape3D`:
+
+```typescript
+import { shape3d } from "shapeitup";
+const plate = shape3d(drawRectangle(60, 40).sketchOnPlane("XY").extrude(5));
+plate.cut(hole);  // OK
+```
+
 ### holes — cut tools
 
 ```typescript

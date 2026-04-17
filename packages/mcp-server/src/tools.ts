@@ -1080,7 +1080,7 @@ export function registerTools(server: McpServer) {
     {
       filePath: z.string().optional().describe("Optional .shape.ts to execute first. Defaults to the last-executed shape."),
       cameraAngle: z
-        .enum(["isometric", "top", "front", "right", "back", "left"])
+        .enum(["isometric", "top", "bottom", "front", "right", "back", "left"])
         .optional()
         .describe("Camera angle preset (default: 'isometric')"),
       showDimensions: z.boolean().optional().describe("Overlay bounding-box dimensions (default: true)"),
@@ -1337,7 +1337,7 @@ export function registerTools(server: McpServer) {
     {
       filePath: z.string().optional().describe("Optional absolute path to a PNG. Defaults to the most recent ShapeItUp preview."),
       cameraAngle: z
-        .enum(["isometric", "top", "front", "right", "back", "left"])
+        .enum(["isometric", "top", "bottom", "front", "right", "back", "left"])
         .optional()
         .describe("Used only when filePath is omitted, to pick `shapeitup-preview-<shape>-<angle>.png` instead of the generic latest preview."),
     },
@@ -2239,7 +2239,7 @@ returns a Replicad Shape3D (or Drawing, where noted), so results mix with any
 other Replicad code. Dimensions come from ISO/DIN tables — don't hardcode.
 
 \`\`\`typescript
-import { holes, screws, nuts, washers, inserts, bearings, extrusions, printHints } from "shapeitup";
+import { holes, screws, nuts, washers, inserts, bearings, extrusions, printHints, fromBack, shape3d } from "shapeitup";
 \`\`\`
 
 **Convention for cut-tool shapes** (holes, bearing seats, insert pockets):
@@ -2247,11 +2247,28 @@ axis +Z, top of the tool at Z = 0, tool extends into -Z. Users translate the
 tool to the target location and cut from their part:
 
 \`\`\`typescript
-plate.cut(holes.counterbore("M3", { plateThickness: 4 }).translate(10, 10, 0))
+plate.cut(holes.counterbore("M3", { plateThickness: 4 }).translate(10, 10, 4))
 \`\`\`
 
 **Convention for positive shapes** (screws, nuts, washers, bearings bodies):
 top face at Z = 0, shaft/body extends into -Z. Colors left to the caller.
+
+**Back-face cuts** — wrap a cut tool in \`fromBack(tool)\` to flip it so it
+extends into +Z from Z=0 instead. Use for features that open on the bottom
+face of a plate (heat-set inserts, access ports, etc):
+
+\`\`\`typescript
+plate.cut(fromBack(inserts.pocket("M3")).translate(x, y, 0))
+\`\`\`
+
+**Shape3D type-narrowing** — replicad's \`.extrude()\` returns a wide union
+(\`Shell | Solid | …\`) that lacks \`.cut()\` / \`.fuse()\`. Wrap with
+\`shape3d(...)\` to narrow, instead of writing \`as Shape3D\` everywhere:
+
+\`\`\`typescript
+const plate = shape3d(drawRectangle(60, 40).sketchOnPlane("XY").extrude(5));
+plate.cut(hole);  // OK
+\`\`\`
 
 ---
 

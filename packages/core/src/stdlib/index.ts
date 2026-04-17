@@ -11,6 +11,7 @@ import * as printHints from "./printHints";
 import * as bearings from "./bearings";
 import * as extrusions from "./extrusions";
 import { screws, nuts, washers, inserts } from "./fasteners";
+import { fromBack, shape3d } from "./placement";
 
 export * as standards from "./standards";
 
@@ -18,7 +19,18 @@ export * as standards from "./standards";
 // `import { holes, screws } from "shapeitup"` and the TypeScript service
 // needs these to resolve. The runtime executor separately rewrites that
 // import to destructure from `shapeitupStdlib` below.
-export { holes, printHints, bearings, extrusions, screws, nuts, washers, inserts };
+export {
+  holes,
+  printHints,
+  bearings,
+  extrusions,
+  screws,
+  nuts,
+  washers,
+  inserts,
+  fromBack,
+  shape3d,
+};
 
 /**
  * The single runtime object that user scripts destructure from. Keep keys
@@ -33,6 +45,8 @@ export const shapeitupStdlib = {
   printHints,
   bearings,
   extrusions,
+  fromBack,
+  shape3d,
 };
 
 export type ShapeitupStdlib = typeof shapeitupStdlib;
