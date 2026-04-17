@@ -6,65 +6,107 @@ globs: ["**/*.shape.ts"]
 
 # ShapeItUp — Replicad CAD Scripting Reference
 
+This skill gives you breadth: what to call, when, how. For depth (full signatures, more examples) call `get_api_reference({ category, search?, signaturesOnly? })`.
+
+## Contents
+
+- [AI Workflow (decision tree)](#ai-workflow)
+- [Available MCP Tools](#available-mcp-tools)
+- [Top Best Practices](#top-best-practices)
+- [File Convention](#file-convention)
+- [Core Concepts](#core-concepts)
+- [draw\* vs sketch\*](#draw-vs-sketch)
+- [Drawing API (2D)](#drawing-api-2d)
+- [Sketching (2D → 3D-ready)](#sketching-2d--3d-ready)
+- [3D Solid Operations](#3d-solid-operations)
+- [Boolean Operations](#boolean-operations)
+- [Organic / Sculptural Shapes](#organic--sculptural-shapes)
+- [Shape Modifications](#shape-modifications)
+- [Transformations](#transformations)
+- [Finders](#finders)
+- [Memory Management](#memory-management)
+- [Multi-File & Assemblies](#multi-file--assemblies)
+- [Export Decision Table](#export-decision-table)
+- [Complete Examples](#complete-examples)
+
+---
+
 ## AI Workflow
 
-When creating or modifying shapes, follow this workflow:
-1. `create_shape` or `modify_shape` — creates/updates the file and triggers rendering
-2. `get_render_status` — check if render succeeded (returns bounding box + stats) or failed (returns error message)
-3. If render failed, fix code with `modify_shape` and repeat from step 2
-4. `render_preview` — captures AI-mode screenshot with dimensions. Read the PNG to visually verify.
-5. If the shape looks wrong, modify and repeat
-6. `export_shape` — export to STEP or STL when done
+Start with `create_shape` (or `modify_shape`) — the status from that call tells you whether the render succeeded and returns every stat you need. Branch based on what came back:
 
-### Available MCP Tools
+- Render succeeded
+  - Need visual check → `render_preview` (returns PNG path; Read the file to see it)
+  - Need dims/volume/mass only → use the stats already in the `create_shape`/`modify_shape` response (or `get_render_status`). No screenshot needed.
+  - Exploring a parameter range (target volume, fit tolerance, bbox) → `tune_params` (ephemeral overrides, doesn't touch the file) until happy, then `modify_shape` with the winning value
+  - Multi-part assembly → `check_collisions` to confirm parts don't overlap unintentionally
+  - Trying a variant without touching the file → `preview_shape` (one-shot snippet, deleted after run; pass `workingDir` if the snippet uses local `./foo.shape` imports)
+  - Ready to ship → `export_shape` (STEP for CAD/CAM, STL per part for 3D-print)
+- Render failed
+  - TRUST the `Hint:` line in the error response — it's a one-shot pattern-matched suggestion (fillet-too-large, revolve axis in profile, loft-consumed sketch, etc.). Apply it first before deeper debugging.
+  - Also check `warnings[]` in the status — non-fatal lints fire even on success.
+  - `validate_script({ code })` catches common pitfalls (sketch-mischain, missing `.sketchOnPlane`, unclosed pen, non-uniform scale, oversized fillet, booleans-in-loop) without executing.
+- About to fillet / chamfer / shell with a complex finder expression
+  - `preview_finder({ filePath, finder })` first — it reports how many edges/faces matched and paints pink spheres in the viewer. Saves guessing.
+- Need API depth
+  - `get_api_reference({ search: "sweep" })` — searches across all categories.
+  - `get_api_reference({ category: "finders", signaturesOnly: true })` — compact dump.
+- Sandbox can't read `shapeitup-previews/` (gitignored path)
+  - `get_preview` returns the latest PNG as inline base64 in the tool response.
 
-**File operations:**
-- `create_shape` — create a new `.shape.ts` file with given code
-- `modify_shape` — overwrite an existing shape file
-- `read_shape` — read shape file contents
-- `list_shapes` — find all `.shape.ts` files in a directory
-- `validate_script` — check TypeScript syntax without executing
+---
 
-**Visual review:**
-- `get_render_status` — check if the last render succeeded or failed (returns error messages + bounding box). Call after every create/modify.
-- `render_preview` — capture a PNG screenshot. Params: `renderMode` ("ai"/"dark"), `showDimensions` (bool), `cameraAngle` ("isometric"/"top"/"front"/"right"/"back"/"left"). Saved as `shapeitup-preview-{shape}-{angle}.png` (overwrites per shape+angle combo). These params override the interactive viewer state for the screenshot only.
-- `set_render_mode` — switch the interactive viewer between "ai" and "dark" (render_preview has its own param)
-- `toggle_dimensions` — show/hide dimensions on the interactive viewer (render_preview has its own param)
+## Available MCP Tools
 
-**Export & Reference:**
-- `export_shape` — export to STEP or STL. Provide `outputPath` for direct save.
-- `get_api_reference` — get Replicad API docs. Call without `category` to list all categories.
+All 19 tools. Dense reference — use this table to find the right tool fast.
 
-### Best Practices for AI
-- Always use `export const params = { ... }` so the user gets live sliders in the viewer
-- After creating a shape, call `render_preview` and Read the PNG to self-check
-- If dimensions look wrong, check the code and fix — common mistakes: wrong extrude direction, missing translateZ, swapped width/height
-- Use named parts with colors for assemblies: `return [{ shape, name: "base", color: "#8899aa" }]`
+| Tool | Purpose | Key args |
+|------|---------|----------|
+| `create_shape` | Create new `.shape.ts` and execute | `name`, `code`, `directory?`, `overwrite?` |
+| `modify_shape` | Overwrite existing `.shape.ts` and execute | `filePath`, `code` |
+| `read_shape` | Read file contents | `filePath` |
+| `open_shape` | Execute an existing file, bring up in viewer | `filePath` |
+| `delete_shape` | Delete a `.shape.ts` file | `filePath` |
+| `list_shapes` | Find all `.shape.ts` files | `directory?`, `recursive?` |
+| `validate_script` | Syntax + 6 semantic lints (no execution) | `code` |
+| `preview_shape` | Execute a snippet WITHOUT writing to workspace | `code`, `workingDir?`, `captureScreenshot?`, `focusPart?`, `hideParts?` |
+| `tune_params` | Re-run with ephemeral param overrides, file untouched | `filePath`, `params`, `captureScreenshot?` |
+| `get_render_status` | Last run's stats (volume, area, CoM, bbox, mass, per-part) | — |
+| `render_preview` | PNG screenshot of current shape | `filePath?`, `cameraAngle?`, `renderMode?`, `showDimensions?`, `showAxes?`, `width?`, `height?`, `timeoutMs?`, `finder?`, `partName?`, `partIndex?`, `focusPart?`, `hideParts?` |
+| `get_preview` | Return latest PNG as inline base64 (no Read needed) | `filePath?`, `cameraAngle?` |
+| `set_render_mode` | Switch live viewer ai/dark (UI only) | `mode` |
+| `toggle_dimensions` | Show/hide dims on live viewer (UI only) | `show?` |
+| `preview_finder` | Count + locate edge/face matches; pink-sphere preview in viewer | `filePath`, `finder`, `partName?`, `partIndex?` |
+| `check_collisions` | Pairwise part intersection test on assemblies | `filePath`, `tolerance?` |
+| `export_shape` | Export to STEP or STL; optional single-part | `format`, `filePath?`, `outputPath?`, `partName?`, `openIn?` |
+| `list_installed_apps` | Detect PrusaSlicer/Cura/FreeCAD/Fusion360/etc. | — |
+| `get_api_reference` | Replicad docs; omit category to list; `search` to grep | `category?`, `search?`, `signaturesOnly?` |
+
+---
+
+## Top Best Practices
+
+1. **Always `export const params = { ... }`** so the user gets live sliders and `tune_params` works.
+2. **Add `export const material = { density, name }`** (g/cm³) — `get_render_status` then returns mass per part. Common densities: steel 7.85, aluminum 2.70, brass 8.40, ABS 1.05, PLA 1.24, PETG 1.27, wood ~0.7, water 1.0.
+3. **Use `tune_params` to scan values** before committing with `modify_shape` — binary-search fit tolerance, target volume, target mass without touching the file.
+4. **Trust the `Hint:` line** on render failures — it's operation-specific and usually correct.
+5. **Preview finders before applying them** — `preview_finder({ filePath, finder })` catches zero-match or over-match selections before a fillet/chamfer/shell crashes.
+6. **Apply fillets BEFORE boolean cuts.** Cuts fragment edges into tiny segments that OCCT can't fillet. See [Fillet safety](#fillet-safety).
+7. **Prefer 2D booleans over 3D** — `drawing.fuse / cut / intersect` then a single `.extrude()` is far more robust than many 3D booleans.
+
+---
 
 ## File Convention
 
-Every shape file uses the `.shape.ts` extension and exports a default `main()` function that returns a Shape3D (or array of Shape3D).
+Every shape file uses `.shape.ts` and exports a default `main()` that returns a `Shape3D` (or an array of `{ shape, name, color }`).
 
-### Basic (no parameters)
+### With parameters (preferred)
+
 ```typescript
-import { drawRectangle } from "replicad";
+import { drawRoundedRectangle } from "replicad";
 
-export default function main() {
-  return drawRectangle(50, 30).sketchOnPlane("XY").extrude(10);
-}
-```
-
-### With Parameters (PREFERRED — gives user live sliders)
-```typescript
-import { drawRoundedRectangle, sketchCircle } from "replicad";
-
-export const params = {
-  width: 80,
-  height: 50,
-  depth: 30,
-  wall: 2,
-  cornerRadius: 5,
-};
+export const params = { width: 80, height: 50, depth: 30, wall: 2, cornerRadius: 5 };
+export const material = { density: 7.85, name: "steel" }; // g/cm³
 
 export default function main({ width, height, depth, wall, cornerRadius }: typeof params) {
   const outer = drawRoundedRectangle(width, height, cornerRadius)
@@ -75,131 +117,115 @@ export default function main({ width, height, depth, wall, cornerRadius }: typeo
 }
 ```
 
-The `params` object is auto-detected by the viewer and generates slider controls. Always prefer this pattern so users can interactively adjust dimensions.
+### Minimal (no params)
 
-## Core Concepts
+```typescript
+import { drawRectangle } from "replicad";
+export default function main() {
+  return drawRectangle(50, 30).sketchOnPlane("XY").extrude(10);
+}
+```
 
-- **Flow**: Drawing (2D) → Sketch (placed on a plane) → Shape3D (extruded/revolved/lofted/swept)
-- **Units**: All dimensions in millimeters
-- **Coordinate system**: X = right, Y = forward, Z = up
-- **Planes**: `"XY"` (top), `"XZ"` (front), `"YZ"` (right). Prefix with `-` to flip normal.
+### Multi-part assembly
+
+```typescript
+return [
+  { shape: base,   name: "base",   color: "#8899aa" },
+  { shape: bolt,   name: "bolt",   color: "#aa8855" },
+];
+```
+
+Each part gets its own color in the viewer and becomes a named component in STEP files. Per-part stats (volume, surface area, CoM, bbox, mass) are returned by `get_render_status`.
 
 ---
 
-## Drawing API (2D Shapes)
+## Core Concepts
 
-### Factory Functions
-| Function | Returns | Description |
-|----------|---------|-------------|
-| `draw(origin?)` | DrawingPen | Freeform 2D path builder |
-| `drawRectangle(w, h)` | Drawing | Rectangle centered at origin |
-| `drawRoundedRectangle(w, h, r)` | Drawing | Rounded rectangle |
-| `drawCircle(radius)` | Drawing | Circle centered at origin |
-| `drawEllipse(majorR, minorR)` | Drawing | Ellipse (majorR along X, minorR along Y in drawing plane) |
-| `drawPolysides(radius, numSides)` | Drawing | Regular polygon |
-| `drawText(text, config?)` | Drawing | Text outline |
+- **Flow**: Drawing (2D) → Sketch (placed on a plane) → Shape3D (extruded/revolved/lofted/swept).
+- **Units**: millimeters.
+- **Axes**: X right, Y forward, Z up.
+- **Planes**: `"XY"` (top), `"XZ"` (front), `"YZ"` (right). Prefix with `-` to flip normal.
+- **`sketchOnPlane(plane, origin?)` origin semantics**: `origin` is an offset in WORLD coordinates, NOT plane-local. `sketchOnPlane("XY", [0, 0, 20])` raises the sketch to Z=20. `sketchOnPlane("XZ", [10, 0, 0])` shifts it along world X.
 
-### DrawingPen Methods (all chainable)
-**Lines:**
-- `.lineTo([x, y])` — absolute line
-- `.line(dx, dy)` — relative line
-- `.vLine(d)` — vertical line
-- `.hLine(d)` — horizontal line
-- `.polarLine(distance, angleDeg)` — line at angle
+---
 
-**Arcs:**
-- `.sagittaArcTo([x, y], sagitta)` — arc with bulge
-- `.tangentArcTo([x, y])` — arc tangent to previous segment
-- `.threePointsArcTo([x, y], [mx, my])` — arc through 3 points
+## draw\* vs sketch\*
 
-**Curves:**
-- `.cubicBezierCurveTo([x, y], [cp1x, cp1y], [cp2x, cp2y])`
-- `.smoothSplineTo([x, y], config?)`
+Pitfall at the top: **`sketch*` functions already return a Sketch — do NOT chain `.sketchOnPlane()` on them.**
 
-**Closing:**
-- `.close()` — close shape (required for extrusion)
-- `.closeWithMirror()` — close by mirroring the path
-- `.done()` — open wire (no close)
+| Family | Returns | Next step |
+|--------|---------|-----------|
+| `drawCircle`, `drawRectangle`, `drawRoundedRectangle`, `drawEllipse`, `drawPolysides`, `drawText`, `draw()` | Drawing (2D, no plane yet) | `.sketchOnPlane(plane, origin?)` then `.extrude()` / `.revolve()` |
+| `sketchCircle`, `sketchRectangle` | Sketch (already on a plane via `config`) | Directly `.extrude()` / `.revolve()` |
 
-### 2D Boolean Operations
-- `drawing.fuse(other)` — union
-- `drawing.cut(other)` — subtraction
-- `drawing.intersect(other)` — intersection
-- `drawing.offset(distance)` — offset/inset
-- `drawing.translate(dx, dy)`, `.rotate(angleDeg)`, `.mirror(axis)`
+Use `draw*` when you need 2D ops first (`.fuse`, `.cut`, `.offset`). Use `sketch*` for a one-liner primitive on a plane.
+
+---
+
+## Drawing API (2D)
+
+Signatures only — full reference: `get_api_reference({ category: "drawing" })`.
+
+| Function | Description |
+|----------|-------------|
+| `draw(origin?)` | Freeform 2D pen-builder (returns DrawingPen) |
+| `drawRectangle(w, h)` | Rectangle centered at origin |
+| `drawRoundedRectangle(w, h, r)` | Rounded rectangle |
+| `drawCircle(r)` | Circle |
+| `drawEllipse(majorR, minorR)` | Ellipse (majorR along X) |
+| `drawPolysides(radius, nSides)` | Regular polygon |
+| `drawText(text, config?)` | Text outline |
+
+**DrawingPen** (pitfall: a pen chain MUST end with `.close()`, `.closeWithMirror()`, or `.done()` before `.sketchOnPlane()` / `.extrude()`): lines (`lineTo`, `line`, `vLine`, `hLine`, `polarLine`), arcs (`sagittaArcTo`, `tangentArcTo`, `threePointsArcTo`), curves (`cubicBezierCurveTo`, `smoothSplineTo`), closing (`close`, `closeWithMirror`, `done`).
+
+**2D booleans** (prefer over 3D): `drawing.fuse(other)`, `.cut(other)`, `.intersect(other)`, `.offset(d)`, `.translate(dx,dy)`, `.rotate(deg)`, `.mirror(axis)`.
 
 ---
 
 ## Sketching (2D → 3D-ready)
 
-### Placing Drawings on Planes
 ```typescript
-const sketch = drawRectangle(50, 30).sketchOnPlane("XY");
-const sketch2 = drawCircle(10).sketchOnPlane("XY", [0, 0, 20]); // at height Z=20
-```
-
-### Convenience Functions
-- `sketchRectangle(w, h, config?)` — sketch directly (no drawing step)
-- `sketchCircle(r, config?)` — sketch directly
-
-### Sketcher Class (3D freeform)
-```typescript
-const sketch = new Sketcher("XZ")
-  .hLine(20).vLine(10).hLine(-20).close();
+drawRectangle(50, 30).sketchOnPlane("XY");              // on top
+drawCircle(10).sketchOnPlane("XY", [0, 0, 20]);         // raised to Z=20 (world coords)
+sketchCircle(10, { plane: "XY" });                       // one-liner; already a Sketch
+new Sketcher("XZ").hLine(20).vLine(10).hLine(-20).close(); // freeform
 ```
 
 ---
 
 ## 3D Solid Operations
 
-### From Sketch
-| Method | Description |
-|--------|-------------|
-| `sketch.extrude(distance, config?)` | Linear extrusion |
-| `sketch.revolve(axis?, config?)` | Revolution (default 360°) |
-| `sketch.loftWith(otherSketches, config?)` | Loft between profiles |
-| `sketch.sweepSketch(profileFn, config?)` | Sweep profile along sketch path |
+Pitfall at the top: **`loftWith` CONSUMES its input sketches.** If you need a profile after lofting, recreate it fresh — don't reuse the variable.
 
-**Extrude config**: `{ extrusionDirection?: [x,y,z], twistAngle?: number }`
-**Revolve config**: `{ origin?: [x,y,z], angle?: number }`
+### From a sketch
 
-**Loft config**: `{ ruled?: boolean, startPoint?: [x,y,z], endPoint?: [x,y,z] }`
-- `otherSketches` can be a single Sketch or array of Sketches
-- `ruled`: true for flat ruled surfaces (default), false for smooth interpolation
-- `startPoint`/`endPoint`: taper to a point before/after the profiles
-- **WARNING**: Loft CONSUMES (deletes) input sketches. If you need a sketch after lofting, recreate it — don't reuse the variable.
-- Profiles should have similar topology (same number of segments) for best results. Mismatched segment counts may produce unexpected geometry.
+| Method | Notes |
+|--------|-------|
+| `sketch.extrude(distance, { extrusionDirection?, twistAngle? })` | Linear |
+| `sketch.revolve(axis?, { origin?, angle? })` | Angle in **degrees**, not radians |
+| `sketch.loftWith(otherSketches, { ruled?, startPoint?, endPoint? })` | Profiles with similar topology (same segment counts) loft cleanly |
+| `sketch.sweepSketch((plane, origin) => Sketch, { frenet?, transitionMode? })` | Sweep along an open-wire path; set `frenet: true` for 3D curves |
 
-**Sweep config**: `{ frenet?: boolean, transitionMode?: "right"|"transformed"|"round" }`
-- `profileFn`: `(plane: Plane, origin: Point) => Sketch` — receives the local coordinate frame at each point along the path. Return a Sketch positioned on that plane.
-- `frenet`: use Frenet frame for orientation (recommended for 3D curves)
-- `transitionMode`: how to handle corners — "round" smooths them out
+### Primitive solids
 
-**Sweep example — circle along a bezier path:**
-```typescript
-import { draw, drawCircle, sketchCircle } from "replicad";
-
-export default function main() {
-  // Draw an open wire path (the spine)
-  const path = draw()
-    .cubicBezierCurveTo([0, 40], [20, 10], [-10, 30])
-    .done()  // .done() for open wire, NOT .close()
-    .sketchOnPlane("XZ");
-
-  // Sweep a circular cross-section along the path
-  return path.sweepSketch(
-    (plane, origin) => sketchCircle(3, { plane, origin }),
-    { frenet: true }
-  );
-}
-```
-
-### Primitive Solids
 ```typescript
 makeCylinder(radius, height, location?, direction?)
 makeSphere(radius)
-makeBox(corner1, corner2)  // e.g., makeBox([0,0,0], [10,20,30])
-makeEllipsoid(rx, ry, rz)  // semi-axis lengths along X, Y, Z
+makeBox([0,0,0], [10,20,30])
+makeEllipsoid(rx, ry, rz)   // independent semi-axes — use this instead of non-uniform scale
+```
+
+### Sweep example
+
+```typescript
+import { draw, sketchCircle } from "replicad";
+export default function main() {
+  const path = draw()
+    .cubicBezierCurveTo([0, 40], [20, 10], [-10, 30])
+    .done()                // open wire for sweeps — .done(), not .close()
+    .sketchOnPlane("XZ");
+  return path.sweepSketch((plane, origin) => sketchCircle(3, { plane, origin }), { frenet: true });
+}
 ```
 
 ---
@@ -207,167 +233,165 @@ makeEllipsoid(rx, ry, rz)  // semi-axis lengths along X, Y, Z
 ## Boolean Operations
 
 ```typescript
-shape.fuse(other)       // union
-shape.cut(tool)         // subtraction
-shape.intersect(other)  // intersection
+shape.fuse(other)        // union
+shape.cut(tool)          // subtraction
+shape.intersect(other)   // intersection — FRAGILE on curved solids
 ```
 
-### Boolean Best Practices
-- `fuse()` and `cut()` are generally reliable on all geometry
-- `intersect()` on two complex curved solids (bezier extrusions, spline surfaces) is **fragile** — it may return empty or incorrect geometry silently
-- **Prefer 2D booleans** when possible: do `drawing.fuse(other)`, `drawing.cut(other)` on 2D Drawings, then extrude the result. 2D booleans are far more robust than 3D.
-- If `intersect()` fails, use the **mold-cut workaround**: `bigBox.cut(tool)` then `shape.cut(mold)` (see Organic Shapes section)
-- Wrap complex boolean chains in try/catch when combining many parts
+- `fuse` and `cut` are reliable on most geometry.
+- `intersect` on two complex curved solids (bezier extrusions, spline surfaces) may return empty or wrong geometry silently. Prefer 2D `drawing.intersect` when possible.
+- If 3D `intersect` fails, use the **mold-cut workaround** — see [Organic Shapes](#organic--sculptural-shapes).
+- Booleans inside a `for` loop are slow. Combine in 2D first (one `drawing.fuse` chain), then a single `.extrude()`.
 
 ---
 
 ## Organic / Sculptural Shapes
 
-For curved, organic shapes (animals, figurines, ergonomic grips, etc.), **do NOT use extrude + fillet**. Extruding a complex bezier profile creates a flat slab, and filleting complex geometry almost always fails in OpenCascade.
+For curved / organic geometry (animals, figurines, ergonomic grips): **do NOT extrude-then-fillet a complex bezier profile.** Extruding makes a flat slab; filleting complex geometry crashes OCCT.
 
-### Recommended Approaches (in order of reliability)
+Approaches in order of reliability:
 
-**1. Sweep a cross-section along a profile path** (best for tube-like organic forms)
+**1. Sweep a cross-section along a path** (best for tube-like forms)
+
 ```typescript
-// Draw the silhouette as an open wire, sweep a circle along it
 const spine = draw()
   .cubicBezierCurveTo([0, 40], [15, 10], [-5, 30])
   .cubicBezierCurveTo([5, 60], [10, 45], [5, 55])
-  .done()  // open wire — use .done(), NOT .close()
+  .done()
   .sketchOnPlane("XZ");
-return spine.sweepSketch(
-  (plane, origin) => sketchCircle(5, { plane, origin }),
-  { frenet: true }
-);
+return spine.sweepSketch((plane, origin) => sketchCircle(5, { plane, origin }), { frenet: true });
 ```
 
-**2. Loft between cross-section profiles** (best for shapes that vary in cross-section)
+**2. Loft between cross-sections** (best for shapes varying in cross-section)
+
 ```typescript
-// Define cross-sections at different heights, loft between them
 const bottom = drawCircle(15).sketchOnPlane("XY");
 const middle = drawEllipse(20, 12).sketchOnPlane("XY", [0, 0, 20]);
-const top = drawCircle(8).sketchOnPlane("XY", [0, 0, 40]);
+const top    = drawCircle(8).sketchOnPlane("XY", [0, 0, 40]);
 return bottom.loftWith([middle, top], { ruled: false });
 ```
 
-**3. Revolve a profile** (best for rotationally symmetric shapes)
+**3. Revolve a profile** (rotationally symmetric)
+
 ```typescript
-const profile = draw()
-  .vLine(30)
-  .smoothSplineTo([10, 20])
-  .smoothSplineTo([5, 10])
-  .smoothSplineTo([8, 0])
-  .close();
+const profile = draw().vLine(30).smoothSplineTo([10, 20]).smoothSplineTo([5, 10]).smoothSplineTo([8, 0]).close();
 return profile.sketchOnPlane("XZ").revolve();
 ```
 
-**4. Mold-cut for shaping** (workaround when intersect() fails on complex curves)
+**4. Mold-cut workaround** (when 3D `intersect()` fails on curves)
+
 ```typescript
-// Instead of shape.intersect(ellipsoid) which may fail:
-// Use the "inverse mold" approach
-const mold = makeBox([-50,-50,-50],[50,50,50]).cut(makeEllipsoid(25, 15, 30));
-const shaped = rawShape.cut(mold);  // cuts away everything outside the ellipsoid
+// Build an "inverse mold" around the target volume, then cut it from the raw shape.
+const mold = makeBox([-50,-50,-50], [50,50,50]).cut(makeEllipsoid(25, 15, 30));
+const shaped = rawShape.cut(mold);  // removes everything outside the ellipsoid
 ```
 
-### What to AVOID for organic shapes
-- **Don't** extrude a complex bezier profile and try to fillet the flat faces — fillet will fail on 16+ segment profiles
-- **Don't** use `intersect()` between two complex curved solids — it often produces empty/wrong results
-- **Don't** rely on non-uniform scale — `scale()` only takes a single number (uniform). Use `makeEllipsoid(rx, ry, rz)` for ellipsoidal shapes instead.
-- **Prefer 2D booleans** (fuse, cut, intersect on Drawings) before extruding — 2D booleans are far more robust than 3D
+**Avoid**: extruding a bezier then trying to fillet flat faces; `intersect()` between two complex curved solids; non-uniform `.scale()` (doesn't exist — scale takes one number).
 
 ---
 
 ## Shape Modifications
 
-### Fillet (round edges)
-```typescript
-shape.fillet(radius)                              // all edges
-shape.fillet(radius, e => e.inDirection("Z"))     // filtered edges
-```
+<a id="fillet-safety"></a>
+**Fillet safety (read before calling fillet on anything non-trivial):**
+- Apply fillets BEFORE boolean cuts. Cuts create tiny edge fragments that crash OCCT.
+- Use a filter when you can: `.fillet(r, e => e.inDirection("Z"))` beats all-edges.
+- Keep radii small on complex geometry (0.3–0.5 mm).
+- Wrap in try/catch so the whole script doesn't die: `try { shape = shape.fillet(0.5); } catch { /* skip */ }`.
+- If it still fails: reduce radius, select fewer edges, move the fillet earlier in the pipeline, or run `validate_script` — it flags radii above half the smallest observed dimension.
 
-### Chamfer
 ```typescript
-shape.chamfer(distance)
-shape.chamfer(distance, e => e.inDirection("Z"))
-```
-
-### Shell (hollow out)
-```typescript
+shape.fillet(2)                                    // all edges
+shape.fillet(2, e => e.inDirection("Z"))           // filtered
+shape.chamfer(1, e => e.inPlane("XY", 0))          // similar API
 shape.shell({ thickness: 2, filter: f => f.inPlane("XY", height) })
-```
-
-### Draft (taper walls)
-```typescript
 shape.draft(angleDeg, faceFinder, neutralPlane?)
 ```
 
-### Fillet/Chamfer Best Practices
-- Apply fillets BEFORE boolean cuts when possible
-- Avoid `.fillet(r, e => e.inPlane("XY", z))` after many boolean cuts — tiny edges crash OpenCascade
-- Prefer `.fillet(r, e => e.inDirection("Z"))` for outer vertical edges only
-- Use small radii (0.3-0.5mm) on complex geometry
-- Wrap fillets in try/catch: `try { shape = shape.fillet(0.5); } catch { /* skip */ }`
-- If fillet crashes: reduce radius, fillet fewer edges, or fillet before cutting holes
-```
-
 ---
 
-## Transformations (all return new shape)
+## Transformations
+
+All return a new shape.
 
 ```typescript
 shape.translate(x, y, z)
-shape.translateX(d)  /  .translateY(d)  /  .translateZ(d)
+shape.translateX(d) / translateY(d) / translateZ(d)
 shape.rotate(angleDeg, position?, direction?)
 shape.mirror(plane?, origin?)
-shape.scale(factor, center?)   // UNIFORM only — single number, not per-axis
+shape.scale(factor, center?)   // UNIFORM only — one number
 ```
 
-**Note**: `scale()` only supports uniform scaling (same factor for all axes). For non-uniform shapes, use `makeEllipsoid(rx, ry, rz)` or draw the desired shape directly in 2D.
+`scale()` is uniform-only (OpenCascade constraint — no `scaleNonUniform` exists). To stretch non-uniformly:
+- Parameterize the dimensions (`drawRectangle(W, H)` with W and H as separate params, then use `tune_params`).
+- Work in 2D first (Drawings are planar — X/Y transforms happen before extrude; Z comes from extrude distance).
+- Use `makeEllipsoid(rx, ry, rz)` for ellipsoidal bodies (three independent semi-axes).
+- For organic stretching, loft between differently-sized ellipse profiles at different heights.
 
 ---
 
-## Finders (selecting edges/faces for fillet, chamfer, shell)
+## Finders
 
-### EdgeFinder (for fillet/chamfer)
+Signatures only — full reference: `get_api_reference({ category: "finders" })`. Run `preview_finder` BEFORE applying a fillet/chamfer/shell you're not sure of.
+
+### EdgeFinder (for fillet / chamfer)
+
 ```typescript
-shape.fillet(2, e => e.inDirection("Z"))        // edges along Z
-shape.fillet(2, e => e.inPlane("XY"))           // edges in XY plane
-shape.fillet(2, e => e.ofLength(20))            // edges of length 20
-shape.fillet(2, e => e.ofCurveType("CIRCLE"))   // circular edges
-shape.fillet(2, e => e.parallelTo("XY"))
-shape.fillet(2, e => e.containsPoint([x,y,z]))
-shape.fillet(2, e => e.atDistance(d, point?))
+e => e.inDirection("Z")             // edges along Z
+e => e.inPlane("XY", offset?)       // edges in a plane
+e => e.ofLength(20)                 // exact length
+e => e.ofCurveType("CIRCLE")
+e => e.parallelTo("XY")
+e => e.containsPoint([x, y, z])
+e => e.atDistance(d, point?)
 ```
 
-### FaceFinder (for shell, draft)
+### FaceFinder (for shell / draft)
+
 ```typescript
-shape.shell({ thickness: 2, filter: f => f.inPlane("XY", 10) })
-shape.shell({ thickness: 2, filter: f => f.parallelTo("XZ") })
-shape.shell({ thickness: 2, filter: f => f.ofSurfaceType("PLANE") })
-shape.shell({ thickness: 2, filter: f => f.containsPoint([x,y,z]) })
+f => f.inPlane("XY", 10)
+f => f.parallelTo("XZ")
+f => f.ofSurfaceType("PLANE")
+f => f.containsPoint([x, y, z])
 ```
 
-### Combining Finders
+### Combining
+
 ```typescript
-e => e.inDirection("Z").and(e2 => e2.atDistance(5, [0,0,0]))
-e => e.inDirection("X").or(e2 => e2.inDirection("Y"))
-e => e.not(e2 => e2.inPlane("XY"))
+e.inDirection("Z").and(e2 => e2.atDistance(5, [0,0,0]))
+e.inDirection("X").or(e2 => e2.inDirection("Y"))
+e.not(e2 => e2.inPlane("XY"))
 ```
+
+### `highlightFinder` (injected into every script, no import)
+
+```typescript
+import { drawRoundedRectangle, EdgeFinder } from "replicad";
+export default function main() {
+  const box = drawRoundedRectangle(80, 50, 5).sketchOnPlane("XY").extrude(20);
+  // Preview: pink spheres on matched edges.
+  return highlightFinder(box, new EdgeFinder().inDirection("Z"));
+  // Swap for the real op once the selection looks right:
+  // return box.fillet(3, e => e.inDirection("Z"));
+}
+```
+
+Options: `{ color?, shapeColor?, radius? }`. Works with both EdgeFinder and FaceFinder. Prefer the `preview_finder` MCP tool when you don't want to edit the file.
 
 ---
 
 ## Memory Management
 
-For complex scripts with many intermediate shapes:
+For scripts with many intermediate shapes:
+
 ```typescript
 import { localGC } from "replicad";
-
 export default function main() {
   const [r, gc] = localGC();
   const base = r(drawRectangle(100, 60).sketchOnPlane("XY").extrude(10));
-  // ... many operations using r() to register intermediates ...
+  // ... many ops, wrap intermediates with r() ...
   const result = base.fillet(2);
-  gc(); // clean up registered intermediates
+  gc();
   return result;
 }
 ```
@@ -376,167 +400,169 @@ export default function main() {
 
 ## Multi-File & Assemblies
 
-### Importing from other files
-Shape files can export reusable functions and import them in other files:
+### Importing between shape files
+
+`main()` is only invoked when a file is the top-level shape — it's NOT imported. Export named factory functions for reuse. If you see `No matching export in "x.shape.ts" for import "makeX"`, you're trying to import something that's only reachable via `main()`'s return value.
 
 ```typescript
-// bolt.shape.ts — reusable part
+// bolt.shape.ts
 import { sketchCircle, drawPolysides } from "replicad";
-
 export function makeBolt(diameter = 8, length = 30) {
   const head = drawPolysides(diameter * 0.9, 6).sketchOnPlane("XY").extrude(5);
   const shaft = sketchCircle(diameter / 2).extrude(length).translateZ(-length);
   return head.fuse(shaft);
 }
-
 export default function main() { return makeBolt(); }
 ```
 
 ```typescript
-// assembly.shape.ts — imports the bolt
+// assembly.shape.ts
 import { makeBolt } from "./bolt.shape";
-
 export default function main() {
-  const bolt1 = makeBolt(8, 20).translate(10, 0, 0);
-  const bolt2 = makeBolt(8, 20).translate(-10, 0, 0);
-  return [bolt1, bolt2]; // renders both
+  return [makeBolt(8, 20).translate(10, 0, 0), makeBolt(8, 20).translate(-10, 0, 0)];
 }
 ```
 
-### Returning multiple parts
-`main()` can return:
-- **Single shape**: `return shape;`
-- **Array of shapes**: `return [shape1, shape2];` (auto-colored)
-- **Array with metadata**: `return [{ shape, name: "base", color: "#8899aa" }, ...]`
+### `main()` return types
 
-Each part gets its own color in the viewer and is exported as a named component in STEP files.
+- Single shape: `return shape;`
+- Array (auto-colored): `return [shape1, shape2];`
+- Array with metadata: `return [{ shape, name, color }, ...];`
+
+### Assemblies: check for collisions
+
+For multi-part designs where parts should fit together without overlapping, call `check_collisions({ filePath })` — pairwise intersection test with AABB prefilter.
+
+### `preview_shape` with local imports
+
+`preview_shape` runs a snippet without writing it to the workspace. By default the temp file lives in isolated globalStorage — `./foo.shape` imports won't resolve. Pass `workingDir: "."` (or the workspace root absolute path) to make the snippet's relative imports work.
+
+---
+
+## Export Decision Table
+
+`export_shape` signature: `{ format, filePath?, outputPath?, partName?, openIn? }`.
+
+| Format | `partName`? | Use for |
+|--------|-------------|---------|
+| `"step"` | omit | CAD/CAM workflow — STEP preserves all named components in one structured file (send the whole assembly to FreeCAD/Fusion360) |
+| `"stl"` | per part | 3D printing — one STL per printable part, each oriented independently on the build plate (STL can't carry multi-part structure) |
+| `"stl"` | omit | Single-part print, or a pre-merged assembly where all parts share orientation |
+
+Example — enclosure with case/lid/bracket for 3D printing:
+
+```text
+export_shape({ filePath: "enclosure.shape.ts", format: "stl", partName: "case" })
+export_shape({ filePath: "enclosure.shape.ts", format: "stl", partName: "lid" })
+export_shape({ filePath: "enclosure.shape.ts", format: "stl", partName: "bracket" })
+// → enclosure.case.stl, enclosure.lid.stl, enclosure.bracket.stl
+```
+
+`openIn` launches the export in a detected app (`prusaslicer`, `cura`, `bambustudio`, `orcaslicer`, `freecad`, `fusion360`). Call `list_installed_apps` first to see what's available on the user's machine.
 
 ---
 
 ## Complete Examples
 
-### Box with Center Hole and Fillets
+### Box with center hole and fillets
+
 ```typescript
 import { drawRectangle, sketchCircle } from "replicad";
-
 export default function main() {
   let box = drawRectangle(60, 40).sketchOnPlane("XY").extrude(20);
-  box = box.fillet(2); // Fillet BEFORE cutting holes
+  box = box.fillet(2);                   // BEFORE cutting
   const hole = sketchCircle(8).extrude(20);
   return box.cut(hole);
 }
 ```
 
-### L-Bracket with Mounting Holes
+### L-bracket with mounting holes
+
 ```typescript
 import { draw, makeCylinder } from "replicad";
-
 export default function main() {
-  const profile = draw()
-    .hLine(60).vLine(5).hLine(-55).vLine(35).hLine(-5).close();
+  const profile = draw().hLine(60).vLine(5).hLine(-55).vLine(35).hLine(-5).close();
   let bracket = profile.sketchOnPlane("XZ").extrude(30);
   const h1 = makeCylinder(3, 30, [45, 0, 2.5], [0, 1, 0]);
   const h2 = makeCylinder(3, 30, [15, 0, 2.5], [0, 1, 0]);
   const h3 = makeCylinder(3, 30, [2.5, 0, 25], [0, 1, 0]);
   bracket = bracket.cut(h1).cut(h2).cut(h3);
-  try { bracket = bracket.fillet(2, e => e.inDirection("Y")); } catch { /* skip fillet if geometry too complex */ }
-  return bracket;
+  return bracket.fillet(2, e => e.inDirection("Y"));
 }
 ```
 
-### Flanged Cylinder (Bottle Shape)
+### Flanged cylinder (bottle shape)
+
 ```typescript
 import { sketchCircle } from "replicad";
-
 export default function main() {
   const base = sketchCircle(30).extrude(5);
   const body = sketchCircle(15).extrude(50).translateZ(5);
-  let shape = base.fuse(body).fillet(3); // Fillet BEFORE cutting interior
+  let shape = base.fuse(body).fillet(3);  // fillet BEFORE cutting interior
   const interior = sketchCircle(12).extrude(52);
   return shape.cut(interior);
 }
 ```
 
-### Enclosure Shell
+### Enclosure shell
+
 ```typescript
 import { drawRoundedRectangle } from "replicad";
-
 export default function main() {
   const outer = drawRoundedRectangle(80, 50, 5).sketchOnPlane("XY").extrude(30);
-  const inner = drawRoundedRectangle(76, 46, 3)
-    .sketchOnPlane("XY", [0, 0, 2]).extrude(30);
+  const inner = drawRoundedRectangle(76, 46, 3).sketchOnPlane("XY", [0, 0, 2]).extrude(30);
   return outer.cut(inner);
 }
 ```
 
-### Organic Vase (Loft Between Profiles)
+### Organic vase (loft between profiles)
+
 ```typescript
 import { drawCircle, drawEllipse } from "replicad";
-
 export const params = { baseR: 20, midR: 25, neckR: 10, topR: 12, height: 60 };
-
 export default function main({ baseR, midR, neckR, topR, height }: typeof params) {
-  const base = drawCircle(baseR).sketchOnPlane("XY");
+  const base  = drawCircle(baseR).sketchOnPlane("XY");
   const belly = drawEllipse(midR, midR * 0.8).sketchOnPlane("XY", [0, 0, height * 0.4]);
-  const neck = drawCircle(neckR).sketchOnPlane("XY", [0, 0, height * 0.75]);
-  const top = drawCircle(topR).sketchOnPlane("XY", [0, 0, height]);
-
-  let vase = base.loftWith([belly, neck, top], { ruled: false });
-
-  // Hollow out
-  try {
-    vase = vase.shell({ thickness: 2, filter: (f: any) => f.inPlane("XY", height) });
-  } catch { /* skip shell if geometry too complex */ }
-
-  return vase;
+  const neck  = drawCircle(neckR).sketchOnPlane("XY", [0, 0, height * 0.75]);
+  const top   = drawCircle(topR).sketchOnPlane("XY", [0, 0, height]);
+  return base.loftWith([belly, neck, top], { ruled: false })
+    .shell({ thickness: 2, filter: (f: any) => f.inPlane("XY", height) });
 }
 ```
 
-### Swept Tube (Sweep Along Bezier Path)
+### Swept tube (sweep along bezier)
+
 ```typescript
 import { draw, sketchCircle } from "replicad";
-
 export const params = { radius: 4, height: 50 };
-
 export default function main({ radius, height }: typeof params) {
   const path = draw()
     .cubicBezierCurveTo([15, height * 0.5], [0, height * 0.2], [20, height * 0.3])
     .cubicBezierCurveTo([0, height], [-10, height * 0.7], [0, height * 0.9])
     .done()
     .sketchOnPlane("XZ");
-
-  return path.sweepSketch(
-    (plane, origin) => sketchCircle(radius, { plane, origin }),
-    { frenet: true }
-  );
+  return path.sweepSketch((plane, origin) => sketchCircle(radius, { plane, origin }), { frenet: true });
 }
 ```
 
-### Wheel / Disc with Spokes
+### Wheel with spoke slots
+
 ```typescript
 import { sketchCircle, drawRectangle } from "replicad";
-
 export default function main() {
   const disc = sketchCircle(40).extrude(8);
-  const hub = sketchCircle(10).extrude(15);
+  const hub  = sketchCircle(10).extrude(15);
   const axleHole = sketchCircle(5).extrude(15);
-
   let wheel = disc.fuse(hub).cut(axleHole);
-
-  // Cut 6 rectangular slots as "spokes"
   for (let i = 0; i < 6; i++) {
     const angle = (i * 60 * Math.PI) / 180;
-    const cx = Math.cos(angle) * 25;
-    const cy = Math.sin(angle) * 25;
     const slot = drawRectangle(12, 5)
       .sketchOnPlane("XY")
       .extrude(8)
-      .translate(cx, cy, 0)
+      .translate(Math.cos(angle) * 25, Math.sin(angle) * 25, 0)
       .rotate(i * 60, [0, 0, 0], [0, 0, 1]);
     wheel = wheel.cut(slot);
   }
-
-  try { wheel = wheel.fillet(1); } catch { /* skip fillet if geometry too complex */ }
-  return wheel;
+  return wheel.fillet(1);
 }
 ```
