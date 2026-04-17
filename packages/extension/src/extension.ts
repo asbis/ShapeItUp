@@ -3,6 +3,8 @@ import * as path from "path";
 import { ViewerProvider } from "./viewer-provider";
 import { registerCommands } from "./commands";
 import { createFileWatcher } from "./file-watcher";
+import { getDetectedApps, getDetectedAppsAsync, warmAppCache, type AppId } from "./app-detector";
+import { exportAndOpen, findAppById, openFileInApp, resolveLaunchMode } from "./open-in-app";
 
 let viewerProvider: ViewerProvider;
 export const outputChannel = vscode.window.createOutputChannel("ShapeItUp");
@@ -10,6 +12,11 @@ export const outputChannel = vscode.window.createOutputChannel("ShapeItUp");
 export function activate(context: vscode.ExtensionContext) {
   outputChannel.appendLine("ShapeItUp activating...");
   viewerProvider = new ViewerProvider(context, outputChannel);
+
+  // Kick off installed-app detection now so the first MCP call hits a warm
+  // cache. Windows fs scans + the Fusion reg query can take a few seconds
+  // together — doing it here offloads that from the MCP request path.
+  warmAppCache();
 
   // Register as a panel view (appears in the bottom panel area)
   context.subscriptions.push(
@@ -28,6 +35,9 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Install the `/shapeitup` Claude Code skill (Replicad API reference)
   installClaudeSkill(context, outputChannel);
+
+  // Install the Gemini CLI extension (bundles MCP server + skill)
+  installGeminiExtension(context, outputChannel);
 
   // Manual preview command (still useful for opening the panel tab)
   context.subscriptions.push(
@@ -109,147 +119,318 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // Heartbeat so the MCP server can detect if no extension is running and
+  // fail fast instead of blocking for 10–30s. Written every 2s.
+  {
+    const fs = require("fs");
+    const hbPath = path.join(context.globalStorageUri.fsPath, "shapeitup-heartbeat.json");
+    const writeHb = () => {
+      try {
+        fs.mkdirSync(context.globalStorageUri.fsPath, { recursive: true });
+        // Include workspaceRoots so the MCP server (whose process.cwd() is the
+        // extension's install dir, not the user's workspace) can default
+        // create_shape / list_shapes to the right place. See tools.ts
+        // getDefaultDirectory().
+        const workspaceRoots =
+          vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? [];
+        fs.writeFileSync(
+          hbPath,
+          JSON.stringify({ timestamp: Date.now(), pid: process.pid, workspaceRoots })
+        );
+      } catch {}
+    };
+    writeHb();
+    const hbInterval = setInterval(writeHb, 2000);
+    context.subscriptions.push({ dispose: () => clearInterval(hbInterval) });
+  }
+
   // Watch for MCP command files (allows MCP server to trigger extension actions)
   const commandFile = path.join(context.globalStorageUri.fsPath, "mcp-command.json");
-  let lastCommandId = "";
+  const resultFile = path.join(context.globalStorageUri.fsPath, "mcp-result.json");
+  const seenCommandIds = new Set<string>();
+  const writeResult = async (id: string | undefined, payload: Record<string, any>) => {
+    try {
+      await vscode.workspace.fs.writeFile(
+        vscode.Uri.file(resultFile),
+        Buffer.from(JSON.stringify({ _id: id, ...payload }), "utf-8")
+      );
+    } catch {}
+  };
+
+  // Serialize command processing: concurrent render/screenshot/export calls
+  // race on webview state (pendingScreenshotResolve, render mode, camera) and
+  // cause one to hang forever. A FIFO queue prevents this.
+  let queue: Promise<void> = Promise.resolve();
+  const enqueue = (fn: () => Promise<void>) => {
+    queue = queue.then(fn, fn);
+  };
+
   const commandWatcher = vscode.workspace.createFileSystemWatcher(
     new vscode.RelativePattern(context.globalStorageUri, "mcp-command.json")
   );
   commandWatcher.onDidChange(async () => {
+    let cmd: any;
     try {
       const data = await vscode.workspace.fs.readFile(vscode.Uri.file(commandFile));
-      const cmd = JSON.parse(Buffer.from(data).toString("utf-8"));
+      cmd = JSON.parse(Buffer.from(data).toString("utf-8"));
+    } catch {
+      return;
+    }
 
-      // Dedup: file watcher fires multiple times per write
-      const cmdId = JSON.stringify(cmd);
-      if (cmdId === lastCommandId) return;
-      lastCommandId = cmdId;
-      setTimeout(() => { lastCommandId = ""; }, 2000); // allow same command after 2s
-      if (cmd.command === "open-shape") {
-        // Open a .shape.ts file, render it, and wait for the result
-        outputChannel.appendLine(`[ai] Opening ${cmd.filePath}`);
+    // Dedup: file watcher double-fires on a single write. Use the _id written
+    // by the MCP server (prefixed with pid+time so it's unique across restarts).
+    const id: string | undefined = cmd?._id;
+    if (id) {
+      if (seenCommandIds.has(id)) return;
+      seenCommandIds.add(id);
+      // Bounded memory: only keep the last ~200 ids.
+      if (seenCommandIds.size > 200) {
+        const first = seenCommandIds.values().next().value;
+        if (first) seenCommandIds.delete(first);
+      }
+    }
+
+    enqueue(async () => {
+      try {
+        await handleCommand(cmd, id);
+      } catch (e: any) {
+        outputChannel.appendLine(`[ai] command error: ${e?.message ?? e}`);
+        await writeResult(id, { error: String(e?.message ?? e) });
+      }
+    });
+  });
+  context.subscriptions.push(commandWatcher);
+
+  async function handleCommand(cmd: any, id: string | undefined) {
+    if (cmd.command === "open-shape") {
+      outputChannel.appendLine(`[ai] Opening ${cmd.filePath}`);
+      const doc = await vscode.workspace.openTextDocument(cmd.filePath);
+      lastPreviewedFile = doc.fileName;
+      await vscode.window.showTextDocument(doc, { preview: false });
+
+      // Make sure the preview panel is open before dispatching the script —
+      // agent workflows often run without any visible viewer, and executeScript
+      // silently no-ops if there's no webview to receive it.
+      await viewerProvider.ensureWebview();
+      viewerProvider.executeScript(doc);
+
+      const fs = require("fs");
+      const statusPath = path.join(context.globalStorageUri.fsPath, "shapeitup-status.json");
+      const startTime = Date.now();
+      try { fs.unlinkSync(statusPath); } catch {}
+
+      let renderDone = false;
+      while (Date.now() - startTime < 8000) {
+        await new Promise((r) => setTimeout(r, 100));
+        if (fs.existsSync(statusPath)) {
+          try {
+            const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+            if (status.timestamp && new Date(status.timestamp).getTime() > startTime) {
+              await writeResult(id, { renderStatus: status });
+              renderDone = true;
+              break;
+            }
+          } catch {}
+        }
+      }
+      if (!renderDone) {
+        await writeResult(id, {
+          renderStatus: { success: false, error: "Render timed out after 8 seconds", fileName: cmd.filePath },
+        });
+      }
+    } else if (cmd.command === "render-preview") {
+      outputChannel.appendLine(`[ai] render-preview: file=${cmd.filePath || "<last>"} mode=${cmd.renderMode}, dims=${cmd.showDimensions}, axes=${!!cmd.showAxes}, camera=${cmd.cameraAngle || "isometric"}, size=${cmd.width || "auto"}x${cmd.height || "auto"}`);
+
+      const ready = await viewerProvider.ensureWebview();
+      if (!ready) {
+        await writeResult(id, { error: "Viewer webview could not be opened — the extension host may be unresponsive." });
+        return;
+      }
+
+      // If MCP passed an explicit file path, make sure that's what's loaded in
+      // the viewer before capturing. The engine in the MCP process already
+      // renders in Node; we re-render here so the user's visible viewer shows
+      // the same shape they're about to screenshot.
+      if (cmd.filePath) {
         try {
           const doc = await vscode.workspace.openTextDocument(cmd.filePath);
-          // Set lastPreviewedFile BEFORE showing doc to prevent auto-preview from doubling
           lastPreviewedFile = doc.fileName;
-          await vscode.window.showTextDocument(doc, { preview: false });
-
-          viewerProvider.executeScript(doc);
-
-          // Wait for render to complete (poll status file for up to 8 seconds)
-          const fs = require("fs");
-          const statusPath = path.join(context.globalStorageUri.fsPath, "shapeitup-status.json");
+          // `cmd.params` (optional) is the ephemeral param override map set by
+          // tune_params so the viewer re-renders the same configuration the
+          // MCP engine just computed. Absent on normal render_preview calls.
+          viewerProvider.executeScript(doc, cmd.params);
+          // Wait briefly for the render to complete before capturing.
           const startTime = Date.now();
-          let renderDone = false;
-
-          // Clear old status so we know when new one arrives
-          try { fs.unlinkSync(statusPath); } catch {}
-
-          // Poll for new status (render writes it on success or error)
+          const statusPath = path.join(context.globalStorageUri.fsPath, "shapeitup-status.json");
+          const fs = require("fs");
           while (Date.now() - startTime < 8000) {
-            await new Promise((r) => setTimeout(r, 500));
+            await new Promise((r) => setTimeout(r, 100));
             if (fs.existsSync(statusPath)) {
               try {
-                const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
-                if (status.timestamp && new Date(status.timestamp).getTime() > startTime) {
-                  renderDone = true;
-                  // Write result for the MCP server to read
-                  const resultFile = path.join(context.globalStorageUri.fsPath, "mcp-result.json");
-                  await vscode.workspace.fs.writeFile(
-                    vscode.Uri.file(resultFile),
-                    Buffer.from(JSON.stringify({ renderStatus: status }), "utf-8")
-                  );
-                  break;
-                }
+                const s = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+                if (s.timestamp && new Date(s.timestamp).getTime() > startTime) break;
               } catch {}
             }
           }
-
-          if (!renderDone) {
-            const resultFile = path.join(context.globalStorageUri.fsPath, "mcp-result.json");
-            await vscode.workspace.fs.writeFile(
-              vscode.Uri.file(resultFile),
-              Buffer.from(JSON.stringify({ renderStatus: { success: false, error: "Render timed out after 8 seconds", fileName: cmd.filePath } }), "utf-8")
-            );
-          }
         } catch (e: any) {
-          outputChannel.appendLine(`[ai] open-shape error: ${e.message}`);
+          outputChannel.appendLine(`[ai] render-preview: failed to load ${cmd.filePath}: ${e?.message ?? e}`);
         }
+      }
 
-      } else if (cmd.command === "render-preview") {
-        // Combined command: switch mode, toggle dims, wait, screenshot, restore
-        outputChannel.appendLine(`[ai] render-preview: mode=${cmd.renderMode}, dims=${cmd.showDimensions}, camera=${cmd.cameraAngle || "isometric"}`);
+      // Reset the per-part warning buffer before dispatching — any mismatches
+      // for focusPart/hideParts reported by the viewer during this screenshot
+      // call will land here and get surfaced to the MCP response.
+      viewerProvider.resetPartWarnings();
 
-        // Send all render settings as a single atomic command to the viewer
-        viewerProvider.sendViewerCommand("prepare-screenshot", {
-          renderMode: cmd.renderMode || "ai",
-          showDimensions: !!cmd.showDimensions,
-          cameraAngle: cmd.cameraAngle || "isometric",
+      viewerProvider.sendViewerCommand("prepare-screenshot", {
+        renderMode: cmd.renderMode || "ai",
+        showDimensions: !!cmd.showDimensions,
+        showAxes: !!cmd.showAxes,
+        cameraAngle: cmd.cameraAngle || "isometric",
+        focusPart: cmd.focusPart,
+        hideParts: cmd.hideParts,
+      });
+
+      await new Promise((r) => setTimeout(r, 500));
+
+      // Prefer a workspace-local dir so sandboxed agents can read the PNG with
+      // a relative path; fall back to globalStorage when no workspace is open.
+      // Note: avoid a dot-prefixed dir — AI agent tools (Claude Code / Gemini
+      // CLI Read) hide dotfiles by default, which would break the
+      // "render preview → read PNG → self-correct" loop.
+      const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      let outputDir: string | undefined;
+      if (wsRoot) {
+        outputDir = path.join(wsRoot, "shapeitup-previews");
+        try {
+          const fs = require("fs");
+          fs.mkdirSync(outputDir, { recursive: true });
+          const gitignorePath = path.join(outputDir, ".gitignore");
+          if (!fs.existsSync(gitignorePath)) {
+            fs.writeFileSync(gitignorePath, "*\n");
+          }
+        } catch {}
+      }
+
+      const screenshotPath = await viewerProvider.captureScreenshot(
+        outputDir,
+        cmd.cameraAngle,
+        cmd.width,
+        cmd.height
+      );
+
+      // Always restore user's dark mode + hide dimensions, even on failure.
+      // Axes default to visible in the interactive viewer, so restore them at
+      // default scale regardless of what the screenshot asked for.
+      viewerProvider.sendViewerCommand("set-render-mode", { mode: "dark" });
+      viewerProvider.sendViewerCommand("toggle-dimensions", { show: false });
+      viewerProvider.sendViewerCommand("toggle-axes", { show: true, scaleToModel: false });
+      // Unconditionally restore every part to visible — focusPart/hideParts
+      // are transient for the screenshot and must not leak into the
+      // interactive viewer's state.
+      viewerProvider.sendViewerCommand("restore-part-visibility", {});
+
+      const partWarnings = viewerProvider.drainPartWarnings();
+
+      if (screenshotPath) {
+        await writeResult(id, { screenshotPath, partWarnings });
+        const displayPath =
+          wsRoot && screenshotPath.startsWith(wsRoot)
+            ? path.relative(wsRoot, screenshotPath).split(path.sep).join("/")
+            : screenshotPath;
+        outputChannel.appendLine(`[ai] Screenshot saved: ${displayPath}`);
+      } else {
+        await writeResult(id, {
+          error: "Screenshot capture timed out — the viewer webview may be closed or the worker may have crashed.",
+          partWarnings,
         });
+        outputChannel.appendLine("[ai] Screenshot failed (timeout)");
+      }
+    } else if (cmd.command === "screenshot") {
+      const screenshotPath = await viewerProvider.captureScreenshot(cmd.outputDir);
+      if (screenshotPath) {
+        await writeResult(id, { screenshotPath });
+      } else {
+        await writeResult(id, { error: "Screenshot capture timed out" });
+      }
+    } else if (cmd.command === "export-shape") {
+      outputChannel.appendLine(`[ai] Export: ${cmd.format} → ${cmd.outputPath || "dialog"}${cmd.openIn ? ` (open in ${cmd.openIn})` : ""}`);
 
-        // Wait for viewer to process all settings + render a frame
-        await new Promise((r) => setTimeout(r, 1000));
+      if (cmd.outputPath) {
+        const data = await viewerProvider.requestExport(cmd.format);
+        if (data) {
+          const fs = require("fs");
+          fs.writeFileSync(cmd.outputPath, Buffer.from(data));
+          outputChannel.appendLine(`[ai] Exported to ${cmd.outputPath}`);
 
-        // Step 4: Capture screenshot
-        const screenshotPath = await viewerProvider.captureScreenshot(undefined, cmd.cameraAngle);
-
-        // Step 5: Restore user's dark mode + hide dimensions (don't reset camera)
-        viewerProvider.sendViewerCommand("set-render-mode", { mode: "dark" });
-        viewerProvider.sendViewerCommand("toggle-dimensions", { show: false });
-
-        // Step 6: Write result
-        const resultFile = path.join(context.globalStorageUri.fsPath, "mcp-result.json");
-        await vscode.workspace.fs.writeFile(
-          vscode.Uri.file(resultFile),
-          Buffer.from(JSON.stringify({ screenshotPath }), "utf-8")
-        );
-        outputChannel.appendLine(`[ai] Screenshot saved: ${screenshotPath}`);
-
-      } else if (cmd.command === "screenshot") {
-        const screenshotPath = await viewerProvider.captureScreenshot(cmd.outputDir);
-        const resultFile = path.join(context.globalStorageUri.fsPath, "mcp-result.json");
-        await vscode.workspace.fs.writeFile(
-          vscode.Uri.file(resultFile),
-          Buffer.from(JSON.stringify({ screenshotPath }), "utf-8")
-        );
-      } else if (cmd.command === "export-shape") {
-        outputChannel.appendLine(`[ai] Export: ${cmd.format} → ${cmd.outputPath || "dialog"}`);
-        const resultFile = path.join(context.globalStorageUri.fsPath, "mcp-result.json");
-
-        if (cmd.outputPath) {
-          // Direct save — no dialog (for AI workflows)
-          const data = await viewerProvider.requestExport(cmd.format);
-          if (data) {
-            const fs = require("fs");
-            fs.writeFileSync(cmd.outputPath, Buffer.from(data));
-            await vscode.workspace.fs.writeFile(
-              vscode.Uri.file(resultFile),
-              Buffer.from(JSON.stringify({ exportPath: cmd.outputPath }), "utf-8")
-            );
-            outputChannel.appendLine(`[ai] Exported to ${cmd.outputPath}`);
+          // Optional: launch the exported file in the requested app.
+          if (cmd.openIn) {
+            const app = findAppById(cmd.openIn as AppId);
+            if (!app) {
+              await writeResult(id, {
+                exportPath: cmd.outputPath,
+                openInError: `${cmd.openIn} is not installed or was not detected. Run list_installed_apps to see available apps.`,
+              });
+            } else {
+              try {
+                // MCP path is non-interactive: use the stored preference or fall back to "reuse".
+                const mode = await resolveLaunchMode(app, context, false);
+                await openFileInApp(cmd.outputPath, app, outputChannel, mode);
+                await writeResult(id, { exportPath: cmd.outputPath, openedIn: app.name });
+              } catch (e: any) {
+                await writeResult(id, { exportPath: cmd.outputPath, openInError: e?.message ?? String(e) });
+              }
+            }
           } else {
-            await vscode.workspace.fs.writeFile(
-              vscode.Uri.file(resultFile),
-              Buffer.from(JSON.stringify({ error: "No shape to export" }), "utf-8")
-            );
+            await writeResult(id, { exportPath: cmd.outputPath });
           }
         } else {
-          // Interactive — show save dialog
-          if (cmd.format === "step") {
-            vscode.commands.executeCommand("shapeitup.exportSTEP");
-          } else {
-            vscode.commands.executeCommand("shapeitup.exportSTL");
-          }
+          await writeResult(id, { error: "Export timed out — no shape loaded, or the worker did not reply." });
         }
-
-      } else if (cmd.command === "set-render-mode") {
-        viewerProvider.sendViewerCommand("set-render-mode", { mode: cmd.mode });
-      } else if (cmd.command === "toggle-dimensions") {
-        viewerProvider.sendViewerCommand("toggle-dimensions", { show: cmd.show });
+      } else {
+        if (cmd.format === "step") {
+          vscode.commands.executeCommand("shapeitup.exportSTEP");
+        } else {
+          vscode.commands.executeCommand("shapeitup.exportSTL");
+        }
+        await writeResult(id, { error: "Interactive export requires a UI dialog — MCP clients should pass outputPath." });
       }
-    } catch {}
-  });
-  context.subscriptions.push(commandWatcher);
+    } else if (cmd.command === "list-installed-apps") {
+      // Async path is important here: on a cold cache the Windows scan can
+      // take several seconds. With the 10s ceiling inside detectWindowsAsync
+      // we're guaranteed to return within the MCP timeout.
+      const detected = await getDetectedAppsAsync();
+      const apps = detected.map((a) => ({
+        id: a.id,
+        name: a.name,
+        preferredFormat: a.preferredFormat,
+      }));
+      await writeResult(id, { apps });
+    } else if (cmd.command === "open-in-app") {
+      const app = findAppById(cmd.appId as AppId);
+      if (!app) {
+        await writeResult(id, { error: `App not detected: ${cmd.appId}` });
+      } else {
+        try {
+          // This IPC command is only sent by the MCP server — don't prompt.
+          const exportPath = await exportAndOpen(viewerProvider, app, context, outputChannel, { interactive: false });
+          if (exportPath) {
+            await writeResult(id, { exportPath, openedIn: app.name });
+          } else {
+            await writeResult(id, { error: "Export failed — no shape loaded, or the worker did not reply." });
+          }
+        } catch (e: any) {
+          await writeResult(id, { error: e?.message ?? String(e) });
+        }
+      }
+    } else if (cmd.command === "set-render-mode") {
+      viewerProvider.sendViewerCommand("set-render-mode", { mode: cmd.mode });
+      await writeResult(id, { ok: true });
+    } else if (cmd.command === "toggle-dimensions") {
+      viewerProvider.sendViewerCommand("toggle-dimensions", { show: cmd.show });
+      await writeResult(id, { ok: true });
+    }
+  }
 
   outputChannel.appendLine("ShapeItUp activated");
 }
@@ -278,12 +459,13 @@ function registerMcpServer(
   const mcpServerPath = path.join(
     context.extensionPath,
     "dist",
-    "mcp-server.js"
+    "mcp-server.mjs"
   );
 
   // Register via VS Code API for GitHub Copilot compatibility
   try {
-    if (vscode.lm?.registerMcpServerDefinitionProvider) {
+    // Older VS Code versions don't expose this API — check dynamically.
+    if ((vscode.lm as any)?.registerMcpServerDefinitionProvider) {
       const provider = (vscode.lm as any).registerMcpServerDefinitionProvider("shapeitup-mcp", {
         provideMcpServerDefinitions: () => {
           return [
@@ -402,6 +584,95 @@ function installClaudeSkill(
     output.appendLine(`[skill] Installed /shapeitup skill → ${dest}`);
   } catch (e: any) {
     output.appendLine(`[skill] Failed to install /shapeitup skill: ${e.message}`);
+  }
+}
+
+/**
+ * Install the ShapeItUp Gemini CLI extension into ~/.gemini/extensions/shapeitup/.
+ *
+ * Gemini CLI auto-discovers extensions at ~/.gemini/extensions/<name>/, each
+ * containing a gemini-extension.json manifest (which can declare MCP servers
+ * just like Claude's ~/.claude.json mcpServers) and an optional skills/
+ * subdirectory where SKILL.md files are auto-registered.
+ *
+ * We bypass `gemini extensions install` and write the three files directly —
+ * same pattern as the Claude install above — so users don't need the gemini
+ * CLI on PATH and don't have to run any manual command.
+ */
+function installGeminiExtension(
+  context: vscode.ExtensionContext,
+  output: vscode.OutputChannel
+) {
+  const fs = require("fs");
+  const os = require("os");
+
+  const srcMcp = path.join(context.extensionPath, "dist", "mcp-server.mjs");
+  const srcSkill = path.join(context.extensionPath, "dist", "skill", "SKILL.md");
+  if (!fs.existsSync(srcMcp) || !fs.existsSync(srcSkill)) {
+    output.appendLine("[gemini] Bundled mcp-server.mjs or SKILL.md missing — skipping");
+    return;
+  }
+
+  const home = os.homedir();
+  const hasGeminiCli =
+    fs.existsSync(path.join(home, ".gemini")) ||
+    fs.existsSync(path.join(home, ".gemini", "settings.json")) ||
+    fs.existsSync(path.join(home, ".local", "bin", "gemini")) ||
+    fs.existsSync("/usr/local/bin/gemini") ||
+    fs.existsSync("/opt/homebrew/bin/gemini");
+
+  if (!hasGeminiCli) {
+    output.appendLine("[gemini] Gemini CLI not detected — skipping extension install");
+    return;
+  }
+
+  try {
+    const extDir = path.join(home, ".gemini", "extensions", "shapeitup");
+    const skillDir = path.join(extDir, "skills", "shapeitup");
+    const destSkill = path.join(skillDir, "SKILL.md");
+    const manifestPath = path.join(extDir, "gemini-extension.json");
+
+    fs.mkdirSync(skillDir, { recursive: true });
+
+    // Point Gemini directly at the VSCode extension's dist/mcp-server.mjs.
+    // Early versions copied the bundle to ~/.gemini/extensions/shapeitup/, but
+    // that directory has no node_modules, so the server crashed at startup
+    // trying to resolve its externalized deps (esbuild, replicad-opencascadejs)
+    // and Gemini silently registered zero tools. Referencing the VSCode
+    // install path means Node uses that location's node_modules — which is
+    // guaranteed to exist because the user had to install the extension first.
+    const version = context.extension?.packageJSON?.version ?? "0.0.0";
+    const serverPath = path.join(context.extensionPath, "dist", "mcp-server.mjs");
+    const manifest = {
+      name: "shapeitup",
+      version,
+      description: "ShapeItUp CAD — scripted 3D modeling with Replicad",
+      mcpServers: {
+        shapeitup: {
+          command: "node",
+          args: [serverPath],
+          cwd: context.extensionPath,
+        },
+      },
+    };
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+
+    const srcSkillMtime = fs.statSync(srcSkill).mtimeMs;
+    const destSkillMtime = fs.existsSync(destSkill) ? fs.statSync(destSkill).mtimeMs : 0;
+    if (destSkillMtime < srcSkillMtime) fs.copyFileSync(srcSkill, destSkill);
+
+    // Clean up stale copies from earlier install versions that copied the
+    // server binary here (now it lives only at the VSCode extension path).
+    for (const stale of ["mcp-server.js", "mcp-server.mjs", "mcp-server.mjs.map", "mcp-server.js.map"]) {
+      const p = path.join(extDir, stale);
+      if (fs.existsSync(p)) {
+        try { fs.unlinkSync(p); } catch {}
+      }
+    }
+
+    output.appendLine(`[gemini] Installed Gemini CLI extension → ${extDir} (server: ${serverPath})`);
+  } catch (e: any) {
+    output.appendLine(`[gemini] Failed to install Gemini CLI extension: ${e.message}`);
   }
 }
 

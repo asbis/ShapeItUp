@@ -2,6 +2,8 @@ import * as vscode from "vscode";
 import * as esbuild from "esbuild-wasm";
 import * as path from "path";
 import type { ExportFormat } from "@shapeitup/shared";
+import type { DetectedApp } from "./app-detector";
+import { getDetectedApps } from "./app-detector";
 
 let esbuildInitPromise: Promise<void> | null = null;
 
@@ -20,9 +22,13 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
   private pendingExportResolve?: (data: ArrayBuffer) => void;
   private pendingScreenshotResolve?: (dataUrl: string) => void;
   private isReady = false;
-  private pendingScript?: { js: string; fileName: string };
+  private pendingScript?: { js: string; fileName: string; paramOverrides?: Record<string, number> };
   private lastScreenshotPath?: string;
   private lastExecutedFile?: string;
+  // Buffer for per-part visibility warnings surfaced by the viewer while a
+  // screenshot is being prepared. The render-preview handler clears this
+  // before dispatching and drains it into the MCP result afterwards.
+  private partWarnings: string[] = [];
 
   constructor(context: vscode.ExtensionContext, output: vscode.OutputChannel) {
     this.context = context;
@@ -33,11 +39,18 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     this.view = webviewView;
     this.isReady = false;
     this.configureWebview(webviewView.webview);
+    webviewView.onDidDispose(() => {
+      this.view = undefined;
+      this.isReady = false;
+      this.clearPending("view disposed");
+    });
   }
 
-  openPanel(context: vscode.ExtensionContext) {
+  openPanel(context: vscode.ExtensionContext, opts?: { preserveFocus?: boolean }) {
     if (this.panel) {
-      this.panel.reveal(vscode.ViewColumn.Beside);
+      if (!opts?.preserveFocus) {
+        this.panel.reveal(vscode.ViewColumn.Beside);
+      }
       return;
     }
 
@@ -45,7 +58,7 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     this.panel = vscode.window.createWebviewPanel(
       "shapeitup.preview",
       "ShapeItUp Preview",
-      vscode.ViewColumn.Beside,
+      { viewColumn: vscode.ViewColumn.Beside, preserveFocus: !!opts?.preserveFocus },
       {
         enableScripts: true,
         retainContextWhenHidden: true,
@@ -60,7 +73,52 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     this.panel.onDidDispose(() => {
       this.panel = undefined;
       this.isReady = false;
+      this.clearPending("panel disposed");
     });
+  }
+
+  /**
+   * Ensure a webview exists and is ready. Auto-opens a preview panel if none
+   * is present (e.g., when an MCP agent calls render_preview before the user
+   * has opened the viewer). Waits up to `timeoutMs` for the worker to report
+   * ready. Called from captureScreenshot/executeScript.
+   */
+  async ensureWebview(timeoutMs = 15000): Promise<vscode.Webview | undefined> {
+    const existing = this.getActiveWebview();
+    if (existing && this.isReady) return existing;
+
+    if (!existing) {
+      this.output.appendLine("[webview] No active webview — auto-opening preview panel");
+      this.openPanel(this.context, { preserveFocus: true });
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (this.isReady) {
+        const wv = this.getActiveWebview();
+        if (wv) return wv;
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    this.output.appendLine(`[webview] Timed out waiting for webview ready after ${timeoutMs}ms`);
+    return undefined;
+  }
+
+  /**
+   * Resolve any pending screenshot/export promises so commands in flight fail
+   * fast instead of waiting for their full timeout when the webview goes away.
+   */
+  private clearPending(reason: string) {
+    if (this.pendingScreenshotResolve) {
+      this.output.appendLine(`[viewer] Clearing pending screenshot: ${reason}`);
+      this.pendingScreenshotResolve(undefined as any);
+      this.pendingScreenshotResolve = undefined;
+    }
+    if (this.pendingExportResolve) {
+      this.output.appendLine(`[viewer] Clearing pending export: ${reason}`);
+      this.pendingExportResolve(undefined as any);
+      this.pendingExportResolve = undefined;
+    }
   }
 
   private configureWebview(webview: vscode.Webview) {
@@ -164,6 +222,38 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     #toolbar button:active { background: #505050; }
     #toolbar button.active { background: #0e639c; color: #fff; border-color: #1177bb; }
     #toolbar .sep { width: 1px; background: #3c3c3c; margin: 2px 1px; }
+
+    /* Export dropdown */
+    .menu-wrapper { position: relative; }
+    .dropdown-menu {
+      display: none;
+      position: absolute;
+      top: calc(100% + 4px);
+      right: 0;
+      min-width: 180px;
+      background: rgba(37,37,38,0.98);
+      border: 1px solid #3c3c3c;
+      border-radius: 4px;
+      padding: 3px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      backdrop-filter: blur(8px);
+      z-index: 30;
+    }
+    .menu-wrapper.open .dropdown-menu { display: block; }
+    .dropdown-menu button {
+      display: block; width: 100%; text-align: left;
+      background: transparent; border: 1px solid transparent; color: #ddd;
+      font-family: inherit; font-size: 11px; padding: 5px 10px;
+      border-radius: 3px; cursor: pointer;
+    }
+    .dropdown-menu button:hover { background: #0e639c; color: #fff; }
+    .dropdown-menu .menu-sep {
+      height: 1px; background: #3c3c3c; margin: 4px 2px;
+    }
+    .dropdown-menu .menu-heading {
+      font-size: 10px; color: #888; text-transform: uppercase;
+      padding: 4px 10px 2px; letter-spacing: 0.5px;
+    }
 
     /* Left toolbar (view controls) */
     #view-toolbar {
@@ -287,8 +377,14 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         <button id="btn-section" title="Section/clip plane">Section</button>
         <button id="btn-measure" title="Click-to-measure mode">Measure</button>
         <div class="sep"></div>
-        <button id="btn-step" title="Export STEP">&#x21e9; STEP</button>
-        <button id="btn-stl" title="Export STL">&#x21e9; STL</button>
+        <div id="export-menu-wrapper" class="menu-wrapper">
+          <button id="btn-export" title="Export or open in another app">&#x21e9; Export &#9662;</button>
+          <div id="export-menu" class="dropdown-menu">
+            <button data-action="export-step">Save as STEP…</button>
+            <button data-action="export-stl">Save as STL…</button>
+            <div id="export-menu-apps"></div>
+          </div>
+        </div>
       </div>
 
       <div id="viewcube">
@@ -338,6 +434,9 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       case "ready":
         this.output.appendLine("[viewer] Ready — WASM loaded");
         this.isReady = true;
+        // Push the list of detected 3D apps so the viewer can render the
+        // "Open in …" dropdown items.
+        this.sendInstalledApps(getDetectedApps());
         // If a script was queued while we were loading, execute it now
         if (this.pendingScript) {
           this.output.appendLine(
@@ -355,7 +454,13 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         this.output.appendLine(`[error] ${msg.message}`);
         this.output.show(true);
         vscode.window.showErrorMessage(`ShapeItUp: ${msg.message}`);
-        this.writeStatusFile({ success: false, error: msg.message, fileName: this.lastExecutedFile || msg.fileName });
+        this.writeStatusFile({
+          success: false,
+          error: msg.message,
+          fileName: this.lastExecutedFile || msg.fileName,
+          operation: msg.operation,
+          stack: msg.stack,
+        });
         break;
       case "render-success":
         this.output.appendLine(`[render] ${msg.stats}`);
@@ -366,6 +471,10 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           boundingBox: msg.boundingBox,
           partCount: msg.partCount,
           partNames: msg.partNames,
+          currentParams: msg.currentParams,
+          timings: msg.timings,
+          warnings: msg.warnings,
+          properties: msg.properties,
         });
         break;
       case "status":
@@ -379,6 +488,9 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           vscode.commands.executeCommand("shapeitup.exportSTL");
         }
         break;
+      case "toolbar-open-in-app":
+        vscode.commands.executeCommand("shapeitup.openInApp", msg.appId);
+        break;
       case "export-data":
         if (this.pendingExportResolve) {
           this.pendingExportResolve(msg.data);
@@ -391,7 +503,28 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           this.pendingScreenshotResolve = undefined;
         }
         break;
+      case "part-warning":
+        // Non-fatal: a focusPart/hideParts name didn't match any loaded part.
+        // Log it and buffer it so the active render-preview call can surface it
+        // to the MCP response.
+        if (typeof msg.message === "string") {
+          this.output.appendLine(`[warn] ${msg.message}`);
+          this.partWarnings.push(msg.message);
+        }
+        break;
     }
+  }
+
+  /** Clear the per-part visibility warning buffer (called before a render). */
+  resetPartWarnings() {
+    this.partWarnings = [];
+  }
+
+  /** Drain the buffered per-part visibility warnings. */
+  drainPartWarnings(): string[] {
+    const out = this.partWarnings;
+    this.partWarnings = [];
+    return out;
   }
 
   private getActiveWebview(): vscode.Webview | undefined {
@@ -400,7 +533,7 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
 
   private executing = false;
 
-  async executeScript(document: vscode.TextDocument) {
+  async executeScript(document: vscode.TextDocument, paramOverrides?: Record<string, number>) {
     const webview = this.getActiveWebview();
     if (!webview) {
       this.output.appendLine("[warn] No active webview to send script to");
@@ -440,7 +573,13 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       });
 
       const js = result.outputFiles[0].text;
-      const msg = { js, fileName: document.fileName };
+      const msg: { js: string; fileName: string; paramOverrides?: Record<string, number> } = { js, fileName: document.fileName };
+      // Ephemeral param overrides used by MCP's tune_params + any caller that
+      // wants the viewer to render with non-default values without touching
+      // the file on disk. Undefined means "use the script's declared defaults".
+      if (paramOverrides && Object.keys(paramOverrides).length > 0) {
+        msg.paramOverrides = paramOverrides;
+      }
 
       this.lastExecutedFile = document.fileName;
 
@@ -461,9 +600,31 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** Push the list of detected 3D apps to the viewer so it can render the "Open in …" dropdown. */
+  sendInstalledApps(apps: DetectedApp[]) {
+    const webview = this.getActiveWebview();
+    if (!webview) return;
+    // Strip execPath — the webview doesn't need it and it's nicer not to leak paths.
+    const payload = apps.map((a) => ({
+      id: a.id,
+      name: a.name,
+      preferredFormat: a.preferredFormat,
+    }));
+    webview.postMessage({ type: "installed-apps", apps: payload });
+  }
+
   async requestExport(format: ExportFormat): Promise<ArrayBuffer | undefined> {
     const webview = this.getActiveWebview();
-    if (!webview) return undefined;
+    if (!webview) {
+      this.output.appendLine("[export] No active webview — aborting");
+      return undefined;
+    }
+
+    // If a previous export is still in flight, cancel it so the new one isn't
+    // silently dropped (pendingExportResolve is single-slot).
+    if (this.pendingExportResolve) {
+      this.clearPending("superseded by new export");
+    }
 
     return new Promise((resolve) => {
       this.pendingExportResolve = resolve;
@@ -471,23 +632,42 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       setTimeout(() => {
         if (this.pendingExportResolve === resolve) {
           this.pendingExportResolve = undefined;
+          this.output.appendLine(`[export] Timeout after 30s — worker did not reply`);
           resolve(undefined);
         }
       }, 30000);
     });
   }
 
-  /** Capture a screenshot and save to disk. Returns the file path. */
-  async captureScreenshot(outputDir?: string, cameraAngle?: string): Promise<string | undefined> {
-    const webview = this.getActiveWebview();
-    if (!webview) return undefined;
+  /**
+   * Capture a screenshot and save to disk. Returns the file path.
+   * `width`/`height` temporarily resize the WebGL canvas so the output is
+   * decoupled from the user's window size — important for AI consumers that
+   * need a predictable resolution.
+   */
+  async captureScreenshot(
+    outputDir?: string,
+    cameraAngle?: string,
+    width?: number,
+    height?: number
+  ): Promise<string | undefined> {
+    const webview = await this.ensureWebview();
+    if (!webview) {
+      this.output.appendLine("[screenshot] No active webview — aborting");
+      return undefined;
+    }
+
+    if (this.pendingScreenshotResolve) {
+      this.clearPending("superseded by new screenshot");
+    }
 
     const dataUrl = await new Promise<string | undefined>((resolve) => {
       this.pendingScreenshotResolve = resolve;
-      webview.postMessage({ type: "request-screenshot" });
+      webview.postMessage({ type: "request-screenshot", width, height });
       setTimeout(() => {
         if (this.pendingScreenshotResolve === resolve) {
           this.pendingScreenshotResolve = undefined;
+          this.output.appendLine("[screenshot] Timeout after 10s — webview did not reply");
           resolve(undefined);
         }
       }, 10000);

@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { createScene } from "./scene";
+import { createScene, setAxesVisible } from "./scene";
 import { createCamera, createControls, fitCameraToObject } from "./camera";
 import { buildMesh, buildEdges } from "./mesh-builder";
 import { initMessageHandler, onMessage, postToExtension } from "./message-handler";
@@ -32,6 +32,8 @@ scene.add(modelGroup);
 let edgesVisible = true;
 let wireframe = false;
 let partsPanelOpen = false;
+// Axes start visible (matches legacy behavior where they were always drawn).
+let axesVisible = true;
 
 // Track part info for the browser panel
 interface PartInfo {
@@ -256,6 +258,44 @@ function handleWorkerMessage(msg: WorkerToWebview) {
         const bbox = new THREE.Box3().setFromObject(modelGroup);
         const bboxSize = bbox.getSize(new THREE.Vector3());
 
+        const currentParams: Record<string, number> = {};
+        for (const p of msg.params || []) {
+          currentParams[p.name] = p.value;
+        }
+
+        // Collect per-part geometric properties (volume, surface area, CoM)
+        // and a volume-weighted aggregate. OCCT volume is in mm³, area in mm².
+        const partProperties = msg.parts.map((p: TessellatedPart) => ({
+          name: p.name,
+          volume: p.volume,
+          surfaceArea: p.surfaceArea,
+          centerOfMass: p.centerOfMass,
+        }));
+        let totalVolume = 0;
+        let totalSurfaceArea = 0;
+        let hasAnyVolume = false;
+        let hasAnySurface = false;
+        const weightedCoM: [number, number, number] = [0, 0, 0];
+        for (const p of msg.parts) {
+          if (typeof p.volume === "number") {
+            totalVolume += p.volume;
+            hasAnyVolume = true;
+            if (p.centerOfMass) {
+              weightedCoM[0] += p.centerOfMass[0] * p.volume;
+              weightedCoM[1] += p.centerOfMass[1] * p.volume;
+              weightedCoM[2] += p.centerOfMass[2] * p.volume;
+            }
+          }
+          if (typeof p.surfaceArea === "number") {
+            totalSurfaceArea += p.surfaceArea;
+            hasAnySurface = true;
+          }
+        }
+        const aggregateCoM: [number, number, number] | undefined =
+          hasAnyVolume && totalVolume > 0
+            ? [weightedCoM[0] / totalVolume, weightedCoM[1] / totalVolume, weightedCoM[2] / totalVolume]
+            : undefined;
+
         postToExtension({
           type: "render-success",
           stats: statusText,
@@ -265,6 +305,15 @@ function handleWorkerMessage(msg: WorkerToWebview) {
             x: parseFloat(bboxSize.x.toFixed(1)),
             y: parseFloat(bboxSize.y.toFixed(1)),
             z: parseFloat(bboxSize.z.toFixed(1)),
+          },
+          currentParams,
+          timings: (msg as any).timings || undefined,
+          warnings: (msg as any).warnings || undefined,
+          properties: {
+            parts: partProperties,
+            totalVolume: hasAnyVolume ? totalVolume : undefined,
+            totalSurfaceArea: hasAnySurface ? totalSurfaceArea : undefined,
+            centerOfMass: aggregateCoM,
           },
         });
       } catch (err: any) {
@@ -297,7 +346,12 @@ function handleWorkerMessage(msg: WorkerToWebview) {
         }
         return;
       }
-      postToExtension({ type: "error", message: msg.message });
+      postToExtension({
+        type: "error",
+        message: msg.message,
+        operation: (msg as any).operation,
+        stack: (msg as any).stack,
+      });
       statusEl.textContent = `Error: ${msg.message}`;
       break;
   }
@@ -310,10 +364,21 @@ onMessage("execute-script", (msg) => {
   if (worker) {
     statusEl.textContent = "Executing...";
     lastScriptJs = msg.js;
-    currentParamValues = {};
+    // Reset slider state unless the caller supplied explicit overrides (e.g.
+    // MCP tune_params rendering an ephemeral configuration). Seeding
+    // currentParamValues from the overrides keeps the slider UI in sync with
+    // what the worker is about to render.
+    currentParamValues = msg.paramOverrides ? { ...msg.paramOverrides } : {};
     const name = msg.fileName.replace(/.*[\/\\]/, "");
     filenameEl.textContent = name;
-    worker.postMessage({ type: "execute", js: msg.js });
+    const workerMsg: { type: "execute"; js: string; paramOverrides?: Record<string, number> } = {
+      type: "execute",
+      js: msg.js,
+    };
+    if (msg.paramOverrides && Object.keys(msg.paramOverrides).length > 0) {
+      workerMsg.paramOverrides = msg.paramOverrides;
+    }
+    worker.postMessage(workerMsg);
 
     // If the worker doesn't respond within 15s, assume it's dead and respawn
     clearWorkerResponseTimer();
@@ -334,17 +399,48 @@ onMessage("request-export", (msg) => {
 // Track if a custom camera angle was set (by set-camera-angle command)
 let customCameraAngleSet = false;
 
-onMessage("request-screenshot", () => {
+onMessage("request-screenshot", (msg: any) => {
   // Only set default isometric if no custom angle was explicitly set
   if (!customCameraAngleSet && modelGroup.children.length > 0) {
     setCameraAngle([1, -1.2, 0.8]);
   }
   customCameraAngleSet = false; // reset for next screenshot
-  // Wait one frame for the render to complete
-  controls.update();
-  renderer.render(scene, camera);
-  const dataUrl = renderer.domElement.toDataURL("image/png");
-  postToExtension({ type: "screenshot-data", dataUrl });
+
+  // Width/height override: renders at a fixed resolution regardless of the
+  // user's window size. The WebGL backbuffer and camera aspect are resized
+  // just for this screenshot, then restored so the live viewer is unaffected.
+  // This is what makes the AI screenshot independent of how the user has
+  // sized their VSCode window.
+  const targetW = typeof msg?.width === "number" ? msg.width : 0;
+  const targetH = typeof msg?.height === "number" ? msg.height : 0;
+  const needsResize = targetW > 0 && targetH > 0;
+
+  let origSize: { w: number; h: number; pr: number } | null = null;
+  if (needsResize) {
+    origSize = {
+      w: container.clientWidth,
+      h: container.clientHeight,
+      pr: renderer.getPixelRatio(),
+    };
+    renderer.setPixelRatio(1);
+    renderer.setSize(targetW, targetH, false);
+    camera.aspect = targetW / targetH;
+    camera.updateProjectionMatrix();
+  }
+
+  try {
+    controls.update();
+    renderer.render(scene, camera);
+    const dataUrl = renderer.domElement.toDataURL("image/png");
+    postToExtension({ type: "screenshot-data", dataUrl });
+  } finally {
+    if (origSize) {
+      renderer.setPixelRatio(origSize.pr);
+      renderer.setSize(origSize.w, origSize.h, false);
+      camera.aspect = origSize.w / origSize.h;
+      camera.updateProjectionMatrix();
+    }
+  }
 });
 
 // Camera angle presets: name → [x, y, z] direction vector
@@ -357,6 +453,73 @@ const CAMERA_ANGLE_PRESETS: Record<string, [number, number, number]> = {
   left: [-1, 0, 0.3],
 };
 
+// --- Per-part visibility control (used by render_preview focusPart/hideParts) ---
+function applyPartVisibility(focusPart?: string, hideParts?: string[]) {
+  // If the script returned a single part (non-assembly), these options are
+  // no-ops — but we still emit a warning if the caller explicitly named a part
+  // so they know it wasn't honored.
+  const isAssembly = currentParts.length > 1;
+
+  if (focusPart) {
+    if (!isAssembly) {
+      postToExtension({
+        type: "part-warning",
+        message: `focusPart "${focusPart}" ignored: this shape is not a multi-part assembly.`,
+      });
+    } else {
+      const match = currentParts.find((p) => p.name === focusPart);
+      if (!match) {
+        postToExtension({
+          type: "part-warning",
+          message: `focusPart "${focusPart}" did not match any loaded part. Available: ${currentParts.map((p) => p.name).join(", ")}`,
+        });
+        // Fall through — nothing to focus; leave everything visible.
+      } else {
+        for (const p of currentParts) {
+          const visible = p.name === focusPart;
+          p.visible = visible;
+          p.group.visible = visible;
+        }
+        updatePartsList();
+        return;
+      }
+    }
+  }
+
+  if (hideParts && hideParts.length > 0) {
+    if (!isAssembly) {
+      postToExtension({
+        type: "part-warning",
+        message: `hideParts ${JSON.stringify(hideParts)} ignored: this shape is not a multi-part assembly.`,
+      });
+      return;
+    }
+    const loadedNames = new Set(currentParts.map((p) => p.name));
+    const missing = hideParts.filter((n) => !loadedNames.has(n));
+    if (missing.length > 0) {
+      postToExtension({
+        type: "part-warning",
+        message: `hideParts name(s) did not match any loaded part: ${missing.join(", ")}. Available: ${currentParts.map((p) => p.name).join(", ")}`,
+      });
+    }
+    const hideSet = new Set(hideParts);
+    for (const p of currentParts) {
+      const visible = !hideSet.has(p.name);
+      p.visible = visible;
+      p.group.visible = visible;
+    }
+    updatePartsList();
+  }
+}
+
+function restorePartVisibility() {
+  for (const p of currentParts) {
+    p.visible = true;
+    p.group.visible = true;
+  }
+  updatePartsList();
+}
+
 onMessage("viewer-command", (msg) => {
   switch (msg.command) {
     case "set-render-mode":
@@ -364,6 +527,15 @@ onMessage("viewer-command", (msg) => {
       break;
     case "toggle-dimensions":
       toggleDimensions(msg.show);
+      break;
+    case "toggle-axes":
+      setAxes(msg.show, msg.scaleToModel);
+      break;
+    case "set-part-visibility":
+      applyPartVisibility(msg.focusPart, msg.hideParts);
+      break;
+    case "restore-part-visibility":
+      restorePartVisibility();
       break;
     case "set-camera-angle": {
       const preset = CAMERA_ANGLE_PRESETS[msg.angle];
@@ -374,10 +546,17 @@ onMessage("viewer-command", (msg) => {
       break;
     }
     case "prepare-screenshot": {
-      // Atomic: apply render mode + dimensions + camera angle all at once
+      // Atomic: apply render mode + dimensions + axes + camera angle all at once
       setRenderMode(msg.renderMode || "ai");
       if (msg.showDimensions) toggleDimensions(true);
       else toggleDimensions(false);
+      // showAxes is opt-in; when present, scale axes to the model so they're
+      // legible without dominating the frame.
+      setAxes(!!msg.showAxes, !!msg.showAxes);
+      // focusPart wins over hideParts when both are supplied.
+      if (msg.focusPart || (msg.hideParts && msg.hideParts.length > 0)) {
+        applyPartVisibility(msg.focusPart, msg.hideParts);
+      }
       const camPreset = CAMERA_ANGLE_PRESETS[msg.cameraAngle || "isometric"];
       if (camPreset && modelGroup.children.length > 0) {
         setCameraAngle(camPreset);
@@ -437,12 +616,66 @@ document.getElementById("btn-measure")!.addEventListener("click", () => {
   }
 });
 
-document.getElementById("btn-step")!.addEventListener("click", () => {
-  postToExtension({ type: "toolbar-export", format: "step" });
+// --- Export dropdown ---
+type InstalledApp = { id: string; name: string; preferredFormat: "step" | "stl" };
+
+const exportWrapper = document.getElementById("export-menu-wrapper")!;
+const exportMenu = document.getElementById("export-menu")!;
+const exportBtn = document.getElementById("btn-export")!;
+const appsContainer = document.getElementById("export-menu-apps")!;
+let installedApps: InstalledApp[] = [];
+
+function renderAppsMenu() {
+  appsContainer.innerHTML = "";
+  if (installedApps.length === 0) return;
+
+  const sep = document.createElement("div");
+  sep.className = "menu-sep";
+  appsContainer.appendChild(sep);
+
+  const heading = document.createElement("div");
+  heading.className = "menu-heading";
+  heading.textContent = "Open in";
+  appsContainer.appendChild(heading);
+
+  for (const app of installedApps) {
+    const btn = document.createElement("button");
+    btn.textContent = `${app.name} (${app.preferredFormat.toUpperCase()})`;
+    btn.dataset.appId = app.id;
+    btn.addEventListener("click", () => {
+      exportWrapper.classList.remove("open");
+      postToExtension({ type: "toolbar-open-in-app", appId: app.id });
+    });
+    appsContainer.appendChild(btn);
+  }
+}
+
+exportBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  exportWrapper.classList.toggle("open");
 });
 
-document.getElementById("btn-stl")!.addEventListener("click", () => {
-  postToExtension({ type: "toolbar-export", format: "stl" });
+exportMenu.addEventListener("click", (e) => {
+  const target = e.target as HTMLElement;
+  const action = target.dataset.action;
+  if (action === "export-step") {
+    exportWrapper.classList.remove("open");
+    postToExtension({ type: "toolbar-export", format: "step" });
+  } else if (action === "export-stl") {
+    exportWrapper.classList.remove("open");
+    postToExtension({ type: "toolbar-export", format: "stl" });
+  }
+});
+
+document.addEventListener("click", (e) => {
+  if (!exportWrapper.contains(e.target as Node)) {
+    exportWrapper.classList.remove("open");
+  }
+});
+
+onMessage("installed-apps", (msg) => {
+  installedApps = msg.apps || [];
+  renderAppsMenu();
 });
 
 // --- ViewCube ---
@@ -748,6 +981,19 @@ let dimensionsVisible = false;
 function toggleDimensions(show?: boolean) {
   dimensionsVisible = show !== undefined ? show : !dimensionsVisible;
   updateDimensions();
+}
+
+function setAxes(show?: boolean, scaleToModel?: boolean) {
+  axesVisible = show !== undefined ? show : !axesVisible;
+  let target: number | undefined;
+  if (axesVisible && scaleToModel && modelGroup.children.length > 0) {
+    const box = new THREE.Box3().setFromObject(modelGroup);
+    const size = box.getSize(new THREE.Vector3());
+    const largest = Math.max(size.x, size.y, size.z);
+    // Axes slightly longer than the model half-extent reads well in screenshots.
+    if (largest > 0) target = largest * 0.6;
+  }
+  setAxesVisible(scene, axesVisible, target);
 }
 
 function updateDimensions() {

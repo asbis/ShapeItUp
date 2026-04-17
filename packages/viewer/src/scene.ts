@@ -12,6 +12,30 @@ export function createScene(): THREE.Scene {
   return scene;
 }
 
+export function getAxesGroup(scene: THREE.Scene): THREE.Group | undefined {
+  return scene.userData.axesGroup as THREE.Group | undefined;
+}
+
+/**
+ * Toggle axis visibility; optional targetLength rescales the group so the
+ * axes read roughly as long as the model (avoids being invisible or dominant).
+ */
+export function setAxesVisible(
+  scene: THREE.Scene,
+  visible: boolean,
+  targetLength?: number
+) {
+  const group = getAxesGroup(scene);
+  if (!group) return;
+  group.visible = visible;
+  if (!visible) return;
+  if (targetLength && targetLength > 0) {
+    group.scale.setScalar(targetLength / THEME.axisLength);
+  } else {
+    group.scale.setScalar(1);
+  }
+}
+
 function addLighting(scene: THREE.Scene) {
   // Ambient fill
   scene.add(new THREE.AmbientLight(THEME.ambientColor, THEME.ambientIntensity));
@@ -59,22 +83,27 @@ function addGrid(scene: THREE.Scene) {
 
 function addAxes(scene: THREE.Scene) {
   const len = THEME.axisLength;
+  const group = new THREE.Group();
+  group.name = "axes";
 
   // X axis (red)
-  addAxisLine(scene, [0, 0, 0], [len, 0, 0], THEME.axisX);
-  addAxisCone(scene, [len, 0, 0], [1, 0, 0], THEME.axisX);
+  addAxisLine(group, [0, 0, 0], [len, 0, 0], THEME.axisX);
+  addAxisCone(group, [len, 0, 0], [1, 0, 0], THEME.axisX);
 
   // Y axis (green)
-  addAxisLine(scene, [0, 0, 0], [0, len, 0], THEME.axisY);
-  addAxisCone(scene, [0, len, 0], [0, 1, 0], THEME.axisY);
+  addAxisLine(group, [0, 0, 0], [0, len, 0], THEME.axisY);
+  addAxisCone(group, [0, len, 0], [0, 1, 0], THEME.axisY);
 
   // Z axis (blue)
-  addAxisLine(scene, [0, 0, 0], [0, 0, len], THEME.axisZ);
-  addAxisCone(scene, [0, 0, len], [0, 0, 1], THEME.axisZ);
+  addAxisLine(group, [0, 0, 0], [0, 0, len], THEME.axisZ);
+  addAxisCone(group, [0, 0, len], [0, 0, 1], THEME.axisZ);
+
+  scene.add(group);
+  scene.userData.axesGroup = group;
 }
 
 function addAxisLine(
-  scene: THREE.Scene,
+  parent: THREE.Object3D,
   from: [number, number, number],
   to: [number, number, number],
   color: number
@@ -84,11 +113,11 @@ function addAxisLine(
     new THREE.Vector3(...to),
   ]);
   const mat = new THREE.LineBasicMaterial({ color });
-  scene.add(new THREE.Line(geom, mat));
+  parent.add(new THREE.Line(geom, mat));
 }
 
 function addAxisCone(
-  scene: THREE.Scene,
+  parent: THREE.Object3D,
   position: [number, number, number],
   direction: [number, number, number],
   color: number
@@ -104,5 +133,5 @@ function addAxisCone(
   const quat = new THREE.Quaternion().setFromUnitVectors(up, dir);
   cone.quaternion.copy(quat);
 
-  scene.add(cone);
+  parent.add(cone);
 }

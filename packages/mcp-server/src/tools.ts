@@ -1,11 +1,23 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync } from "fs";
-import { join, resolve, basename } from "path";
-// Note: no esbuild dependency — this server must be fully self-contained
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync, renameSync } from "fs";
+import { join, resolve, basename, dirname, isAbsolute } from "path";
 import { homedir } from "os";
+import {
+  executeShapeFile,
+  exportLastToFile,
+  getCore,
+  getLastFileName,
+  type EngineStatus,
+  type ShapeProperties,
+} from "./engine.js";
 
-// Path where the extension stores command files for IPC
+/**
+ * Shared globalStorage dir with the VSCode extension. Both processes write and
+ * read `shapeitup-status.json` here, so MCP-driven renders and extension-driven
+ * renders stay interchangeable. This is the only place we "touch" VSCode: it's
+ * a file location, not a runtime dependency.
+ */
 const GLOBAL_STORAGE = join(
   homedir(),
   process.platform === "win32"
@@ -13,17 +25,42 @@ const GLOBAL_STORAGE = join(
     : ".config/Code/User/globalStorage/shapeitup.shapeitup-vscode"
 );
 
+// --- File-based IPC to the extension (optional, best-effort) ---
+// Only used for UI-sync commands: set_render_mode, toggle_dimensions,
+// list_installed_apps, open-in-app. If VSCode isn't running these report that
+// honestly — everything else works without VSCode.
+
+const ID_PREFIX = `${process.pid}-${Date.now().toString(36)}-`;
 let commandCounter = 0;
 
-function sendExtensionCommand(command: string, params: Record<string, any> = {}): boolean {
+// Extend-while-alive grace for waitForResult: if the nominal timeout expires
+// but the extension heartbeat is still fresh, grant ONE additional window of
+// this length before giving up. Matches the reality of cold OCCT renders —
+// the extension is still working, MCP just needs to be patient. Granted at
+// most once per waitForResult call, so a truly stuck render eventually fails.
+const WAIT_GRACE_MS = 30_000;
+
+// Set by waitForResult on the failing path so the caller can distinguish
+// "extension crashed / disappeared" from "extension is alive but render is
+// slower than the budget". Reset to null on every successful resolution.
+// Module-level rather than a return-shape change to keep the diff minimal
+// across the several callers (list_installed_apps, open-in-app, export_shape,
+// preview_finder, render_preview).
+let lastWaitTimeoutReason: "dead" | "slow" | null = null;
+
+function nextCommandId(): string {
+  return ID_PREFIX + (++commandCounter);
+}
+
+function sendExtensionCommand(command: string, params: Record<string, any> = {}): string | undefined {
   try {
     mkdirSync(GLOBAL_STORAGE, { recursive: true });
     const cmdFile = join(GLOBAL_STORAGE, "mcp-command.json");
-    // Include unique ID so the extension can dedup file watcher double-fires
-    writeFileSync(cmdFile, JSON.stringify({ command, _id: ++commandCounter, ...params }));
-    return true;
+    const _id = nextCommandId();
+    writeFileSync(cmdFile, JSON.stringify({ command, _id, ...params }));
+    return _id;
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -38,26 +75,217 @@ function readExtensionResult(): any {
   return null;
 }
 
+function readHeartbeat(): { timestamp?: number; workspaceRoots?: string[] } | null {
+  try {
+    const hb = join(GLOBAL_STORAGE, "shapeitup-heartbeat.json");
+    if (!existsSync(hb)) return null;
+    return JSON.parse(readFileSync(hb, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+function isExtensionAlive(): boolean {
+  const hb = readHeartbeat();
+  if (!hb) return false;
+  return Date.now() - (hb.timestamp ?? 0) < 5000;
+}
+
+/**
+ * Where should a `create_shape` / `list_shapes` call default to when the caller
+ * doesn't pass a directory? `process.cwd()` is wrong: when VSCode or Claude
+ * Code spawns the MCP stdio child, cwd is wherever node was launched from
+ * (commonly the extension's install dir or the user's home), so files "leak"
+ * outside the user's workspace. The VSCode extension writes its
+ * workspaceRoots into the heartbeat — prefer the first one when fresh, and
+ * fall back to cwd only if the extension isn't running at all.
+ */
+function getDefaultDirectory(): string {
+  const hb = readHeartbeat();
+  if (hb && Date.now() - (hb.timestamp ?? 0) < 5000) {
+    const root = hb.workspaceRoots?.[0];
+    if (root) return root;
+  }
+  return process.cwd();
+}
+
+/**
+ * Resolve a user-supplied `filePath` argument to an absolute path. Absolute
+ * inputs pass through `resolve` unchanged; relative inputs anchor against
+ * `getDefaultDirectory()` (the active VSCode workspace root, or cwd when the
+ * extension isn't running) instead of `process.cwd()`. Plain `resolve(filePath)`
+ * is wrong here: when VSCode/Claude Code spawns the MCP stdio child, cwd is
+ * the extension's install dir — so a relative "bracket.shape.ts" handed to
+ * modify/read/delete/open would miss the file the agent just created in the
+ * workspace.
+ */
+function resolveShapePath(filePath: string): string {
+  if (isAbsolute(filePath)) return resolve(filePath);
+  return resolve(getDefaultDirectory(), filePath);
+}
+
+async function waitForResult(commandId: string, timeoutMs: number): Promise<any> {
+  const start = Date.now();
+  let aliveChecks = 0;
+  let deadline = start + timeoutMs;
+  let graceGranted = false;
+  lastWaitTimeoutReason = null;
+  while (true) {
+    if (Date.now() >= deadline) {
+      // Deadline reached. If the extension still looks alive AND we haven't
+      // already extended once, grant a single grace window — a cold OCCT
+      // render on complex geometry can legitimately overshoot the initial
+      // budget while the extension is still making progress.
+      if (!graceGranted && isExtensionAlive()) {
+        graceGranted = true;
+        deadline += WAIT_GRACE_MS;
+        continue;
+      }
+      // Give up. Record why so the caller can shape the user-facing message.
+      lastWaitTimeoutReason = isExtensionAlive() ? "slow" : "dead";
+      return null;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+    const result = readExtensionResult();
+    if (result && result._id === commandId) {
+      lastWaitTimeoutReason = null;
+      return result;
+    }
+    // Cheap early exit: if the extension died mid-wait there's no point
+    // holding open the full timeout. Only relevant BEFORE grace is granted;
+    // once we've extended, we stop short-circuiting on liveness since the
+    // heartbeat writer itself could be briefly delayed on a slow machine.
+    if (!graceGranted && ++aliveChecks % 10 === 0 && !isExtensionAlive()) {
+      lastWaitTimeoutReason = "dead";
+      return null;
+    }
+  }
+}
+
+function extensionOfflineError(tool: string) {
+  return {
+    content: [{
+      type: "text" as const,
+      text: `${tool} requires the ShapeItUp VSCode extension to be running (it's a viewer-state command). Open VSCode with the extension installed, then retry.\n(No heartbeat at ${join(GLOBAL_STORAGE, "shapeitup-heartbeat.json")})`,
+    }],
+    isError: true,
+  };
+}
+
+/**
+ * Best-effort: when an MCP operation changes the current shape, poke the
+ * extension so its live viewer re-renders the same file. Fires and forgets —
+ * if VSCode isn't running, nothing happens and MCP still succeeds.
+ */
+function notifyExtensionOfShape(filePath: string): void {
+  if (isExtensionAlive()) {
+    sendExtensionCommand("open-shape", { filePath });
+  }
+}
+
+function formatStatusText(status: EngineStatus): string {
+  if (!status.success) {
+    const hint = status.hint ? `\nHint: ${status.hint}` : "";
+    const operation = status.operation ? `\nFailed operation: ${status.operation}` : "";
+    // Include the first few lines of the stack — enough to show which Replicad
+    // / OCCT call blew up without dumping an unreadable wall of text. Agents
+    // need this to know whether to back off the fillet, simplify geometry, etc.
+    const stack = status.stack
+      ? `\nStack (top frames):\n${status.stack.split("\n").slice(0, 6).map((l) => `  ${l.trim()}`).filter((l) => l.trim().length > 2).join("\n")}`
+      : "";
+    return `Render FAILED\nError: ${status.error}${hint}${operation}${stack}\nFile: ${status.fileName || "unknown"}\nTip: call get_preview to view the last successful render for visual comparison (the PNG is NOT overwritten on failure).\nTime: ${status.timestamp}`;
+  }
+  const parts = status.partNames?.length ? `\nParts: ${status.partNames.join(", ")}` : "";
+  const paramEntries = status.currentParams ? Object.entries(status.currentParams) : [];
+  const currentParams = paramEntries.length
+    ? `\nCurrent params: ${paramEntries.map(([k, v]) => `${k}=${v}`).join(", ")}`
+    : "";
+  const timingEntries = status.timings
+    ? Object.entries(status.timings).sort((a, b) => b[1] - a[1]).slice(0, 8)
+    : [];
+  const timings = timingEntries.length
+    ? `\nTop operations (ms): ${timingEntries.map(([k, v]) => `${k}=${Math.round(v)}`).join(", ")}`
+    : "";
+  const warnings = Array.isArray(status.warnings) && status.warnings.length
+    ? `\nGeometry warnings:\n - ${status.warnings.join("\n - ")}`
+    : "";
+  const properties = formatProperties(status.properties);
+  const bbox = status.boundingBox
+    ? `\nBounding box: ${status.boundingBox.x} x ${status.boundingBox.y} x ${status.boundingBox.z} mm`
+    : "";
+  const material = status.material
+    ? `\nMaterial: ${status.material.name ? status.material.name + ", " : ""}density ${status.material.density} g/cm³`
+    : "";
+  return `Render SUCCESS\nFile: ${status.fileName || "unknown"}\nStats: ${status.stats}${parts}${bbox}${material}${properties}${currentParams}${timings}${warnings}\nTime: ${status.timestamp}`;
+}
+
+/**
+ * Shared helper used by `preview_finder` and `render_preview` to emit the
+ * synthetic `.shape.ts` wrapper that feeds into the extension's render-preview
+ * pipeline. The wrapper re-exports the user's `params` so sliders still work,
+ * re-invokes their `main()` to produce the parts, picks the target part, then
+ * hands it to the worker-injected `highlightFinder(shape, finder)` helper
+ * (which paints pink spheres at each match; see packages/core/src/executor.ts).
+ *
+ * Both callers resolve partName → index *before* calling this — keeping the
+ * wrapper itself free of any MCP-side state (no parts list to consult) and
+ * making the rendered template purely mechanical. The helper does NOT write
+ * the file; callers are responsible for writing + unlinking so they can wrap
+ * the whole render call in try/finally.
+ */
+function buildFinderWrapperScript(
+  sourcePath: string,
+  finderExpr: string,
+  partSelector: { index: number }
+): string {
+  const userBase = basename(sourcePath).replace(/\.shape\.ts$/, "");
+  // Escape the finder expression for safe embedding in the template literal
+  // below. Same escapes preview_finder used to apply inline.
+  const escapedFinder = finderExpr
+    .replace(/\\/g, "\\\\")
+    .replace(/`/g, "\\`")
+    .replace(/\$\{/g, "\\${");
+  return `import * as __user__ from "./${userBase}.shape";
+import { EdgeFinder, FaceFinder } from "replicad";
+
+export const params: Record<string, number> = ((__user__ as any).params ?? {});
+
+export default function main(p: Record<string, number>) {
+  const userMain: any = (__user__ as any).default;
+  if (typeof userMain !== "function") {
+    throw new Error("Source file has no default export");
+  }
+  const result = userMain.length > 0 ? userMain(p) : userMain();
+  const arr = Array.isArray(result) ? result : [{ shape: result, name: "shape" }];
+  const target: any = arr[${partSelector.index}];
+  const shape = (target && target.shape) ? target.shape : target;
+  const finder: any = (${escapedFinder});
+  return (highlightFinder as any)(shape, finder);
+}
+`;
+}
+
 export function registerTools(server: McpServer) {
   server.tool(
     "create_shape",
-    "Create a new .shape.ts CAD script file. Fails if file already exists — use modify_shape to update existing files.",
+    "Create a new .shape.ts CAD script file and execute it. Fails if file already exists — use modify_shape to update existing files.",
     {
       name: z.string().describe("File name without extension (e.g., 'bracket')"),
       code: z.string().describe("TypeScript source code using Replicad API"),
-      directory: z
-        .string()
-        .optional()
-        .describe("Directory to create the file in (defaults to cwd)"),
+      directory: z.string().optional().describe("Directory to create the file in (defaults to the active VSCode workspace root, or cwd if no extension is running)"),
       overwrite: z.boolean().optional().describe("Set to true to overwrite an existing file (default: false)"),
     },
     async ({ name, code, directory, overwrite }) => {
-      const dir = directory || process.cwd();
+      // If `directory` is relative, anchor it to the workspace root (not cwd)
+      // for the same reason resolveShapePath exists; absolute values pass through.
+      const dir = directory
+        ? (isAbsolute(directory) ? resolve(directory) : resolve(getDefaultDirectory(), directory))
+        : getDefaultDirectory();
       const filePath = join(dir, `${name}.shape.ts`);
 
       if (!code.trim() || !code.includes("function")) {
         return {
-          content: [{ type: "text" as const, text: `Invalid code: must contain at least a function definition. Example:\nimport { drawRectangle } from "replicad";\nexport default function main() { return drawRectangle(50,30).sketchOnPlane("XY").extrude(10); }` }],
+          content: [{ type: "text" as const, text: `Invalid code: must contain at least a function definition.` }],
           isError: true,
         };
       }
@@ -69,86 +297,69 @@ export function registerTools(server: McpServer) {
         };
       }
 
+      mkdirSync(dirname(filePath), { recursive: true });
       writeFileSync(filePath, code, "utf-8");
 
-      // Tell VS Code to open and render the file
-      sendExtensionCommand("open-shape", { filePath });
+      const { status } = await executeShapeFile(filePath, GLOBAL_STORAGE);
+      notifyExtensionOfShape(filePath);
 
+      const prefix = `${overwrite ? "Overwrote" : "Created"} ${filePath}\n`;
       return {
-        content: [{ type: "text" as const, text: `${overwrite ? "Overwrote" : "Created"} ${filePath}\nFile is rendering in the viewer. Call get_render_status to check the result.` }],
+        content: [{ type: "text" as const, text: prefix + formatStatusText(status) }],
+        isError: !status.success,
       };
     }
   );
 
   server.tool(
     "open_shape",
-    "Open an existing .shape.ts file in VS Code and render it in the 3D viewer. Use this to switch the viewer to a different file. Not needed after create_shape or modify_shape (they auto-render).",
+    "Execute an existing .shape.ts file and (if VSCode is open) also bring it up in the viewer.",
     {
-      filePath: z.string().describe("Path to the .shape.ts file to open and render"),
+      filePath: z.string().describe("Path to the .shape.ts file to execute. Relative paths resolve against the active VSCode workspace root."),
     },
     async ({ filePath }) => {
-      const resolved = resolve(filePath);
-      if (!existsSync(resolved)) {
+      const absPath = resolveShapePath(filePath);
+      if (!existsSync(absPath)) {
         return {
-          content: [{ type: "text" as const, text: `File not found: ${resolved}` }],
+          content: [{ type: "text" as const, text: `File not found: ${absPath}` }],
           isError: true,
         };
       }
 
-      // Clear previous result
-      const resultFile = join(GLOBAL_STORAGE, "mcp-result.json");
-      try { writeFileSync(resultFile, "{}"); } catch {}
+      const { status } = await executeShapeFile(absPath, GLOBAL_STORAGE);
+      notifyExtensionOfShape(absPath);
 
-      // Send command to extension (it will wait for render and write result)
-      sendExtensionCommand("open-shape", { filePath: resolved });
-
-      // Wait for the extension to complete (it blocks up to 8s for render)
-      await new Promise((r) => setTimeout(r, 10000));
-
-      // Read back the result
-      const result = readExtensionResult();
-      const status = result?.renderStatus;
-
-      if (status?.success) {
-        const parts = status.partNames?.length ? `\nParts: ${status.partNames.join(", ")}` : "";
-        return {
-          content: [{ type: "text" as const, text: `Opened in editor and rendered.\nRender SUCCESS\nFile: ${resolved}\nStats: ${status.stats}${parts}${status.boundingBox ? `\nBounding box: ${status.boundingBox.x} x ${status.boundingBox.y} x ${status.boundingBox.z} mm` : ""}` }],
-        };
-      } else if (status?.error) {
-        return {
-          content: [{ type: "text" as const, text: `Render FAILED\nFile: ${resolved}\nError: ${status.error}` }],
-          isError: true,
-        };
-      } else {
-        return {
-          content: [{ type: "text" as const, text: `File opened: ${resolved}\nRender status unknown — the viewer may still be loading. Use get_render_status to check.` }],
-        };
-      }
+      return {
+        content: [{ type: "text" as const, text: formatStatusText(status) }],
+        isError: !status.success,
+      };
     }
   );
 
   server.tool(
     "modify_shape",
-    "Overwrite an existing .shape.ts file with new code",
+    "Overwrite an existing .shape.ts file with new code and execute it.",
     {
-      filePath: z.string().describe("Path to the .shape.ts file"),
+      filePath: z.string().describe("Path to the .shape.ts file. Relative paths resolve against the active VSCode workspace root."),
       code: z.string().describe("New TypeScript source code"),
     },
     async ({ filePath, code }) => {
-      const resolved = resolve(filePath);
-      if (!existsSync(resolved)) {
+      const absPath = resolveShapePath(filePath);
+      if (!existsSync(absPath)) {
         return {
-          content: [{ type: "text" as const, text: `File not found: ${resolved}` }],
+          content: [{ type: "text" as const, text: `File not found: ${absPath}` }],
           isError: true,
         };
       }
-      writeFileSync(resolved, code, "utf-8");
+      writeFileSync(absPath, code, "utf-8");
 
-      // Tell VS Code to re-render the file
-      sendExtensionCommand("open-shape", { filePath: resolved });
+      const { status } = await executeShapeFile(absPath, GLOBAL_STORAGE);
+      notifyExtensionOfShape(absPath);
 
+      const prefix = `Updated ${absPath}\n`;
       return {
-        content: [{ type: "text" as const, text: `Updated ${resolved}\nFile is rendering in the viewer. Call get_render_status to check the result.` }],
+        content: [{ type: "text" as const, text: prefix + formatStatusText(status) }],
+        isError: !status.success,
       };
     }
   );
@@ -157,20 +368,18 @@ export function registerTools(server: McpServer) {
     "read_shape",
     "Read the contents of a .shape.ts file",
     {
-      filePath: z.string().describe("Path to the .shape.ts file"),
+      filePath: z.string().describe("Path to the .shape.ts file. Relative paths resolve against the active VSCode workspace root."),
     },
     async ({ filePath }) => {
-      const resolved = resolve(filePath);
-      if (!existsSync(resolved)) {
+      const absPath = resolveShapePath(filePath);
+      if (!existsSync(absPath)) {
         return {
-          content: [{ type: "text" as const, text: `File not found: ${resolved}` }],
+          content: [{ type: "text" as const, text: `File not found: ${absPath}` }],
           isError: true,
         };
       }
-      const content = readFileSync(resolved, "utf-8");
-      return {
-        content: [{ type: "text" as const, text: content }],
-      };
+      const content = readFileSync(absPath, "utf-8");
+      return { content: [{ type: "text" as const, text: content }] };
     }
   );
 
@@ -178,84 +387,156 @@ export function registerTools(server: McpServer) {
     "delete_shape",
     "Delete a .shape.ts file",
     {
-      filePath: z.string().describe("Path to the .shape.ts file to delete"),
+      filePath: z.string().describe("Path to the .shape.ts file to delete. Relative paths resolve against the active VSCode workspace root."),
     },
     async ({ filePath }) => {
-      const resolved = resolve(filePath);
-      if (!existsSync(resolved)) {
+      const absPath = resolveShapePath(filePath);
+      if (!existsSync(absPath)) {
         return {
-          content: [{ type: "text" as const, text: `File not found: ${resolved}` }],
+          content: [{ type: "text" as const, text: `File not found: ${absPath}` }],
           isError: true,
         };
       }
-      if (!resolved.endsWith(".shape.ts")) {
+      if (!absPath.endsWith(".shape.ts")) {
         return {
-          content: [{ type: "text" as const, text: `Refusing to delete non-.shape.ts file: ${resolved}` }],
+          content: [{ type: "text" as const, text: `Refusing to delete non-.shape.ts file: ${absPath}` }],
           isError: true,
         };
       }
       const { unlinkSync } = require("fs");
-      unlinkSync(resolved);
-      return {
-        content: [{ type: "text" as const, text: `Deleted ${resolved}` }],
-      };
+      unlinkSync(absPath);
+      return { content: [{ type: "text" as const, text: `Deleted ${absPath}` }] };
     }
   );
 
   server.tool(
     "export_shape",
-    "Export the currently rendered shape to STEP or STL file. Provide outputPath to save directly (no dialog). The shape must be rendered in the viewer first.",
+    "Export the last executed shape to STEP or STL. Optionally pass `filePath` to execute and export a specific file in one call. For multi-part assemblies, pass `partName` to export a single named part instead of the whole assembly.",
     {
-      format: z.enum(["step", "stl"]).describe("Export format: 'step' for CNC/manufacturing, 'stl' for 3D printing"),
-      outputPath: z.string().optional().describe("Output file path. If provided, saves directly without a dialog. If omitted, generates a default path next to the shape file."),
+      format: z.enum(["step", "stl"]).describe("'step' for CNC/manufacturing or CAD, 'stl' for 3D printing"),
+      outputPath: z.string().optional().describe("Output file path. Auto-derived from the source .shape.ts filename if omitted."),
+      filePath: z.string().optional().describe("Optional .shape.ts path to execute first. Defaults to the last-executed shape."),
+      partName: z.string().optional().describe("For multi-part assemblies: export only the part whose name matches exactly (e.g., 'bolt'). If omitted, the full assembly is exported."),
+      openIn: z
+        .enum(["prusaslicer", "cura", "bambustudio", "orcaslicer", "freecad", "fusion360"])
+        .optional()
+        .describe("If set, open the exported file in this app after saving. Requires VSCode + the extension."),
     },
-    async ({ format, outputPath }) => {
-      // If no outputPath, generate one based on the last rendered file
-      let savePath = outputPath;
-      if (!savePath) {
-        const statusFile = join(GLOBAL_STORAGE, "shapeitup-status.json");
+    async ({ format, outputPath, filePath, partName, openIn }) => {
+      // Figure out which file we're exporting. Precedence: explicit arg →
+      // in-process last file → status file's fileName (set by VSCode/prior runs).
+      let source: string | undefined = filePath ? resolveShapePath(filePath) : getLastFileName();
+      if (!source) {
         try {
-          const status = JSON.parse(readFileSync(statusFile, "utf-8"));
-          if (status.fileName) {
-            savePath = status.fileName.replace(/\.shape\.ts$/, `.${format}`);
-          }
+          const status = JSON.parse(readFileSync(join(GLOBAL_STORAGE, "shapeitup-status.json"), "utf-8"));
+          if (status.fileName) source = status.fileName;
         } catch {}
       }
-      if (!savePath) {
-        savePath = join(process.cwd(), `export.${format}`);
-      }
-
-      // Clear old result
-      const resultFile = join(GLOBAL_STORAGE, "mcp-result.json");
-      try { writeFileSync(resultFile, "{}"); } catch {}
-
-      sendExtensionCommand("export-shape", { format, outputPath: savePath });
-
-      // Wait for export
-      await new Promise((r) => setTimeout(r, 5000));
-
-      const result = readExtensionResult();
-      if (result?.exportPath && existsSync(result.exportPath)) {
-        const fileSize = statSync(result.exportPath).size;
-        const sizeStr = fileSize > 1024*1024 ? `${(fileSize/1024/1024).toFixed(1)}MB` : `${Math.round(fileSize/1024)}KB`;
-        let sourceInfo = "";
-        try {
-          const statusFile = join(GLOBAL_STORAGE, "shapeitup-status.json");
-          const s = JSON.parse(readFileSync(statusFile, "utf-8"));
-          if (s.fileName) sourceInfo = `\nSource: ${s.fileName}`;
-        } catch {}
+      if (!source) {
         return {
-          content: [{ type: "text" as const, text: `Exported to: ${result.exportPath}\nFormat: ${format.toUpperCase()}\nSize: ${sizeStr}${sourceInfo}` }],
-        };
-      }
-      if (result?.error) {
-        return {
-          content: [{ type: "text" as const, text: `Export failed: ${result.error}` }],
+          content: [{ type: "text" as const, text: "Nothing to export — call create_shape, open_shape, or modify_shape first, or pass filePath." }],
           isError: true,
         };
       }
+
+      // Always re-execute — guarantees correctness even if something mutated
+      // OCCT state between the last render and now.
+      const { status } = await executeShapeFile(source, GLOBAL_STORAGE);
+      if (!status.success) {
+        return {
+          content: [{ type: "text" as const, text: `Cannot export — render failed.\n${formatStatusText(status)}` }],
+          isError: true,
+        };
+      }
+
+      // If the caller asked for a specific part, validate up front and fail
+      // with a helpful list of available names before we touch the filesystem.
+      const availablePartNames = status.partNames ?? [];
+      if (partName !== undefined && !availablePartNames.includes(partName)) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `No part named "${partName}" in ${source}. Available parts: ${availablePartNames.join(", ") || "(none)"}`,
+          }],
+          isError: true,
+        };
+      }
+
+      // Default output path: include the part name in the file name so
+      // single-part exports don't collide with full-assembly exports.
+      const defaultSuffix = partName ? `.${partName}.${format}` : `.${format}`;
+      const savePath = outputPath || source.replace(/\.shape\.ts$/, defaultSuffix);
+      try {
+        await exportLastToFile(format, savePath, partName);
+      } catch (e: any) {
+        return {
+          content: [{ type: "text" as const, text: `Export failed: ${e?.message ?? e}` }],
+          isError: true,
+        };
+      }
+
+      const fileSize = statSync(savePath).size;
+      const sizeStr = fileSize > 1024 * 1024
+        ? `${(fileSize / 1024 / 1024).toFixed(1)}MB`
+        : `${Math.round(fileSize / 1024)}KB`;
+
+      // open-in-app still needs the VSCode extension for app detection +
+      // launching. Best-effort — never fails the export itself.
+      let openLine = "";
+      if (openIn) {
+        if (!isExtensionAlive()) {
+          openLine = `\nOpen-in skipped: VSCode extension not running. Launch the file manually: ${savePath}`;
+        } else {
+          const cmdId = sendExtensionCommand("open-in-app", { appId: openIn, exportPath: savePath });
+          if (cmdId) {
+            const result = await waitForResult(cmdId, 15000);
+            if (result?.openedIn) openLine = `\nOpened in: ${result.openedIn}`;
+            else if (result?.error) openLine = `\nOpen-in warning: ${result.error}`;
+          }
+        }
+      }
+
+      // Describe what was exported. Single-part exports (either because
+      // partName was specified or the script only returned one part) show the
+      // part name; full multi-part exports list the assembly contents.
+      let contentsLine: string;
+      if (partName) {
+        contentsLine = `\nPart: ${partName} (single part from ${availablePartNames.length}-part assembly)`;
+      } else if (availablePartNames.length > 1) {
+        contentsLine = `\nParts: ${availablePartNames.join(", ")}`;
+      } else if (availablePartNames.length === 1) {
+        contentsLine = `\nPart: ${availablePartNames[0]}`;
+      } else {
+        contentsLine = "";
+      }
+
       return {
-        content: [{ type: "text" as const, text: `Export may still be in progress. Check: ${savePath}` }],
+        content: [{ type: "text" as const, text: `Exported to: ${savePath}\nFormat: ${format.toUpperCase()}\nSize: ${sizeStr}\nSource: ${source}${contentsLine}${openLine}` }],
+      };
+    }
+  );
+
+  server.tool(
+    "list_installed_apps",
+    "List 3D apps detected on the user's machine (PrusaSlicer, Cura, Bambu Studio, OrcaSlicer, FreeCAD, Fusion 360). Requires VSCode extension — it owns the filesystem scanning logic.",
+    {},
+    async () => {
+      if (!isExtensionAlive()) return extensionOfflineError("list_installed_apps");
+      const cmdId = sendExtensionCommand("list-installed-apps", {});
+      if (!cmdId) {
+        return { content: [{ type: "text" as const, text: "Failed to send command to extension" }], isError: true };
+      }
+      const result = await waitForResult(cmdId, 15000);
+      if (!result) {
+        return { content: [{ type: "text" as const, text: "list_installed_apps timed out after 15s." }], isError: true };
+      }
+      const apps: Array<{ id: string; name: string; preferredFormat: string }> = result.apps || [];
+      if (apps.length === 0) {
+        return { content: [{ type: "text" as const, text: "No compatible 3D apps detected on this machine." }] };
+      }
+      const lines = apps.map((a) => `- ${a.id} (${a.name}) — preferred format: ${a.preferredFormat.toUpperCase()}`);
+      return {
+        content: [{ type: "text" as const, text: `Detected apps (pass the id to export_shape's openIn parameter):\n${lines.join("\n")}` }],
       };
     }
   );
@@ -264,17 +545,12 @@ export function registerTools(server: McpServer) {
     "list_shapes",
     "Find all .shape.ts files in a directory",
     {
-      directory: z
-        .string()
-        .optional()
-        .describe("Directory to search (defaults to cwd)"),
-      recursive: z
-        .boolean()
-        .optional()
-        .describe("Search subdirectories recursively (default: true). Set to false for top-level only."),
+      directory: z.string().optional().describe("Directory to search (defaults to the active VSCode workspace root, or cwd if no extension is running)"),
+      recursive: z.boolean().optional().describe("Search subdirectories recursively (default: true). Set to false for top-level only."),
     },
     async ({ directory, recursive }) => {
-      const dir = resolve(directory || process.cwd());
+      const usedDefault = !directory;
+      const dir = resolve(directory || getDefaultDirectory());
       if (!existsSync(dir)) {
         return {
           content: [{ type: "text" as const, text: `Directory not found: ${dir}` }],
@@ -283,50 +559,42 @@ export function registerTools(server: McpServer) {
       }
       const depth = recursive === false ? 1 : 3;
       const files = findShapeFiles(dir, depth);
+      // Always surface which directory was actually searched — when no
+      // `directory` is passed, agents otherwise can't tell whether we used
+      // the workspace root (extension alive) or process.cwd() (fallback).
+      const source = usedDefault
+        ? isExtensionAlive() ? " (default: active VSCode workspace)" : " (default: cwd — extension not running)"
+        : "";
+      const header = `Searched: ${dir}${source}\nFound: ${files.length} .shape.ts file${files.length === 1 ? "" : "s"}`;
+      const body = files.length > 0 ? `\n\n${files.join("\n")}` : "";
       return {
-        content: [
-          {
-            type: "text" as const,
-            text:
-              files.length > 0
-                ? files.join("\n")
-                : `No .shape.ts files found in ${dir}`,
-          },
-        ],
+        content: [{
+          type: "text" as const,
+          text: header + body,
+        }],
       };
     }
   );
 
   server.tool(
     "validate_script",
-    "Check syntax of a .shape.ts script (syntax only — does not verify imports or runtime behavior). Use get_render_status after create/modify to catch runtime errors.",
+    "Check syntax of a .shape.ts script (syntax only — does not verify imports or runtime behavior).",
     {
       code: z.string().describe("TypeScript source code to validate"),
     },
     async ({ code }) => {
       try {
-        // Strip TypeScript and ESM syntax to validate as plain JS
         let stripped = code;
-        // Remove import statements entirely (including multi-line)
         stripped = stripped.replace(/^import\s+[\s\S]*?from\s*["'][^"']*["']\s*;?\s*$/gm, "");
         stripped = stripped.replace(/^import\s+["'][^"']*["']\s*;?\s*$/gm, "");
-        // Remove export keywords
         stripped = stripped.replace(/^export\s+(default\s+)?/gm, "");
-        // Remove `: typeof X` annotations
         stripped = stripped.replace(/:\s*typeof\s+\w+/g, "");
-        // Remove function parameter type annotations: (x: Type, y: Type)
-        // Only match `: Type` after a parameter name followed by , or )
         stripped = stripped.replace(/(\w)\s*:\s*(?:string|number|boolean|any|void|never|unknown|null|undefined)(?:\[\])?\s*(?=[,)])/g, "$1");
-        // Remove `as Type` casts
         stripped = stripped.replace(/\bas\s+\w+/g, "");
-        // Remove interface/type declarations (whole line)
         stripped = stripped.replace(/^(interface|type)\s+\w+[^=].*$/gm, "");
-        // Remove generic type params <T> from function declarations
         stripped = stripped.replace(/(<\w[\w,\s]*>)\s*\(/g, "(");
-        // Try parsing
         new Function(stripped);
 
-        // Check for unknown method calls
         const knownMethods = new Set([
           "drawRectangle", "drawRoundedRectangle", "drawCircle", "drawEllipse", "drawPolysides", "drawText", "draw",
           "sketchCircle", "sketchRectangle", "makeCylinder", "makeSphere", "makeBox", "makeEllipsoid",
@@ -344,30 +612,149 @@ export function registerTools(server: McpServer) {
         const unknownMethods = new Set<string>();
         let match;
         while ((match = methodCallPattern.exec(code)) !== null) {
-          const methodName = match[1];
-          if (!knownMethods.has(methodName)) {
-            unknownMethods.add(methodName);
+          if (!knownMethods.has(match[1])) unknownMethods.add(match[1]);
+        }
+
+        // --- Semantic checks (pitfall linter) -----------------------------
+        // Regex-only, conservative. These warnings are hints, not failures:
+        // the script may be intentional, and we prefer false-negatives to
+        // false-positives. isError stays false regardless.
+        const semanticWarnings: string[] = [];
+
+        // 1. sketchCircle/sketchRectangle already return a Sketch — chaining
+        //    .sketchOnPlane() on top throws at runtime. Easy to confuse with
+        //    the draw* family since the names rhyme.
+        const sketchMisChain = /\b(sketchCircle|sketchRectangle)\s*\([^)]*\)\s*\.\s*sketchOnPlane\s*\(/;
+        if (sketchMisChain.test(code)) {
+          semanticWarnings.push(
+            "`sketchCircle`/`sketchRectangle` already return a Sketch — remove the `.sketchOnPlane()` call (pass `{ plane: ... }` as config to the sketch* function instead)."
+          );
+        }
+
+        // 2. draw*(...).(...).extrude() without an intervening sketchOnPlane/
+        //    sketchOnFace. Tolerate 2D ops (fuse, cut, offset, translate,
+        //    rotate, mirror) in the chain — those are all legal on Drawings.
+        //    Match is deliberately non-greedy and bounded to a single chain
+        //    expression (method calls with balanced-ish parens).
+        const drawExtrudePattern = /\b(drawRectangle|drawRoundedRectangle|drawCircle|drawEllipse|drawPolysides|drawText)\s*\(([^()]|\([^()]*\))*\)((?:\s*\.\s*(?:fuse|cut|intersect|offset|translate|rotate|mirror)\s*\(([^()]|\([^()]*\))*\))*)\s*\.\s*extrude\s*\(/;
+        if (drawExtrudePattern.test(code)) {
+          semanticWarnings.push(
+            "Drawings must be placed on a plane before extruding — add `.sketchOnPlane(\"XY\")` between the draw call and `.extrude()`."
+          );
+        }
+
+        // 3. Non-uniform .scale(). Replicad's shape.scale is uniform-only.
+        //    Flag array arg OR multiple numeric args (comma-separated).
+        const scaleArrayPattern = /\.\s*scale\s*\(\s*\[/;
+        const scaleMultiArgPattern = /\.\s*scale\s*\(\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*[,)]/;
+        if (scaleArrayPattern.test(code) || scaleMultiArgPattern.test(code)) {
+          semanticWarnings.push(
+            "`shape.scale()` is uniform-only — pass a single number. For non-uniform scaling use `makeEllipsoid(rx, ry, rz)` or draw the target shape in 2D."
+          );
+        }
+
+        // 4. draw() pen-builder chain missing .close()/.done() before
+        //    .sketchOnPlane() or .extrude(). Match `draw(` (not drawXxx —
+        //    the (?![a-zA-Z]) guard ensures we don't catch drawRectangle),
+        //    followed by any chain of method calls up to the first
+        //    sketchOnPlane/extrude. Warn if that chain contains no
+        //    close/done/closeWithMirror call.
+        const penChainPattern = /\bdraw\s*\((?![a-zA-Z])([^()]|\([^()]*\))*\)((?:\s*\.\s*[a-zA-Z_]\w*\s*\(([^()]|\([^()]*\))*\))*?)\s*\.\s*(sketchOnPlane|extrude)\s*\(/g;
+        let penMatch: RegExpExecArray | null;
+        while ((penMatch = penChainPattern.exec(code)) !== null) {
+          const chainMiddle = penMatch[2] || "";
+          if (!/\.\s*(close|closeWithMirror|done)\s*\(/.test(chainMiddle)) {
+            semanticWarnings.push(
+              "A `draw()` pen chain needs `.close()` (for extrudable regions) or `.done()` (for open sweep paths) before sketching/extruding."
+            );
+            break; // one warning is enough
           }
         }
 
-        if (unknownMethods.size > 0) {
-          const methodList = Array.from(unknownMethods).map(m => `.${m}()`).join(", ");
-          return {
-            content: [{ type: "text" as const, text: `Syntax OK. Warning: unknown method(s) found: ${methodList} — these may cause runtime errors. Use get_render_status after create/modify for full validation.` }],
-          };
+        // 5. Fillet/chamfer radius sanity check against observed dimensions.
+        //    Collect numeric literals from shape-factory calls and extrude
+        //    distances. Take min > 0 as "smallest significant" dimension.
+        //    Warn if any fillet/chamfer radius literal exceeds half of that.
+        const dims: number[] = [];
+        const extractNums = (s: string) => {
+          const nums: number[] = [];
+          const re = /-?\d+(?:\.\d+)?/g;
+          let m: RegExpExecArray | null;
+          while ((m = re.exec(s)) !== null) {
+            const v = parseFloat(m[0]);
+            if (isFinite(v) && v > 0) nums.push(v);
+          }
+          return nums;
+        };
+        const dimFnPattern = /\b(drawRectangle|drawRoundedRectangle|drawCircle|drawEllipse|sketchCircle|sketchRectangle|makeBox|makeCylinder|makeSphere|makeEllipsoid)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)/g;
+        let dimMatch: RegExpExecArray | null;
+        while ((dimMatch = dimFnPattern.exec(code)) !== null) {
+          dims.push(...extractNums(dimMatch[2]));
+        }
+        const extrudePattern = /\.\s*extrude\s*\(\s*(-?\d+(?:\.\d+)?)/g;
+        let eMatch: RegExpExecArray | null;
+        while ((eMatch = extrudePattern.exec(code)) !== null) {
+          const v = parseFloat(eMatch[1]);
+          if (isFinite(v) && v > 0) dims.push(v);
+        }
+        if (dims.length > 0) {
+          const smallest = Math.min(...dims);
+          const filletChamferPattern = /\.\s*(fillet|chamfer)\s*\(\s*(-?\d+(?:\.\d+)?)/g;
+          let fcMatch: RegExpExecArray | null;
+          const flagged = new Set<string>();
+          while ((fcMatch = filletChamferPattern.exec(code)) !== null) {
+            const r = parseFloat(fcMatch[2]);
+            if (!isFinite(r) || r <= 0) continue;
+            if (r > smallest * 0.5) {
+              const key = `${fcMatch[1]}:${r}:${smallest}`;
+              if (flagged.has(key)) continue;
+              flagged.add(key);
+              semanticWarnings.push(
+                `Fillet/chamfer radius ${r} may be too large for the smallest feature dimension (${smallest}) — OpenCascade often fails on radii larger than half the edge length.`
+              );
+            }
+          }
         }
 
-        return {
-          content: [{ type: "text" as const, text: "Syntax OK (imports and runtime not checked — use get_render_status after create/modify for full validation)" }],
-        };
+        // 6. .fuse(/.cut( inside a for-loop body — classic "slow pattern".
+        //    Walk the raw code, track brace depth from the `for (...)` header
+        //    to the matching `}`, and flag fuse/cut within.
+        const forPattern = /\bfor\s*\([^)]*\)\s*\{/g;
+        let forMatch: RegExpExecArray | null;
+        let loopBoolSuggested = false;
+        while ((forMatch = forPattern.exec(code)) !== null) {
+          let depth = 1;
+          let i = forMatch.index + forMatch[0].length;
+          const start = i;
+          while (i < code.length && depth > 0) {
+            const ch = code[i];
+            if (ch === "{") depth++;
+            else if (ch === "}") depth--;
+            i++;
+          }
+          const body = code.slice(start, i);
+          if (/\.\s*(fuse|cut)\s*\(/.test(body)) {
+            loopBoolSuggested = true;
+            break;
+          }
+        }
+        if (loopBoolSuggested) {
+          semanticWarnings.push(
+            "Multiple 3D `fuse`/`cut` inside a loop is slow — consider combining in 2D first (with `drawing.fuse()` / `drawing.cut()`) then a single `.extrude()` at the end. See the `booleans` category in get_api_reference."
+          );
+        }
+
+        // --- Assemble response --------------------------------------------
+        const baseText = unknownMethods.size > 0
+          ? `Syntax OK. Warning: unknown method(s) found: ${Array.from(unknownMethods).map(m => `.${m}()`).join(", ")}.`
+          : "Syntax OK";
+        const warningBlock = semanticWarnings.length > 0
+          ? `\nSemantic warnings:\n${semanticWarnings.map(w => ` - ${w}`).join("\n")}`
+          : "";
+        return { content: [{ type: "text" as const, text: baseText + warningBlock }] };
       } catch (e: any) {
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Syntax error: ${e.message}`,
-            },
-          ],
+          content: [{ type: "text" as const, text: `Syntax error: ${e.message}` }],
           isError: true,
         };
       }
@@ -375,131 +762,646 @@ export function registerTools(server: McpServer) {
   );
 
   server.tool(
-    "get_api_reference",
-    "Get Replicad API reference. Call without category to list available categories, or with a category name for detailed docs.",
+    "preview_shape",
+    "Execute a .shape.ts snippet WITHOUT writing it to the user's workspace — ideal for trying boolean-chain variations, sketch tweaks, or debugging steps while iterating. The snippet must have an `export default` main() returning a Shape3D or an array of parts (same contract as create_shape). The code is written to a throwaway temp file, executed through the same engine as create_shape, and deleted afterwards. By default the temp file lives in an isolated globalStorage path — local `./` imports cannot resolve from there. Pass `workingDir` (usually `.` or the workspace root) to have the temp file written there instead, which enables relative imports like `./bolt.shape` to resolve against your workspace. Set captureScreenshot:true to also render a PNG (requires the VSCode extension).",
     {
-      category: z
-        .enum([
-          "overview",
-          "drawing",
-          "sketching",
-          "solids",
-          "booleans",
-          "modifications",
-          "transforms",
-          "finders",
-          "export",
-          "examples",
-        ])
-        .optional()
-        .describe("API category. Omit to see the list of available categories."),
+      code: z.string().describe("Full .shape.ts source — must include an `export default` main() function returning a Shape3D or array of parts. Pair with `workingDir` to enable local `./` imports."),
+      workingDir: z.string().optional().describe("Directory to write the temp snippet file in. When set, relative imports (`./foo.shape`) resolve against this directory. Defaults to a private globalStorage path (isolated; relative imports won't work). Pass the workspace root — usually `.` or an absolute path — to make `./foo.shape` imports from your assembly work."),
+      captureScreenshot: z.boolean().optional().describe("If true, also capture a PNG screenshot via the VSCode extension. Default: false. Requires the extension to be running."),
+      focusPart: z.string().optional().describe("For multi-part assemblies only: name of a single part to display exclusively in the screenshot — all other parts are hidden. No-op on single-part shapes. Takes precedence over hideParts when both are supplied. The interactive viewer's part visibility is restored after the screenshot."),
+      hideParts: z.array(z.string()).optional().describe("For multi-part assemblies only: list of part names to hide in the screenshot. Other parts remain visible. Ignored if focusPart is also set. The interactive viewer's part visibility is restored after the screenshot."),
     },
-    async ({ category }) => {
-      if (!category) {
+    async ({ code, workingDir, captureScreenshot, focusPart, hideParts }) => {
+      // Cheap pre-flight: reject obvious non-starters before touching the engine.
+      // Matches the lightweight check create_shape does — full parse happens in esbuild.
+      if (!code || !code.trim()) {
         return {
-          content: [{
-            type: "text" as const,
-            text: "Available API reference categories:\n- overview (start here)\n- drawing (2D shapes)\n- sketching (2D → 3D)\n- solids (3D operations)\n- booleans (cut, fuse, intersect)\n- modifications (fillet, chamfer, shell)\n- transforms (translate, rotate, mirror)\n- finders (edge/face selection)\n- export (STEP, STL)\n- examples (complete worked examples)\n\nCall get_api_reference with a category name for detailed docs.",
-          }],
+          content: [{ type: "text" as const, text: "preview_shape: `code` is empty. Provide a full .shape.ts snippet with an `export default` main()." }],
+          isError: true,
         };
       }
-      const ref = getApiReference(category);
+      if (!code.includes("function") && !/=>/.test(code)) {
+        return {
+          content: [{ type: "text" as const, text: "preview_shape: snippet must contain at least a function definition (regular or arrow). Did you forget the `export default function main(...)` wrapper?" }],
+          isError: true,
+        };
+      }
+
+      // Decide where the temp file lives. Default: isolated globalStorage path
+      // — nothing leaks into the user's tree, but relative imports can't
+      // resolve. Opt-in: caller passes `workingDir`, which anchors relative
+      // imports via esbuild's resolveDir (engine uses dirname(absPath)).
+      // pid+timestamp avoids collisions across concurrent calls in either dir.
+      let tempPath: string;
+      let usingWorkingDir = false;
+      if (workingDir !== undefined) {
+        // Reuse the same resolution rule as every other filePath arg: absolute
+        // inputs pass through, relatives anchor against the active workspace
+        // root (not cwd, which is wrong for stdio children). `.` therefore
+        // means "the workspace root", which is the most useful default value
+        // for the agent to pass.
+        const resolvedDir = resolveShapePath(workingDir);
+        if (!existsSync(resolvedDir)) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `preview_shape: workingDir does not exist: ${resolvedDir}. Pass a path to an existing directory (usually the workspace root) — preview_shape will not auto-create directories.`,
+            }],
+            isError: true,
+          };
+        }
+        let st;
+        try {
+          st = statSync(resolvedDir);
+        } catch (e: any) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `preview_shape: failed to stat workingDir ${resolvedDir}: ${e?.message ?? e}`,
+            }],
+            isError: true,
+          };
+        }
+        if (!st.isDirectory()) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `preview_shape: workingDir is not a directory: ${resolvedDir}. Pass a directory path, not a file.`,
+            }],
+            isError: true,
+          };
+        }
+
+        // Opportunistic cleanup of stale snippet files from prior runs that
+        // died before the finally-unlink could fire (e.g. hard kill). Capped
+        // to files older than an hour so we never nuke a concurrent in-flight
+        // snippet. Best-effort; errors are swallowed.
+        try {
+          const oneHourMs = 60 * 60 * 1000;
+          const now = Date.now();
+          for (const entry of readdirSync(resolvedDir)) {
+            if (!entry.startsWith(".shapeitup-snippet-") || !entry.endsWith(".shape.ts")) continue;
+            const full = join(resolvedDir, entry);
+            try {
+              const est = statSync(full);
+              if (now - est.mtimeMs > oneHourMs) unlinkSync(full);
+            } catch {}
+          }
+        } catch {}
+
+        // Leading dot keeps it out of most editor tree views; ts+pid suffix
+        // prevents concurrent-call collisions.
+        tempPath = join(resolvedDir, `.shapeitup-snippet-${Date.now()}-${process.pid}.shape.ts`);
+        usingWorkingDir = true;
+      } else {
+        mkdirSync(join(GLOBAL_STORAGE, "preview-snippets"), { recursive: true });
+        tempPath = join(
+          GLOBAL_STORAGE,
+          "preview-snippets",
+          `snippet-${Date.now()}-${process.pid}.shape.ts`
+        );
+      }
+
+      const wantScreenshot = captureScreenshot === true;
+      let screenshotLine = "";
+      let screenshotWarning = "";
+
+      try {
+        try {
+          writeFileSync(tempPath, code, "utf-8");
+        } catch (e: any) {
+          // Permission / EROFS / disk full on the chosen dir. Surface it
+          // clearly rather than crashing — same status-text convention as the
+          // other soft failures in this tool.
+          return {
+            content: [{
+              type: "text" as const,
+              text: `preview_shape: failed to write temp snippet at ${tempPath}: ${e?.message ?? e}. Check that the directory is writable.`,
+            }],
+            isError: true,
+          };
+        }
+
+        // Same path as create_shape — consistent status output + hints for free.
+        const { status } = await executeShapeFile(tempPath, GLOBAL_STORAGE);
+
+        // Screenshot branch: only when requested AND engine run succeeded AND the
+        // extension is alive. The temp file MUST survive long enough for the
+        // viewer to read it back, so we defer the unlink into the finally below.
+        if (wantScreenshot && status.success) {
+          if (!isExtensionAlive()) {
+            screenshotWarning = "\n(Screenshot skipped: VSCode extension is not running.)";
+          } else {
+            const cmdId = sendExtensionCommand("render-preview", {
+              filePath: tempPath,
+              renderMode: "ai",
+              showDimensions: true,
+              cameraAngle: "isometric",
+              width: 1280,
+              height: 960,
+              focusPart,
+              hideParts,
+            });
+            if (!cmdId) {
+              screenshotWarning = "\n(Screenshot skipped: failed to send command to extension.)";
+            } else {
+              const result = await waitForResult(cmdId, 60_000);
+              if (!result) {
+                const reason = lastWaitTimeoutReason === "slow"
+                  ? "extension is alive but render exceeded 60s"
+                  : "extension stopped responding";
+                screenshotWarning = `\n(Screenshot skipped: ${reason}.)`;
+              } else if (result.error) {
+                screenshotWarning = `\n(Screenshot skipped: ${result.error})`;
+              } else if (result.screenshotPath) {
+                const partsLine = focusPart
+                  ? `\nParts: ${focusPart} (focused)`
+                  : hideParts && hideParts.length > 0
+                    ? `\nParts hidden: ${hideParts.join(", ")}`
+                    : "";
+                const partWarnLine = Array.isArray(result.partWarnings) && result.partWarnings.length > 0
+                  ? `\nPart warnings: ${result.partWarnings.join("; ")}`
+                  : "";
+                screenshotLine = `\nScreenshot: ${result.screenshotPath}${partsLine}${partWarnLine}`;
+              }
+            }
+          }
+        }
+
+        const header = usingWorkingDir
+          ? `Snippet executed (not saved to disk)\nSnippet written to: ${tempPath}\n`
+          : "Snippet executed (not saved to disk)\n";
+        const body = formatStatusText(status) + screenshotLine + screenshotWarning;
+        return {
+          content: [{ type: "text" as const, text: header + body }],
+          // A failed render is a tool error (the snippet didn't work). A missing
+          // screenshot when render succeeded is just a warning — not isError.
+          isError: !status.success,
+        };
+      } finally {
+        // Always clean up the temp file — engine failures, screenshot timeouts,
+        // and thrown exceptions all funnel through here.
+        try { unlinkSync(tempPath); } catch {}
+      }
+    }
+  );
+
+  server.tool(
+    "tune_params",
+    "Re-execute an existing .shape.ts with ephemeral `params` overrides WITHOUT modifying the file — the file on disk is untouched. Returns the same stats as get_render_status (volume, surface area, bounding box, timings, warnings) so agents can binary-search a design constraint (target volume, bounding box, mass, fit tolerance) before committing the winning value with modify_shape. Pass `captureScreenshot: true` to also render a PNG of the tuned configuration via the VSCode extension.",
+    {
+      filePath: z.string().describe("Path to the .shape.ts file. Relative paths resolve against the active VSCode workspace root."),
+      params: z.record(z.string(), z.number()).describe("Map of param name → override value. Only listed params are overridden; others fall back to the file's declared defaults. Values must be numbers."),
+      captureScreenshot: z.boolean().optional().describe("If true, also capture a PNG screenshot of the tuned configuration via the VSCode extension. Default: false. Requires the extension to be running."),
+    },
+    async ({ filePath, params, captureScreenshot }) => {
+      const absPath = resolveShapePath(filePath);
+      if (!existsSync(absPath)) {
+        return {
+          content: [{ type: "text" as const, text: `File not found: ${absPath}` }],
+          isError: true,
+        };
+      }
+      if (!absPath.endsWith(".shape.ts")) {
+        return {
+          content: [{ type: "text" as const, text: `tune_params only operates on .shape.ts files: ${absPath}` }],
+          isError: true,
+        };
+      }
+
+      // Summary of the overrides for the response header. Render this even on
+      // failure so the agent can see what it just tried.
+      const entries = Object.entries(params);
+      const paramsSummary = entries.length > 0
+        ? entries.map(([k, v]) => `${k}=${v}`).join(", ")
+        : "(none)";
+
+      const { status } = await executeShapeFile(absPath, GLOBAL_STORAGE, params);
+
+      // Warn about keys that aren't declared in the script's `params` object.
+      // The engine silently accepts unknown keys (they just don't do anything);
+      // flagging them at the MCP layer is how the agent learns about a typo.
+      const declaredKeys = status.currentParams ? Object.keys(status.currentParams) : [];
+      const requestedKeys = Object.keys(params);
+      const ignoredKeys = requestedKeys.filter((k) => !declaredKeys.includes(k));
+      const warningLines: string[] = [];
+      if (status.success && declaredKeys.length === 0 && requestedKeys.length > 0) {
+        warningLines.push(
+          "Note: this script doesn't declare any params — tune_params had no effect. Add `export const params = { ... }` to the file to make it tunable."
+        );
+      } else if (ignoredKeys.length > 0) {
+        warningLines.push(
+          `Note: ignored unknown param${ignoredKeys.length === 1 ? "" : "s"} (not declared in script's params): ${ignoredKeys.join(", ")}. Declared: ${declaredKeys.join(", ") || "(none)"}`
+        );
+      }
+
+      const header = `Tuned (file NOT modified) with: ${paramsSummary}\n`;
+      const warningBlock = warningLines.length > 0 ? warningLines.join("\n") + "\n" : "";
+      let responseText = header + warningBlock + formatStatusText(status);
+
+      // Optional screenshot branch — only meaningful on a successful render
+      // AND when the extension is running. Mirrors the preview_shape pattern
+      // (warning, not isError, when the screenshot can't be produced).
+      if (captureScreenshot === true && status.success) {
+        if (!isExtensionAlive()) {
+          responseText += "\n(Screenshot skipped: VSCode extension is not running.)";
+        } else {
+          const cmdId = sendExtensionCommand("render-preview", {
+            filePath: absPath,
+            renderMode: "ai",
+            showDimensions: true,
+            cameraAngle: "isometric",
+            width: 1280,
+            height: 960,
+            // Forwarded to the extension host, which threads it through
+            // executeScript → viewer → worker so the PNG matches the tuned
+            // configuration we just stat'd, not the file's defaults.
+            params,
+          });
+          if (!cmdId) {
+            responseText += "\n(Screenshot skipped: failed to send command to extension.)";
+          } else {
+            const result = await waitForResult(cmdId, 60_000);
+            if (!result) {
+              const reason = lastWaitTimeoutReason === "slow"
+                ? "extension is alive but render exceeded 60s"
+                : "extension stopped responding";
+              responseText += `\n(Screenshot skipped: ${reason}.)`;
+            } else if (result.error) {
+              responseText += `\n(Screenshot skipped: ${result.error})`;
+            } else if (result.screenshotPath) {
+              responseText += `\nScreenshot: ${result.screenshotPath}`;
+            }
+          }
+        }
+      }
+
       return {
-        content: [{ type: "text" as const, text: ref }],
+        content: [{ type: "text" as const, text: responseText }],
+        isError: !status.success,
       };
     }
   );
 
-  // --- AI Review Tools ---
+  server.tool(
+    "get_api_reference",
+    "Get Replicad API reference. Call without category to list available categories, pass `search` to find the most relevant sections across all categories, or pass `signaturesOnly: true` to get just the method signatures (token-efficient lookup).",
+    {
+      category: z
+        .enum(["overview", "drawing", "sketching", "solids", "booleans", "modifications", "transforms", "finders", "export", "examples"])
+        .optional()
+        .describe("API category. Omit to see the list of available categories."),
+      search: z.string().optional().describe("Keyword / phrase to search for across all categories. Returns the most relevant sections instead of one full category. Can be combined with `category` to search within a single category."),
+      signaturesOnly: z.boolean().optional().describe("Return only method signatures (lines with `→` or top-level function/method declarations) from the requested category. Strips examples and prose for a compact lookup. Requires `category`."),
+    },
+    async ({ category, search, signaturesOnly }) => {
+      if (search && search.trim().length > 0) {
+        return { content: [{ type: "text" as const, text: searchApiReference(search, category) }] };
+      }
+      if (!category) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: "Available API reference categories:\n- overview (start here)\n- drawing (2D shapes)\n- sketching (2D → 3D)\n- solids (3D operations)\n- booleans (cut, fuse, intersect)\n- modifications (fillet, chamfer, shell)\n- transforms (translate, rotate, mirror)\n- finders (edge/face selection)\n- export (STEP, STL)\n- examples (complete worked examples)\n\nCall get_api_reference with a category name for detailed docs, or pass `search` to search across all categories.",
+          }],
+        };
+      }
+      const body = getApiReference(category);
+      if (signaturesOnly) {
+        return { content: [{ type: "text" as const, text: extractSignatures(body, category) }] };
+      }
+      return { content: [{ type: "text" as const, text: body }] };
+    }
+  );
 
   server.tool(
     "render_preview",
-    "Capture a screenshot of the current 3D preview. Temporarily switches to the specified render mode and camera angle for the screenshot, then restores the viewer to dark mode. Screenshots are saved per shape name + camera angle (e.g. shapeitup-preview-bracket-top.png). The params here override set_render_mode/toggle_dimensions for the screenshot only.",
+    "Capture a PNG screenshot of the current shape. Requires VSCode + the ShapeItUp extension to be running (the extension renders via its webview, which works regardless of window size — the canvas is temporarily resized to the requested resolution). Preview PNGs are written to `{workspace}/shapeitup-previews/` — Read the returned absolute path to view the image. For headless verification without VSCode, use get_render_status which returns volume, surface area, center of mass, and bounding box. Pass `finder` to paint pink highlight spheres on the matched edges/faces in the screenshot (for just a text match count with no PNG, use `preview_finder`).",
     {
-      showDimensions: z.boolean().optional().describe("Show dimension overlay (default: true)"),
-      renderMode: z.enum(["ai", "dark"]).optional().describe("Render mode: 'ai' for high-contrast light background (default), 'dark' for user's dark mode"),
-      cameraAngle: z.enum(["isometric", "top", "front", "right", "back", "left"]).optional().describe("Camera angle preset (default: 'isometric')"),
+      filePath: z.string().optional().describe("Optional .shape.ts to execute first. Defaults to the last-executed shape."),
+      cameraAngle: z
+        .enum(["isometric", "top", "front", "right", "back", "left"])
+        .optional()
+        .describe("Camera angle preset (default: 'isometric')"),
+      showDimensions: z.boolean().optional().describe("Overlay bounding-box dimensions (default: true)"),
+      showAxes: z.boolean().optional().describe("Overlay X/Y/Z coordinate axes in the screenshot (default: false). Helpful for orienting symmetric or complex models."),
+      renderMode: z.enum(["ai", "dark"]).optional().describe("'ai' for high-contrast light background (default), 'dark' for dark mode"),
+      width: z.number().optional().describe("Output width in pixels (default 1280)"),
+      height: z.number().optional().describe("Output height in pixels (default 960)"),
+      timeoutMs: z
+        .number()
+        .int()
+        .min(10000)
+        .optional()
+        .describe("Upper bound in milliseconds before giving up. Default 60000 (60s). Cold OCCT renders on complex geometry may need more. Values above ~180000 are rarely useful."),
+      focusPart: z.string().optional().describe("For multi-part assemblies only: name of a single part to display exclusively in the screenshot — all other parts are hidden. No-op on single-part shapes. Takes precedence over hideParts when both are supplied. The interactive viewer's part visibility is restored after the screenshot."),
+      hideParts: z.array(z.string()).optional().describe("For multi-part assemblies only: list of part names to hide in the screenshot. Other parts remain visible. Ignored if focusPart is also set. The interactive viewer's part visibility is restored after the screenshot."),
+      finder: z.string().optional().describe("Optional EdgeFinder/FaceFinder expression, e.g. 'new EdgeFinder().inDirection(\"Z\")'. When provided, the rendered screenshot shows pink highlight spheres at each matched entity — same as preview_finder, but the PNG is saved alongside other render_previews (not ephemeral)."),
+      partName: z.string().optional().describe("With `finder` on a multi-part assembly: apply the finder to the part whose name matches exactly. Wins over partIndex when both are given. Ignored when `finder` isn't set."),
+      partIndex: z.number().int().nonnegative().optional().describe("With `finder` on a multi-part assembly: 0-based index of the part to apply the finder to (default: 0). Ignored when `finder` isn't set or `partName` is provided."),
     },
-    async ({ showDimensions, renderMode, cameraAngle }) => {
-      // Check if last render succeeded before attempting screenshot
-      const statusFile = join(GLOBAL_STORAGE, "shapeitup-status.json");
-      try {
-        const status = JSON.parse(readFileSync(statusFile, "utf-8"));
-        if (!status.success) {
-          return { content: [{ type: "text" as const, text: `Cannot preview: last render failed.\nError: ${status.error}\nFix the shape code and call get_render_status to verify before previewing.` }] };
-        }
-      } catch {}
-
-      // Clear old result
-      const resultFile = join(GLOBAL_STORAGE, "mcp-result.json");
-      try { writeFileSync(resultFile, "{}"); } catch {}
-
-      // Send a single combined command
-      sendExtensionCommand("render-preview", {
-        renderMode: renderMode || "ai",
-        showDimensions: showDimensions !== false,
-        cameraAngle: cameraAngle || "isometric",
-      });
-
-      // Retry: poll for the screenshot file with increasing delays
-      let screenshotPath: string | undefined;
-      for (let attempt = 0; attempt < 4; attempt++) {
-        await new Promise((r) => setTimeout(r, attempt === 0 ? 2000 : 1500));
-        const result = readExtensionResult();
-        if (result?.screenshotPath && existsSync(result.screenshotPath)) {
-          screenshotPath = result.screenshotPath;
-          break;
-        }
-        // Re-send command on retry in case file watcher missed it
-        if (attempt > 0) {
-          sendExtensionCommand("render-preview", {
-            renderMode: renderMode || "ai",
-            showDimensions: showDimensions !== false,
-            cameraAngle: cameraAngle || "isometric",
-          });
-        }
-      }
-
-      if (screenshotPath) {
-        // Read render status to include file info
-        const statusFile = join(GLOBAL_STORAGE, "shapeitup-status.json");
-        let fileInfo = "";
+    async ({ filePath, cameraAngle, showDimensions, showAxes, renderMode, width, height, timeoutMs, focusPart, hideParts, finder, partName, partIndex }) => {
+      // Resolve which file to render: explicit > engine's last-executed > status file.
+      let source: string | undefined = filePath ? resolveShapePath(filePath) : getLastFileName();
+      if (!source) {
         try {
-          const status = JSON.parse(readFileSync(statusFile, "utf-8"));
-          if (status.fileName) fileInfo = `\nFile: ${status.fileName}`;
-          if (status.stats) fileInfo += `\nStats: ${status.stats}`;
+          const status = JSON.parse(readFileSync(join(GLOBAL_STORAGE, "shapeitup-status.json"), "utf-8"));
+          if (status.fileName) source = status.fileName;
         } catch {}
-
+      }
+      if (!source) {
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Screenshot saved to: ${screenshotPath}\nRender mode: ${renderMode || "ai"}, Dimensions: ${showDimensions !== false ? "ON" : "OFF"}, Camera: ${cameraAngle || "isometric"}${fileInfo}\nUse the Read tool to view this image and verify the shape is correct.`,
-            },
-          ],
+          content: [{ type: "text" as const, text: "No shape to preview. Call create_shape, open_shape, or modify_shape first, or pass filePath." }],
+          isError: true,
         };
       }
 
-      return {
-        content: [
-          {
+      if (!isExtensionAlive()) {
+        return {
+          content: [{
             type: "text" as const,
-            text: "Could not capture screenshot. Make sure the ShapeItUp viewer is open in VSCode and a shape is loaded.",
-          },
-        ],
-        isError: true,
-      };
+            text: `render_preview requires the VSCode extension to be running. Open VSCode with the ShapeItUp extension and retry.\n\nFor headless verification, use get_render_status — it returns volume, surface area, center of mass, and bounding box without needing a screenshot.`,
+          }],
+          isError: true,
+        };
+      }
+
+      // --- Optional finder branch ---------------------------------------------
+      // When `finder` is set, we don't ship the user's file to the extension as
+      // usual; we generate a wrapper .shape.ts next to it that applies
+      // highlightFinder() to the chosen part and render THAT. The wrapper is
+      // cleaned up in a finally so we never leave droppings if the render
+      // crashes. `buildFinderWrapperScript` is the shared helper also used by
+      // preview_finder — keeping the wrapper contract in one place.
+      let wrapperPath: string | undefined;
+      let finderAppliedLine = "";
+      let finderPartWarning: string | undefined;
+      let renderFileArg = source;
+      if (finder !== undefined && finder.trim().length > 0) {
+        // Run the script once to resolve the target part + validate the finder
+        // expression. Matches preview_finder: lets us produce clean error
+        // messages ("no part named X", "finder failed to evaluate") *before*
+        // burning a full extension render.
+        const { status: preStatus, parts } = await executeShapeFile(source, GLOBAL_STORAGE);
+        if (!preStatus.success || !parts || parts.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: `Cannot render finder preview — script failed to render.\n${formatStatusText(preStatus)}` }],
+            isError: true,
+          };
+        }
+
+        let resolvedIdx: number;
+        if (partName !== undefined) {
+          if (parts.length === 1) {
+            // Spec: single-part script + partName/partIndex passed → warn and
+            // proceed (finder applies to the sole part).
+            finderPartWarning = `partName='${partName}' ignored: script returned a single part ('${parts[0].name}'). Finder applied to it.`;
+            resolvedIdx = 0;
+          } else {
+            const byName = parts.findIndex((p) => p.name === partName);
+            if (byName < 0) {
+              return {
+                content: [{ type: "text" as const, text: `No part named "${partName}" in ${basename(source)}. Available parts: ${parts.map((p) => p.name).join(", ") || "(none)"}` }],
+                isError: true,
+              };
+            }
+            resolvedIdx = byName;
+          }
+        } else if (partIndex !== undefined) {
+          if (parts.length === 1 && partIndex !== 0) {
+            finderPartWarning = `partIndex=${partIndex} ignored: script returned a single part ('${parts[0].name}'). Finder applied to it.`;
+            resolvedIdx = 0;
+          } else if (partIndex >= parts.length) {
+            return {
+              content: [{ type: "text" as const, text: `partIndex ${partIndex} out of range — script returned ${parts.length} part${parts.length === 1 ? "" : "s"} (${parts.map((p) => p.name).join(", ")}).` }],
+              isError: true,
+            };
+          } else {
+            resolvedIdx = partIndex;
+          }
+        } else {
+          resolvedIdx = 0;
+        }
+
+        // Pre-evaluate the finder expression with EdgeFinder/FaceFinder in
+        // scope. Catches typos + undefined-method errors up-front so the MCP
+        // response carries a clear message instead of a generic "script
+        // failed" from the worker. Same sandbox pattern as preview_finder.
+        try {
+          const core = await getCore();
+          const replicad: any = core.replicad();
+          const EdgeFinder = replicad.EdgeFinder;
+          const FaceFinder = replicad.FaceFinder;
+          const fn = new Function("EdgeFinder", "FaceFinder", "replicad", `return (${finder});`);
+          const finderObj = fn(EdgeFinder, FaceFinder, replicad);
+          if (!finderObj || typeof finderObj.find !== "function") {
+            return {
+              content: [{ type: "text" as const, text: `Finder expression did not produce an EdgeFinder/FaceFinder (missing .find method).\nExpression: ${finder}` }],
+              isError: true,
+            };
+          }
+        } catch (e: any) {
+          return {
+            content: [{ type: "text" as const, text: `Finder expression failed to evaluate: ${e?.message ?? e}\nExpression: ${finder}` }],
+            isError: true,
+          };
+        }
+
+        // Emit the "(applied to part N: <name>)" line for multi-part assemblies
+        // — matches the spec's guidance for the default-partIndex case.
+        if (parts.length > 1) {
+          finderAppliedLine = `\nFinder applied to part ${resolvedIdx}: ${parts[resolvedIdx].name}`;
+        }
+
+        const stamp = Date.now().toString(36);
+        const dir = dirname(source);
+        wrapperPath = join(dir, `.shapeitup-finder-preview-${stamp}.shape.ts`);
+        try {
+          const wrapperSource = buildFinderWrapperScript(source, finder, { index: resolvedIdx });
+          writeFileSync(wrapperPath, wrapperSource, "utf-8");
+        } catch (e: any) {
+          // Couldn't even stage the wrapper — no cleanup needed since
+          // writeFileSync didn't succeed.
+          wrapperPath = undefined;
+          return {
+            content: [{ type: "text" as const, text: `Failed to stage finder wrapper file: ${e?.message ?? e}` }],
+            isError: true,
+          };
+        }
+        renderFileArg = wrapperPath;
+      }
+
+      try {
+        const cmdId = sendExtensionCommand("render-preview", {
+          filePath: renderFileArg,
+          renderMode: renderMode || "ai",
+          showDimensions: showDimensions !== false,
+          showAxes: showAxes === true,
+          cameraAngle: cameraAngle || "isometric",
+          width: width || 1280,
+          height: height || 960,
+          focusPart,
+          hideParts,
+        });
+        if (!cmdId) {
+          return { content: [{ type: "text" as const, text: "Failed to send command to extension" }], isError: true };
+        }
+
+        // The viewer does: execute script → render at requested size → capture.
+        // 60s default covers cold OCCT init + render on complex geometry. Callers
+        // can raise this via the tool's `timeoutMs` argument; waitForResult will
+        // also extend once more (WAIT_GRACE_MS) if the extension is still alive
+        // at the deadline, so truly-slow-but-responsive renders don't spuriously
+        // fail.
+        const effectiveTimeout = timeoutMs ?? 60_000;
+        const result = await waitForResult(cmdId, effectiveTimeout);
+        if (!result) {
+          // Distinguish the two failure modes. `lastWaitTimeoutReason` is set by
+          // waitForResult on the failing path.
+          const totalWaitMs = effectiveTimeout + (lastWaitTimeoutReason === "slow" ? WAIT_GRACE_MS : 0);
+          const msg = lastWaitTimeoutReason === "slow"
+            ? `render_preview timed out after ${totalWaitMs}ms. The extension is still responsive but the render is taking longer than ${totalWaitMs}ms — consider passing a larger \`timeoutMs\`.`
+            : `render_preview timed out after ${effectiveTimeout}ms. The extension appears to have crashed or was closed.`;
+          return {
+            content: [{ type: "text" as const, text: msg }],
+            isError: true,
+          };
+        }
+        if (result.error) {
+          return {
+            content: [{ type: "text" as const, text: `Screenshot failed: ${result.error}` }],
+            isError: true,
+          };
+        }
+
+        // Pull the latest render status so the response includes geometric props.
+        let statusText = "";
+        try {
+          const status: EngineStatus = JSON.parse(readFileSync(join(GLOBAL_STORAGE, "shapeitup-status.json"), "utf-8"));
+          if (status.success) {
+            statusText = `\nStats: ${status.stats}${formatProperties(status.properties)}`;
+          }
+        } catch {}
+
+        const partsLine = focusPart
+          ? `\nParts: ${focusPart} (focused — other parts hidden in screenshot)`
+          : hideParts && hideParts.length > 0
+            ? `\nParts hidden: ${hideParts.join(", ")}`
+            : "";
+        const partWarnLine = Array.isArray(result.partWarnings) && result.partWarnings.length > 0
+          ? `\nPart warnings: ${result.partWarnings.join("; ")}`
+          : "";
+        const finderWarnLine = finderPartWarning ? `\nWarning: ${finderPartWarning}` : "";
+
+        // For finder-wrapper renders, the extension names the PNG after the
+        // wrapper (leading-dot ugly name). Rename it in place so the returned
+        // path uses the user's shape basename — the screenshot still lives in
+        // `{workspace}/shapeitup-previews/`, just with a human-readable name.
+        // Best-effort: if rename fails, fall back to the raw extension path.
+        let screenshotPath: string = result.screenshotPath;
+        if (wrapperPath && screenshotPath && existsSync(screenshotPath)) {
+          try {
+            const userBase = basename(source).replace(/\.shape\.ts$/, "");
+            const angle = cameraAngle || "isometric";
+            const renamedPath = join(dirname(screenshotPath), `shapeitup-preview-${userBase}-finder-${angle}.png`);
+            if (renamedPath !== screenshotPath) {
+              renameSync(screenshotPath, renamedPath);
+              screenshotPath = renamedPath;
+            }
+          } catch {
+            // keep raw screenshotPath
+          }
+        }
+
+        const finderLine = finder !== undefined && finder.trim().length > 0
+          ? `\nFinder: ${finder}${finderAppliedLine}${finderWarnLine}`
+          : "";
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Screenshot saved to: ${screenshotPath}\nRender mode: ${renderMode || "ai"}, Camera: ${cameraAngle || "isometric"}, Axes: ${showAxes === true ? "ON" : "OFF"}, Size: ${width || 1280}x${height || 960}\nFile: ${source}${partsLine}${partWarnLine}${finderLine}${statusText}\nUse the Read tool to view this image. Or call the \`get_preview\` MCP tool to receive the PNG data inline without needing filesystem access.`,
+          }],
+        };
+      } finally {
+        if (wrapperPath) {
+          try { unlinkSync(wrapperPath); } catch {}
+        }
+      }
+    }
+  );
+
+  server.tool(
+    "get_preview",
+    "Return the latest (or a specified) ShapeItUp preview PNG as inline MCP image content — base64 bytes delivered directly in the tool response, no filesystem Read required. Use this when your sandbox ignores `shapeitup-previews/` (gitignored) or restricts filesystem reads. Does NOT trigger a render — call `render_preview` first if no preview exists yet.",
+    {
+      filePath: z.string().optional().describe("Optional absolute path to a PNG. Defaults to the most recent ShapeItUp preview."),
+      cameraAngle: z
+        .enum(["isometric", "top", "front", "right", "back", "left"])
+        .optional()
+        .describe("Used only when filePath is omitted, to pick `shapeitup-preview-<shape>-<angle>.png` instead of the generic latest preview."),
+    },
+    async ({ filePath, cameraAngle }) => {
+      // 1) Resolve target PNG. Precedence: explicit filePath → per-shape+angle
+      // file in workspace previews dir → workspace "latest" → GLOBAL_STORAGE
+      // pre-workspace-move fallback.
+      let target: string | undefined;
+      if (filePath) {
+        target = resolveShapePath(filePath);
+      } else {
+        const wsRoot = getDefaultDirectory();
+        const previewsDir = join(wsRoot, "shapeitup-previews");
+        let shapeName: string | undefined;
+        try {
+          const status = JSON.parse(readFileSync(join(GLOBAL_STORAGE, "shapeitup-status.json"), "utf-8"));
+          if (status.fileName) shapeName = basename(status.fileName).replace(/\.shape\.ts$/, "");
+        } catch {}
+        const candidates: string[] = [];
+        if (shapeName && cameraAngle) candidates.push(join(previewsDir, `shapeitup-preview-${shapeName}-${cameraAngle}.png`));
+        candidates.push(join(previewsDir, "shapeitup-preview.png"));
+        candidates.push(join(GLOBAL_STORAGE, "shapeitup-preview.png"));
+        target = candidates.find((p) => existsSync(p));
+      }
+      if (!target || !existsSync(target)) {
+        return {
+          content: [{ type: "text" as const, text: `No preview PNG found${target ? ` at ${target}` : ""}. Call render_preview first to generate one.` }],
+          isError: true,
+        };
+      }
+      try {
+        const st = statSync(target);
+        if (st.size > 10 * 1024 * 1024) {
+          return {
+            content: [{ type: "text" as const, text: `Preview PNG is ${(st.size / 1024 / 1024).toFixed(1)} MB (>10 MB limit for inline delivery). Call render_preview again with a smaller width/height.` }],
+            isError: true,
+          };
+        }
+        const buf = readFileSync(target);
+        const data = buf.toString("base64");
+        return {
+          content: [
+            { type: "image" as const, data, mimeType: "image/png" },
+            { type: "text" as const, text: `Loaded: ${target}\nSize: ${(st.size / 1024).toFixed(1)} KB\nModified: ${st.mtime.toISOString()}` },
+          ],
+        };
+      } catch (e: any) {
+        return {
+          content: [{ type: "text" as const, text: `Failed to read preview PNG at ${target}: ${e?.message ?? e}. Call render_preview to regenerate.` }],
+          isError: true,
+        };
+      }
     }
   );
 
   server.tool(
     "set_render_mode",
-    "Switch the interactive 3D viewer between dark and AI mode. Note: render_preview has its own renderMode param that overrides this for screenshots.",
+    "Switch the interactive VSCode viewer between dark and AI mode. Requires VSCode extension — this is a UI-only setting.",
     {
       mode: z.enum(["ai", "dark"]).describe("'ai' for high-contrast light mode, 'dark' for normal dark mode"),
     },
     async ({ mode }) => {
-      const ok = sendExtensionCommand("set-render-mode", { mode });
+      if (!isExtensionAlive()) return extensionOfflineError("set_render_mode");
+      const ok = !!sendExtensionCommand("set-render-mode", { mode });
       return {
         content: [{ type: "text" as const, text: ok ? `Render mode set to: ${mode}` : "Failed to send command" }],
         isError: !ok,
@@ -509,14 +1411,21 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "toggle_dimensions",
-    "Show or hide dimension measurements on the interactive viewer. Note: render_preview has its own showDimensions param that overrides this for screenshots.",
+    "Show or hide dimension measurements on the VSCode viewer. Requires VSCode extension — UI-only setting. Omit `show` to toggle the current state.",
     {
-      show: z.boolean().describe("true to show dimensions, false to hide"),
+      show: z
+        .union([z.boolean(), z.enum(["true", "false"])])
+        .optional()
+        .describe("true to show dimensions, false to hide. Omit to toggle the current state. Also accepts 'true'/'false' strings for clients that stringify booleans."),
     },
     async ({ show }) => {
-      const ok = sendExtensionCommand("toggle-dimensions", { show });
+      if (!isExtensionAlive()) return extensionOfflineError("toggle_dimensions");
+      const normalized: boolean | undefined =
+        typeof show === "string" ? show === "true" : show;
+      const ok = !!sendExtensionCommand("toggle-dimensions", { show: normalized });
+      const stateLabel = normalized === undefined ? "toggled" : normalized ? "visible" : "hidden";
       return {
-        content: [{ type: "text" as const, text: ok ? `Dimensions: ${show ? "visible" : "hidden"}` : "Failed to send command" }],
+        content: [{ type: "text" as const, text: ok ? `Dimensions: ${stateLabel}` : "Failed to send command" }],
         isError: !ok,
       };
     }
@@ -524,37 +1433,21 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "get_render_status",
-    "Get the result of the last shape render — shows whether it succeeded or failed, with error messages and render stats. Call this after creating or modifying a .shape.ts file to check if it rendered correctly.",
+    "Get the result of the last shape render — whether it succeeded or failed, with stats, geometric properties (volume, area, center of mass, mass when material is exported), and bounding box. Reads the shared status file, which both MCP-driven and VSCode-driven renders write to. Includes currentParams — the resolved values of every exported param, so you don't need to re-read the file to inspect parameter state. For multi-part assemblies, returns per-part stats (name, volume, surface area, center of mass, bounding box, mass) — no separate list_parts tool needed.",
     {},
     async () => {
       const statusFile = join(GLOBAL_STORAGE, "shapeitup-status.json");
       if (!existsSync(statusFile)) {
         return {
-          content: [{ type: "text" as const, text: "No render status available. Make sure a .shape.ts file is open in VS Code and the ShapeItUp viewer is active." }],
+          content: [{ type: "text" as const, text: "No render status available. Call create_shape, open_shape, or modify_shape first." }],
         };
       }
-
       try {
-        const status = JSON.parse(readFileSync(statusFile, "utf-8"));
-        if (status.success) {
-          const parts = status.partNames?.length
-            ? `\nParts: ${status.partNames.join(", ")}`
-            : "";
-          return {
-            content: [{
-              type: "text" as const,
-              text: `Render SUCCESS\nFile: ${status.fileName || "unknown"}\nStats: ${status.stats}${parts}${status.boundingBox ? `\nBounding box: ${status.boundingBox.x} x ${status.boundingBox.y} x ${status.boundingBox.z} mm` : ""}\nTime: ${status.timestamp}`,
-            }],
-          };
-        } else {
-          return {
-            content: [{
-              type: "text" as const,
-              text: `Render FAILED\nError: ${status.error}\nFile: ${status.fileName || "unknown"}\nTime: ${status.timestamp}`,
-            }],
-            // Not isError — render failure is an expected state, not a tool error
-          };
-        }
+        const status: EngineStatus = JSON.parse(readFileSync(statusFile, "utf-8"));
+        return {
+          content: [{ type: "text" as const, text: formatStatusText(status) }],
+          // Render failures are an expected state, not tool errors.
+        };
       } catch {
         return {
           content: [{ type: "text" as const, text: "Could not read render status." }],
@@ -563,6 +1456,397 @@ export function registerTools(server: McpServer) {
       }
     }
   );
+
+  server.tool(
+    "preview_finder",
+    "Preview which edges/faces a Replicad EdgeFinder or FaceFinder matches on a shape — WITHOUT editing the user's script. Runs the given .shape.ts file, applies the finder to the resulting shape, and reports how many entities matched plus their locations. `EdgeFinder` and `FaceFinder` are implicitly in scope — pass a plain TS finder expression (same DSL you'd use in a fillet/chamfer/shell call), e.g. `new EdgeFinder().inDirection(\"Z\")` or `new FaceFinder().inPlane(\"XY\", 10)`. Supports the full finder DSL: `.and`, `.or`, `.not`, `.inDirection`, `.inPlane`, `.ofLength`, `.containsPoint`, etc. If the VSCode extension is running, also renders the highlighted preview in the viewer (pink spheres at each match); otherwise just returns the text report.",
+    {
+      filePath: z.string().describe("Path to the .shape.ts file whose shape the finder should be applied to"),
+      finder: z.string().describe("TS expression producing an EdgeFinder or FaceFinder, e.g. 'new EdgeFinder().inDirection(\"Z\").ofLength(l => l > 10)'"),
+      partIndex: z.number().int().nonnegative().optional().describe("If the script returns a multi-part assembly, which part's shape to apply the finder to (default: 0). Ignored when `partName` is also provided."),
+      partName: z.string().optional().describe("For multi-part assemblies: apply the finder to the part whose name matches exactly (e.g., 'bolt'). Takes precedence over `partIndex` when both are provided."),
+    },
+    async ({ filePath, finder, partIndex, partName }) => {
+      const absPath = resolveShapePath(filePath);
+      if (!existsSync(absPath)) {
+        return {
+          content: [{ type: "text" as const, text: `File not found: ${absPath}` }],
+          isError: true,
+        };
+      }
+
+      // Step 1: execute the user's script to get the live OCCT parts.
+      const { status, parts } = await executeShapeFile(absPath, GLOBAL_STORAGE);
+      if (!status.success || !parts || parts.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: `Cannot preview finder — script failed to render.\n${formatStatusText(status)}` }],
+          isError: true,
+        };
+      }
+
+      // Resolve the target part: partName (if provided) wins over partIndex.
+      let idx: number;
+      if (partName !== undefined) {
+        idx = parts.findIndex((p) => p.name === partName);
+        if (idx < 0) {
+          return {
+            content: [{ type: "text" as const, text: `No part named "${partName}" in ${basename(absPath)}. Available parts: ${parts.map((p) => p.name).join(", ") || "(none)"}` }],
+            isError: true,
+          };
+        }
+      } else {
+        idx = partIndex ?? 0;
+      }
+      if (idx >= parts.length) {
+        return {
+          content: [{ type: "text" as const, text: `partIndex ${idx} out of range — script returned ${parts.length} part${parts.length === 1 ? "" : "s"} (${parts.map((p) => p.name).join(", ")}).` }],
+          isError: true,
+        };
+      }
+      const target = parts[idx];
+      const shape = target.shape;
+
+      // Step 2: evaluate the finder expression with EdgeFinder/FaceFinder in scope.
+      const core = await getCore();
+      const replicad: any = core.replicad();
+      const EdgeFinder = replicad.EdgeFinder;
+      const FaceFinder = replicad.FaceFinder;
+      if (!EdgeFinder || !FaceFinder) {
+        return {
+          content: [{ type: "text" as const, text: "Internal error: replicad EdgeFinder/FaceFinder exports not available." }],
+          isError: true,
+        };
+      }
+
+      let finderObj: any;
+      try {
+        // Construct a sandboxed expression. The finder string is user-supplied TS
+        // but we're already executing user-supplied TS via create_shape/etc., so
+        // this is not a new trust boundary.
+        const fn = new Function("EdgeFinder", "FaceFinder", "replicad", `return (${finder});`);
+        finderObj = fn(EdgeFinder, FaceFinder, replicad);
+      } catch (e: any) {
+        return {
+          content: [{ type: "text" as const, text: `Failed to evaluate finder expression: ${e?.message ?? e}\nExpression: ${finder}` }],
+          isError: true,
+        };
+      }
+
+      if (!finderObj || typeof finderObj.find !== "function") {
+        return {
+          content: [{ type: "text" as const, text: `Finder expression did not produce an EdgeFinder/FaceFinder (missing .find method).\nExpression: ${finder}` }],
+          isError: true,
+        };
+      }
+
+      const isFace = finderObj instanceof FaceFinder;
+      const entityKind = isFace ? "face" : "edge";
+
+      let matches: any[];
+      try {
+        matches = finderObj.find(shape) || [];
+      } catch (e: any) {
+        return {
+          content: [{ type: "text" as const, text: `Finder .find() threw: ${e?.message ?? e}\nExpression: ${finder}` }],
+          isError: true,
+        };
+      }
+
+      // Step 3: build the text description — count + per-match location hints.
+      const header = `Finder matched ${matches.length} ${entityKind}${matches.length === 1 ? "" : "s"} on part '${target.name}' of ${basename(absPath)}.`;
+      const locationLines: string[] = [];
+      const maxListed = 10;
+      const fmt = (n: number) => (Math.abs(n) >= 1000 ? n.toFixed(0) : n.toFixed(2));
+      for (let i = 0; i < Math.min(matches.length, maxListed); i++) {
+        const m = matches[i];
+        let pt: any;
+        try {
+          if (typeof m.pointAt === "function") pt = m.pointAt(0.5);
+          else if (m.center) pt = m.center;
+        } catch {}
+        const px = pt?.x ?? (Array.isArray(pt) ? pt[0] : undefined);
+        const py = pt?.y ?? (Array.isArray(pt) ? pt[1] : undefined);
+        const pz = pt?.z ?? (Array.isArray(pt) ? pt[2] : undefined);
+        const loc = (typeof px === "number" && typeof py === "number" && typeof pz === "number")
+          ? `at (${fmt(px)}, ${fmt(py)}, ${fmt(pz)})`
+          : "(location unavailable)";
+        let extra = "";
+        try {
+          if (!isFace && typeof m.length === "number") extra = `, length=${fmt(m.length)}mm`;
+        } catch {}
+        locationLines.push(`  [${i}] ${entityKind} ${loc}${extra}`);
+        try { m.delete?.(); } catch {}
+      }
+      if (matches.length > maxListed) {
+        locationLines.push(`  ... ${matches.length - maxListed} more`);
+      }
+
+      if (matches.length === 0) {
+        const zeroHint = `\nThe finder matched nothing — double-check the filters (e.g. plane offset, direction axis, length constraint). ${isFace ? "FaceFinder" : "EdgeFinder"} DSL: .inDirection('X'|'Y'|'Z'), .inPlane('XY'|'XZ'|'YZ', offset?), .ofLength(n|fn), .containsPoint([x,y,z]), .atAngleWith(dir, deg), .parallelTo(plane), .not(f), .either([f1, f2]).`;
+        // No render-preview when there are no matches — the viewer would just
+        // show the raw shape which is visually indistinguishable from "script
+        // loaded fine".
+        return {
+          content: [{ type: "text" as const, text: header + zeroHint }],
+        };
+      }
+
+      let text = `${header}\n${locationLines.join("\n")}`;
+
+      // Step 4: optional highlighted preview in the VSCode viewer. Write a
+      // synthetic wrapper .shape.ts next to the user's file (so local imports
+      // resolve through esbuild's bundler), render-preview it, then clean up.
+      if (isExtensionAlive()) {
+        const stamp = Date.now().toString(36);
+        const dir = dirname(absPath);
+        const previewPath = join(dir, `.shapeitup-finder-preview-${stamp}.shape.ts`);
+        const wrapperSource = buildFinderWrapperScript(absPath, finder, { index: idx });
+        try {
+          writeFileSync(previewPath, wrapperSource, "utf-8");
+          const cmdId = sendExtensionCommand("render-preview", {
+            filePath: previewPath,
+            renderMode: "ai",
+            showDimensions: false,
+            cameraAngle: "isometric",
+            width: 1280,
+            height: 960,
+          });
+          if (cmdId) {
+            const result = await waitForResult(cmdId, 30000);
+            if (result?.screenshotPath) {
+              text += `\n\nHighlighted preview: ${result.screenshotPath}\nUse the Read tool to view this image.`;
+            } else if (result?.error) {
+              text += `\n\n(Highlighted preview unavailable: ${result.error})`;
+            }
+          }
+        } catch (e: any) {
+          text += `\n\n(Highlighted preview skipped: ${e?.message ?? e})`;
+        } finally {
+          try { unlinkSync(previewPath); } catch {}
+        }
+      }
+
+      return {
+        content: [{ type: "text" as const, text }],
+      };
+    }
+  );
+
+  server.tool(
+    "check_collisions",
+    "Detects pairwise intersections between named parts in a multi-part assembly. AABB prefilter skips obviously-disjoint pairs; remaining pairs are tested with Replicad's 3D intersect (which can fail on complex curved solids — those pairs are reported as 'intersect failed' rather than silently ignored). Tolerance filters out numerical-noise contacts (default 0.001 mm³); very large assemblies (100+ parts) will be slow because work grows as N².",
+    {
+      filePath: z.string().describe("Path to the .shape.ts file to check for part collisions."),
+      tolerance: z.number().optional().describe("Minimum intersection volume in mm³ to count as a collision. Defaults to 0.001 — filters out numerical-noise overlaps on touching-but-not-overlapping parts. Negative values are clamped to 0."),
+    },
+    async ({ filePath, tolerance }) => {
+      const absPath = resolveShapePath(filePath);
+      if (!existsSync(absPath)) {
+        return {
+          content: [{ type: "text" as const, text: `File not found: ${absPath}` }],
+          isError: true,
+        };
+      }
+
+      // Step 1: execute the script to get live OCCT parts. Failure here is
+      // surfaced via formatStatusText so the agent sees the engine's own
+      // error hint (fillet too large, wire not closed, etc.).
+      const { status, parts } = await executeShapeFile(absPath, GLOBAL_STORAGE);
+      if (!status.success || !parts) {
+        return {
+          content: [{ type: "text" as const, text: `Cannot check collisions — script failed to render.\n${formatStatusText(status)}` }],
+          isError: true,
+        };
+      }
+
+      if (parts.length < 2) {
+        return {
+          content: [{ type: "text" as const, text: "Collision check skipped — file contains a single part. Collisions only apply to multi-part assemblies." }],
+        };
+      }
+
+      const tol = Math.max(0, typeof tolerance === "number" ? tolerance : 0.001);
+
+      // Step 2: compute per-part AABBs from the tessellated vertex arrays.
+      // Same math as engine.boundingBoxFromVertices but we keep the raw
+      // min/max bounds instead of collapsing to width/height/depth — we need
+      // them for overlap testing. A tiny epsilon on the overlap check keeps
+      // perfectly-adjacent parts (shared face) out of the "maybe collide"
+      // bucket cheaply. Parts with zero vertices get a null box and are
+      // skipped with a warning.
+      type Box = { minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number };
+      const boxes: Array<Box | null> = parts.map((p) => {
+        const v = p.vertices;
+        if (!v || v.length < 3) return null;
+        let minX = Infinity, minY = Infinity, minZ = Infinity;
+        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+        for (let i = 0; i < v.length; i += 3) {
+          if (v[i] < minX) minX = v[i];
+          if (v[i] > maxX) maxX = v[i];
+          if (v[i + 1] < minY) minY = v[i + 1];
+          if (v[i + 1] > maxY) maxY = v[i + 1];
+          if (v[i + 2] < minZ) minZ = v[i + 2];
+          if (v[i + 2] > maxZ) maxZ = v[i + 2];
+        }
+        return { minX, minY, minZ, maxX, maxY, maxZ };
+      });
+
+      const AABB_EPS = 1e-6;
+      const aabbsOverlap = (a: Box, b: Box): boolean =>
+        a.maxX > b.minX + AABB_EPS && b.maxX > a.minX + AABB_EPS &&
+        a.maxY > b.minY + AABB_EPS && b.maxY > a.minY + AABB_EPS &&
+        a.maxZ > b.minZ + AABB_EPS && b.maxZ > a.minZ + AABB_EPS;
+
+      // Duplicate-name detection — index prefix disambiguates in the report.
+      const nameCounts = new Map<string, number>();
+      for (const p of parts) nameCounts.set(p.name, (nameCounts.get(p.name) ?? 0) + 1);
+      const labelFor = (i: number): string =>
+        (nameCounts.get(parts[i].name) ?? 0) > 1 ? `part-${i}:${parts[i].name}` : parts[i].name;
+
+      // Step 3: grab replicad for measureShapeVolumeProperties. Same pattern
+      // as preview_finder.
+      const core = await getCore();
+      const replicad: any = core.replicad();
+      const measureVol = replicad?.measureShapeVolumeProperties;
+
+      const collisions: Array<{ a: string; b: string; volume: number }> = [];
+      const failures: Array<{ a: string; b: string; error: string }> = [];
+      const degenerateWarnings: string[] = [];
+      let skippedByAABB = 0;
+      let tested = 0;
+      const totalPairs = (parts.length * (parts.length - 1)) / 2;
+
+      for (let i = 0; i < parts.length; i++) {
+        const boxI = boxes[i];
+        if (!boxI) {
+          // Record once per degenerate part, not once per pair — noise.
+          if (!degenerateWarnings.some((w) => w.includes(`[${i}]`))) {
+            degenerateWarnings.push(`  - ${labelFor(i)} [${i}] has no tessellated vertices — skipped from collision scan.`);
+          }
+          continue;
+        }
+        for (let j = i + 1; j < parts.length; j++) {
+          const boxJ = boxes[j];
+          if (!boxJ) continue; // degenerate; warning already recorded above
+
+          if (!aabbsOverlap(boxI, boxJ)) {
+            skippedByAABB++;
+            continue;
+          }
+
+          tested++;
+
+          // Step 4: attempt the 3D intersect. Per-pair try/catch — one failing
+          // pair must not kill the scan. WASM handle hygiene: the overlap
+          // solid (on success) goes through a finally that calls .delete()
+          // with its own swallowing try/catch so cleanup can never throw.
+          let overlapShape: any = null;
+          try {
+            overlapShape = parts[i].shape.intersect(parts[j].shape);
+          } catch (e: any) {
+            failures.push({ a: labelFor(i), b: labelFor(j), error: e?.message ?? String(e) });
+            continue;
+          }
+
+          try {
+            // Measure volume of the intersection solid. measureShapeVolumeProperties
+            // can itself throw or return null for truly empty results — treat
+            // a null/zero volume as "no collision" (intersect returned an
+            // empty solid, the expected signal on non-overlapping inputs) but
+            // a thrown error as a probe failure worth reporting.
+            let volume = 0;
+            let volProps: any = null;
+            try {
+              volProps = measureVol?.(overlapShape);
+              if (volProps && typeof volProps.volume === "number") {
+                volume = volProps.volume;
+              }
+            } catch (e: any) {
+              failures.push({ a: labelFor(i), b: labelFor(j), error: `volume measurement failed: ${e?.message ?? e}` });
+              continue;
+            } finally {
+              try { volProps?.delete?.(); } catch {}
+            }
+
+            if (volume > tol) {
+              collisions.push({ a: labelFor(i), b: labelFor(j), volume });
+            }
+          } finally {
+            // CRITICAL: always delete the overlap solid, even on measurement
+            // failure, to avoid leaking WASM handles.
+            try { overlapShape?.delete?.(); } catch {}
+          }
+        }
+      }
+
+      // Step 5: format the summary.
+      const fmt = (n: number) => (Math.abs(n) >= 1000 ? n.toFixed(0) : n.toFixed(2));
+      const header = `Collision check: ${parts.length} parts, ${tested} pair${tested === 1 ? "" : "s"} tested (${skippedByAABB} skipped by AABB prefilter), ${collisions.length} collision${collisions.length === 1 ? "" : "s"} found, ${failures.length} intersect call${failures.length === 1 ? "" : "s"} failed.`;
+
+      const sections: string[] = [header];
+
+      if (collisions.length > 0) {
+        const lines = collisions.map((c) => `  - ${c.a} ↔ ${c.b}: ${fmt(c.volume)} mm³ overlap`);
+        sections.push(`\nCollisions:\n${lines.join("\n")}`);
+      }
+
+      if (failures.length > 0) {
+        const lines = failures.map((f) => `  - ${f.a} ↔ ${f.b}: ${f.error}`);
+        sections.push(`\nIntersect failures (retry with mold-cut or report to developer):\n${lines.join("\n")}`);
+      }
+
+      if (degenerateWarnings.length > 0) {
+        sections.push(`\nWarnings:\n${degenerateWarnings.join("\n")}`);
+      }
+
+      // Clean "all clear" message when nothing collided, nothing failed, and
+      // at least one pair was actually tested (otherwise the AABB prefilter
+      // skipped everything and "no collisions detected" would be misleading).
+      if (collisions.length === 0 && failures.length === 0 && skippedByAABB < totalPairs) {
+        return {
+          content: [{ type: "text" as const, text: `No collisions detected (all ${tested} tested pair${tested === 1 ? "" : "s"} clear).${degenerateWarnings.length ? `\n\nWarnings:\n${degenerateWarnings.join("\n")}` : ""}` }],
+        };
+      }
+
+      return {
+        content: [{ type: "text" as const, text: sections.join("\n") }],
+      };
+    }
+  );
+}
+
+function formatProperties(props: ShapeProperties | undefined): string {
+  if (!props) return "";
+  const fmt = (n: number) =>
+    Math.abs(n) >= 1000 ? n.toFixed(0) : n.toFixed(2);
+  const fmtPt = (p: [number, number, number]) =>
+    `(${fmt(p[0])}, ${fmt(p[1])}, ${fmt(p[2])})`;
+
+  const lines: string[] = [];
+  if (typeof props.totalVolume === "number") {
+    lines.push(`  volume: ${fmt(props.totalVolume)} mm³ (${fmt(props.totalVolume / 1000)} cm³)`);
+  }
+  if (typeof props.totalSurfaceArea === "number") {
+    lines.push(`  surface area: ${fmt(props.totalSurfaceArea)} mm²`);
+  }
+  if (typeof props.totalMass === "number") {
+    lines.push(`  mass: ${fmt(props.totalMass)} g`);
+  }
+  if (props.centerOfMass) {
+    lines.push(`  center of mass: ${fmtPt(props.centerOfMass)} mm`);
+  }
+  if (props.parts && props.parts.length > 1) {
+    for (const p of props.parts) {
+      const bits: string[] = [];
+      if (typeof p.volume === "number") bits.push(`V=${fmt(p.volume)}mm³`);
+      if (typeof p.surfaceArea === "number") bits.push(`A=${fmt(p.surfaceArea)}mm²`);
+      if (typeof p.mass === "number") bits.push(`mass=${fmt(p.mass)}g`);
+      if (p.centerOfMass) bits.push(`CoM=${fmtPt(p.centerOfMass)}`);
+      if (p.boundingBox) bits.push(`bbox=${fmt(p.boundingBox.x)}x${fmt(p.boundingBox.y)}x${fmt(p.boundingBox.z)}`);
+      if (bits.length) lines.push(`  - ${p.name}: ${bits.join(", ")}`);
+    }
+  }
+  return lines.length ? `\nGeometric properties:\n${lines.join("\n")}` : "";
 }
 
 function findShapeFiles(dir: string, depth = 3): string[] {
@@ -579,10 +1863,40 @@ function findShapeFiles(dir: string, depth = 3): string[] {
         results.push(...findShapeFiles(full, depth - 1));
       }
     }
-  } catch {
-    // Permission errors etc
-  }
+  } catch {}
   return results;
+}
+
+/**
+ * Strip a category body down to signature-like lines: anything with a Replicad
+ * arrow `→`, anything that looks like a function/method call (`name(args)`), and
+ * inline-code signatures inside backticks. Drops prose, code fences, and blank
+ * regions so agents doing quick API lookups don't pay for the full example text.
+ * Headings are kept as section markers.
+ */
+function extractSignatures(body: string, category: string): string {
+  const lines = body.split("\n");
+  const kept: string[] = [];
+  let inFence = false;
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, "");
+    if (/^```/.test(line)) { inFence = !inFence; continue; }
+    if (inFence) {
+      // Keep signature-ish lines inside code fences (function decls, arrow types).
+      if (/→|^\s*(?:export\s+)?(?:function|const|class|interface|type)\s+\w/.test(line)) {
+        kept.push(line.trim());
+      }
+      continue;
+    }
+    if (/^#{1,4}\s/.test(line)) { kept.push(line); continue; }
+    if (/→/.test(line)) { kept.push(line.trim()); continue; }
+    // Plain signature-ish prose lines: bulleted or bare method calls.
+    if (/^\s*[-*]?\s*`?\w[\w.]*\(/.test(line) && line.includes("(")) kept.push(line.trim());
+  }
+  const body2 = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return body2.length > 0
+    ? `# ${category} — signatures only\n\n${body2}`
+    : `# ${category} — signatures only\n\n(No signature-style lines found in this category; call get_api_reference without signaturesOnly for the full content.)`;
 }
 
 function getApiReference(category: string): string {
@@ -602,14 +1916,6 @@ export default function main({ width, height, depth }: typeof params) {
 }
 \`\`\`
 
-Simple pattern (no sliders):
-\`\`\`typescript
-import { drawRectangle } from "replicad";
-export default function main() {
-  return drawRectangle(50, 30).sketchOnPlane("XY").extrude(10);
-}
-\`\`\`
-
 Multi-part assemblies:
 \`\`\`typescript
 return [
@@ -618,28 +1924,57 @@ return [
 ];
 \`\`\`
 
-Multi-file imports:
-\`\`\`typescript
-import { makeBolt } from "./bolt.shape";
-\`\`\`
-
 Flow: Drawing (2D) → Sketch (on plane) → Shape3D (extrude/revolve/loft/sweep)
-Coordinates: millimeters, X=right, Y=forward, Z=up
-Planes: "XY" (top), "XZ" (front), "YZ" (right)
 
-AI workflow: create_shape → render_preview → Read PNG → verify → modify if needed
-Use render_preview to self-check your work. It shows dimensions automatically.
+Coordinate system (units: millimeters):
+  X = right, Y = forward (into the screen from the default iso view), Z = up.
+\`\`\`
+        Z (up)
+        |
+        |
+        +------ X (right)
+       /
+      /
+     Y (forward, away from camera)
+\`\`\`
+Planes and their extrude directions:
+- "XY" — horizontal plane (top-down view). .extrude(d) goes +Z (up).
+- "XZ" — vertical plane, faces the camera in "front" view. .extrude(d) goes +Y (away from camera).
+- "YZ" — vertical plane, faces the camera in "right" view. .extrude(d) goes +X.
+Prefix "-" flips the plane's normal, so extrude reverses: "-XY" extrudes in -Z (down),
+"-XZ" in -Y, "-YZ" in -X. Use this when cutting a hole downward through a base, or any
+time you want the solid to grow opposite the default direction.
+
+draw* vs sketch* — they look alike but return different things:
+- drawCircle/drawRectangle/drawRoundedRectangle/drawEllipse/drawPolysides/drawText/draw()
+    return a Drawing (2D, not placed). You MUST call .sketchOnPlane() before extruding.
+    e.g. drawCircle(10).sketchOnPlane("XY").extrude(5)
+- sketchCircle/sketchRectangle return a Sketch already placed via its config arg.
+    Do NOT chain .sketchOnPlane() — it's already a Sketch. Go straight to extrude/revolve.
+    e.g. sketchCircle(10, { plane: "XY" }).extrude(5)
+
+Optional material for mass reporting:
+  export const material = { density: 7.85, name: "steel" };  // g/cm³
+Common densities (g/cm³): steel 7.85, aluminum 2.70, brass 8.50, ABS 1.04,
+PLA 1.24, nylon 1.15, wood (pine) 0.50. When material is exported, get_render_status
+returns mass alongside volume.
+
+AI workflow: create_shape → get_render_status → render_preview (if visual check needed)
 
 Categories: drawing, sketching, solids, booleans, modifications, transforms, finders, export, examples`,
-
     drawing: `# Drawing API (2D Shapes)
+
+All draw* functions return a **Drawing** — a 2D shape NOT yet placed on a plane.
+You MUST call .sketchOnPlane("XY"|"XZ"|"YZ", origin?) before extruding/revolving.
+(If you want a one-liner already placed on a plane, use sketchCircle/sketchRectangle
+from the sketching category instead.)
 
 ## Factory Functions
 - draw(origin?) → DrawingPen (freeform builder)
 - drawRectangle(width, height) → Drawing
 - drawRoundedRectangle(width, height, radius) → Drawing
 - drawCircle(radius) → Drawing
-- drawEllipse(majorR, minorR) → Drawing (majorR along X axis, minorR along Y axis of drawing plane)
+- drawEllipse(xRadius, yRadius) → Drawing
 - drawPolysides(radius, numSides) → Drawing
 - drawText(text, { fontSize?, fontFamily? }) → Drawing
 
@@ -647,239 +1982,394 @@ Categories: drawing, sketching, solids, booleans, modifications, transforms, fin
 Lines: .lineTo([x,y]), .line(dx,dy), .vLine(d), .hLine(d), .polarLine(d, angle)
 Arcs: .sagittaArcTo([x,y], sagitta), .tangentArcTo([x,y]), .threePointsArcTo([x,y], [mx,my])
 Curves: .cubicBezierCurveTo([x,y], [cp1x,cp1y], [cp2x,cp2y]), .smoothSplineTo([x,y])
-Close: .close() (closed shape), .closeWithMirror(), .done() (open wire)
+Close: .close(), .closeWithMirror(), .done()
 
 ## 2D Operations
 .fuse(other), .cut(other), .intersect(other)
 .offset(distance), .translate(dx,dy), .rotate(angle), .mirror(axis)`,
-
     sketching: `# Sketching (2D → 3D-ready)
 
-## Place a Drawing on a Plane
-drawing.sketchOnPlane(plane?, origin?) → Sketch
-drawing.sketchOnFace(face, scaleMode?) → Sketch
+A Sketch is a 2D shape placed on a plane — the input to extrude/revolve/loft/sweep.
 
-## Convenience Sketchers
-sketchRectangle(w, h, config?) → Sketch
-sketchCircle(r, config?) → Sketch
+Two ways to get one:
+  1. From a Drawing (the draw* family): drawCircle(10).sketchOnPlane("XY", [0,0,0])
+  2. Directly, via a sketch* convenience:  sketchCircle(10, { plane: "XY" })
 
-## Sketcher Class (3D pen)
-new Sketcher(plane?, origin?) → (same methods as DrawingPen, but in 3D)
-  .lineTo([x,y,z]), .line(dx,dy,dz), etc.
-  .close() → Sketch ready for extrude/revolve
+The sketch* functions ALREADY return a Sketch — do NOT chain .sketchOnPlane() onto them.
+sketchCircle(r).sketchOnPlane(...) throws at runtime.
 
-## Plane Config
-{ plane: "XY"|"XZ"|"YZ", origin: [x,y,z] }
-Or: "XY", "XZ", "YZ", "-XY", "-XZ", "-YZ"`,
+Methods:
+- drawing.sketchOnPlane(plane?, origin?) → Sketch
+    plane: "XY" | "XZ" | "YZ" (prefix "-" to flip normal, e.g. "-XY")
+    origin: [x, y, z] — offsets the sketch along the plane normal, e.g. [0,0,20]
+- drawing.sketchOnFace(face, scaleMode?) → Sketch
+- sketchRectangle(w, h, config?) → Sketch
+- sketchCircle(r, config?) → Sketch
 
+Plane config for sketch*: { plane: "XY"|"XZ"|"YZ", origin: [x,y,z] }
+
+Plane orientation — what \`origin\` actually means:
+The \`origin\` arg is NOT a 2D offset within the sketch plane — it is a full 3D point
+that shifts the plane along its own normal. \`sketchOnPlane("XY", [0,0,20])\` places the
+sketch on XY raised 20 mm in +Z. For "XZ" the normal is +Y (so [0,20,0] shifts 20 mm
+forward); for "YZ" the normal is +X. To translate within the plane, use \`drawing.translate(dx, dy)\` before \`sketchOnPlane\`, not the origin arg.
+
+## Composition Patterns
+
+All draw* factories return an origin-centered Drawing — most "constraint" questions
+(center, edge-align, symmetry, radial patterns) reduce to plain 2D translate/cut.
+
+Center one shape inside another — both are origin-centered, so a cut just works:
+\`\`\`typescript
+const base = drawRectangle(80, 50);
+const hole = drawCircle(5);
+const plate = base.cut(hole).sketchOnPlane("XY").extrude(10);
+\`\`\`
+
+Corner-relative placement — translate a pre-centered drawing by (halfW - inset, halfH - inset):
+\`\`\`typescript
+// 4mm bolt hole 5mm in from the +X/+Y corner of an 80x50 plate.
+const hole = drawCircle(2).translate(80 / 2 - 5, 50 / 2 - 5);
+\`\`\`
+
+Symmetry via 2D mirror — \`closeWithMirror\` reflects the pen path across the X-axis and closes:
+\`\`\`typescript
+const halfProfile = draw().hLine(20).vLine(10).hLine(-15).closeWithMirror();
+\`\`\`
+
+N-fold radial patterning (bolt circles, cooling fins) — build the pattern in 2D, extrude once:
+\`\`\`typescript
+let plate = drawRectangle(100, 100);
+for (let i = 0; i < 6; i++) {
+  const angle = (i / 6) * 2 * Math.PI;
+  const bolt = drawCircle(3).translate(40 * Math.cos(angle), 40 * Math.sin(angle));
+  plate = plate.cut(bolt);
+}
+const part = plate.sketchOnPlane("XY").extrude(5);
+\`\`\`
+
+Sketch a feature on a raised plane — the \`origin\` arg of \`sketchOnPlane\` is a 3D point
+that shifts the plane along its normal (see note above). A boss on top of a base:
+\`\`\`typescript
+const baseH = 10;
+const boss = drawCircle(8).sketchOnPlane("XY", [0, 0, baseH]).extrude(5);
+\`\`\``,
     solids: `# 3D Solid Operations
 
-## From Sketch
 sketch.extrude(distance, config?) → Shape3D
-  config: { extrusionDirection?, twistAngle? }
 sketch.revolve(axis?, config?) → Shape3D
-  config: { origin?, angle? } (default 360°)
 sketch.loftWith(otherSketches, config?) → Shape3D
-  otherSketches: single Sketch or Sketch[]
-  config: { ruled?, startPoint?, endPoint? }
-  WARNING: loft CONSUMES input sketches — recreate if needed after lofting
-  Profiles should have similar segment counts for best results
 sketch.sweepSketch(profileFn, config?) → Shape3D
-  profileFn: (plane, origin) => Sketch — return a sketch on the given plane
-  config: { frenet?, transitionMode?: "right"|"transformed"|"round" }
-  Use .done() (not .close()) for the path wire when sweeping along an open curve
 
-## Primitive Solids
 makeCylinder(radius, height, location?, direction?) → Shape3D
 makeSphere(radius) → Shape3D
 makeBox(corner1, corner2) → Shape3D
-  e.g. makeBox([0,0,0], [10,20,30])
 makeEllipsoid(rx, ry, rz) → Solid
-  Semi-axis lengths along X, Y, Z. Use instead of scale() for non-uniform shapes.
-  e.g. makeEllipsoid(20, 10, 15) — 40mm wide, 20mm deep, 30mm tall`,
 
+For positioning tricks (centering, corner-relative, radial patterns) see "Composition Patterns" in the sketching category.`,
     booleans: `# Boolean Operations
 
-shape.fuse(other) → Shape3D          (union)
-shape.cut(tool) → Shape3D            (subtraction)
-shape.intersect(other) → Shape3D     (intersection)
+shape.fuse(other) — union
+shape.cut(tool) — subtraction
+shape.intersect(other) — intersection
 
-Works on both 2D (Drawing) and 3D (Shape3D).
-For 2D: fuse2D, cut2D, intersect2D
+PREFER 2D booleans over 3D intersect — drawing.fuse/cut is far more robust.
 
-## Best Practices
-- fuse() and cut() are reliable on most geometry
-- intersect() on two complex curved solids is FRAGILE — may silently return empty/wrong geometry
-- PREFER 2D booleans: do drawing.fuse(other) / drawing.cut(other) on 2D Drawings, then extrude. 2D booleans are far more robust.
-- If intersect() fails, use the mold-cut workaround: bigBox.cut(tool) then shape.cut(mold)
-- Wrap complex boolean chains in try/catch`,
+## Patterned Features
 
+For repeated features (N cooling fins, bolt-circle holes, ribs, teeth): combine
+everything at the **Drawing (2D)** level with drawing.fuse/cut in a loop, THEN do
+a single .sketchOnPlane().extrude() (or .revolve()) at the end. Each 3D fuse/cut
+forces OCCT to rebuild the full solid topology, so N 3D ops cost O(N) solid
+rebuilds. N 2D ops are cheap planar operations and a single extrude is one solid
+build — often 10×+ faster, and far more robust on dense patterns. Only drop to
+3D booleans when the features truly differ along the extrude axis (e.g. varying
+heights or offset planes). See the "Cooling Fins" example in the examples category.`,
     modifications: `# Shape Modifications
 
-## Fillet (round edges)
 shape.fillet(radius, finder?) → Shape3D
-  finder: (edge) => edge.inDirection("Z")  (filter which edges)
-  Or: number applies to all edges
-
-## Chamfer
 shape.chamfer(distance, finder?) → Shape3D
-
-## Shell (hollow out)
 shape.shell({ thickness, filter }) → Shape3D
-  filter: face finder to remove (e.g., top face)
-  e.g. shape.shell({ thickness: 2, filter: f => f.inPlane("XY", 10) })
-
-## Draft (taper walls)
 shape.draft(angle, faceFinder, neutralPlane?)
 
-## IMPORTANT: Fillet/Chamfer Best Practices
-- Apply fillets BEFORE boolean cuts when possible
-- Avoid .fillet(r, e => e.inPlane("XY", z)) after many boolean cuts — tiny edges from cutouts crash OpenCascade
-- Prefer .fillet(r, e => e.inDirection("Z")) to select outer vertical edges only
-- Use small radii (0.3-0.5mm) on complex geometry, larger (1-3mm) only on simple shapes
-- Wrap fillets in try/catch — if it fails, skip or reduce the radius
-- If fillet crashes, try: reduce radius, fillet fewer edges, or fillet before cutting holes`,
-
+Apply fillets BEFORE boolean cuts. Use small radii (0.3-0.5mm) on complex geometry.`,
     transforms: `# Transformations
 
-shape.translate(x, y, z) → Shape3D
-shape.translateX(d), .translateY(d), .translateZ(d)
-shape.rotate(angleDeg, position?, direction?) → Shape3D
-shape.mirror(plane?, origin?) → Shape3D
-shape.scale(factor, center?) → Shape3D
-  UNIFORM only — factor is a single number (same for all axes)
-  For non-uniform shapes, use makeEllipsoid(rx, ry, rz) or draw the shape directly in 2D
+shape.translate(x, y, z), .translateX/Y/Z(d)
+shape.rotate(angleDeg, position?, direction?)
+shape.mirror(plane?, origin?)
+shape.scale(factor, center?)  — uniform only
 
-All return new shapes (immutable).`,
-
+For non-uniform, use makeEllipsoid(rx, ry, rz) or draw directly in 2D.`,
     finders: `# Finders (selecting faces/edges)
 
-## EdgeFinder
-shape.fillet(2, e => e.inDirection("Z"))
-  .inDirection(dir)         edges along a direction
-  .ofLength(l)              edges of specific length
-  .ofCurveType("CIRCLE")    circular edges
-  .parallelTo(plane)
-  .inPlane(plane, origin?)
-  .atDistance(d, point?)
-  .containsPoint(pt)
+EdgeFinder picks edges for fillet/chamfer; FaceFinder picks faces for shell/draft.
+Pass a lambda \`e => e.method()\` (or \`f => f.method()\`) to the modification call — it receives a fresh finder.
 
-## FaceFinder
-shape.shell({ thickness: 2, filter: f => f.inPlane("XY", 10) })
-  .inPlane(plane, origin?)
-  .parallelTo(plane)
-  .ofSurfaceType("PLANE"|"CYLINDER"|"CONE"|"SPHERE")
-  .containsPoint(pt)
-  .atDistance(d, pt?)
+## Common recipes
 
-## Combinators
-.and(finder), .or(finder), .not(finder)`,
+Vertical (Z-aligned) edges — outer corners of a vertical extrude:
+\`shape.fillet(2, e => e.inDirection("Z"))\`
 
+Top face of a part of height h — for shell or draft:
+\`shape.shell({ thickness: 1, filter: f => f.inPlane("XY", h) })\`
+
+All circular edges (hole rims, cylinder caps):
+\`shape.fillet(0.5, e => e.ofCurveType("CIRCLE"))\`
+
+Circular edges of a specific radius r — \`ofLength\` matches circumference for circles (2*PI*r):
+\`shape.fillet(0.3, e => e.ofCurveType("CIRCLE").ofLength(2 * Math.PI * r))\`
+
+Edge at a specific corner (pick one vertex to round):
+\`shape.fillet(3, e => e.containsPoint([x, y, z]))\`
+
+All edges at Z=10 — e.g. top rim of a cylinder:
+\`shape.fillet(1, e => e.inPlane("XY", 10))\`
+
+Horizontal edges on the top face — combine with \`.and\`:
+\`shape.fillet(1, e => e.inPlane("XY", h).and(e2 => e2.ofLength(edgeLen)))\`
+
+All edges except the top — invert with \`.not\`:
+\`shape.fillet(1, e => e.not(e2 => e2.inPlane("XY", h)))\`
+
+Edges aligned with X or Y — either/or with \`.or\`:
+\`shape.chamfer(0.5, e => e.inDirection("X").or(e2 => e2.inDirection("Y")))\`
+
+Outer vertical edges only — exclude vertical edges created by internal boolean cuts
+(filter Z-aligned edges to those whose length matches the full extrude height):
+\`shape.fillet(1, e => e.inDirection("Z").and(e2 => e2.ofLength(height)))\`
+
+Top rim of a cylinder / any circular top edge at Z=height:
+\`shape.fillet(0.5, e => e.inPlane("XY", height).and(e2 => e2.ofCurveType("CIRCLE")))\`
+
+Bolt-hole rims — circular edges whose circumference matches a given hole radius \`r\`:
+\`shape.fillet(0.3, e => e.ofCurveType("CIRCLE").ofLength(2 * Math.PI * r))\`
+
+Fillet everything EXCEPT the top opening (e.g. a shelled enclosure with an open top):
+\`shape.fillet(1, e => e.not(e2 => e2.inPlane("XY", height)))\`
+
+## Method reference
+
+EdgeFinder + FaceFinder:
+.inDirection(dir)                  — "X" | "Y" | "Z" | [x,y,z]
+.inPlane(plane, origin?)           — "XY" | "XZ" | "YZ", optional offset
+.parallelTo(plane)                 — plane name or a face
+.containsPoint([x,y,z])
+.atDistance(d, point?)
+.atAngleWith(dir, angle?)
+.and(fn), .or(fn), .not(fn)        — compose predicates
+
+EdgeFinder only:
+.ofLength(len)                     — length, or circumference for CIRCLE
+.ofCurveType("CIRCLE" | "LINE" | "BSPLINE" | "BEZIER" | ...)
+
+FaceFinder only:
+.ofSurfaceType("PLANE" | "CYLINDER" | "SPHERE" | ...)
+
+## Debugging
+
+Before applying a fillet/chamfer, verify the selection:
+- \`highlightFinder(shape, new EdgeFinder().inDirection("Z"))\` — highlights matched edges inline.
+- Or call the \`preview_finder\` MCP tool to render a screenshot with the matched edges/faces highlighted. Use it whenever a finder might be ambiguous — much cheaper than a failed fillet on complex geometry.`,
     export: `# Export
 
-Shapes are exported via the VSCode extension:
-- Ctrl+Shift+P → "ShapeItUp: Export as STEP"
-- Ctrl+Shift+P → "ShapeItUp: Export as STL"
+export_shape tool:
+- format: "step" (CAD/CNC) or "stl" (3D printing)
+- outputPath: optional, auto-derived from source file name
+- filePath: optional, defaults to last executed
+- partName: optional — for multi-part assemblies (\`return [{ shape, name, color }, ...]\`),
+    export ONLY the named component instead of the whole assembly.
+- openIn: optional — launch in PrusaSlicer/Cura/Bambu/Orca/FreeCAD/Fusion
 
-In scripts, just return the shape from main().
-The extension handles STEP/STL export from the rendered shape.
+## Choosing format for assemblies
 
-Supported formats: STEP (.step), STL (.stl)
-STEP preserves exact B-Rep geometry (best for CNC/manufacturing).
-STL is mesh-based (best for 3D printing).`,
+- **3D printing (STL)**: export each printable component SEPARATELY with \`partName\` —
+    they almost always need different orientations on the build plate, and STL has no
+    concept of named components anyway. One STL per part.
+- **CAD / CNC (STEP)**: export the full assembly WITHOUT \`partName\`. STEP preserves
+    the named components as a single structured file — that's what downstream CAD/CAM
+    tools expect.
 
+Example — pulling one part from a multi-part assembly for printing:
+\`\`\`
+export_shape({ filePath: "assembly.shape.ts", format: "stl", partName: "bolt" })
+// → writes assembly.bolt.stl
+\`\`\`
+
+Runs fully in-process, no VSCode needed.`,
     examples: `# Example Shape Scripts
 
 ## Box with Hole and Fillets
 \`\`\`typescript
 import { drawRectangle, sketchCircle } from "replicad";
-
 export default function main() {
+  // drawRectangle returns a Drawing — must sketchOnPlane before extruding.
   let shape = drawRectangle(60, 40).sketchOnPlane("XY").extrude(20);
-  shape = shape.fillet(2); // Fillet BEFORE cutting holes
+  shape = shape.fillet(2);
+  // sketchCircle returns a Sketch directly (plane is passed via config).
+  // Do NOT chain .sketchOnPlane() — it's already a Sketch.
   const hole = sketchCircle(8, { plane: "XY" }).extrude(20);
   return shape.cut(hole);
 }
 \`\`\`
 
-## L-Bracket with Mounting Holes
+## Cooling Fins (Patterned Feature)
+Combine all N fins into the 2D cross-section first, then extrude once.
+Doing this with N 3D .fuse() calls on an extruded cylinder is much slower —
+OCCT rebuilds the solid topology on every call.
 \`\`\`typescript
-import { draw, makeCylinder } from "replicad";
+import { drawCircle, drawRectangle } from "replicad";
 
-export default function main() {
-  const profile = draw()
-    .hLine(60).vLine(5).hLine(-55)
-    .vLine(35).hLine(-5).close();
+export const params = { finCount: 20, finThickness: 2, baseR: 15, finR: 30, height: 40 };
 
-  let bracket = profile.sketchOnPlane("XZ").extrude(30);
-
-  // Mounting holes
-  const hole1 = makeCylinder(3, 30, [45, 0, 2.5], [0, 1, 0]);
-  const hole2 = makeCylinder(3, 30, [15, 0, 2.5], [0, 1, 0]);
-  const hole3 = makeCylinder(3, 30, [2.5, 0, 25], [0, 1, 0]);
-
-  bracket = bracket.cut(hole1).cut(hole2).cut(hole3);
-  try { bracket = bracket.fillet(2, e => e.inDirection("Y")); } catch { /* skip fillet if geometry too complex */ }
-  return bracket;
-}
-\`\`\`
-
-## Cylinder with Flange
-\`\`\`typescript
-import { sketchCircle, drawCircle } from "replicad";
-
-export default function main() {
-  const base = sketchCircle(30).extrude(5);
-  const tube = sketchCircle(15).extrude(40).translateZ(5);
-  let shape = base.fuse(tube).fillet(3); // Fillet BEFORE cutting interior
-  const innerHole = sketchCircle(12).extrude(45);
-  return shape.cut(innerHole);
-}
-\`\`\`
-
-## Organic Vase (Loft Between Profiles)
-\`\`\`typescript
-import { drawCircle, drawEllipse } from "replicad";
-export default function main() {
-  const base = drawCircle(20).sketchOnPlane("XY");
-  const belly = drawEllipse(25, 20).sketchOnPlane("XY", [0, 0, 25]);
-  const neck = drawCircle(10).sketchOnPlane("XY", [0, 0, 45]);
-  const top = drawCircle(12).sketchOnPlane("XY", [0, 0, 60]);
-  let vase = base.loftWith([belly, neck, top], { ruled: false });
-  try { vase = vase.shell({ thickness: 2, filter: f => f.inPlane("XY", 60) }); } catch {}
-  return vase;
-}
-\`\`\`
-
-## Swept Tube Along Bezier Path
-\`\`\`typescript
-import { draw, sketchCircle } from "replicad";
-export default function main() {
-  const path = draw()
-    .cubicBezierCurveTo([15, 25], [0, 10], [20, 15])
-    .cubicBezierCurveTo([0, 50], [-10, 35], [0, 45])
-    .done()
-    .sketchOnPlane("XZ");
-  return path.sweepSketch(
-    (plane, origin) => sketchCircle(4, { plane, origin }),
-    { frenet: true }
-  );
-}
-\`\`\`
-
-## Enclosure with Lid
-\`\`\`typescript
-import { drawRoundedRectangle } from "replicad";
-
-export default function main() {
-  const outer = drawRoundedRectangle(80, 50, 5).sketchOnPlane("XY").extrude(30);
-  const inner = drawRoundedRectangle(76, 46, 3)
-    .sketchOnPlane("XY", [0, 0, 2])
-    .extrude(30);
-  return outer.cut(inner);
+export default function main({ finCount, finThickness, baseR, finR, height }: typeof params) {
+  let profile = drawCircle(baseR);
+  for (let i = 0; i < finCount; i++) {
+    const angle = (i / finCount) * 360;
+    const fin = drawRectangle(finR * 2, finThickness).rotate(angle);
+    profile = profile.fuse(fin); // cheap 2D boolean
+  }
+  return profile.sketchOnPlane("XY").extrude(height); // single solid build
 }
 \`\`\``,
   };
-
   return refs[category] || refs.overview;
+}
+
+// --- Keyword search over the API reference ---------------------------------
+
+// Full category list kept in sync with the z.enum above. We can't introspect
+// `getApiReference.refs` from out here, so we re-enumerate. If you add a
+// category, add it here too.
+const API_REFERENCE_CATEGORIES = [
+  "overview", "drawing", "sketching", "solids", "booleans",
+  "modifications", "transforms", "finders", "export", "examples",
+] as const;
+
+const SEARCH_STOPWORDS = new Set([
+  "how", "to", "do", "a", "an", "the", "in", "with", "for", "of", "on",
+  "and", "or", "is", "are", "be", "can", "i", "my", "it", "this", "that",
+]);
+
+function tokenizeSearch(query: string): string[] {
+  return query
+    .toLowerCase()
+    .split(/\s+/)
+    .map((t) => t.replace(/[^\w]+/g, ""))
+    .filter((t) => t.length >= 2 && !SEARCH_STOPWORDS.has(t));
+}
+
+interface RefSection {
+  category: string;
+  heading: string;
+  body: string; // heading + body combined (what we display)
+}
+
+/**
+ * Split a category body into sections. Each section is the top `# Title` block
+ * plus any subsequent `## Subheading` blocks. If the body has no `##` headers,
+ * the whole body is one section.
+ */
+function splitIntoSections(category: string, body: string): RefSection[] {
+  const lines = body.split(/\r?\n/);
+  const sections: RefSection[] = [];
+  let currentHeading = category;
+  let currentLines: string[] = [];
+
+  const flush = () => {
+    // Drop leading/trailing blank lines.
+    while (currentLines.length && currentLines[0].trim() === "") currentLines.shift();
+    while (currentLines.length && currentLines[currentLines.length - 1].trim() === "") currentLines.pop();
+    if (currentLines.length === 0) return;
+    sections.push({
+      category,
+      heading: currentHeading,
+      body: currentLines.join("\n"),
+    });
+  };
+
+  for (const line of lines) {
+    const m = line.match(/^(#{1,3})\s+(.*)$/);
+    if (m) {
+      // New heading — flush the previous section.
+      flush();
+      currentHeading = m[2].trim();
+      currentLines = [line];
+    } else {
+      currentLines.push(line);
+    }
+  }
+  flush();
+
+  // Fallback: if we somehow produced nothing (body was empty of headers),
+  // use a single-section blob split on double-newlines would over-fragment
+  // code blocks, so just return the whole body.
+  if (sections.length === 0 && body.trim().length > 0) {
+    sections.push({ category, heading: category, body });
+  }
+  return sections;
+}
+
+// Lazily-built cache of all sections, keyed by category.
+let _sectionCache: Map<string, RefSection[]> | null = null;
+function getAllSections(): Map<string, RefSection[]> {
+  if (_sectionCache) return _sectionCache;
+  const cache = new Map<string, RefSection[]>();
+  for (const cat of API_REFERENCE_CATEGORIES) {
+    cache.set(cat, splitIntoSections(cat, getApiReference(cat)));
+  }
+  _sectionCache = cache;
+  return cache;
+}
+
+function scoreSection(section: RefSection, tokens: string[]): number {
+  if (tokens.length === 0) return 0;
+  const headingLower = section.heading.toLowerCase();
+  const bodyLower = section.body.toLowerCase();
+  let score = 0;
+  for (const tok of tokens) {
+    // Count occurrences in body (includes heading line). Heading matches get a 3x boost on top.
+    const bodyMatches = bodyLower.split(tok).length - 1;
+    if (bodyMatches > 0) score += bodyMatches;
+    if (headingLower.includes(tok)) score += 3;
+  }
+  return score;
+}
+
+function searchApiReference(query: string, scope?: string): string {
+  const tokens = tokenizeSearch(query);
+  const cache = getAllSections();
+  const categoriesToSearch = scope ? [scope] : [...API_REFERENCE_CATEGORIES];
+  const categoryList = API_REFERENCE_CATEGORIES.join(", ");
+
+  if (tokens.length === 0) {
+    return `No searchable keywords in "${query}" (all terms were stopwords or too short). Available categories: ${categoryList}. Try a more specific term.`;
+  }
+
+  const scored: Array<{ section: RefSection; score: number }> = [];
+  for (const cat of categoriesToSearch) {
+    const sections = cache.get(cat);
+    if (!sections) continue;
+    for (const section of sections) {
+      const score = scoreSection(section, tokens);
+      if (score > 0) scored.push({ section, score });
+    }
+  }
+
+  if (scored.length === 0) {
+    return `No matches for "${query}". Available categories: ${categoryList}. Try broader terms or call without \`search\` to see a category.`;
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  const top = scored.slice(0, 5);
+
+  const lines: string[] = [];
+  lines.push(`Search results for "${query}"${scope ? ` in category ${scope}` : ""} — top ${top.length} of ${scored.length} match${scored.length === 1 ? "" : "es"}:`);
+  lines.push("");
+  top.forEach((hit, i) => {
+    lines.push(`[${i + 1}] ${hit.section.category} › ${hit.section.heading} (score: ${hit.score})`);
+    lines.push(hit.section.body);
+    lines.push("");
+  });
+  return lines.join("\n").trimEnd();
 }

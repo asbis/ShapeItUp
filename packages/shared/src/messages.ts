@@ -2,9 +2,9 @@ import type { ExportFormat } from "./types.js";
 
 // Extension Host → Webview
 export type ExtToWebview =
-  | { type: "execute-script"; js: string; fileName: string }
+  | { type: "execute-script"; js: string; fileName: string; paramOverrides?: Record<string, number> }
   | { type: "request-export"; format: ExportFormat }
-  | { type: "request-screenshot" }
+  | { type: "request-screenshot"; width?: number; height?: number }
   | { type: "viewer-command"; command: string; [key: string]: any }
   | { type: "set-theme"; background: string };
 
@@ -32,6 +32,11 @@ export interface TessellatedPart {
   normals: Float32Array;
   triangles: Uint32Array;
   edgeVertices: Float32Array;
+  // Geometric properties computed from the original OCCT shape (not the mesh).
+  // Optional because measurement can fail on degenerate geometry.
+  volume?: number;
+  surfaceArea?: number;
+  centerOfMass?: [number, number, number];
 }
 
 // Parameter definition extracted from script
@@ -53,6 +58,13 @@ export type WorkerToWebview =
       params: ParamDef[];
       execTimeMs: number;
       tessTimeMs: number;
+      timings?: Record<string, number>;
+      warnings?: string[];
     }
   | { type: "export-result"; format: ExportFormat; data: ArrayBuffer }
-  | { type: "error"; message: string; stack?: string };
+  | {
+      type: "error";
+      message: string;
+      stack?: string;
+      operation?: string;
+    };
