@@ -1,6 +1,9 @@
 import * as vscode from "vscode";
 import type { ViewerProvider } from "./viewer-provider";
 import { exportToFile } from "./export";
+import { exportAndOpen, findAppById, resetLaunchPrefs } from "./open-in-app";
+import { getDetectedApps, rescanApps, type AppId } from "./app-detector";
+import { outputChannel } from "./extension";
 
 export function registerCommands(
   context: vscode.ExtensionContext,
@@ -13,6 +16,48 @@ export function registerCommands(
 
     vscode.commands.registerCommand("shapeitup.exportSTL", async () => {
       await exportToFile(viewer, "stl");
+    }),
+
+    vscode.commands.registerCommand(
+      "shapeitup.openInApp",
+      async (appId?: AppId) => {
+        let app = appId ? findAppById(appId) : undefined;
+        if (!app) {
+          const detected = getDetectedApps();
+          if (detected.length === 0) {
+            vscode.window.showInformationMessage(
+              "ShapeItUp: no compatible 3D apps detected on this machine. Install PrusaSlicer, Bambu Studio, OrcaSlicer, Cura, FreeCAD, or Fusion 360."
+            );
+            return;
+          }
+          const picked = await vscode.window.showQuickPick(
+            detected.map((a) => ({
+              label: a.name,
+              description: `Export as ${a.preferredFormat.toUpperCase()}`,
+              app: a,
+            })),
+            { placeHolder: "Open rendered shape in…" }
+          );
+          if (!picked) return;
+          app = picked.app;
+        }
+        await exportAndOpen(viewer, app, context, outputChannel);
+      }
+    ),
+
+    vscode.commands.registerCommand("shapeitup.resetLaunchPrefs", async () => {
+      await resetLaunchPrefs(context);
+      vscode.window.showInformationMessage(
+        "ShapeItUp: cleared saved launch preferences. You'll be prompted again next time."
+      );
+    }),
+
+    vscode.commands.registerCommand("shapeitup.rescanApps", () => {
+      const apps = rescanApps();
+      viewer.sendInstalledApps(apps);
+      vscode.window.showInformationMessage(
+        `ShapeItUp: detected ${apps.length} compatible app${apps.length === 1 ? "" : "s"}${apps.length ? ` (${apps.map((a) => a.name).join(", ")})` : ""}.`
+      );
     }),
 
     vscode.commands.registerCommand("shapeitup.newShape", async () => {
