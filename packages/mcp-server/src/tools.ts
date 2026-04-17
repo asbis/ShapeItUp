@@ -2432,6 +2432,36 @@ positions via bounding-box math and requires no joints.
 \`makeCylinder\`. Takes named \`{ top | bottom, length, diameter, direction? }\`
 so the anchor is unambiguous.
 
+**Insertion mates** — when a part must nest INSIDE another (press-fit bearing
+in a pocket, dowel in a blind hole), declare the moving joint at the FAR
+end of the overlap region with axis pointing OUTWARD. With \`gap=0\`,
+\`mate()\` puts the two joint origins at the same place; the bulk of the
+moving part then extends BEHIND the joint into the host:
+
+\`\`\`typescript
+const bearing = part({
+  shape: bearings.body("608"), name: "bearing", color: "#c0c4c8",
+  joints: {
+    pocketSeat: faceAt(BEARING_WIDTH, { axis: "-Z" }),   // top of bearing, axis back out of pocket
+  },
+});
+const plate = part({
+  shape: plateWithPocket, name: "plate", color: "#8899aa",
+  joints: { pocketMouth: faceAt(PLATE_THICKNESS) },      // mouth at top face, axis +Z
+});
+// Bearing body ends up occupying Z ∈ [mouth - width, mouth] — nested in the pocket.
+mate(plate.joints.pocketMouth, bearing.joints.pocketSeat);
+\`\`\`
+
+**Debugging joint positions** — two helpers for "where did this joint land?":
+
+\`\`\`typescript
+console.log(debugJoints(positioned));   // text dump of every joint → world pos + axis
+return highlightJoints(positioned);     // viewer: renders parts + pink spheres at each joint
+\`\`\`
+
+\`highlightJoints\` is the fastest way to diagnose a misaligned mate.
+
 See \`examples/stdlib/leadscrew-assembly.shape.ts\` for a full NEMA17 →
 coupler → leadscrew assembly using this API.
 

@@ -14,7 +14,7 @@ import * as patterns from "./patterns";
 import { screws, nuts, washers, inserts } from "./fasteners";
 import { fromBack, shape3d } from "./placement";
 import { Part, joint, part, faceAt, shaftAt, boreAt } from "./parts";
-import { mate, assemble, stackOnZ, entries } from "./assembly";
+import { mate, assemble, stackOnZ, entries, debugJoints, highlightJoints } from "./assembly";
 import { cylinder } from "./cylinder";
 
 export * as standards from "./standards";
@@ -45,6 +45,8 @@ export {
   assemble,
   stackOnZ,
   entries,
+  debugJoints,
+  highlightJoints,
   cylinder,
 };
 
@@ -74,6 +76,8 @@ export const shapeitupStdlib = {
   assemble,
   stackOnZ,
   entries,
+  debugJoints,
+  highlightJoints,
   cylinder,
 };
 

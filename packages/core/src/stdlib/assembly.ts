@@ -13,7 +13,7 @@
  * joint declarations.
  */
 
-import type { Shape3D } from "replicad";
+import { makeSphere, type Shape3D } from "replicad";
 import {
   Part,
   type AttachedJoint,
@@ -300,4 +300,96 @@ export function entries(
   parts: Part[]
 ): Array<{ shape: Shape3D; name?: string; color?: string }> {
   return parts.map((p) => p.toEntry());
+}
+
+// ── Diagnostics ─────────────────────────────────────────────────────────────
+
+/**
+ * Return a text summary of every joint on every part, with world-space
+ * positions and axes. Use when a mate isn't positioning where you expect
+ * and you want to see where joints actually landed.
+ *
+ *   console.log(debugJoints(positioned));
+ *
+ * Output format (one joint per line):
+ *   motor.shaftTip       pos (0.0, 0.0, 64.0)  axis (0.0, 0.0, 1.0)
+ *   plate.motorFace      pos (0.0, 0.0, 40.0)  axis (0.0, 0.0, -1.0)
+ *
+ * Unnamed parts are referred to as `?` in the output.
+ */
+export function debugJoints(parts: Part[]): string {
+  const lines: string[] = [];
+  const fmt = (n: number) => n.toFixed(2);
+  for (const p of parts) {
+    const partName = p.name ?? "?";
+    const jointEntries = Object.entries(p.joints);
+    if (jointEntries.length === 0) {
+      lines.push(`${partName}  (no joints)`);
+      continue;
+    }
+    const longestJointName = jointEntries.reduce(
+      (m, [n]) => Math.max(m, n.length),
+      0
+    );
+    for (const [jname, j] of jointEntries) {
+      const jp = `${partName}.${jname}`.padEnd(partName.length + longestJointName + 2);
+      lines.push(
+        `${jp}  pos (${fmt(j.position[0])}, ${fmt(j.position[1])}, ${fmt(j.position[2])})  axis (${fmt(j.axis[0])}, ${fmt(j.axis[1])}, ${fmt(j.axis[2])})`
+      );
+    }
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Return a viewer-entry array that includes every part's shape AND a small
+ * pink sphere at each joint's world-space position. Use as the return value
+ * of `main()` to visually verify joint positions after `assemble()`.
+ *
+ *   const positioned = assemble([motor, plate, coupler], [...mates]);
+ *   return highlightJoints(positioned);   // renders parts + joint spheres
+ *
+ * The sphere radius auto-scales to the assembly's bounding box (2% of the
+ * largest dimension). Override via `opts.radius`. The sphere color defaults
+ * to a hot pink that contrasts with both AI-mode white and dark-mode bg.
+ */
+export function highlightJoints(
+  parts: Part[],
+  opts: { radius?: number; color?: string } = {}
+): Array<{ shape: Shape3D; name?: string; color?: string }> {
+  // Gather all entries first so we can size the markers to the scene.
+  const partEntries = parts.map((p) => p.toEntry());
+  const color = opts.color ?? "#ff3366";
+
+  let radius = opts.radius;
+  if (radius === undefined) {
+    // Walk every part's bounding box to compute a sane marker size.
+    let maxDim = 0;
+    for (const e of partEntries) {
+      try {
+        const bb = (e.shape as any).boundingBox?.bounds;
+        if (bb) {
+          const dx = bb[1][0] - bb[0][0];
+          const dy = bb[1][1] - bb[0][1];
+          const dz = bb[1][2] - bb[0][2];
+          maxDim = Math.max(maxDim, dx, dy, dz);
+        }
+      } catch {}
+    }
+    radius = Math.max(maxDim * 0.02, 0.5);
+  }
+
+  const markers: Array<{ shape: Shape3D; name?: string; color?: string }> = [];
+  for (const p of parts) {
+    const partName = p.name ?? "part";
+    for (const [jname, j] of Object.entries(p.joints)) {
+      const sphere = makeSphere(radius).translate(
+        j.position[0],
+        j.position[1],
+        j.position[2]
+      );
+      markers.push({ shape: sphere, name: `${partName}.${jname}`, color });
+    }
+  }
+  return [...partEntries, ...markers];
 }

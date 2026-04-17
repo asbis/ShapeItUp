@@ -806,3 +806,55 @@ cylinder({ bottom: [0,0,0], length: 50, diameter: 8, direction: "+Y" })  // alon
 ```
 
 See `examples/stdlib/leadscrew-assembly.shape.ts` for a full NEMA17 → coupler → leadscrew demo.
+
+### Insertion mates — when a part nests INSIDE another
+
+`mate()` positions parts so the moving part's joint origin lands at the fixed joint's origin (plus `gap`). For standard face-to-face stacks this is correct. When a part must **overlap** with the host (press-fit bearing in a pocket, dowel in a blind hole), declare the moving joint at the FAR END of the overlap region with axis pointing OUTWARD:
+
+```typescript
+// Bearing body — the part overlaps with a pocket cut into the plate. Build
+// the bearing at origin with Z ∈ [0, bearingWidth]. The joint that mates
+// with the pocket sits at the bearing's TOP, axis pointing back OUT of the
+// pocket (same direction as the pocket mouth's outward axis).
+const bearing = part({
+  shape: bearings.body("608"),
+  name: "bearing", color: "#c0c4c8",
+  joints: {
+    // bearing's "top" at z=width, axis -Z (opposite the pocket's +Z outward).
+    pocketSeat: faceAt(BEARING_WIDTH, { axis: "-Z" }),
+  },
+});
+
+// Plate's pocket joint — at the mouth, axis +Z (opens upward out of plate).
+const plate = part({
+  shape: plateWithPocket,
+  name: "plate", color: "#8899aa",
+  joints: {
+    pocketMouth: faceAt(PLATE_THICKNESS),   // top face, +Z axis
+  },
+});
+
+// Mate: bearing slides INTO the pocket. With gap=0, the bearing's top lands
+// exactly at the pocket mouth, so the bearing body occupies Z ∈ [mouth - width, mouth].
+mate(plate.joints.pocketMouth, bearing.joints.pocketSeat);
+```
+
+The mental model: `mate()` puts the two joint ORIGINS at the same place. If you want the moving part's bulk to extend BEHIND the fixed joint (into the host), put the moving joint at the FAR end of the bulk. If you want it to extend AHEAD, put the joint at the NEAR end.
+
+### Debugging joint positions
+
+Two helpers for answering "where did this joint actually end up after `assemble()`?":
+
+```typescript
+import { debugJoints, highlightJoints } from "shapeitup";
+
+// 1. Text dump — use for numeric verification or logging
+console.log(debugJoints(positioned));
+//   motor.shaftTip   pos (0.00, 0.00, 64.00)  axis (0.00, 0.00, 1.00)
+//   plate.motorFace  pos (0.00, 0.00, 40.00)  axis (0.00, 0.00, -1.00)
+
+// 2. Visual markers — returns a parts array with a sphere at every joint
+return highlightJoints(positioned);   // use as main()'s return value
+```
+
+`highlightJoints` is the fastest way to diagnose a misaligned mate — render the assembly and see where joints land as pink spheres, with part names in the parts panel.

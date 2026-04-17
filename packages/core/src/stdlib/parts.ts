@@ -371,15 +371,35 @@ export function shaftAt(
 }
 
 /**
- * Joint shorthand for a FEMALE BORE OPENING (role = "female"). The joint
- * sits at the MOUTH of the bore with its axis pointing OUTWARD along the
- * bore (away from where the bore continues). Axis defaults to "-Z" — a
- * bore opening on the part's BOTTOM face, outward direction -Z, which
- * mates with a shaftTip (+Z) coming from below.
+ * Joint shorthand for a FEMALE BORE (role = "female"). Axis points OUTWARD
+ * from the part along the bore's direction — default "-Z" for a bore that
+ * opens on the part's bottom face and accepts a shaft coming up from below.
+ *
+ * ### Picking `z` — mouth vs bottom
+ *
+ * This helper is agnostic about which end of the bore the `z` parameter
+ * names — the caller decides based on how they want the mating shaft to
+ * sit. Two common patterns:
+ *
+ * **Anchor at the MOUTH** — the mating shaft sits AGAINST the rim; the
+ * bore may be deeper but the shaft doesn't penetrate farther than the mouth.
+ * Use when you want to butt two coaxial parts together at a face.
+ *
+ *   boreAt(0, 5)                   // mouth at local z=0, axis -Z (opens down)
+ *
+ * **Anchor at the BOTTOM** — the mating shaft FILLS the bore; the shaft
+ * tip lands against the back wall. Use when the shaft insertion depth IS
+ * the bore depth (a press-fit bearing pocket behaves this way).
+ *
+ *   boreAt(BORE_DEPTH, 5)          // bottom of bore at local z=BORE_DEPTH
+ *
+ * In either case `mate(shaftTip, bore, { gap })` positions the SHAFT TIP at
+ * the joint's anchor point (± gap). So bottom-anchoring gives a fully-
+ * inserted shaft; mouth-anchoring gives a shaft that just touches the rim.
  *
  *   joints: {
- *     motorEnd:     boreAt(BORE_DEPTH, 5),                       // bottom bore (axis -Z default)
- *     leadscrewEnd: boreAt(COUPLER_LENGTH, 8, { axis: "+Z" }),   // top bore
+ *     motorEnd:     boreAt(COUPLER_BORE_DEPTH, 5),             // shaft fills bore
+ *     leadscrewEnd: boreAt(COUPLER_LENGTH, 8, { axis: "+Z" }), // top bore
  *   }
  */
 export function boreAt(
