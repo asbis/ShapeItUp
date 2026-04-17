@@ -209,6 +209,80 @@ export const FIT: Record<FitStyle, number> = {
  */
 export type Point3 = [number, number, number];
 
+/** NEMA stepper motor spec. Body is a square prism; shaft exits one face. */
+export interface NemaMotorSpec {
+  /** Body face size (square). */
+  body: number;
+  /** Body depth along the shaft axis. */
+  height: number;
+  /** Output shaft nominal diameter. */
+  shaft: number;
+  /** Typical exposed shaft length (varies by supplier — override per-part as needed). */
+  shaftLength: number;
+  /** Bolt pattern pitch — square. NEMA 17 = 31mm, NEMA 23 = 47.14mm, NEMA 14 = 26mm. */
+  boltPitch: number;
+  /** Pilot boss outer diameter (raised ring around the shaft on the front face). */
+  pilotDia: number;
+  /** Metric mount screw size for the bolt pattern. */
+  mountScrew: MetricSize;
+}
+
+export const NEMA17: NemaMotorSpec = {
+  body: 42,
+  height: 40,
+  shaft: 5,
+  shaftLength: 24,
+  boltPitch: 31,
+  pilotDia: 22,
+  mountScrew: "M3",
+};
+
+export const NEMA23: NemaMotorSpec = {
+  body: 56.4,
+  height: 56,
+  shaft: 6.35,     // 1/4" imperial is common on NEMA 23; 8mm variants exist
+  shaftLength: 21,
+  boltPitch: 47.14,
+  pilotDia: 38.1,
+  mountScrew: "M4",
+};
+
+export const NEMA14: NemaMotorSpec = {
+  body: 35,
+  height: 28,
+  shaft: 5,
+  shaftLength: 20,
+  boltPitch: 26,
+  pilotDia: 22,
+  mountScrew: "M3",
+};
+
+/** Flexible / jaw shaft coupler. Two bores, one per end. */
+export interface FlexibleCouplerSpec {
+  od: number;
+  length: number;
+  motorBore: number;
+  leadscrewBore: number;
+  /** How deep the motor-side bore extends (default half the length). */
+  motorBoreDepth: number;
+}
+
+export const FLEXIBLE_COUPLER_5_8: FlexibleCouplerSpec = {
+  od: 20,
+  length: 25,
+  motorBore: 5,
+  leadscrewBore: 8,
+  motorBoreDepth: 12.5,
+};
+
+export const FLEXIBLE_COUPLER_6_8: FlexibleCouplerSpec = {
+  od: 25,
+  length: 30,
+  motorBore: 6.35,   // 1/4"
+  leadscrewBore: 8,
+  motorBoreDepth: 15,
+};
+
 /**
  * Parse a screw designator like "M3x10" into size + length.
  * Accepts either "M3" (length = undefined) or "M3x10".

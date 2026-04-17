@@ -858,3 +858,30 @@ return highlightJoints(positioned);   // use as main()'s return value
 ```
 
 `highlightJoints` is the fastest way to diagnose a misaligned mate — render the assembly and see where joints land as pink spheres, with part names in the parts panel.
+
+### Standard part builders
+
+Common mechanical parts ship as pre-assembled `Part` builders with joints ready to mate. Skip the manual body+shaft+joint declaration boilerplate:
+
+```typescript
+import { motors, couplers } from "shapeitup";
+
+const motor   = motors.nema17();                 // Part with mountFace + shaftTip joints
+const coupler = couplers.flexible();             // default 5mm→8mm bores
+
+// Dimensions you'd otherwise hardcode live in standards.NEMA17 etc.
+patterns.grid(2, 2, standards.NEMA17.boltPitch, standards.NEMA17.boltPitch);
+```
+
+Motor layout convention — body at local Z=[0, HEIGHT], shaft on top (Z=[HEIGHT, HEIGHT+SHAFT_LENGTH]), mountFace at bottom (axis "-Z"). Fits the "motor sits atop a plate with shaft extending up" case natively. For the inverse (motor hangs below a plate, shaft through a pilot hole), rotate: `motors.nema17().rotate(180, "+X")`.
+
+| Builder | Size | Joints |
+|---|---|---|
+| `motors.nema17(opts?)` | 42×42×40 body, Ø5 shaft | `mountFace` (-Z), `shaftTip` (+Z, Ø5) |
+| `motors.nema23(opts?)` | 56.4×56.4×56 body, Ø6.35 shaft | same pattern |
+| `motors.nema14(opts?)` | 35×35×28 body, Ø5 shaft | same pattern |
+| `couplers.flexible(opts?)` | Ø20 × 25, 5↔8 bores (defaults) | `motorEnd` (-Z, Ø motorBore), `leadscrewEnd` (+Z, Ø leadscrewBore) |
+
+All opts accept overrides for name, color, and dimensions. For non-standard coupler bores: `couplers.flexible({ motorBore: 6.35, leadscrewBore: 10 })`.
+
+See `examples/stdlib/linear-actuator.shape.ts` for a 7-part assembly using these builders (motor + coupler + custom end-caps + extrusion + bearing).

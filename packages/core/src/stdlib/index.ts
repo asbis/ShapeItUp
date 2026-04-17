@@ -16,6 +16,8 @@ import { fromBack, shape3d } from "./placement";
 import { Part, joint, part, faceAt, shaftAt, boreAt } from "./parts";
 import { mate, assemble, stackOnZ, entries, debugJoints, highlightJoints } from "./assembly";
 import { cylinder } from "./cylinder";
+import * as motors from "./motors";
+import * as couplers from "./couplers";
 
 export * as standards from "./standards";
 
@@ -48,6 +50,8 @@ export {
   debugJoints,
   highlightJoints,
   cylinder,
+  motors,
+  couplers,
 };
 
 /**
@@ -79,6 +83,8 @@ export const shapeitupStdlib = {
   debugJoints,
   highlightJoints,
   cylinder,
+  motors,
+  couplers,
 };
 
 export type ShapeitupStdlib = typeof shapeitupStdlib;

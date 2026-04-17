@@ -2239,7 +2239,7 @@ returns a Replicad Shape3D (or Drawing, where noted), so results mix with any
 other Replicad code. Dimensions come from ISO/DIN tables — don't hardcode.
 
 \`\`\`typescript
-import { holes, screws, nuts, washers, inserts, bearings, extrusions, patterns, printHints, fromBack, shape3d, part, faceAt, shaftAt, boreAt, mate, assemble, stackOnZ, entries, cylinder } from "shapeitup";
+import { holes, screws, nuts, washers, inserts, bearings, extrusions, patterns, printHints, motors, couplers, fromBack, shape3d, part, faceAt, shaftAt, boreAt, mate, assemble, stackOnZ, entries, debugJoints, highlightJoints, cylinder, standards } from "shapeitup";
 \`\`\`
 
 **Convention for cut-tool shapes** (holes, bearing seats, insert pockets):
@@ -2464,6 +2464,40 @@ return highlightJoints(positioned);     // viewer: renders parts + pink spheres 
 
 See \`examples/stdlib/leadscrew-assembly.shape.ts\` for a full NEMA17 →
 coupler → leadscrew assembly using this API.
+
+---
+
+## Standard part builders — motors, couplers
+
+Pre-assembled \`Part\` builders with joints already declared. Skip the
+manual body+shaft+joint boilerplate when a standard mechanical part will do:
+
+\`\`\`typescript
+const motor   = motors.nema17();           // Part with mountFace + shaftTip joints
+const coupler = couplers.flexible();       // default 5mm↔8mm bore pair
+\`\`\`
+
+Motor layout — body at Z=[0, HEIGHT], shaft on top (Z=[HEIGHT, HEIGHT+SHAFT_LENGTH]),
+\`mountFace\` at the BOTTOM (axis "-Z"), \`shaftTip\` at the shaft end (axis "+Z").
+Fits a "motor on top of a cap with shaft extending up" case natively. For the
+inverse, rotate: \`motors.nema17().rotate(180, "+X")\`.
+
+| Builder | Size | Joints exposed |
+|---|---|---|
+| \`motors.nema17(opts?)\` | 42×42×40, Ø5 shaft | mountFace, shaftTip |
+| \`motors.nema23(opts?)\` | 56.4×56.4×56, Ø6.35 shaft | mountFace, shaftTip |
+| \`motors.nema14(opts?)\` | 35×35×28, Ø5 shaft | mountFace, shaftTip |
+| \`couplers.flexible(opts?)\` | Ø20 × 25, 5→8 bores | motorEnd (female), leadscrewEnd (female) |
+
+Raw dimensions live in \`standards.NEMA17\` / \`.NEMA23\` / \`.NEMA14\` /
+\`.FLEXIBLE_COUPLER_5_8\` for user patterns:
+
+\`\`\`typescript
+patterns.grid(2, 2, standards.NEMA17.boltPitch, standards.NEMA17.boltPitch);
+\`\`\`
+
+See \`examples/stdlib/linear-actuator.shape.ts\` (155 lines, 7 parts — same
+assembly that took 286 lines before these builders landed).
 
 ---
 
