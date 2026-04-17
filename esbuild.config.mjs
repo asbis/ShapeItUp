@@ -52,6 +52,10 @@ const workerConfig = {
   },
 };
 
+// replicad-opencascadejs ships a ~30 MB WASM loader that would blow up the
+// bundle — keep it external so it loads from node_modules at runtime.
+const mcpExternal = ["esbuild", "replicad-opencascadejs"];
+
 // 4. MCP Server (Node.js, ESM) — standalone
 const mcpServerConfig = {
   ...sharedConfig,
@@ -60,17 +64,20 @@ const mcpServerConfig = {
   platform: "node",
   format: "esm",
   banner: { js: "#!/usr/bin/env node\nimport { createRequire } from 'module'; const require = createRequire(import.meta.url);" },
-  external: ["esbuild"],
+  external: mcpExternal,
 };
 
-// 5. MCP Server copy bundled into extension dist (for auto-discovery)
-// This must be fully self-contained — no external dependencies
+// 5. MCP Server copy bundled into extension dist (for auto-discovery).
+// Emitted as .mjs/ESM so import.meta.url works for module resolution (the
+// extension's own package.json is CJS, so we can't just set "type": "module").
 const mcpServerExtConfig = {
   ...sharedConfig,
   entryPoints: [resolve(__dirname, "packages/mcp-server/src/index.ts")],
-  outfile: resolve(__dirname, "packages/extension/dist/mcp-server.js"),
+  outfile: resolve(__dirname, "packages/extension/dist/mcp-server.mjs"),
   platform: "node",
-  format: "cjs",
+  format: "esm",
+  banner: { js: "import { createRequire } from 'module'; const require = createRequire(import.meta.url);" },
+  external: mcpExternal,
 };
 
 function copyWasmFiles() {

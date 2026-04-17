@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "dependencies": {
+    "@shapeitup/shared": "workspace:*",
     "three": "^0.170.0"
   },
   "devDependencies": {

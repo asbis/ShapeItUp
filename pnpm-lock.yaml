@@ -22,8 +22,23 @@ importers:
         specifier: ^5.7.0
         version: 5.9.3
 
+  packages/core:
+    dependencies:
+      '@shapeitup/shared':
+        specifier: workspace:*
+        version: link:../shared
+      replicad:
+        specifier: ^0.23.0
+        version: 0.23.0
+      replicad-opencascadejs:
+        specifier: ^0.23.0
+        version: 0.23.0
+
   packages/extension:
     dependencies:
+      '@shapeitup/shared':
+        specifier: workspace:*
+        version: link:../shared
       esbuild-wasm:
         specifier: ^0.28.0
         version: 0.28.0
@@ -37,6 +52,12 @@ importers:
       '@modelcontextprotocol/sdk':
         specifier: ^1.0.0
         version: 1.29.0(zod@4.3.6)
+      '@shapeitup/core':
+        specifier: workspace:*
+        version: link:../core
+      '@shapeitup/shared':
+        specifier: workspace:*
+        version: link:../shared
       esbuild:
         specifier: ^0.24.0
         version: 0.24.2
@@ -54,6 +75,9 @@ importers:
 
   packages/viewer:
     dependencies:
+      '@shapeitup/shared':
+        specifier: workspace:*
+        version: link:../shared
       three:
         specifier: ^0.170.0
         version: 0.170.0
@@ -64,6 +88,12 @@ importers:
 
   packages/worker:
     dependencies:
+      '@shapeitup/core':
+        specifier: workspace:*
+        version: link:../core
+      '@shapeitup/shared':
+        specifier: workspace:*
+        version: link:../shared
       replicad:
         specifier: ^0.23.0
         version: 0.23.0

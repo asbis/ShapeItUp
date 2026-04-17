@@ -8,6 +8,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
+    "@shapeitup/core": "workspace:*",
+    "@shapeitup/shared": "workspace:*",
     "esbuild": "^0.24.0",
     "replicad": "^0.23.0",
     "replicad-opencascadejs": "^0.23.0",

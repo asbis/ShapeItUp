@@ -1,9 +1,5 @@
 import type { PartInput } from "./tessellate";
 
-/**
- * Export shapes to STEP or STL format.
- * Accepts an array of parts for assembly export.
- */
 export async function exportShapes(
   parts: PartInput[],
   format: "step" | "stl",
@@ -18,11 +14,7 @@ export async function exportShapes(
   }
 }
 
-/**
- * Generate binary STL from multiple shapes, concatenated into one file.
- */
 function generateCombinedSTL(parts: PartInput[]): ArrayBuffer {
-  // Collect all triangles from all parts
   const allTris: { nx: number; ny: number; nz: number; v: number[][] }[] = [];
 
   for (const part of parts) {

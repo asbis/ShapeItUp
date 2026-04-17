@@ -1,16 +1,15 @@
 /**
- * ShapeItUp Web Worker
+ * ShapeItUp Web Worker (webview context).
+ *
+ * Thin adapter over @shapeitup/core. The worker's job is postMessage plumbing:
+ * it receives execute/export commands from the viewer, delegates to core, and
+ * ships the resulting mesh data back as Transferable buffers.
  */
 
-import { executeScript } from "./executor";
-import { normalizeParts, tessellatePart } from "./tessellate";
-import type { PartInput, TessellatedPart } from "./tessellate";
-import { exportShapes } from "./exporter";
+import { initCore, type Core } from "@shapeitup/core";
+import { loadOCCTBrowser } from "./browser-loader";
 
-let replicadModule: any = null;
-let replicadExports: Record<string, any> = {};
-let lastParts: PartInput[] = [];
-let lastJs: string = "";
+let core: Core | null = null;
 let executing = false;
 
 self.onmessage = async (event: MessageEvent) => {
@@ -19,12 +18,11 @@ self.onmessage = async (event: MessageEvent) => {
   try {
     switch (msg.type) {
       case "init":
-        await initOCCT(msg.wasmLoaderUrl, msg.wasmUrl);
+        core = await initCore(() => loadOCCTBrowser(msg.wasmLoaderUrl, msg.wasmUrl));
+        self.postMessage({ type: "ready" });
         break;
       case "execute":
-        // Skip if already executing (rapid file switches)
         if (executing) return;
-        lastJs = msg.js;
         await executeUserScript(msg.js, msg.paramOverrides);
         break;
       case "export":
@@ -33,7 +31,6 @@ self.onmessage = async (event: MessageEvent) => {
     }
   } catch (err: any) {
     executing = false;
-    // OCCT throws integer error codes (WASM pointers) — translate to useful messages
     let message = err.message || String(err);
     if (/^\d+$/.test(message)) {
       message = `OpenCascade operation failed (error code ${message}). This usually means a geometry operation like fillet, chamfer, or boolean failed. Try reducing fillet radii, simplifying geometry, or checking for zero-thickness walls.`;
@@ -42,141 +39,57 @@ self.onmessage = async (event: MessageEvent) => {
     } else if (/memory\s+access\s+out\s+of\s+bounds|RuntimeError:/i.test(message)) {
       message = `${message}\n\nWASM memory error — the OpenCascade kernel crashed. Common causes:\n- Fillet on complex geometry (many bezier segments)\n- Boolean operation on incompatible/degenerate geometry\n- Too many intermediate shapes without cleanup (use localGC)`;
     }
+    if (err.operation) {
+      message = `${message}\n\nFailed during: ${err.operation}`;
+    }
     self.postMessage({
       type: "error",
       message,
       stack: err.stack,
+      operation: err.operation,
     });
   }
 };
 
-async function initOCCT(wasmLoaderUrl: string, wasmUrl: string) {
-  // Retry fetch up to 3 times (handles 408 timeouts on rapid reloads)
-  let response: Response | null = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      response = await fetch(wasmLoaderUrl);
-      if (response.ok) break;
-    } catch {}
-    if (attempt < 2) await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-  }
-  if (!response || !response.ok) {
-    throw new Error(`Failed to fetch WASM loader after 3 attempts: ${response?.status || "network error"}`);
-  }
-  let loaderCode = await response.text();
-  loaderCode = loaderCode.replace(/export\s+default\s+Module\s*;?\s*$/, "");
-
-  const initFn = new Function(`
-    ${loaderCode}
-    return Module;
-  `)();
-
-  if (!initFn || typeof initFn !== "function") {
-    throw new Error("WASM loader did not produce a Module function");
-  }
-
-  const oc = await initFn({
-    locateFile: (filename: string) => {
-      if (filename.endsWith(".wasm")) return wasmUrl;
-      return filename;
-    },
-  });
-
-  const replicad = await import("replicad");
-  replicad.setOC(oc);
-
-  replicadModule = replicad;
-  replicadExports = { ...replicad };
-
-  self.postMessage({ type: "ready" });
-}
-
-/** Clean up previously created shapes to prevent WASM memory corruption */
-function cleanupLastParts() {
-  for (const part of lastParts) {
-    try {
-      if (part.shape && typeof part.shape.delete === "function") {
-        part.shape.delete();
-      }
-    } catch {
-      // Already deleted or invalid — ignore
-    }
-  }
-  lastParts = [];
-}
-
 async function executeUserScript(js: string, paramOverrides?: Record<string, number>) {
+  if (!core) throw new Error("Worker received 'execute' before 'init' completed");
   executing = true;
-
-  // Clean up previous shapes before creating new ones
-  cleanupLastParts();
-
-  const execStart = performance.now();
-
-  // Use localGC to track and clean up intermediate shapes
-  const gc = replicadExports.localGC
-    ? replicadExports.localGC()
-    : null;
-  const register = gc ? gc[0] : (v: any) => v;
-  const cleanup = gc ? gc[1] : () => {};
-
-  let result: any;
-  let params: any[];
-
   try {
-    const execResult = executeScript(js, replicadExports, paramOverrides);
-    result = execResult.result;
-    params = execResult.params;
-  } catch (err) {
-    cleanup();
-    executing = false;
-    throw err;
-  }
+    const result = await core.execute(js, paramOverrides);
 
-  const parts = normalizeParts(result);
-  lastParts = parts;
-  const execTime = performance.now() - execStart;
+    // Strip the live OCCT shape handle — not transferable; the viewer only
+    // needs the tessellated mesh arrays.
+    const tessellated = result.parts.map(({ shape: _shape, ...rest }) => rest);
 
-  const tessStart = performance.now();
-  const tessellated: TessellatedPart[] = parts.map((p) => tessellatePart(p));
-  const tessTime = performance.now() - tessStart;
+    const transferables: ArrayBuffer[] = [];
+    for (const t of tessellated) {
+      transferables.push(
+        t.vertices.buffer as ArrayBuffer,
+        t.normals.buffer as ArrayBuffer,
+        t.triangles.buffer as ArrayBuffer,
+        t.edgeVertices.buffer as ArrayBuffer
+      );
+    }
 
-  // Clean up intermediates (but NOT the final shapes — we need those for export)
-  cleanup();
-
-  const transferables: ArrayBuffer[] = [];
-  for (const t of tessellated) {
-    transferables.push(
-      t.vertices.buffer,
-      t.normals.buffer,
-      t.triangles.buffer,
-      t.edgeVertices.buffer
+    self.postMessage(
+      {
+        type: "mesh-result",
+        parts: tessellated,
+        params: result.params,
+        execTimeMs: result.execTimeMs,
+        tessTimeMs: result.tessTimeMs,
+        timings: result.timings,
+        warnings: result.warnings,
+      },
+      transferables as any
     );
+  } finally {
+    executing = false;
   }
-
-  self.postMessage(
-    {
-      type: "mesh-result",
-      parts: tessellated,
-      params,
-      execTimeMs: Math.round(execTime),
-      tessTimeMs: Math.round(tessTime),
-    },
-    transferables as any
-  );
-
-  executing = false;
 }
 
 async function handleExport(format: "step" | "stl") {
-  if (lastParts.length === 0) {
-    throw new Error("No shapes to export. Execute a script first.");
-  }
-
-  const data = await exportShapes(lastParts, format, replicadModule);
-
-  self.postMessage(
-    { type: "export-result", format, data },
-    [data] as any
-  );
+  if (!core) throw new Error("Worker received 'export' before 'init' completed");
+  const data = await core.exportLast(format);
+  self.postMessage({ type: "export-result", format, data }, [data] as any);
 }

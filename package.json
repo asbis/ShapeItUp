@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node esbuild.config.mjs --watch",
     "build": "node esbuild.config.mjs",
-    "lint": "tsc --noEmit -p packages/extension/tsconfig.json && tsc --noEmit -p packages/mcp-server/tsconfig.json",
+    "lint": "tsc -b packages/extension packages/mcp-server",
     "package": "pnpm build && cd packages/extension && vsce package --no-dependencies"
   },
   "pnpm": {

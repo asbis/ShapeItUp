@@ -56,6 +56,18 @@
         "title": "ShapeItUp: Export as STL"
       },
       {
+        "command": "shapeitup.openInApp",
+        "title": "ShapeItUp: Export and Open in…"
+      },
+      {
+        "command": "shapeitup.rescanApps",
+        "title": "ShapeItUp: Rescan installed 3D apps"
+      },
+      {
+        "command": "shapeitup.resetLaunchPrefs",
+        "title": "ShapeItUp: Reset launch preferences (single-window vs new)"
+      },
+      {
         "command": "shapeitup.newShape",
         "title": "ShapeItUp: New Shape File"
       },
@@ -113,6 +125,7 @@
     ]
   },
   "dependencies": {
+    "@shapeitup/shared": "workspace:*",
     "esbuild-wasm": "^0.28.0"
   },
   "devDependencies": {

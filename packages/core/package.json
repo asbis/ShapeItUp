@@ -1,9 +1,10 @@
 {
-  "name": "@shapeitup/worker",
+  "name": "@shapeitup/core",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
+  "main": "src/index.ts",
   "dependencies": {
-    "@shapeitup/core": "workspace:*",
     "@shapeitup/shared": "workspace:*",
     "replicad": "^0.23.0",
     "replicad-opencascadejs": "^0.23.0"
