@@ -197,32 +197,39 @@ export function teardrop(
   }
   const r = diameter / 2;
 
-  // Build the 2D cross-section in a plane normal to the extrusion axis. The
-  // cross-section is drawn in local 2D coordinates where the local +Y will
-  // map to world +Z (so the triangular tip points up — the printable roof).
-  //
-  // Shape: a full circle fused with an isoceles triangle whose apex sits at
-  // local Y = 2r. The triangle's base sits at the circle equator (y = 0) so
-  // the fused outline is: lower half of the circle plus two straight lines
-  // meeting at the apex. This gives FDM a ~45° (actually arctan(2) ≈ 63°)
-  // roof which prints cleanly without supports.
-  const circle = drawCircle(r);
-  const triangle = draw([r, 0])
-    .lineTo([0, 2 * r])
-    .lineTo([-r, 0])
-    .close();
-  const outline = circle.fuse(triangle);
-
-  // Pick a plane where the sketch's local +Y maps to world +Z (so the apex
-  // points up). Extrude along the chosen world axis.
+  // Build the teardrop as the 3D fusion of a circle-prism and a triangle-prism.
+  // Earlier attempts fused the two in 2D (circle + triangle as Drawings, then
+  // sketched + extruded once); that produced a degenerate outline that OCCT
+  // extruded to an empty/invalid solid, so the downstream cut silently did
+  // nothing. Building them as independent 3D solids and fusing in 3D is
+  // robust — OCCT handles coplanar-face union of the circle's upper half and
+  // the triangle's base without issue.
   //
   //   axis = "Y" → sketch on XZ, extrude along +Y. Local X → world X, local Y → world Z.
   //   axis = "X" → sketch on YZ, extrude along +X. Local X → world Y, local Y → world Z.
   const plane = axis === "Y" ? "XZ" : "YZ";
-  const sketch = outline.sketchOnPlane(plane);
-  // Extrude full depth along the plane normal; the resulting solid sits in
-  // the half-space axis >= 0. Users translate it to the target face.
-  return sketch.extrude(depth).asShape3D();
+
+  const circleSolid = drawCircle(r)
+    .sketchOnPlane(plane)
+    .extrude(depth)
+    .asShape3D();
+
+  // Triangle: apex at (0, 2r), base corners DELIBERATELY below the circle's
+  // equator at (±r, -r). The lower half of this triangle is hidden inside
+  // the circle, so the visible silhouette is still a clean teardrop — but
+  // the 3D fuse now has a volumetric overlap instead of two shared boundary
+  // points. OCCT's boolean robustness drops sharply on shapes that only
+  // touch at points, which is why the earlier shared-equator variants
+  // produced shapes the downstream cut couldn't process.
+  const triangleSolid = draw([r, -r])
+    .lineTo([0, 2 * r])
+    .lineTo([-r, -r])
+    .close()
+    .sketchOnPlane(plane)
+    .extrude(depth)
+    .asShape3D();
+
+  return circleSolid.fuse(triangleSolid);
 }
 
 /**

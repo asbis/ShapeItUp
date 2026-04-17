@@ -45,29 +45,30 @@ export default function main({
     .extrude(height);
 
   // Read the LM8UU length from the bearing's own bounding box so we stay in
-  // sync with the standards table without hardcoding.
-  const rawBody = bearings.linearBody(BEARING); // Z ∈ [0, length]
-  const bearingLen = rawBody.boundingBox.depth;
+  // sync with the standards table without hardcoding. This body is
+  // discarded — the renderable bodies are built fresh below.
+  const probeBody = bearings.linearBody(BEARING);
+  const bearingLen = probeBody.boundingBox.depth;
 
-  // Seat pocket — rotate so axis is along +Y.
-  // Before rotation: seat Z ∈ [-bearingLen, 0]. -90° around +X maps
-  // (x,y,z) → (x, z, -y), so (0,0,-L) → (0,-L,0) → after rotation Y ∈ [-L, 0].
-  const seatTool = alongYCentered(
-    bearings.linearSeat(BEARING),
-    -bearingLen,
-    0
-  ).translate(0, 0, height / 2);
+  // Build each seat/body fresh rather than sharing a tool, because
+  // translate()/rotate() in Replicad can share the underlying OCCT handle
+  // with the source shape — cutting one copy can then invalidate the other.
+  const makeSeatTool = () =>
+    alongYCentered(
+      bearings.linearSeat(BEARING),
+      -bearingLen,
+      0
+    ).translate(0, 0, height / 2);
 
-  // Bearing body — same rotation. Before rotation: Z ∈ [0, bearingLen] →
-  // after rotation Y ∈ [0, bearingLen].
-  const bodyTool = alongYCentered(rawBody, 0, bearingLen).translate(
-    0,
-    0,
-    height / 2
-  );
+  const makeBodyTool = () =>
+    alongYCentered(bearings.linearBody(BEARING), 0, bearingLen).translate(
+      0,
+      0,
+      height / 2
+    );
 
-  const leftSeat = seatTool.translate(-bearingSpacing / 2, 0, 0);
-  const rightSeat = seatTool.translate(bearingSpacing / 2, 0, 0);
+  const leftSeat = makeSeatTool().translate(-bearingSpacing / 2, 0, 0);
+  const rightSeat = makeSeatTool().translate(bearingSpacing / 2, 0, 0);
 
   // Rod-clearance through-hole: a cylinder along +Y spanning the whole block
   // depth plus a hair. makeCylinder axis +Y starting at Y=-depth/2-1.
@@ -86,8 +87,8 @@ export default function main({
     .cut(rodHole(-bearingSpacing / 2))
     .cut(rodHole(bearingSpacing / 2));
 
-  const leftBody = bodyTool.translate(-bearingSpacing / 2, 0, 0);
-  const rightBody = bodyTool.translate(bearingSpacing / 2, 0, 0);
+  const leftBody = makeBodyTool().translate(-bearingSpacing / 2, 0, 0);
+  const rightBody = makeBodyTool().translate(bearingSpacing / 2, 0, 0);
 
   return [
     { shape: carriage, name: "carriage", color: "#556677" },
