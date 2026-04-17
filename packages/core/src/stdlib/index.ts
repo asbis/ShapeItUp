@@ -10,6 +10,7 @@ import * as holes from "./holes";
 import * as printHints from "./printHints";
 import * as bearings from "./bearings";
 import * as extrusions from "./extrusions";
+import * as patterns from "./patterns";
 import { screws, nuts, washers, inserts } from "./fasteners";
 import { fromBack, shape3d } from "./placement";
 
@@ -24,6 +25,7 @@ export {
   printHints,
   bearings,
   extrusions,
+  patterns,
   screws,
   nuts,
   washers,
@@ -45,6 +47,7 @@ export const shapeitupStdlib = {
   printHints,
   bearings,
   extrusions,
+  patterns,
   fromBack,
   shape3d,
 };

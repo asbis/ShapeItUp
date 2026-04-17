@@ -2239,7 +2239,7 @@ returns a Replicad Shape3D (or Drawing, where noted), so results mix with any
 other Replicad code. Dimensions come from ISO/DIN tables — don't hardcode.
 
 \`\`\`typescript
-import { holes, screws, nuts, washers, inserts, bearings, extrusions, printHints, fromBack, shape3d } from "shapeitup";
+import { holes, screws, nuts, washers, inserts, bearings, extrusions, patterns, printHints, fromBack, shape3d } from "shapeitup";
 \`\`\`
 
 **Convention for cut-tool shapes** (holes, bearing seats, insert pockets):
@@ -2322,6 +2322,44 @@ Linear bearings: LM4UU, LM6UU, LM8UU, LM10UU, LM12UU.
 \`bearings.seat\` uses \`FIT.press\` (slight interference) to grip the bearing. Default
 is a stepped pocket with the bearing resting on a 3 mm shoulder; pass
 \`{ throughHole: true }\` for a straight cylinder.
+
+---
+
+## patterns — placement arrays + single-call apply
+
+\`\`\`typescript
+patterns.polar(n, radius, { startAngle?, axis?: "X"|"Y"|"Z", orientOutward? })
+patterns.grid(nx, ny, dx, dy?)                       // centered on origin
+patterns.linear(n, [dx, dy, dz])                     // N copies along a vector
+
+patterns.spread(makeShape, placements)               // fuse N copies (positive shape)
+patterns.cutAt(target, makeTool, placements)         // cut N copies (cut-tool shape)
+patterns.applyPlacement(shape, placement)            // low-level: apply one
+\`\`\`
+
+**Important**: \`spread\` and \`cutAt\` take a **factory** (\`() => Shape3D\`), not
+a shape. Replicad shares OCCT handles across \`.translate()\`/\`.rotate()\` calls —
+reusing one shape across multiple cuts invalidates earlier copies ("this
+object has been deleted"). The factory guarantees a fresh handle per placement.
+
+Generators return \`Placement[]\` — plain data (\`{ translate, rotate?, axis? }\`)
+you can map, filter, or combine manually. Common uses:
+
+\`\`\`typescript
+// Bolt circle — 6 × M4 counterbored on a 40mm PCD
+flange = patterns.cutAt(
+  flange,
+  () => holes.counterbore("M4", { plateThickness: 5 }).translate(0, 0, 5),
+  patterns.polar(6, 20),
+);
+
+// PCB standoffs — 2×2 grid of M3 heat-set pockets
+plate = patterns.cutAt(
+  plate,
+  () => inserts.pocket("M3").translate(0, 0, thickness),
+  patterns.grid(2, 2, 50, 40),
+);
+\`\`\`
 
 ---
 

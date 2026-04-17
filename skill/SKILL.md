@@ -650,6 +650,47 @@ extrusions.tSlotChannel("2020", 200)  // outer-envelope cut-tool (sliding bracke
 
 Profiles: `"2020"`, `"3030"`, `"4040"`. **v1 simplification**: quad-slot square with center hole, no internal T-cavity.
 
+### patterns — arrays of placements + single-call apply
+
+```typescript
+patterns.polar(6, 20, { startAngle?: number, axis?: "X"|"Y"|"Z", orientOutward?: boolean })
+patterns.grid(3, 4, 10, 15)                          // nx, ny, dx, dy? (default dy = dx)
+patterns.linear(5, [10, 0, 0])                       // n, step vector
+
+patterns.spread(makeShape, placements)               // fuse N copies (positive shape)
+patterns.cutAt(target, makeTool, placements)         // subtract N copies (cut tool)
+patterns.applyPlacement(shape, placement)            // low-level: apply a single placement
+```
+
+**Important:** `spread` and `cutAt` take a **factory** (`() => Shape3D`), not a shape. Replicad shares OCCT handles across `.translate()`/`.rotate()` calls — reusing one shape across multiple cuts invalidates earlier copies ("this object has been deleted"). The factory guarantees a fresh handle per placement.
+
+Generators return `Placement[]` — plain data (`{ translate, rotate?, axis? }`) so you can filter, map, or combine them manually.
+
+**Common patterns**:
+
+```typescript
+// Bolt circle: 6 × M4 counterbored on a 40mm PCD
+flange = patterns.cutAt(
+  flange,
+  () => holes.counterbore("M4", { plateThickness: 5 }).translate(0, 0, 5),
+  patterns.polar(6, 20),
+);
+
+// PCB standoffs: 2×2 grid of M3 heat-set pockets
+plate = patterns.cutAt(
+  plate,
+  () => inserts.pocket("M3").translate(0, 0, thickness),
+  patterns.grid(2, 2, 50, 40),
+);
+
+// Motor-mount corners: 4 holes at the corners of a rectangle
+plate = patterns.cutAt(
+  plate,
+  () => holes.through("M3"),
+  patterns.grid(2, 2, width - 2*inset, depth - 2*inset),
+);
+```
+
 ### printHints — FDM print-cleanliness
 
 ```typescript
