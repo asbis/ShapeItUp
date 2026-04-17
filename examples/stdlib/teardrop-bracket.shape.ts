@@ -3,7 +3,7 @@
  * face. Teardrop holes print cleanly on FDM without supports because the
  * triangular roof replaces the un-bridgeable top of a circle.
  */
-import { draw } from "replicad";
+import { draw, type Shape3D } from "replicad";
 import { holes } from "shapeitup";
 
 export const params = {
@@ -44,7 +44,12 @@ export default function main({
     .hLine(-t)                // top of upright
     .close();                 // down the outer-left edge back to start
 
-  let bracket = profile.sketchOnPlane("XZ", [0, -depth / 2, 0]).extrude(depth);
+  // Cast to Shape3D: replicad's .extrude() types as an overly-wide union in
+  // its published .d.ts, so `.cut()` on the raw result doesn't type-check.
+  // Runtime always returns a Solid.
+  let bracket = profile
+    .sketchOnPlane("XZ", [0, -depth / 2, 0])
+    .extrude(depth) as Shape3D;
 
   // Two horizontal teardrop holes running along Y (axis = "Y"), through the
   // vertical plate. The vertical plate occupies X from

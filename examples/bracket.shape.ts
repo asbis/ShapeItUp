@@ -1,4 +1,4 @@
-import { drawRectangle, makeCylinder, EdgeFinder } from "replicad";
+import { drawRectangle, makeCylinder, EdgeFinder, type Shape3D } from "replicad";
 
 export const params = {
   width: 40,
@@ -10,13 +10,15 @@ export const params = {
 };
 
 export default function main({ width, height, depth, thickness, holeRadius, filletRadius }: typeof params) {
-  // Base
-  const base = drawRectangle(width, thickness).sketchOnPlane("XY").extrude(depth);
-  
+  // Base — cast to Shape3D because replicad's .extrude() types as a wide union.
+  const base = drawRectangle(width, thickness)
+    .sketchOnPlane("XY")
+    .extrude(depth) as Shape3D;
+
   // Upright
   const upright = drawRectangle(thickness, height)
     .sketchOnPlane("XY", [-width / 2 + thickness / 2, -height / 2 + thickness / 2, 0])
-    .extrude(depth);
+    .extrude(depth) as Shape3D;
 
   let bracket = base.fuse(upright);
 

@@ -5,7 +5,7 @@
  *
  * Bearings are rendered in place for visual fit-check.
  */
-import { drawRoundedRectangle, makeCylinder } from "replicad";
+import { drawRoundedRectangle, makeCylinder, type Shape3D } from "replicad";
 import { bearings } from "shapeitup";
 
 export const params = {
@@ -40,9 +40,11 @@ export default function main({
   bearingSpacing,
 }: typeof params) {
   // Block: Z ∈ [0, height], X ∈ [-width/2, +width/2], Y ∈ [-depth/2, +depth/2].
+  // Cast to Shape3D — replicad's .extrude() has an overly-wide return type
+  // in its published .d.ts; runtime always returns a Solid.
   const block = drawRoundedRectangle(width, depth, 3)
     .sketchOnPlane("XY")
-    .extrude(height);
+    .extrude(height) as Shape3D;
 
   // Read the LM8UU length from the bearing's own bounding box so we stay in
   // sync with the standards table without hardcoding. This body is

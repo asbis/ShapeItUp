@@ -4,7 +4,7 @@
  *
  * Swap `bearingSize` to any key of BALL_BEARING ("608", "625", "626", ...).
  */
-import { drawRoundedRectangle } from "replicad";
+import { drawRoundedRectangle, type Shape3D } from "replicad";
 import { bearings } from "shapeitup";
 
 export const params = {
@@ -20,10 +20,12 @@ export default function main({
   height,
   bearingSize,
 }: typeof params) {
-  // Block body, Z from 0 to height.
+  // Block body, Z from 0 to height. Cast to Shape3D: replicad's .extrude()
+  // types as an overly-wide union in its published .d.ts, so `.cut()` on the
+  // raw result doesn't type-check. Runtime always returns a Solid.
   const block = drawRoundedRectangle(width, depth, 2)
     .sketchOnPlane("XY")
-    .extrude(height);
+    .extrude(height) as Shape3D;
 
   // seat() returns a cut-tool with the pocket top at Z=0, cavity into -Z.
   // Translate it so Z=0 sits at the top face of the block, centered in XY.
