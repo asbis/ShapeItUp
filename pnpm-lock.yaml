@@ -40,9 +40,6 @@ importers:
         specifier: ^0.28.0
         version: 0.28.0
     devDependencies:
-      '@shapeitup/shared':
-        specifier: workspace:*
-        version: link:../shared
       '@types/vscode':
         specifier: ^1.106.0
         version: 1.115.0
