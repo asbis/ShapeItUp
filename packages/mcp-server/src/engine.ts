@@ -154,7 +154,7 @@ export async function executeShapeFile(
       write: false,
       format: "esm",
       target: "es2022",
-      external: ["replicad"],
+      external: ["replicad", "shapeitup"],
       platform: "neutral",
       absWorkingDir: dirname(absPath),
     });

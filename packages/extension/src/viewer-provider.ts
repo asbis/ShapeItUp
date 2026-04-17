@@ -567,7 +567,7 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         write: false,
         format: "esm",
         target: "es2022",
-        external: ["replicad"],
+        external: ["replicad", "shapeitup"],
         platform: "browser",
         absWorkingDir: resolveDir,
       });
