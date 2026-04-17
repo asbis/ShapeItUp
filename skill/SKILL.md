@@ -726,3 +726,83 @@ export default function main({ width, depth, thickness }: typeof params) {
 ```
 
 See `examples/stdlib/` for more worked patterns: `mounting-plate`, `heatset-enclosure`, `teardrop-bracket`, `screw-gallery`, `bearing-block`, `extrusion-length`, `linear-rail-carriage`.
+
+## Parts + Joints — declarative assembly
+
+For multi-part assemblies where bodies must mate face-to-face (motors onto plates, couplers onto shafts, bearings into pockets), the stdlib provides a joint-based assembly API. **Every part is built at its local origin**, declares named joints describing where it connects to other parts, and `assemble()` positions everything.
+
+```typescript
+import { part, faceAt, shaftAt, boreAt, mate, assemble, entries, cylinder } from "shapeitup";
+
+const motor = part({
+  shape: motorBody.fuse(shaft),
+  name: "motor", color: "#2b2b2b",
+  joints: {
+    mountFace: faceAt(MOTOR_HEIGHT),                              // +Z face, role "face"
+    shaftTip:  shaftAt(MOTOR_HEIGHT + 24, 5),                     // +Z shaft tip, Ø5, role "male"
+  },
+});
+
+const plate = part({
+  shape: plateShape,
+  name: "plate", color: "#8899aa",
+  joints: {
+    motorFace: faceAt(0, { axis: "-Z" }),                         // bottom face
+  },
+});
+
+const coupler = part({
+  shape: couplerShape,
+  name: "coupler", color: "#b5651d",
+  joints: {
+    motorEnd:     boreAt(COUPLER_MOTOR_BORE_DEPTH, 5),             // default axis -Z
+    leadscrewEnd: boreAt(COUPLER_LENGTH, 8, { axis: "+Z" }),
+  },
+});
+
+const positioned = assemble([motor, plate, coupler], [
+  mate(motor.joints.mountFace,      plate.joints.motorFace),
+  mate(motor.joints.shaftTip,       coupler.joints.motorEnd),
+  mate(coupler.joints.leadscrewEnd, leadscrew.joints.bottom, { gap: 0.2 }),
+]);
+
+return entries(positioned);
+```
+
+### Joint shortcut helpers
+
+All three accept `{ axis?, xy? }`. They encode the **"axis points outward from the part"** convention so you don't have to reason about +Z vs -Z per joint.
+
+| Helper | Role | Default axis | Use for |
+|---|---|---|---|
+| `faceAt(z)` | `"face"` | `"+Z"` | Flat mounting faces |
+| `shaftAt(z, d)` | `"male"` | `"+Z"` | Shaft tips, studs, protrusions |
+| `boreAt(z, d)` | `"female"` | `"-Z"` | Bore mouths, pocket openings |
+
+### mate() with pre-flight validation
+
+`mate(a, b, { gap? })` throws at declaration time if:
+- `a.role` and `b.role` are incompatible (male/female pair, face/face pair — no other combos)
+- `a.diameter` and `b.diameter` differ by > 0.01mm
+
+Catches wrong-size bolts + misaligned conventions before you render anything. `gap` adds axial clearance along the joint axis.
+
+### assemble() — BFS graph resolver
+
+`assemble(parts, mates)` picks `parts[0]` as the fixed root and walks the mate graph, positioning each reachable part. Unreachable parts are returned unchanged with a console.warn. `entries(positioned)` converts the result to the `{ shape, name, color }[]` format `main()` returns.
+
+### When NOT to use joints
+
+For simple coaxial stacks (4 cylinders pancaked on each other), `stackOnZ([parts], { gap? })` is a zero-ceremony alternative — it positions each part's bounding-box bottom on the previous part's top via pure geometry. No joint declarations needed. Use joints when you need role/diameter checking, non-Z axes, or want to expose named mating points for reuse.
+
+### cylinder() — orientation-explicit alternative to makeCylinder
+
+`makeCylinder(r, h, [base], [dir])` from replicad anchors at the base. The stdlib's `cylinder({ top?, bottom?, length, diameter, direction? })` wrapper matches the stdlib cut-tool convention (top-at-Z=0 style) and takes named args so the anchor is unambiguous.
+
+```typescript
+cylinder({ bottom: [0, 0, 0], length: 24, diameter: 5 })         // base at origin, extends +Z
+cylinder({ top: [0, 0, 0], length: 10, diameter: 3 })            // top at origin, extends -Z
+cylinder({ bottom: [0,0,0], length: 50, diameter: 8, direction: "+Y" })  // along +Y
+```
+
+See `examples/stdlib/leadscrew-assembly.shape.ts` for a full NEMA17 → coupler → leadscrew demo.

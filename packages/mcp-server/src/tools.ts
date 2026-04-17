@@ -2239,7 +2239,7 @@ returns a Replicad Shape3D (or Drawing, where noted), so results mix with any
 other Replicad code. Dimensions come from ISO/DIN tables — don't hardcode.
 
 \`\`\`typescript
-import { holes, screws, nuts, washers, inserts, bearings, extrusions, patterns, printHints, fromBack, shape3d } from "shapeitup";
+import { holes, screws, nuts, washers, inserts, bearings, extrusions, patterns, printHints, fromBack, shape3d, part, faceAt, shaftAt, boreAt, mate, assemble, stackOnZ, entries, cylinder } from "shapeitup";
 \`\`\`
 
 **Convention for cut-tool shapes** (holes, bearing seats, insert pockets):
@@ -2375,6 +2375,65 @@ Profiles: "2020", "3030", "4040". **v1 simplification**: the profile is a
 quad-slot square (one rectangular slot per side) with a center hole — no
 internal T-cavity. Good for visualization + mounting reference; not
 STEP-accurate for manufacturing.
+
+---
+
+## Parts + joints — declarative assembly
+
+For multi-part assemblies where bodies must mate face-to-face, use the
+joints API: every part is built at its local origin, declares named
+joints, and \`assemble()\` positions them via a mate graph.
+
+\`\`\`typescript
+const motor = part({
+  shape: motorBody.fuse(shaft),
+  name: "motor", color: "#2b2b2b",
+  joints: {
+    mountFace: faceAt(MOTOR_HEIGHT),                 // +Z face
+    shaftTip:  shaftAt(MOTOR_HEIGHT + 24, 5),        // +Z shaft tip, Ø5
+  },
+});
+
+const positioned = assemble(
+  [motor, plate, coupler, leadscrew],
+  [
+    mate(motor.joints.mountFace,      plate.joints.motorFace),
+    mate(motor.joints.shaftTip,       coupler.joints.motorEnd),
+    mate(coupler.joints.leadscrewEnd, leadscrew.joints.bottom, { gap: 0.2 }),
+  ],
+);
+return entries(positioned);
+\`\`\`
+
+**Joint shortcuts** — encode the "axis points outward" convention so you
+don't have to pick +Z vs -Z manually:
+
+| Helper | Role | Default axis |
+|---|---|---|
+| \`faceAt(z)\` | \`"face"\` | \`"+Z"\` |
+| \`shaftAt(z, diameter)\` | \`"male"\` | \`"+Z"\` |
+| \`boreAt(z, diameter)\` | \`"female"\` | \`"-Z"\` |
+
+Pass \`{ axis: "-Z" }\` (or any other) to override the default.
+
+**\`mate()\` pre-flight**: throws if male/female roles are incompatible, if
+face/face is mixed with male/female, or if matched diameters differ by
+> 0.01mm. Catches wrong-size bolts + misaligned conventions at declaration
+time, before a silent interference.
+
+**\`assemble(parts, mates)\`** picks \`parts[0]\` as the fixed root, BFS-walks
+the mate graph, returns the parts in their final positions.
+\`entries(positioned)\` converts to the \`{shape, name, color}[]\` return format.
+
+**Simple coaxial stacks** don't need joint declarations — \`stackOnZ(parts, { gap? })\`
+positions via bounding-box math and requires no joints.
+
+**\`cylinder({...})\`** — orientation-explicit alternative to replicad's
+\`makeCylinder\`. Takes named \`{ top | bottom, length, diameter, direction? }\`
+so the anchor is unambiguous.
+
+See \`examples/stdlib/leadscrew-assembly.shape.ts\` for a full NEMA17 →
+coupler → leadscrew assembly using this API.
 
 ---
 

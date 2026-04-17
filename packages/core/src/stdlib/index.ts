@@ -13,6 +13,9 @@ import * as extrusions from "./extrusions";
 import * as patterns from "./patterns";
 import { screws, nuts, washers, inserts } from "./fasteners";
 import { fromBack, shape3d } from "./placement";
+import { Part, joint, part, faceAt, shaftAt, boreAt } from "./parts";
+import { mate, assemble, stackOnZ, entries } from "./assembly";
+import { cylinder } from "./cylinder";
 
 export * as standards from "./standards";
 
@@ -32,6 +35,17 @@ export {
   inserts,
   fromBack,
   shape3d,
+  Part,
+  joint,
+  part,
+  faceAt,
+  shaftAt,
+  boreAt,
+  mate,
+  assemble,
+  stackOnZ,
+  entries,
+  cylinder,
 };
 
 /**
@@ -50,6 +64,17 @@ export const shapeitupStdlib = {
   patterns,
   fromBack,
   shape3d,
+  Part,
+  joint,
+  part,
+  faceAt,
+  shaftAt,
+  boreAt,
+  mate,
+  assemble,
+  stackOnZ,
+  entries,
+  cylinder,
 };
 
 export type ShapeitupStdlib = typeof shapeitupStdlib;
