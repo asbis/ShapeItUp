@@ -1,27 +1,16 @@
-import { makeBolt } from "./bolt.shape";
-import { makePlate } from "./plate.shape";
+import { makeCylinder, drawPolysides } from "replicad";
 
-/**
- * Assembly example: a plate with bolts in the mounting holes.
- * Demonstrates multi-file imports and multi-part rendering.
- */
 export default function main() {
-  const plate = makePlate(80, 50, 5, 5, 3);
+  const head = drawPolysides(8, 6).sketchOnPlane("XY").extrude(5);
+  const shaft = makeCylinder(4, 20, [0, 0, 5]);
+  const bolt = head.fuse(shaft);
 
-  // Place bolts in each mounting hole
-  const hx = 80 / 2 - 12;
-  const hy = 50 / 2 - 10;
-
-  const bolt1 = makeBolt(8, 20, 4).translate(hx, hy, 5);
-  const bolt2 = makeBolt(8, 20, 4).translate(-hx, hy, 5);
-  const bolt3 = makeBolt(8, 20, 4).translate(-hx, -hy, 5);
-  const bolt4 = makeBolt(8, 20, 4).translate(hx, -hy, 5);
+  const nutHead = drawPolysides(10, 6).sketchOnPlane("XY", [20, 0, 0]).extrude(5);
+  const nutHole = makeCylinder(4, 5, [20, 0, 0]);
+  const nut = nutHead.cut(nutHole);
 
   return [
-    { shape: plate, name: "plate", color: "#8899aa" },
-    { shape: bolt1, name: "bolt-1", color: "#aa8855" },
-    { shape: bolt2, name: "bolt-2", color: "#aa8855" },
-    { shape: bolt3, name: "bolt-3", color: "#aa8855" },
-    { shape: bolt4, name: "bolt-4", color: "#aa8855" },
+    { shape: bolt, name: "bolt", color: "#cccccc" },
+    { shape: nut, name: "nut", color: "#aaaaaa" }
   ];
 }

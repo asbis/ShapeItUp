@@ -1,28 +1,35 @@
-import { draw, makeCylinder } from "replicad";
+import { drawRectangle, makeCylinder, EdgeFinder } from "replicad";
 
-export default function main() {
-  // L-shaped bracket with mounting holes
-  const profile = draw()
-    .hLine(60)
-    .vLine(5)
-    .hLine(-55)
-    .vLine(35)
-    .hLine(-5)
-    .close();
+export const params = {
+  width: 40,
+  height: 40,
+  depth: 20,
+  thickness: 5,
+  holeRadius: 3,
+  filletRadius: 2
+};
 
-  const bracket = profile.sketchOnPlane("XZ").extrude(30);
+export default function main({ width, height, depth, thickness, holeRadius, filletRadius }: typeof params) {
+  // Base
+  const base = drawRectangle(width, thickness).sketchOnPlane("XY").extrude(depth);
+  
+  // Upright
+  const upright = drawRectangle(thickness, height)
+    .sketchOnPlane("XY", [-width / 2 + thickness / 2, -height / 2 + thickness / 2, 0])
+    .extrude(depth);
 
-  // Mounting holes through the base
-  const hole1 = makeCylinder(3, 30, [45, 0, 2.5], [0, 1, 0]);
-  const hole2 = makeCylinder(3, 30, [15, 0, 2.5], [0, 1, 0]);
+  let bracket = base.fuse(upright);
 
-  // Mounting hole through the upright
-  const hole3 = makeCylinder(3, 30, [2.5, 0, 25], [0, 1, 0]);
+  // Fillet vertical edges
+  try {
+    bracket = bracket.fillet(filletRadius, e => e.inDirection("Z"));
+  } catch (e) {
+    console.warn("Fillet failed", e);
+  }
 
-  // Chain booleans and fillet
-  return bracket
-    .cut(hole1)
-    .cut(hole2)
-    .cut(hole3)
-    .fillet(2, (e: any) => e.inDirection("Y"));
+  // Holes
+  const h1 = makeCylinder(holeRadius, thickness * 2, [width / 4, 0, depth / 2], [0, 1, 0]).translateY(-thickness);
+  const h2 = makeCylinder(holeRadius, thickness * 2, [-width / 2 + thickness / 2, height / 2 - height / 4, depth / 2], [1, 0, 0]).translateX(-thickness);
+
+  return bracket.cut(h1).cut(h2);
 }
