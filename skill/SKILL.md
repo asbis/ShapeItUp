@@ -566,3 +566,107 @@ export default function main() {
   return wheel.fillet(1);
 }
 ```
+
+---
+
+## ShapeItUp stdlib — `import from "shapeitup"`
+
+Mechanical / 3D-printing helpers layered on top of Replicad. **Use these instead of re-deriving standards dimensions by hand** — you'll get correct ISO/DIN sizes, consistent orientation, and FDM-tuned fits on the first try.
+
+```typescript
+import { holes, screws, nuts, washers, inserts, bearings, extrusions, printHints } from "shapeitup";
+```
+
+**Cut-tool orientation convention** — every hole/seat/pocket helper returns a Shape3D with axis +Z, top at Z=0, extending into -Z. Translate it to the target location, then `.cut()`:
+
+```typescript
+plate.cut(holes.counterbore("M3", { plateThickness: 4 }).translate(10, 10, 4))
+// Note: Z = plate_thickness, so the pocket's top aligns with the plate's top face.
+```
+
+**Positive-shape convention** (screws, nuts, bearings bodies) — top at Z=0, body/shaft extends into -Z.
+
+### holes — cut tools
+
+```typescript
+holes.through("M3", { depth?, fit? })                     // clearance hole; or raw number for plain cylinder
+holes.counterbore("M3", { plateThickness, fit? })         // socket-head pocket + shaft
+holes.countersink("M4", { plateThickness, fit? })         // 90° flat-head flare + shaft
+holes.tapped("M3", { depth })                             // tap-drill sized
+holes.teardrop("M3", { depth, axis?: "X" | "Y" })         // FDM-printable horizontal hole
+holes.keyhole({ largeD, smallD, slot, depth })            // hang-on-screw mount
+holes.slot({ length, width, depth })                      // elongated adjustment slot
+```
+
+`fit`: `"press" | "slip" | "clearance"` (default) `| "loose"`. For FDM, `clearance` is usually right.
+
+### screws / nuts / washers / inserts — positive shapes
+
+```typescript
+screws.socketHead("M3x10")    // ISO 4762
+screws.buttonHead("M4x8")     // ISO 7380 (head is a plain cylinder in v1)
+screws.flatHead("M5x12")      // ISO 10642 — revolved cone head
+nuts.hex("M3")                // DIN 934
+washers.flat("M3")            // DIN 125
+inserts.heatSet("M3")         // brass body — for visualization
+inserts.pocket("M3")          // CUT-TOOL for the printed part's insert pocket
+```
+
+**For 3D printing**: print with `inserts.pocket`, melt in a brass heat-set insert, use `screws.socketHead` as the fastener. Don't model threaded holes — printed threads are unreliable.
+
+### bearings — seats + visualizations
+
+```typescript
+bearings.seat("608", { throughHole?, depth? })   // press-fit ball-bearing pocket
+bearings.body("608")                              // ring-shape for visualization
+bearings.linearSeat("LM8UU")                      // linear-bearing pocket
+bearings.linearBody("LM8UU")                      // linear-bearing outer shell
+```
+
+Ball: `623`, `624`, `625`, `626`, `608` (skate — most common), `6000`, `6001`, `6002`. Linear: `LM4UU`, `LM6UU`, `LM8UU`, `LM10UU`, `LM12UU`.
+
+### extrusions — T-slot aluminum profiles
+
+```typescript
+extrusions.tSlot("2020", 200)         // 200mm length, extrudes +Z
+extrusions.tSlotProfile("2020")       // 2D Drawing (cross-section)
+extrusions.tSlotChannel("2020", 200)  // outer-envelope cut-tool (sliding bracket fits)
+```
+
+Profiles: `"2020"`, `"3030"`, `"4040"`. **v1 simplification**: quad-slot square with center hole, no internal T-cavity.
+
+### printHints — FDM print-cleanliness
+
+```typescript
+printHints.elephantFootChamfer(shape, 0.4)     // chamfer bottom edges (default 0.4mm)
+printHints.overhangChamfer(shape, 45)          // best-effort; warns + returns unchanged on complex geometry
+printHints.firstLayerPad(shape, { padding?, thickness? })  // thin adhesion pad
+```
+
+### Worked example — plate with counterbored M3 mounting holes
+
+```typescript
+import { drawRoundedRectangle, type Shape3D } from "replicad";
+import { holes } from "shapeitup";
+
+export const params = { width: 60, depth: 40, thickness: 5 };
+
+export default function main({ width, depth, thickness }: typeof params) {
+  let plate = drawRoundedRectangle(width, depth, 3)
+    .sketchOnPlane("XY").extrude(thickness) as Shape3D;
+
+  const inset = 6;
+  for (const [x, y] of [
+    [-width/2 + inset, -depth/2 + inset],
+    [ width/2 - inset, -depth/2 + inset],
+    [-width/2 + inset,  depth/2 - inset],
+    [ width/2 - inset,  depth/2 - inset],
+  ] as [number, number][]) {
+    const cb = holes.counterbore("M3", { plateThickness: thickness }).translate(x, y, thickness);
+    plate = plate.cut(cb);
+  }
+  return plate;
+}
+```
+
+See `examples/stdlib/` for more worked patterns: `mounting-plate`, `heatset-enclosure`, `teardrop-bracket`, `screw-gallery`, `bearing-block`, `extrusion-length`, `linear-rail-carriage`.

@@ -1048,7 +1048,7 @@ export function registerTools(server: McpServer) {
     "Get Replicad API reference. Call without category to list available categories, pass `search` to find the most relevant sections across all categories, or pass `signaturesOnly: true` to get just the method signatures (token-efficient lookup).",
     {
       category: z
-        .enum(["overview", "drawing", "sketching", "solids", "booleans", "modifications", "transforms", "finders", "export", "examples"])
+        .enum(["overview", "drawing", "sketching", "solids", "booleans", "modifications", "transforms", "finders", "export", "examples", "stdlib"])
         .optional()
         .describe("API category. Omit to see the list of available categories."),
       search: z.string().optional().describe("Keyword / phrase to search for across all categories. Returns the most relevant sections instead of one full category. Can be combined with `category` to search within a single category."),
@@ -1062,7 +1062,7 @@ export function registerTools(server: McpServer) {
         return {
           content: [{
             type: "text" as const,
-            text: "Available API reference categories:\n- overview (start here)\n- drawing (2D shapes)\n- sketching (2D → 3D)\n- solids (3D operations)\n- booleans (cut, fuse, intersect)\n- modifications (fillet, chamfer, shell)\n- transforms (translate, rotate, mirror)\n- finders (edge/face selection)\n- export (STEP, STL)\n- examples (complete worked examples)\n\nCall get_api_reference with a category name for detailed docs, or pass `search` to search across all categories.",
+            text: "Available API reference categories:\n- overview (start here)\n- drawing (2D shapes)\n- sketching (2D → 3D)\n- solids (3D operations)\n- booleans (cut, fuse, intersect)\n- modifications (fillet, chamfer, shell)\n- transforms (translate, rotate, mirror)\n- finders (edge/face selection)\n- export (STEP, STL)\n- examples (complete worked examples)\n- stdlib (mechanical/3D-print helpers: holes, screws, bearings, extrusions, print hints)\n\nCall get_api_reference with a category name for detailed docs, or pass `search` to search across all categories.",
           }],
         };
       }
@@ -1961,7 +1961,7 @@ returns mass alongside volume.
 
 AI workflow: create_shape → get_render_status → render_preview (if visual check needed)
 
-Categories: drawing, sketching, solids, booleans, modifications, transforms, finders, export, examples`,
+Categories: drawing, sketching, solids, booleans, modifications, transforms, finders, export, examples, stdlib`,
     drawing: `# Drawing API (2D Shapes)
 
 All draw* functions return a **Drawing** — a 2D shape NOT yet placed on a plane.
@@ -2232,6 +2232,140 @@ export default function main({ finCount, finThickness, baseR, finR, height }: ty
   return profile.sketchOnPlane("XY").extrude(height); // single solid build
 }
 \`\`\``,
+    stdlib: `# ShapeItUp stdlib (\`import from "shapeitup"\`)
+
+Mechanical / 3D-printing helpers layered on top of Replicad. Every function
+returns a Replicad Shape3D (or Drawing, where noted), so results mix with any
+other Replicad code. Dimensions come from ISO/DIN tables — don't hardcode.
+
+\`\`\`typescript
+import { holes, screws, nuts, washers, inserts, bearings, extrusions, printHints } from "shapeitup";
+\`\`\`
+
+**Convention for cut-tool shapes** (holes, bearing seats, insert pockets):
+axis +Z, top of the tool at Z = 0, tool extends into -Z. Users translate the
+tool to the target location and cut from their part:
+
+\`\`\`typescript
+plate.cut(holes.counterbore("M3", { plateThickness: 4 }).translate(10, 10, 0))
+\`\`\`
+
+**Convention for positive shapes** (screws, nuts, washers, bearings bodies):
+top face at Z = 0, shaft/body extends into -Z. Colors left to the caller.
+
+---
+
+## holes — cut-tool shapes
+
+\`\`\`typescript
+holes.through(size, { depth?, fit? })                     // clearance hole ("M3" or raw mm)
+holes.counterbore(spec, { plateThickness, fit? })          // socket-head pocket + shaft
+holes.countersink(spec, { plateThickness, fit? })          // 90° flat-head flare + shaft
+holes.tapped(size, { depth })                              // tap-drill sized (metal taps or skip — use inserts.pocket for FDM)
+holes.teardrop(size, { depth, axis? })                     // horizontal hole, FDM-printable
+holes.keyhole({ largeD, smallD, slot, depth })             // hang-on-screw mount
+holes.slot({ length, width, depth })                       // elongated hole
+\`\`\`
+
+\`fit\` is a FitStyle: "press" | "slip" | "clearance" (default) | "loose".
+\`size\` for through/teardrop accepts \`MetricSize\` strings ("M3") OR a raw diameter in mm.
+\`spec\` for counterbore/countersink is a screw designator ("M3" — length ignored).
+
+---
+
+## screws / nuts / washers / inserts — positive shapes
+
+\`\`\`typescript
+screws.socketHead("M3x10")     // ISO 4762 cap screw, full shape with hex recess
+screws.buttonHead("M4x8")      // ISO 7380 — head is a simple cylinder in v1 (no dome)
+screws.flatHead("M5x12")       // ISO 10642 countersunk — head is a revolved cone
+nuts.hex("M3")                 // DIN 934 hex nut
+washers.flat("M3")             // DIN 125 flat washer
+inserts.heatSet("M3")          // brass heat-set insert BODY (for visualization)
+inserts.pocket("M3")           // CUT-TOOL for the pocket — interference-fit sized
+\`\`\`
+
+For 3D printing: use \`inserts.pocket\` in the printed part + \`screws.socketHead\` as the
+fastener. Don't try to print threaded holes — they're unreliable at small sizes.
+
+---
+
+## bearings — seat cutters + bearing bodies
+
+\`\`\`typescript
+bearings.seat("608", { throughHole?, depth? })   // press-fit pocket, stepped shoulder by default
+bearings.body("608")                              // ring-shape for visualization
+bearings.linearSeat("LM8UU")                      // straight-bore linear-bearing pocket
+bearings.linearBody("LM8UU")                      // linear-bearing outer shell
+\`\`\`
+
+Ball bearings: 623, 624, 625, 626, 608 (skate — most common), 6000, 6001, 6002.
+Linear bearings: LM4UU, LM6UU, LM8UU, LM10UU, LM12UU.
+
+\`bearings.seat\` uses \`FIT.press\` (slight interference) to grip the bearing. Default
+is a stepped pocket with the bearing resting on a 3 mm shoulder; pass
+\`{ throughHole: true }\` for a straight cylinder.
+
+---
+
+## extrusions — T-slot aluminum profiles
+
+\`\`\`typescript
+extrusions.tSlot("2020", 200)         // 200 mm length of 2020 profile (extrudes +Z)
+extrusions.tSlotProfile("2020")       // 2D Drawing of the cross-section
+extrusions.tSlotChannel("2020", 200)  // OUTER-envelope cut-tool for sliding-bracket fits
+\`\`\`
+
+Profiles: "2020", "3030", "4040". **v1 simplification**: the profile is a
+quad-slot square (one rectangular slot per side) with a center hole — no
+internal T-cavity. Good for visualization + mounting reference; not
+STEP-accurate for manufacturing.
+
+---
+
+## printHints — FDM print-cleanliness helpers
+
+\`\`\`typescript
+printHints.elephantFootChamfer(shape, 0.4)       // chamfer bottom edges (default 0.4 mm)
+printHints.overhangChamfer(shape, 45)            // best-effort overhang chamfer (warn on fail)
+printHints.firstLayerPad(shape, { padding?, thickness? })  // thin adhesion pad (manual brim)
+\`\`\`
+
+\`overhangChamfer\` is a v1 stub — returns the shape unchanged with a
+\`console.warn\` on complex geometry. For known-good cases (simple brackets,
+plates) it cuts a reasonable chamfer.
+
+---
+
+## Complete worked example
+
+\`\`\`typescript
+import { drawRoundedRectangle, type Shape3D } from "replicad";
+import { holes, inserts, screws } from "shapeitup";
+
+export const params = { width: 60, depth: 40, thickness: 5 };
+
+export default function main({ width, depth, thickness }: typeof params) {
+  const plate = drawRoundedRectangle(width, depth, 3)
+    .sketchOnPlane("XY")
+    .extrude(thickness) as Shape3D;
+
+  // 4 corner counterbored M3 mounting holes.
+  const inset = 6;
+  const positions: [number, number][] = [
+    [-width/2 + inset, -depth/2 + inset],
+    [ width/2 - inset, -depth/2 + inset],
+    [-width/2 + inset,  depth/2 - inset],
+    [ width/2 - inset,  depth/2 - inset],
+  ];
+  let body = plate;
+  for (const [x, y] of positions) {
+    const cb = holes.counterbore("M3", { plateThickness: thickness }).translate(x, y, thickness);
+    body = body.cut(cb);
+  }
+  return body;
+}
+\`\`\``,
   };
   return refs[category] || refs.overview;
 }
@@ -2243,7 +2377,7 @@ export default function main({ finCount, finThickness, baseR, finR, height }: ty
 // category, add it here too.
 const API_REFERENCE_CATEGORIES = [
   "overview", "drawing", "sketching", "solids", "booleans",
-  "modifications", "transforms", "finders", "export", "examples",
+  "modifications", "transforms", "finders", "export", "examples", "stdlib",
 ] as const;
 
 const SEARCH_STOPWORDS = new Set([
