@@ -29,6 +29,7 @@ import {
   motors,
   part,
   patterns,
+  shaftAt,
   shape3d,
   standards,
 } from "shapeitup";
@@ -108,7 +109,9 @@ export default function main() {
     shape: cylinder({ bottom: [0, 0, 0], length: LEADSCREW_LENGTH, diameter: LEADSCREW_DIA }),
     name: "leadscrew",
     color: "#c0c4c8",
-    joints: { bottom: faceAt(0, { axis: "-Z" }) },
+    // shaftAt for the male shaft tip that inserts into the coupler's female bore —
+    // lets mate() diameter-check the 8mm pair.
+    joints: { bottom: shaftAt(0, LEADSCREW_DIA, { axis: "-Z" }) },
   });
 
   // ── Bearing-end cap — 608 pocket on the BOTTOM face ──────────────────────
