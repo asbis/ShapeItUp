@@ -2239,7 +2239,7 @@ returns a Replicad Shape3D (or Drawing, where noted), so results mix with any
 other Replicad code. Dimensions come from ISO/DIN tables — don't hardcode.
 
 \`\`\`typescript
-import { holes, screws, nuts, washers, inserts, bearings, extrusions, patterns, printHints, motors, couplers, fromBack, shape3d, part, faceAt, shaftAt, boreAt, mate, assemble, subassembly, stackOnZ, entries, debugJoints, highlightJoints, cylinder, standards } from "shapeitup";
+import { holes, screws, nuts, washers, inserts, bearings, extrusions, patterns, printHints, motors, couplers, threads, fromBack, shape3d, part, faceAt, shaftAt, boreAt, mate, assemble, subassembly, stackOnZ, entries, debugJoints, highlightJoints, cylinder, standards } from "shapeitup";
 \`\`\`
 
 **Convention for cut-tool shapes** (holes, bearing seats, insert pockets):
@@ -2544,6 +2544,34 @@ modules.
 
 See \`examples/stdlib/linear-actuator-subassembled.shape.ts\` for a full
 comparison to the flat version.
+
+---
+
+## threads — helical metric + trapezoidal
+
+Real helical threads via OCCT sweep. Mostly useful for STEP export,
+visual fidelity, and large printable threads (jar lids, leadscrews, M8+).
+**Small threads (M2–M5) don't survive FDM printing reliably** — use
+\`inserts.pocket\` + heat-set inserts instead.
+
+\`\`\`typescript
+threads.metric("M5", 20)                           // ISO coarse (0.8mm pitch)
+threads.metric("M5", 20, { pitch: "fine" })        // ISO fine (0.5mm)
+threads.metric("M6", 30, { pitch: 1.5 })           // custom pitch
+
+threads.tapHole("M5", 8)                           // cut-tool for a tapped hole
+plate.cut(threads.tapHole("M5", 8).translate(x, y, plateTop))
+
+threads.leadscrew("TR8x8", 150)                    // 4-start trapezoidal (8mm lead)
+threads.leadscrew("TR8x2", 150)                    // single-start (2mm lead)
+
+// Low-level:
+threads.external({ diameter, pitch, length, profile?, starts? })
+threads.internal({ diameter, pitch, length, profile?, starts? })
+\`\`\`
+
+**Cost**: a 20mm M3 thread adds ~3000 triangles. Plain \`cylinder()\` is
+far cheaper if you don't need actual thread geometry.
 
 ---
 

@@ -18,6 +18,7 @@ import { mate, assemble, subassembly, stackOnZ, entries, debugJoints, highlightJ
 import { cylinder } from "./cylinder";
 import * as motors from "./motors";
 import * as couplers from "./couplers";
+import * as threads from "./threads";
 import * as standards from "./standards";
 
 export { standards };
@@ -54,6 +55,7 @@ export {
   cylinder,
   motors,
   couplers,
+  threads,
 };
 
 /**
@@ -88,6 +90,7 @@ export const shapeitupStdlib = {
   cylinder,
   motors,
   couplers,
+  threads,
   standards,
 };
 

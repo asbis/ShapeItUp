@@ -283,6 +283,47 @@ export const FLEXIBLE_COUPLER_6_8: FlexibleCouplerSpec = {
   motorBoreDepth: 15,
 };
 
+/** ISO 261 metric thread pitch table (coarse pitch, mm). */
+export const METRIC_COARSE_PITCH: Record<MetricSize, number> = {
+  "M2":   0.4,
+  "M2.5": 0.45,
+  "M3":   0.5,
+  "M4":   0.7,
+  "M5":   0.8,
+  "M6":   1.0,
+  "M8":   1.25,
+};
+
+/** ISO 261 metric thread pitch table (fine pitch, mm). */
+export const METRIC_FINE_PITCH: Record<MetricSize, number> = {
+  "M2":   0.25,
+  "M2.5": 0.35,
+  "M3":   0.35,
+  "M4":   0.5,
+  "M5":   0.5,
+  "M6":   0.75,
+  "M8":   1.0,
+};
+
+/** Trapezoidal leadscrew spec (ISO 2901). `majorDia` is nominal diameter. */
+export interface TrapezoidalLeadscrewSpec {
+  majorDia: number;
+  pitch: number;
+  /** Number of thread starts. Most hobby leadscrews are 1 (single-start);
+   *  common "high-speed" 8mm leadscrews are 4-start (TR8x8 = TR8x2 pitch × 4 starts). */
+  starts: number;
+  /** Effective lead per rotation (pitch × starts). */
+  lead: number;
+}
+
+export const TRAPEZOIDAL_LEADSCREW: Record<string, TrapezoidalLeadscrewSpec> = {
+  "TR8x2":   { majorDia: 8,  pitch: 2, starts: 1, lead: 2 },
+  "TR8x8":   { majorDia: 8,  pitch: 2, starts: 4, lead: 8 },   // 4-start, popular on 3D printers
+  "TR10x2":  { majorDia: 10, pitch: 2, starts: 1, lead: 2 },
+  "TR12x2":  { majorDia: 12, pitch: 2, starts: 1, lead: 2 },
+  "TR12x4":  { majorDia: 12, pitch: 2, starts: 2, lead: 4 },
+};
+
 /**
  * Parse a screw designator like "M3x10" into size + length.
  * Accepts either "M3" (length = undefined) or "M3x10".

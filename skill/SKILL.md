@@ -918,3 +918,30 @@ return entries(positioned);   // auto-flattens — every child comes out with it
 **Promoted joints** capture the child joint's position + axis + role/diameter in the subassembly's local frame. They're the *only* joints visible on the subassembly's boundary — internal joints stay private to the module.
 
 See `examples/stdlib/linear-actuator-subassembled.shape.ts` for a side-by-side with the flat version.
+
+### threads — helical metric + trapezoidal
+
+Real helical threads via OCCT sweep. Mostly useful for STEP export to machine shops, large printable threads (M8+, jar lids, leadscrews), and visual fidelity in renders. Small threads (M2–M5) **don't survive FDM printing reliably** — use `inserts.pocket` + heat-set inserts instead.
+
+```typescript
+import { threads } from "shapeitup";
+
+threads.metric("M5", 20);                          // ISO coarse pitch (0.8mm)
+threads.metric("M5", 20, { pitch: "fine" });       // ISO fine pitch (0.5mm)
+threads.metric("M6", 30, { pitch: 1.5 });           // custom pitch
+
+threads.tapHole("M5", 8);                           // CUT-TOOL for a tapped hole
+plate.cut(threads.tapHole("M5", 8).translate(x, y, plateTop));
+
+threads.leadscrew("TR8x8", 150);                    // 4-start trapezoidal leadscrew
+threads.leadscrew("TR8x2", 150);                    // single-start
+```
+
+Low-level access for non-standard sizes:
+
+```typescript
+threads.external({ diameter: 10, pitch: 1.25, length: 30, profile: threads.metricProfile(1.25), starts: 1 });
+threads.internal({ diameter: 8.5, pitch: 1.25, length: 10 });
+```
+
+**Cost warning**: a 20mm M3 thread adds ~3000 triangles. For "looks threaded" needs, a plain `cylinder()` is 20× cheaper.
