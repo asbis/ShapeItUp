@@ -18,8 +18,9 @@ import { mate, assemble, stackOnZ, entries, debugJoints, highlightJoints } from 
 import { cylinder } from "./cylinder";
 import * as motors from "./motors";
 import * as couplers from "./couplers";
+import * as standards from "./standards";
 
-export * as standards from "./standards";
+export { standards };
 
 // Top-level named re-exports — user scripts type
 // `import { holes, screws } from "shapeitup"` and the TypeScript service
@@ -85,6 +86,7 @@ export const shapeitupStdlib = {
   cylinder,
   motors,
   couplers,
+  standards,
 };
 
 export type ShapeitupStdlib = typeof shapeitupStdlib;
