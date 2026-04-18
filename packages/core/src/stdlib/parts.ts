@@ -138,19 +138,35 @@ export interface PartOptions {
   joints?: Record<string, JointSpec>;
   /** @internal Accumulated world transform. */
   xform?: Transform;
+  /**
+   * @internal Non-empty for SUBASSEMBLIES — Parts composed of other Parts.
+   * Each child carries its own `_xform` (from the subassembly's internal
+   * mates); the subassembly's own `_xform` is composed on top at render time.
+   */
+  children?: ReadonlyArray<Part>;
 }
 
 /**
  * Immutable wrapper around a Shape3D with named joints. Every mutating
  * method returns a new Part.
+ *
+ * A Part can also be a SUBASSEMBLY — a composed Part built from other Parts
+ * via `subassembly()`. Subassemblies expose promoted joints on their own
+ * boundary and can be mated into higher-level assemblies like any other Part.
  */
 export class Part {
-  /** The LOCAL shape — before the accumulated world transform is applied. */
+  /**
+   * The LOCAL shape — before the accumulated world transform is applied.
+   * For subassemblies, this is a Compound of all children at their internal
+   * positions (useful for bounding-box queries). Rendering always goes
+   * through `toEntries()` which unpacks the children.
+   */
   readonly shape: Shape3D;
   readonly name?: string;
   readonly color?: string;
   private readonly _localJoints: Record<string, JointSpec>;
   private readonly _xform: Transform;
+  private readonly _children: ReadonlyArray<Part>;
 
   constructor(shape: Shape3D, opts: PartOptions = {}) {
     this.shape = shape;
@@ -158,6 +174,7 @@ export class Part {
     this.color = opts.color;
     this._localJoints = opts.joints ?? {};
     this._xform = opts.xform ?? IDENTITY;
+    this._children = opts.children ?? [];
   }
 
   /**
@@ -184,6 +201,7 @@ export class Part {
       color: this.color,
       joints: { ...this._localJoints, [name]: joint },
       xform: this._xform,
+      children: this._children,
     });
   }
 
@@ -231,6 +249,7 @@ export class Part {
       color: this.color,
       joints: this._localJoints,
       xform,
+      children: this._children,
     });
   }
 
@@ -247,6 +266,10 @@ export class Part {
   /**
    * Convert to the `{ shape, name, color }` entry format used in `main()`'s
    * multi-part return. Applies the accumulated transform.
+   *
+   * For SUBASSEMBLIES, this returns the compound shape as a single entry —
+   * use `toEntries()` instead if you want each child rendered as its own
+   * part in the viewer (typical case).
    */
   toEntry(): { shape: Shape3D; name?: string; color?: string } {
     return {
@@ -254,6 +277,42 @@ export class Part {
       name: this.name,
       color: this.color,
     };
+  }
+
+  /** True when this Part is a subassembly (composed of child Parts). */
+  get isSubassembly(): boolean {
+    return this._children.length > 0;
+  }
+
+  /**
+   * Expand this Part into one or more viewer entries.
+   *
+   * - Regular parts: returns a single-element array of `{ shape, name, color }`.
+   * - Subassemblies: flattens all children recursively, composing the
+   *   subassembly's accumulated transform onto each child's own transform.
+   *   Each child keeps its own name and color (fall back to the
+   *   subassembly's color if a child has none).
+   */
+  toEntries(): Array<{ shape: Shape3D; name?: string; color?: string }> {
+    if (this._children.length === 0) {
+      return [this.toEntry()];
+    }
+    const outerXform = this._xform;
+    const inheritColor = this.color;
+    const out: Array<{ shape: Shape3D; name?: string; color?: string }> = [];
+    for (const child of this._children) {
+      // Child's `_xform` is its position within THIS subassembly (local frame).
+      // Compose with the subassembly's outer xform to get the child's world pose.
+      const composed = new Part(child.shape, {
+        name: child.name,
+        color: child.color ?? inheritColor,
+        joints: child._localJoints,
+        xform: composeTransforms(child._xform, outerXform),
+        children: child._children,
+      });
+      out.push(...composed.toEntries());
+    }
+    return out;
   }
 }
 

@@ -13,10 +13,11 @@
  * joint declarations.
  */
 
-import { makeSphere, type Shape3D } from "replicad";
+import { compoundShapes, makeSphere, type Shape3D } from "replicad";
 import {
   Part,
   type AttachedJoint,
+  type JointSpec,
   type Vec3,
   translateTransform,
   rotateTransform,
@@ -295,11 +296,99 @@ export function stackOnZ(parts: Part[], opts: StackOptions = {}): Part[] {
 
 /**
  * Convenience: map an array of Parts to viewer-entry format in one call.
+ *
+ * Flattens subassemblies — a Part with `isSubassembly === true` expands
+ * into its positioned children rather than appearing as a single compound.
  */
 export function entries(
   parts: Part[]
 ): Array<{ shape: Shape3D; name?: string; color?: string }> {
-  return parts.map((p) => p.toEntry());
+  return parts.flatMap((p) => p.toEntries());
+}
+
+// ── Subassemblies ───────────────────────────────────────────────────────────
+
+export interface SubassemblyOptions {
+  /** Parts to compose. Same semantics as `assemble()`. */
+  parts: Part[];
+  /** Mates that position the parts within the subassembly. */
+  mates: Mate[];
+  /** Name for the subassembly. Applied as a group label if useful downstream. */
+  name?: string;
+  /** Default color for children that don't have their own. */
+  color?: string;
+  /** Root part (default: parts[0]). */
+  root?: Part;
+  /**
+   * Joints to expose on the subassembly's boundary — these become the
+   * interface other parts mate against. Map from the new joint name
+   * (on the subassembly) to the child's attached joint to promote.
+   *
+   *   promote: { mount: plate.joints.couplerFace }
+   *   // → subassembly.joints.mount now reflects plate.couplerFace
+   */
+  promote?: Record<string, AttachedJoint>;
+}
+
+/**
+ * Build a subassembly — resolve internal mates, promote selected joints,
+ * and return the whole thing as a single Part that can be mated into a
+ * higher-level assembly.
+ *
+ * ```typescript
+ * const motorModule = subassembly({
+ *   parts: [motor, plate],
+ *   mates: [mate(motor.joints.mountFace, plate.joints.motorFace)],
+ *   name: "motor-module",
+ *   color: "#777788",
+ *   promote: { mount: plate.joints.couplerFace },
+ * });
+ *
+ * // Use like any other Part
+ * const positioned = assemble([motorModule, coupler, leadscrew], [
+ *   mate(motorModule.joints.mount, coupler.joints.motorEnd),
+ *   ...
+ * ]);
+ * return entries(positioned);  // children are flattened automatically
+ * ```
+ *
+ * Subassemblies compose — a subassembly can be a child of another
+ * subassembly, with transforms composing correctly at each level.
+ */
+export function subassembly(opts: SubassemblyOptions): Part {
+  if (opts.parts.length === 0) {
+    throw new Error("subassembly: parts array is empty");
+  }
+  const positioned = assemble(opts.parts, opts.mates, { root: opts.root });
+
+  // Capture promoted joints' current world-space state (which is the
+  // subassembly's LOCAL frame because its xform starts as identity).
+  const localJoints: Record<string, JointSpec> = {};
+  if (opts.promote) {
+    for (const [name, attachedJoint] of Object.entries(opts.promote)) {
+      localJoints[name] = {
+        position: attachedJoint.position,
+        axis: attachedJoint.axis,
+        role: attachedJoint.role,
+        diameter: attachedJoint.diameter,
+      };
+    }
+  }
+
+  // Give the Part a compound of all children's worldShapes so boundingBox
+  // queries work. Rendering goes through `.toEntries()` which iterates the
+  // children directly — the compound is just for bbox / debug paths.
+  const childShapes = positioned.map((p) => p.worldShape());
+  // compoundShapes types as AnyShape in the stub; runtime always returns a
+  // Compound which satisfies Shape3D for our purposes (boundingBox etc).
+  const compound = compoundShapes(childShapes) as Shape3D;
+
+  return new Part(compound, {
+    name: opts.name,
+    color: opts.color,
+    joints: localJoints,
+    children: positioned,
+  });
 }
 
 // ── Diagnostics ─────────────────────────────────────────────────────────────

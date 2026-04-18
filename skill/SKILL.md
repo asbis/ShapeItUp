@@ -885,3 +885,36 @@ Motor layout convention — body at local Z=[0, HEIGHT], shaft on top (Z=[HEIGHT
 All opts accept overrides for name, color, and dimensions. For non-standard coupler bores: `couplers.flexible({ motorBore: 6.35, leadscrewBore: 10 })`.
 
 See `examples/stdlib/linear-actuator.shape.ts` for a 7-part assembly using these builders (motor + coupler + custom end-caps + extrusion + bearing).
+
+### Subassemblies — compose Parts of Parts
+
+For larger machines, collapse groups of parts into a reusable module with its own promoted joints. `subassembly({...})` returns a Part that behaves like any other Part but renders as all of its children:
+
+```typescript
+import { subassembly, entries } from "shapeitup";
+
+const driveHead = subassembly({
+  parts: [motorCap, motor, coupler, leadscrew],
+  mates: [
+    mate(motorCap.joints.motorFace,   motor.joints.mountFace),
+    mate(motor.joints.shaftTip,       coupler.joints.motorEnd),
+    mate(coupler.joints.leadscrewEnd, leadscrew.joints.bottom, { gap: 0.2 }),
+  ],
+  name: "drive-head",
+  promote: { extrusionFace: motorCap.joints.extrusionFace },  // one joint exposed
+});
+
+// driveHead is a Part — mate it like anything else
+const positioned = assemble([extrusion, driveHead, bearingBlock], [
+  mate(extrusion.joints.topFace,    driveHead.joints.extrusionFace),
+  mate(extrusion.joints.bottomFace, bearingBlock.joints.extrusionFace),
+]);
+
+return entries(positioned);   // auto-flattens — every child comes out with its own color
+```
+
+**Why it matters at scale.** The top-level mate graph in the example above has 2 mates instead of 6 — and each subassembly is independently testable + refactorable. Swap the NEMA 17 for a NEMA 23 by changing ONE line inside `makeDriveHead()`, and nothing downstream cares. Subassemblies compose recursively (a subassembly can be a child of another subassembly).
+
+**Promoted joints** capture the child joint's position + axis + role/diameter in the subassembly's local frame. They're the *only* joints visible on the subassembly's boundary — internal joints stay private to the module.
+
+See `examples/stdlib/linear-actuator-subassembled.shape.ts` for a side-by-side with the flat version.

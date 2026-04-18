@@ -2239,7 +2239,7 @@ returns a Replicad Shape3D (or Drawing, where noted), so results mix with any
 other Replicad code. Dimensions come from ISO/DIN tables — don't hardcode.
 
 \`\`\`typescript
-import { holes, screws, nuts, washers, inserts, bearings, extrusions, patterns, printHints, motors, couplers, fromBack, shape3d, part, faceAt, shaftAt, boreAt, mate, assemble, stackOnZ, entries, debugJoints, highlightJoints, cylinder, standards } from "shapeitup";
+import { holes, screws, nuts, washers, inserts, bearings, extrusions, patterns, printHints, motors, couplers, fromBack, shape3d, part, faceAt, shaftAt, boreAt, mate, assemble, subassembly, stackOnZ, entries, debugJoints, highlightJoints, cylinder, standards } from "shapeitup";
 \`\`\`
 
 **Convention for cut-tool shapes** (holes, bearing seats, insert pockets):
@@ -2498,6 +2498,52 @@ patterns.grid(2, 2, standards.NEMA17.boltPitch, standards.NEMA17.boltPitch);
 
 See \`examples/stdlib/linear-actuator.shape.ts\` (155 lines, 7 parts — same
 assembly that took 286 lines before these builders landed).
+
+---
+
+## Subassemblies — Parts made of Parts
+
+\`subassembly({ parts, mates, name?, color?, promote?, root? })\` returns a
+Part that behaves exactly like a single Part — it can be mated, translated,
+rotated — but under the hood it composes other Parts and renders them all:
+
+\`\`\`typescript
+const driveHead = subassembly({
+  parts: [motorCap, motor, coupler, leadscrew],
+  mates: [
+    mate(motorCap.joints.motorFace,   motor.joints.mountFace),
+    mate(motor.joints.shaftTip,       coupler.joints.motorEnd),
+    mate(coupler.joints.leadscrewEnd, leadscrew.joints.bottom, { gap: 0.2 }),
+  ],
+  name: "drive-head",
+  // Joints to expose on the subassembly's boundary:
+  promote: { extrusionFace: motorCap.joints.extrusionFace },
+});
+
+// Treat the subassembly as a single Part at the top level
+const positioned = assemble([extrusion, driveHead, bearingBlock], [
+  mate(extrusion.joints.topFace,    driveHead.joints.extrusionFace),
+  mate(extrusion.joints.bottomFace, bearingBlock.joints.extrusionFace),
+]);
+return entries(positioned);   // entries() flattens subassemblies automatically
+\`\`\`
+
+\`promote\` maps new-joint-name → existing attached joint on a child. The
+promoted joints become the only interface visible at the outer level.
+Subassemblies compose recursively — a subassembly can be a child of another.
+
+\`entries()\` detects subassemblies and yields one entry per leaf Part with
+colors and names preserved from the child, so the viewer's parts panel
+still shows individual components.
+
+At scale the win is structural: the top-level mate graph shrinks (2 mates
+instead of 6 in the example), each module is independently testable /
+swappable (\`motors.nema17()\` → \`motors.nema23()\` inside \`makeDriveHead()\`
+leaves the outer assembly untouched), and you can ship a library of reusable
+modules.
+
+See \`examples/stdlib/linear-actuator-subassembled.shape.ts\` for a full
+comparison to the flat version.
 
 ---
 
