@@ -20,7 +20,7 @@
  * copies them into both places).
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, cpSync, statSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, cpSync, statSync, lstatSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -64,6 +64,21 @@ function writeStub(cwd: string, name: string, srcDir: string, result: SetupResul
 
   if (!existsSync(srcIndex)) return;
 
+  // pnpm case: `node_modules/replicad` is a symlink pointing at the real
+  // replicad package in the workspace's .pnpm store. The symlink already
+  // provides full types from the installed package; trying to cpSync over it
+  // fails with "Cannot overwrite non-directory". Detect this (lstat, which
+  // does NOT follow the link) and bail out — the stub would only shadow a
+  // better source of types anyway.
+  try {
+    if (lstatSync(destDir).isSymbolicLink()) {
+      result.skipped.push(`node_modules/${name} (pnpm symlink — real install provides types)`);
+      return;
+    }
+  } catch {
+    // destDir does not exist yet — normal case, continue.
+  }
+
   if (existsSync(destIndex)) {
     // Don't clobber a real npm install — check for our "bundled" marker.
     try {
@@ -82,13 +97,24 @@ function writeStub(cwd: string, name: string, srcDir: string, result: SetupResul
     }
   }
 
-  mkdirSync(destDir, { recursive: true });
-  cpSync(srcDir, destDir, { recursive: true, force: true });
-  writeFileSync(
-    join(destDir, "package.json"),
-    JSON.stringify({ name, version: "0.0.0-bundled", types: "./index.d.ts" }, null, 2) + "\n",
-  );
-  result.created.push(`node_modules/${name}/`);
+  // Stubs are cosmetic (editor-only types). Any filesystem hiccup here —
+  // EACCES on a read-only node_modules, EEXIST on an oddly-staged dir, a
+  // symlink race we didn't catch above — must NOT abort the caller's
+  // create_shape / modify_shape. Log to stderr (safe for MCP stdio; stdout
+  // is the JSON-RPC channel) and return gracefully.
+  try {
+    mkdirSync(destDir, { recursive: true });
+    cpSync(srcDir, destDir, { recursive: true, force: true });
+    writeFileSync(
+      join(destDir, "package.json"),
+      JSON.stringify({ name, version: "0.0.0-bundled", types: "./index.d.ts" }, null, 2) + "\n",
+    );
+    result.created.push(`node_modules/${name}/`);
+  } catch (e: any) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`[shapeitup] stub bootstrap skipped for node_modules/${name}: ${msg}`);
+    result.skipped.push(`node_modules/${name} (stub write failed: ${msg})`);
+  }
 }
 
 function writeMinimalTsconfig(cwd: string, result: SetupResult) {
@@ -148,27 +174,38 @@ export function setupShapeProject(cwd: string): SetupResult {
  * to splice into the tool's response, or undefined when nothing was done.
  */
 export function autoBootstrapIfNeeded(fileOrDir: string): string | undefined {
-  // Walk up from the file/dir until we find a reasonable "project root".
-  // Heuristic order: first ancestor with .git, then with package.json, then
-  // the file's own directory. Never write above $HOME.
-  const start = statSync(fileOrDir).isDirectory() ? fileOrDir : dirname(fileOrDir);
-  let candidate = start;
-  const home = process.env.HOME ?? process.env.USERPROFILE ?? "/";
-  while (candidate && candidate !== home && candidate !== "/") {
-    if (existsSync(join(candidate, ".git")) || existsSync(join(candidate, "package.json"))) {
-      break;
+  // Stub bootstrap is a best-effort convenience — failure here must never
+  // bubble up and fail the create_shape / modify_shape call. The outer
+  // try/catch is the last-mile safety net on top of writeStub's per-stub
+  // catch, in case anything throws before we reach writeStub (statSync on a
+  // vanished path, setupShapeProject internals, etc.).
+  try {
+    // Walk up from the file/dir until we find a reasonable "project root".
+    // Heuristic order: first ancestor with .git, then with package.json, then
+    // the file's own directory. Never write above $HOME.
+    const start = statSync(fileOrDir).isDirectory() ? fileOrDir : dirname(fileOrDir);
+    let candidate = start;
+    const home = process.env.HOME ?? process.env.USERPROFILE ?? "/";
+    while (candidate && candidate !== home && candidate !== "/") {
+      if (existsSync(join(candidate, ".git")) || existsSync(join(candidate, "package.json"))) {
+        break;
+      }
+      const parent = dirname(candidate);
+      if (parent === candidate) break;
+      candidate = parent;
     }
-    const parent = dirname(candidate);
-    if (parent === candidate) break;
-    candidate = parent;
-  }
-  if (!candidate || candidate === home || candidate === "/") {
-    candidate = start;
-  }
+    if (!candidate || candidate === home || candidate === "/") {
+      candidate = start;
+    }
 
-  if (isProjectBootstrapped(candidate)) return undefined;
+    if (isProjectBootstrapped(candidate)) return undefined;
 
-  const result = setupShapeProject(candidate);
-  if (result.created.length === 0) return undefined;
-  return `Bootstrapped ShapeItUp types at ${candidate} (${result.created.join(", ")}).`;
+    const result = setupShapeProject(candidate);
+    if (result.created.length === 0) return undefined;
+    return `Bootstrapped ShapeItUp types at ${candidate} (${result.created.join(", ")}).`;
+  } catch (e: any) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`[shapeitup] autoBootstrapIfNeeded skipped: ${msg}`);
+    return undefined;
+  }
 }
