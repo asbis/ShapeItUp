@@ -29,6 +29,7 @@ import {
 } from "./instrumentation";
 import { shapeitupStdlib } from "./stdlib";
 import {
+  drainExtrudeHints,
   drainRuntimeWarnings,
   nextCutCallIndex,
   nextFuseCallIndex,
@@ -666,6 +667,23 @@ export async function initCore(
     const parts = normalizeParts(result);
     lastParts = parts;
     const execTime = performance.now() - execStart;
+
+    // Drain the deferred extrude-plane hints (Issue #1 follow-up). These were
+    // enqueued synchronously at extrude time in instrumentation.ts, but only
+    // emitted here IF the final part's bbox still covers the predicted problem
+    // region. Users who extrude on "XZ" and then translate the part into +Y
+    // space no longer get a stale warning about Y ∈ [-L, 0]. Read bboxes via
+    // the existing `readBoundsSafe` helper (returns the
+    // [[minx,miny,minz],[maxx,maxy,maxz]] tuple or undefined); if none of the
+    // parts expose a bbox, the hint queue gets drained against an empty list
+    // and every pending hint is silently discarded — better than emitting a
+    // prediction we can't verify.
+    const finalBboxes = parts
+      .map((p) => readBoundsSafe(p.shape))
+      .filter((b): b is NonNullable<typeof b> => !!b)
+      .map((b) => ({ min: b[0], max: b[1] }));
+    const extrudeHintMsgs = drainExtrudeHints(finalBboxes);
+    for (const msg of extrudeHintMsgs) pushRuntimeWarning(msg);
 
     // Merge stdlib runtime warnings (e.g. patterns.cutAt no-op detection)
     // with the post-execution validateParts output. Keep runtime warnings

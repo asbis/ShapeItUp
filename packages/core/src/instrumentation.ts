@@ -1,7 +1,7 @@
 import { assertPositiveFinite } from "./stdlib/standards";
 import {
   claimNonXYPlaneHint,
-  emitExtrudePlaneHint,
+  enqueueExtrudeHint,
   pushRuntimeWarning,
 } from "./stdlib/warnings";
 
@@ -601,14 +601,16 @@ function validateSketchExtrude(self: any, distance: unknown): void {
   }
   // Issue #1: if this Sketch came from a non-XY `sketchOnPlane`, the extrude
   // will grow into the plane's signed normal — "XZ" produces a slab with
-  // Y ∈ [-L, 0], not the centered Y ∈ [-L/2, L/2] most users expect. Emit a
-  // one-shot bbox-interval hint BEFORE deferring to OCCT. The latch inside
-  // `emitExtrudePlaneHint` ensures we fire at most once per run, and the
-  // helper returns null for "XY" so the conventional case stays silent.
+  // Y ∈ [-L, 0], not the centered Y ∈ [-L/2, L/2] most users expect.
+  // Historically we emitted the hint synchronously here, but that fired even
+  // when the user then .translate()'d the part into +Y space, turning a useful
+  // heads-up into noise. We now enqueue the predicted interval and let core's
+  // drain step cross-check it against the FINAL part bboxes — the hint only
+  // survives if the problem region is actually still covered by the finished
+  // geometry. See `drainExtrudeHints` in stdlib/warnings.ts for the criterion.
   const plane = typeof self === "object" && self !== null ? SKETCH_PLANE.get(self) : undefined;
   if (typeof plane === "string") {
-    const hint = emitExtrudePlaneHint(plane, distance);
-    if (hint) pushRuntimeWarning(hint);
+    enqueueExtrudeHint(plane, distance);
   }
   try {
     const bp = self?.blueprint;
