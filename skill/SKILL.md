@@ -840,6 +840,35 @@ printHints.overhangChamfer(shape, 45)          // best-effort; warns + returns u
 printHints.firstLayerPad(shape, { padding?, thickness? })  // thin adhesion pad
 ```
 
+### pins — shafts, pivots, cross-pins (mechanism primitives)
+
+```typescript
+pins.pin({ diameter, length, headDia?, headThk?, axis?, chamfer? })   // shaft, optional shoulder, tip chamfer
+pins.pivot({ size, fit?, length })                                     // matched { pin, hole, clearance } pair for a hinge axle
+pins.teeBar({ mainDia, mainLen, crossDia, crossLen, crossAt? })        // T-handle / cross-pin (main axis +Z, cross axis +X)
+```
+
+`pins.pin` returns a Shape3D with the shaft base at the origin extending along `axis` (default `"+Z"`). Passing `headDia` adds a shoulder at the far end so the pin can't fall through a matching bore. `pins.pivot` wraps `pin` with a matching cylinder cut-tool sized to the fit allowance (default `"slip"` for rotating joints) — use it to keep pin and bore diameters in sync automatically.
+
+### cradles — ball cups and elastic anchors
+
+```typescript
+cradles.cradle({ ballDiameter, wall?, capturePercent?, axis? })       // hollow cup sized for a sphere
+cradles.band_post({ postR, hookR, height, headThk?, axis? })          // shaft + mushroom head, retains a rubber band
+```
+
+`cradles.cradle` builds an outer sphere minus an inner cavity, then cuts a top cap to expose the opening. `capturePercent` controls how much of the sphere wraps the ball: `0.4` is a shallow saucer, `0.5` a hemisphere (default), values approaching `1` approach a nearly-closed shell. For FDM, prefer orienting so the opening faces `-Z` — the cavity's ceiling then prints without support. Pair with `standards.SPORTS_BALLS[...].diameter` for standard-sized payloads.
+
+### standards.SPORTS_BALLS — ball dimension tables
+
+```typescript
+standards.SPORTS_BALLS.tennis     // { diameter: 67,    name: "Tennis ball (ITF)" }
+standards.SPORTS_BALLS.pingpong   // { diameter: 40,    name: "Table tennis ball" }
+standards.SPORTS_BALLS.golf       // { diameter: 42.67, name: "Golf ball (R&A/USGA)" }
+standards.SPORTS_BALLS.baseball   // { diameter: 73,    name: "Baseball (MLB)" }
+standards.SPORTS_BALLS.soccer     // { diameter: 216,   name: "Soccer ball (FIFA size 5)" }
+```
+
 ### Worked example — plate with counterbored M3 mounting holes
 
 ```typescript
