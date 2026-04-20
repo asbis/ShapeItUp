@@ -67,34 +67,51 @@ export function extractParamsStatic(sourceCode: string): string[] {
 }
 
 /**
- * Extract `export const config = { strict: true }` from source without
- * executing the script. Parallels {@link extractParamsStatic} — same
- * source-shape assumptions (esbuild ESM output or hand-written TS), same
- * loose regex that falls through to `{}` when the declaration is absent or
- * the value is too complex (spreads, computed keys).
+ * Extract `export const config = { strict: true, meshQuality: "preview" }`
+ * from source without executing the script. Parallels
+ * {@link extractParamsStatic} — same source-shape assumptions (esbuild ESM
+ * output or hand-written TS), same loose regex that falls through to `{}`
+ * when the declaration is absent or the value is too complex (spreads,
+ * computed keys).
  *
- * Feature #3: the only recognised key today is `strict` (opt-in promotion
- * of silent-success warnings to thrown errors). Other keys are extracted
- * but ignored — space left so later issues can add flags without changing
- * the extractor's signature.
+ * Recognised keys:
+ *   - `strict` (boolean) — opt-in promotion of silent-success warnings to
+ *     thrown errors.
+ *   - `meshQuality` (`"preview"` | `"final"`) — override tessellation
+ *     quality for single-part scripts. Overrides the core's auto-degrade
+ *     heuristic (which only kicks in past 15 parts or 50k projected
+ *     triangles) so users with a single sweep-heavy part can opt into the
+ *     coarse mesh for faster iteration.
+ *
+ * Other keys are extracted but ignored — space left so later issues can add
+ * flags without changing the extractor's signature.
  */
-export function extractConfigStatic(sourceCode: string): { strict?: boolean } {
+export function extractConfigStatic(
+  sourceCode: string,
+): { strict?: boolean; meshQuality?: "preview" | "final" } {
   const match = sourceCode.match(/export\s+const\s+config\s*=\s*\{([^}]*)\}/s);
   if (!match) return {};
   const body = match[1];
-  // Pair pattern matches `key: value` where key is identifier or quoted
-  // string, and value is a `true`/`false` literal. Handles quoted keys
-  // (`"strict": true`) and trailing commas. Other value forms (numbers,
-  // strings, nested objects) simply don't match — extractor returns an
-  // empty config rather than guessing.
-  const pairPattern =
+  // Boolean-pair pattern matches `key: true|false`. Handles quoted keys
+  // (`"strict": true`) and trailing commas.
+  const boolPairPattern =
     /(?:^|[,{])\s*(?:"([^"]+)"|'([^']+)'|(\w+))\s*:\s*(true|false)\b/g;
-  const config: { strict?: boolean } = {};
+  // String-pair pattern matches `key: "value"` (or `'value'`) — restricted
+  // to meshQuality's enum values so we don't accidentally pick up material
+  // names or other future string keys.
+  const stringPairPattern =
+    /(?:^|[,{])\s*(?:"([^"]+)"|'([^']+)'|(\w+))\s*:\s*["'](preview|final)["']/g;
+  const config: { strict?: boolean; meshQuality?: "preview" | "final" } = {};
   let m: RegExpExecArray | null;
-  while ((m = pairPattern.exec(body)) !== null) {
+  while ((m = boolPairPattern.exec(body)) !== null) {
     const name = m[1] || m[2] || m[3];
     const value = m[4] === "true";
     if (name === "strict") config.strict = value;
+  }
+  while ((m = stringPairPattern.exec(body)) !== null) {
+    const name = m[1] || m[2] || m[3];
+    const value = m[4] as "preview" | "final";
+    if (name === "meshQuality") config.meshQuality = value;
   }
   return config;
 }
@@ -212,7 +229,7 @@ export function executeScript(
   result: any;
   params: ParamDef[];
   material?: { density: number; name?: string };
-  config?: { strict?: boolean };
+  config?: { strict?: boolean; meshQuality?: "preview" | "final" };
 } {
   // Graceful fallback: callers that go through `core.execute()` can't extend
   // that signature (owned by another agent), so they prepend a
@@ -383,11 +400,17 @@ export function executeScript(
   // like the expected flag bag. Unknown / malformed values are dropped
   // silently so the user gets default (non-strict) behaviour instead of
   // a confusing crash. `strict` must be a literal `true` to opt in —
-  // truthy non-booleans (e.g. `"yes"`, `1`) don't count.
-  let config: { strict?: boolean } | undefined;
+  // truthy non-booleans (e.g. `"yes"`, `1`) don't count. `meshQuality`
+  // must be the exact string `"preview"` or `"final"` — any other value
+  // (numbers, unrelated strings, objects) is dropped so the core's
+  // auto-degrade heuristic still runs.
+  let config: { strict?: boolean; meshQuality?: "preview" | "final" } | undefined;
   if (rawConfig && typeof rawConfig === "object") {
-    const next: { strict?: boolean } = {};
+    const next: { strict?: boolean; meshQuality?: "preview" | "final" } = {};
     if (rawConfig.strict === true) next.strict = true;
+    if (rawConfig.meshQuality === "preview" || rawConfig.meshQuality === "final") {
+      next.meshQuality = rawConfig.meshQuality;
+    }
     if (Object.keys(next).length > 0) config = next;
   }
 

@@ -754,10 +754,18 @@ inserts.pocket("M3")         // CUT-TOOL for the printed part's insert pocket
 
 **For 3D printing**: print with `inserts.pocket`, melt in a brass heat-set insert, use `screws.socket` as the fastener. Modeled threads work but print badly under M5 — prefer heat-set inserts for small sizes.
 
+**Seating fasteners on a plate**: `seatedOnPlate(fastener, plate, axis?)` positions any fastener so its head-top face lands flush on the plate's surface along the given axis (default `"+Z"`). Works with `bolts.socket`, `screws.*`, `bolts.socketMesh`, etc.
+
+```typescript
+const bolt = bolts.socket("M6x20");
+const seated = seatedOnPlate(bolt, topPlate);        // head on plate top (+Z)
+const wall   = seatedOnPlate(bolt, sideWall, "+X");  // head on +X wall face
+```
+
 ### bearings — seats + visualizations
 
 ```typescript
-bearings.seat("608", { throughHole?, depth? })   // press-fit ball-bearing pocket
+bearings.seat("608", { fit?, throughHole?, depth? })   // FDM slip-fit ball-bearing pocket (default +0.1mm radial); fit: "press" | "interference" | number
 bearings.body("608")                              // ring-shape for visualization
 bearings.linearSeat("LM8UU")                      // linear-bearing pocket
 bearings.linearBody("LM8UU")                      // linear-bearing outer shell
@@ -1025,6 +1033,38 @@ Motor layout convention — body at local Z=[0, HEIGHT], shaft on top (Z=[HEIGHT
 All opts accept overrides for name, color, and dimensions. For non-standard coupler bores: `couplers.flexible({ motorBore: 6.35, leadscrewBore: 10 })`.
 
 See `examples/stdlib/linear-actuator.shape.ts` for a 7-part assembly using these builders (motor + coupler + custom end-caps + extrusion + bearing).
+
+#### Motor-mount recipes
+
+Motors ship with `mountFace` (body-bottom, axis -Z) and `shaftTip` (shaft-end, axis +Z). The four common orientations:
+
+**1. Motor atop plate, shaft up (default — no rotate needed):**
+```typescript
+const motor = motors.nema17();
+const plate = part({ shape: plateShape, joints: { motorFace: faceAt(plateTopZ) } });
+mate(plate.joints.motorFace, motor.joints.mountFace);
+```
+
+**2. Motor under plate, shaft up through pilot hole** (common for 3D-printer Z-axes — flip the motor so its mountFace points +Z):
+```typescript
+const motor = motors.nema17().rotate(180, [0, 0, 0], [1, 0, 0]);
+const plate = part({ shape: plateShape, joints: { motorFace: faceAt(plateBottomZ, { axis: "-Z" }) } });
+mate(plate.joints.motorFace, motor.joints.mountFace);
+```
+
+**3. Motor side-mounted on a wall, shaft along +X:**
+```typescript
+const motor = motors.nema17().rotate(90, [0, 0, 0], [0, 1, 0]);
+const wall  = part({ shape: wallShape, joints: { motorFace: faceAt(wallX, { axis: "+X" }) } });
+mate(wall.joints.motorFace, motor.joints.mountFace);
+```
+
+**4. Motor → flex coupler → leadscrew stack** (mate shafts, not faces):
+```typescript
+const motor   = motors.nema17();
+const coupler = couplers.flexible();
+mate(motor.joints.shaftTip, coupler.joints.motorEnd, { gap: 0.1 });
+```
 
 ### Subassemblies — compose Parts of Parts
 

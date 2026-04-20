@@ -309,13 +309,61 @@ function axisDisjointHint(
     const cMin = tool[0][i];
     const cMax = tool[1][i];
     if (cMax < tMin || cMin > tMax) {
-      return (
+      const base =
         ` Target ${axes[i]} ∈ [${tMin.toFixed(2)}, ${tMax.toFixed(2)}], ` +
-        `cutter ${axes[i]} ∈ [${cMin.toFixed(2)}, ${cMax.toFixed(2)}] — disjoint on ${axes[i]} axis.`
-      );
+        `cutter ${axes[i]} ∈ [${cMin.toFixed(2)}, ${cMax.toFixed(2)}] — disjoint on ${axes[i]} axis.`;
+      return base + extrudeMirrorTieBack(axes[i], tMin, tMax, cMin, cMax);
     }
   }
   return "";
+}
+
+/**
+ * When cut-disjointness on an axis looks like a "cutter extruded from the
+ * wrong plane" mirror pattern (target lives on one side of 0; cutter is a
+ * mirror-image on the opposite side, with cutter depth ≤ target span on that
+ * axis), append a targeted tie-back suggesting `.extrude(-L)` or `placeOn`
+ * with explicit `into:` direction. Callers pass the already-known disjoint
+ * axis and the four bbox values.
+ *
+ * Mirror signature:
+ *   - target is entirely on one side of 0 (inclusive) on this axis
+ *   - cutter is entirely on the OPPOSITE side of 0 (inclusive)
+ *   - cutter's depth (cMax - cMin) ≤ target's span (tMax - tMin)
+ * The "cutter depth ≤ target span" bound keeps us from firing on clearly
+ * wrong-scale geometries (a 200 mm cutter mirroring a 5 mm target is not
+ * a plane-flip mistake). Returns an empty string when the signature
+ * doesn't hold, so the caller keeps the existing hint as-is.
+ */
+function extrudeMirrorTieBack(
+  axis: "X" | "Y" | "Z",
+  tMin: number,
+  tMax: number,
+  cMin: number,
+  cMax: number,
+): string {
+  const EPS = 1e-6;
+  const targetPositive = tMin >= -EPS && tMax > EPS;
+  const targetNegative = tMax <= EPS && tMin < -EPS;
+  const cutterPositive = cMin >= -EPS && cMax > EPS;
+  const cutterNegative = cMax <= EPS && cMin < -EPS;
+  const mirrored =
+    (targetPositive && cutterNegative) || (targetNegative && cutterPositive);
+  if (!mirrored) return "";
+  const cDepth = cMax - cMin;
+  const tSpan = tMax - tMin;
+  if (!(cDepth > 0) || !(tSpan > 0)) return "";
+  if (cDepth > tSpan + EPS) return "";
+  // The cutter sits on the opposite half-space from the target — so the
+  // extrude that fixes this points back toward the target's half-space.
+  const intoSign = targetPositive ? "+" : "-";
+  const intoLabel = `${intoSign}${axis}`;
+  const distance = cDepth.toFixed(2);
+  return (
+    ` Did the cutter's sketch use \`sketchOnPlane('XZ').extrude(L)\`? ` +
+    `That extrudes toward -Y. Try \`.extrude(-L)\` or ` +
+    `\`placeOn(..., into: '${intoLabel}', distance: ${distance})\`.`
+  );
 }
 
 /**
@@ -639,7 +687,9 @@ export async function initCore(
     let result: any;
     let params: ParamDef[];
     let material: { density: number; name?: string } | undefined;
-    let scriptConfig: { strict?: boolean } | undefined;
+    let scriptConfig:
+      | { strict?: boolean; meshQuality?: MeshQuality }
+      | undefined;
     try {
       const execResult = executeScript(js, replicadExports, shapeitupStdlib, paramOverrides);
       result = execResult.result;
@@ -742,8 +792,21 @@ export async function initCore(
     const projectedTriangles = parts.length * 5000;
     const shouldAutoDegrade =
       parts.length >= 15 || projectedTriangles > PROJECTED_TRIANGLE_BUDGET;
+    // Precedence (highest → lowest):
+    //   1. `streaming.meshQuality` — caller-supplied override (VSCode worker,
+    //      MCP server). Always wins so external orchestrators stay in control.
+    //   2. `export const config = { meshQuality }` — user's explicit opt-in
+    //      on a single-part sweep-heavy shape. Beats auto-degrade so a user
+    //      who wrote `meshQuality: "final"` doesn't get coarsened when the
+    //      triangle projector overshoots, and a user who wrote
+    //      `meshQuality: "preview"` on a 3-part assembly gets their coarse
+    //      mesh even though auto-degrade wouldn't have kicked in.
+    //   3. Auto-degrade heuristic (15+ parts or >50k projected triangles).
+    //   4. Default `"final"`.
     const effectiveQuality: MeshQuality =
-      streaming?.meshQuality ?? (shouldAutoDegrade ? "preview" : "final");
+      streaming?.meshQuality ??
+      scriptConfig?.meshQuality ??
+      (shouldAutoDegrade ? "preview" : "final");
     // Issue #6: gate per-part B-Rep measurement. On a 14-part assembly the
     // two measureShape*Properties calls together spent ~2.5 s on the hot
     // path. Default `"bbox"` skips both and derives centerOfMass from the

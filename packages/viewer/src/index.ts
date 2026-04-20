@@ -771,6 +771,9 @@ function applyPartVisibility(focusPart?: string, hideParts?: string[]) {
           p.group.visible = visible;
         }
         updatePartsList();
+        // Re-compute the dim-label overlay so it reflects the focused part's
+        // bbox instead of the full assembly's extents.
+        updateDimensions();
         return;
       }
     }
@@ -799,6 +802,7 @@ function applyPartVisibility(focusPart?: string, hideParts?: string[]) {
       p.group.visible = visible;
     }
     updatePartsList();
+    updateDimensions();
   }
 }
 
@@ -808,6 +812,7 @@ function restorePartVisibility() {
     p.group.visible = true;
   }
   updatePartsList();
+  updateDimensions();
 }
 
 onMessage("viewer-command", (msg) => {
@@ -1313,6 +1318,34 @@ function setAxes(show?: boolean, scaleToModel?: boolean) {
   setAxesVisible(scene, axesVisible, target);
 }
 
+// Compute a bbox that ignores hidden parts. `setFromObject` walks the scene
+// graph regardless of `.visible`, so on a focusPart preview it would return
+// the full-assembly extents even though we've hidden two out of three parts —
+// and the resulting dim labels would lie about what the pink outline wraps.
+// This helper only includes leaves whose own visibility flag is true.
+function getBboxOfVisibleParts(group: THREE.Group): THREE.Box3 {
+  const box = new THREE.Box3();
+  let hasVisible = false;
+  group.traverse((obj) => {
+    if (obj.visible && (obj as any).isMesh) {
+      // Also require every ancestor up to `group` to be visible, since
+      // `traverse` visits descendants of hidden ancestors too.
+      let node: THREE.Object3D | null = obj;
+      let ancestorsVisible = true;
+      while (node && node !== group) {
+        if (!node.visible) { ancestorsVisible = false; break; }
+        node = node.parent;
+      }
+      if (ancestorsVisible) {
+        box.expandByObject(obj);
+        hasVisible = true;
+      }
+    }
+  });
+  if (!hasVisible) return new THREE.Box3().setFromObject(group);
+  return box;
+}
+
 function updateDimensions() {
   // Clear old
   dimensionGroup.traverse((child) => {
@@ -1326,7 +1359,7 @@ function updateDimensions() {
 
   if (!dimensionsVisible || modelGroup.children.length === 0) return;
 
-  const box = new THREE.Box3().setFromObject(modelGroup);
+  const box = getBboxOfVisibleParts(modelGroup);
   const size = box.getSize(new THREE.Vector3());
   const min = box.min;
   const max = box.max;
@@ -1347,52 +1380,66 @@ function updateDimensions() {
   // origin indicator regardless of part scale; the proportional term still
   // keeps labels tight on 100mm+ parts.
   const maxDim = Math.max(size.x, size.y, size.z);
-  const offset = Math.max(0.18 * maxDim, 20);
+  const minDim = Math.max(Math.min(size.x, size.y, size.z), 0.001); // avoid div-by-zero
+  const axisRatio = maxDim / minDim;
+
+  // For highly asymmetric parts (e.g. an M6 bolt: X≈10, Y≈10, Z≈80) a single
+  // uniform `0.18 * maxDim` offset (~14.4mm) is larger than the narrow
+  // footprint itself, so X and Y dim labels end up stacked on each other and
+  // become unreadable. Switch to per-axis offsets when asymmetry is sharp,
+  // keeping the uniform-offset look for cubes / iso-proportioned parts where
+  // it already reads well. Threshold of 3 is conservative — a 2:1 part still
+  // gets the consistent uniform treatment.
+  let offsetX: number, offsetY: number, offsetZ: number;
+  if (axisRatio > 3) {
+    offsetX = Math.max(0.18 * size.x, 5);
+    offsetY = Math.max(0.18 * size.y, 5);
+    offsetZ = Math.max(0.18 * size.z, 5);
+  } else {
+    const uniform = Math.max(0.18 * maxDim, 20);
+    offsetX = offsetY = offsetZ = uniform;
+  }
 
   // Each dim line is anchored to the midpoint of the matching bbox edge
   // (rather than a translated model-origin ray) and then shoved
-  // perpendicularly outward by `offset`. This keeps the label glued to the
-  // feature it measures even for shapes whose min corner sits far from the
-  // origin — e.g. a part built at (100, 100, 0) used to render its X label
-  // down at the world X axis because `min.y - offset` happened to straddle
-  // the axes indicator; anchoring at the edge midpoint + outward offset
-  // makes placement translation-invariant.
+  // perpendicularly outward by the appropriate per-axis offset. This keeps
+  // the label glued to the feature it measures even for shapes whose min
+  // corner sits far from the origin — e.g. a part built at (100, 100, 0)
+  // used to render its X label down at the world X axis because
+  // `min.y - offset` happened to straddle the axes indicator; anchoring at
+  // the edge midpoint + outward offset makes placement translation-invariant.
   const midX = (min.x + max.x) / 2;
   const midY = (min.y + max.y) / 2;
   const midZ = (min.z + max.z) / 2;
 
-  // X dim: midpoint of the bottom-front edge (min Y, min Z), offset
-  // outward in -Y. The endpoints run along X at that same offset position,
-  // so the label sits on top of the centerline of its own dim line.
+  // X dim sits along the -Y side of the bbox, so its outward offset is in Y.
   addDimensionLine(
-    [min.x, min.y - offset, min.z],
-    [max.x, min.y - offset, min.z],
+    [min.x, min.y - offsetY, min.z],
+    [max.x, min.y - offsetY, min.z],
     `X: ${formatMm(size.x, 1)}`,
     dimColor, textColor,
-    [midX, min.y - offset, min.z]
+    [midX, min.y - offsetY, min.z]
   );
 
-  // Y dim: midpoint of the right-bottom edge (max X, min Z), offset
-  // outward in +X.
+  // Y dim sits along the +X side of the bbox, so its outward offset is in X.
   addDimensionLine(
-    [max.x + offset, min.y, min.z],
-    [max.x + offset, max.y, min.z],
+    [max.x + offsetX, min.y, min.z],
+    [max.x + offsetX, max.y, min.z],
     `Y: ${formatMm(size.y, 1)}`,
     dimColor, textColor,
-    [max.x + offset, midY, min.z]
+    [max.x + offsetX, midY, min.z]
   );
 
-  // Z dim: midpoint of the far-right vertical edge (max X, max Y), offset
-  // outward in +X AND +Y so the sprite doesn't share a column with the Y
-  // label (which also sits at max.x + offset). Pulling it to the far
-  // corner puts its anchor on a different face of the bbox — readable
+  // Z dim sits at the +X / +Y corner so its sprite doesn't share a column
+  // with the Y label (which also sits at max.x + offsetX). Pulling it to the
+  // far corner puts its anchor on a different face of the bbox — readable
   // from the default iso camera angle.
   addDimensionLine(
-    [max.x + offset, max.y + offset, min.z],
-    [max.x + offset, max.y + offset, max.z],
+    [max.x + offsetX, max.y + offsetY, min.z],
+    [max.x + offsetX, max.y + offsetY, max.z],
     `Z: ${formatMm(size.z, 1)}`,
     dimColor, textColor,
-    [max.x + offset, max.y + offset, midZ]
+    [max.x + offsetX, max.y + offsetY, midZ]
   );
 }
 
@@ -1433,7 +1480,7 @@ function addDimensionLine(
   // tapered) without dislodging labels on large parts where the anchor
   // is already far from origin.
   if (modelGroup.children.length > 0) {
-    const box = new THREE.Box3().setFromObject(modelGroup);
+    const box = getBboxOfVisibleParts(modelGroup);
     const size = box.getSize(new THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z, 1);
     const dist = Math.hypot(midX, midY, midZ);

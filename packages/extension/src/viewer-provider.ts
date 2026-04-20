@@ -15,6 +15,41 @@ async function ensureEsbuild() {
   await esbuildInitPromise;
 }
 
+/**
+ * Scan the ENTRY source for imports of `main` / `params` from sibling .shape(.ts)
+ * files and throw a clear user-facing error before esbuild runs. The worker's
+ * executor strips `export { main as default }` from .shape.ts bundles, so these
+ * imports silently fail with esbuild's generic "No matching export" — confusing
+ * for both humans and AI agents. Only the entry is scanned: utility modules that
+ * happen to export a symbol called `main` from non-`.shape` files are untouched.
+ */
+function preflightShapeImports(sourceCode: string, filePath: string): void {
+  const re = /import\s*\{([^}]+)\}\s*from\s*['"](\.[^'"]*\.shape(?:\.ts)?)['"]/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(sourceCode)) !== null) {
+    const imported = m[1];
+    const source = m[2];
+    const names = imported
+      .split(",")
+      .map((s) => s.trim().split(/\s+as\s+/)[0].trim())
+      .filter((s) => s.length > 0);
+    const bad = names.filter((n) => n === "main" || n === "params");
+    if (bad.length > 0) {
+      throw new Error(
+        `Cannot import ${bad.map((n) => `'${n}'`).join(" / ")} from '${source}' in ${filePath}.\n\n` +
+        `ShapeItUp reserves 'main' and 'params' as runtime entry points — the renderer invokes them, ` +
+        `but other scripts cannot import them (the executor strips their exports before bundling).\n\n` +
+        `To reuse logic across scripts, export a named factory function:\n\n` +
+        `  // in ${source}:\n` +
+        `  export function makeEnclosure(opts) { /* ... */ }\n\n` +
+        `  // in ${filePath}:\n` +
+        `  import { makeEnclosure } from '${source}';\n` +
+        `  export default function main() { return makeEnclosure({ ... }); }\n`
+      );
+    }
+  }
+}
+
 interface BundleCacheEntry {
   /** Bundled JS output text. */
   js: string;
@@ -702,6 +737,11 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         this.output.appendLine(`[exec] Cache hit for ${document.fileName}`);
       } else {
         this.output.appendLine(`[exec] Cache miss (${invalidReason}), rebundling ${document.fileName}`);
+        // Preflight: catch `import { main, params } from './other.shape'` before
+        // esbuild emits its generic "No matching export" — the executor strips
+        // those exports, so a custom error with the factory-function workaround
+        // is far more actionable.
+        preflightShapeImports(code, normalizedPath);
         const result = await esbuild.build({
           stdin: {
             contents: code,

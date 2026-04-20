@@ -11,7 +11,7 @@ import * as printHints from "./printHints";
 import * as bearings from "./bearings";
 import * as extrusions from "./extrusions";
 import * as patterns from "./patterns";
-import { screws, bolts, washers, inserts } from "./fasteners";
+import { screws, bolts, washers, inserts, seatedOnPlate } from "./fasteners";
 import { fromBack, shape3d, placeOn } from "./placement";
 import { Part, joint, part, faceAt, shaftAt, boreAt } from "./parts";
 import { mate, assemble, subassembly, stackOnZ, entries, debugJoints, highlightJoints } from "./assembly";
@@ -23,12 +23,19 @@ import * as gears from "./gears";
 import * as standardsRaw from "./standards";
 import { guardUnknownKeys } from "./standards";
 import { ensureFinderAndPatched } from "./finder-patch";
+import { ensureThreadGuardPatched } from "./threads-patch";
 
 // Patch Replicad's EdgeFinder/FaceFinder `.and()` to accept a single callback
 // in addition to the documented array form. Idempotent, safe to call before
 // OCCT is loaded (the patch only mutates class prototypes on the replicad
 // module). See finder-patch.ts for the full rationale.
 ensureFinderAndPatched();
+
+// Patch `_3DShape.prototype.fuse` / `.cut` to throw at call time (with a clear
+// message naming the fuse-safe alternatives) when either operand is a
+// non-fuse-safe thread Compound. Idempotent; sibling of the finder patch.
+// See threads-patch.ts for the full rationale.
+ensureThreadGuardPatched();
 
 // Re-export the MetricSize union so user scripts can write
 // `import type { MetricSize } from "shapeitup"` instead of digging into the
@@ -67,6 +74,7 @@ export {
   fromBack,
   shape3d,
   placeOn,
+  seatedOnPlate,
   Part,
   joint,
   part,
@@ -104,6 +112,7 @@ export const shapeitupStdlib = {
   fromBack,
   shape3d,
   placeOn,
+  seatedOnPlate,
   Part,
   joint,
   part,

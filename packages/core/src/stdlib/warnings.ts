@@ -119,11 +119,21 @@ export function emitExtrudePlaneHint(plane: string, length: number): string | nu
   const dy = entry.axis === "Y" ? centerShift : 0;
   const dz = entry.axis === "Z" ? centerShift : 0;
 
+  // Flip direction: `.extrude(-L)` inverts the effective sign, so the axis
+  // interval becomes [0, L] when it was [-L, 0] and vice versa. We report the
+  // label of the OPPOSITE half-space (`+Y` when native was `-Y`, etc.) so the
+  // user can see at a glance where the flipped extrude points.
+  const flippedSignSym: "+" | "-" = effectiveSign === 1 ? "-" : "+";
+  const flippedAxisLabel = `${flippedSignSym}${entry.axis}`;
+  const flippedLength = -length;
+
   extrudePlaneHintFired = true;
   return (
     `sketchOnPlane('${plane}').extrude(${length}): shape bounding box will be ` +
-    `${entry.axis} ∈ [${lo}, ${hi}]. Use .translate(${dx},${dy},${dz}) to center, ` +
-    `or sketchOnPlane('XY') if Z-extrusion is intended.`
+    `${entry.axis} ∈ [${lo}, ${hi}]. ` +
+    `Option 1: .translate(${dx},${dy},${dz}) to center on origin. ` +
+    `Option 2: .extrude(${flippedLength}) to flip toward ${flippedAxisLabel}. ` +
+    `Option 3: placeOn(drawing, '${plane}', { into: '${flippedAxisLabel}', distance: ${mag} }) for explicit half-space control.`
   );
 }
 

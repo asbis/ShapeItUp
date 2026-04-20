@@ -694,9 +694,18 @@ export declare class Drawing implements DrawingInterface {
      * @category Drawing Modifications
      */
     chamfer(radius: number, filter?: (c: CornerFinder) => CornerFinder): Drawing;
-    sketchOnPlane(inputPlane: Plane): SketchInterface | Sketches;
-    sketchOnPlane(inputPlane?: PlaneName, origin?: Point | number): SketchInterface | Sketches;
-    sketchOnFace(face: Face, scaleMode: ScaleMode): SketchInterface | Sketches;
+    // ShapeItUp typings note: upstream replicad declares the return as
+    // `SketchInterface | Sketches`, but `Sketches` has none of the
+    // follow-on 3D methods (`loftWith`, `shell`, `fillet`, `chamfer`),
+    // so every `drawCircle(...).sketchOnPlane(...).loftWith(...)` chain
+    // failed to type-check — forcing users into `(f: any) =>` casts on
+    // the downstream `.shell` callback. All of replicad's `draw*()`
+    // factories wrap a single `Blueprint`, whose `sketchOnPlane` returns
+    // a concrete `Sketch` (which implements `SketchInterface`). Drop
+    // `Sketches` from the union so the common case types cleanly.
+    sketchOnPlane(inputPlane: Plane): SketchInterface;
+    sketchOnPlane(inputPlane?: PlaneName, origin?: Point | number): SketchInterface;
+    sketchOnFace(face: Face, scaleMode: ScaleMode): SketchInterface;
     punchHole(shape: AnyShape, faceFinder: SingleFace, options?: {
         height?: number;
         origin?: Point;
@@ -726,9 +735,12 @@ export declare interface DrawingInterface {
     /**
      * Returns the sketched version of the drawing, on a plane
      */
-    sketchOnPlane(inputPlane: Plane): SketchInterface | Sketches;
-    sketchOnPlane(inputPlane?: PlaneName, origin?: Point | number): SketchInterface | Sketches;
-    sketchOnPlane(inputPlane?: PlaneName | Plane, origin?: Point | number): SketchInterface | Sketches;
+    // ShapeItUp typings note: see `Drawing.sketchOnPlane` comment above —
+    // widening this to `SketchInterface | Sketches` broke `.loftWith(...)`
+    // chains because `Sketches` lacks it. Narrow to `SketchInterface`.
+    sketchOnPlane(inputPlane: Plane): SketchInterface;
+    sketchOnPlane(inputPlane?: PlaneName, origin?: Point | number): SketchInterface;
+    sketchOnPlane(inputPlane?: PlaneName | Plane, origin?: Point | number): SketchInterface;
     /**
      * Returns the sketched version of the drawing, on a face.
      *
@@ -741,7 +753,7 @@ export declare interface DrawingInterface {
      * - `bounds` normalises the UV parameters on the face to [0,1] intervals.
      * - `native` uses the default UV parameters of opencascade
      */
-    sketchOnFace(face: Face, scaleMode: ScaleMode): SketchInterface | Sketches;
+    sketchOnFace(face: Face, scaleMode: ScaleMode): SketchInterface;
     /**
      * Formats the drawing as an SVG image
      */

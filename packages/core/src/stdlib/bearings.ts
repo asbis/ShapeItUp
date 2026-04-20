@@ -11,7 +11,7 @@
  */
 
 import { makeCylinder, type Shape3D } from "replicad";
-import { BALL_BEARING, FIT, LINEAR_BEARING } from "./standards";
+import { BALL_BEARING, LINEAR_BEARING } from "./standards";
 import { applyAxis, type HoleAxis } from "./holes";
 
 /** Clearance behind the bearing back so the cut-tool doesn't coplanar-fail. */
@@ -21,6 +21,39 @@ const DEFAULT_THROUGH_DEPTH = 50;
 /** Shoulder width: the radial lip that stops the bearing from going deeper.
  *  3mm (per side) matches the common "bearing sits on a 3mm shelf" rule. */
 const SHOULDER_WIDTH = 3;
+
+/**
+ * Fit preset or explicit radial allowance for bearing pockets.
+ *
+ * The allowance is added to the nominal bearing radius on both sides, so pocket
+ * diameter = `bearing OD + 2 · allowance`. Positive values widen the pocket
+ * (drop-in/rotating fit); negative values produce interference.
+ *
+ * | preset | radial allowance | usage |
+ * |--------|-----------------:|-------|
+ * | `"slip"` (default) | `+0.10 mm` | FDM drop-in — no reaming, bearing can be pressed in by hand |
+ * | `"press"`          | ` 0.00 mm` | Nominal — requires light reaming / sanding on FDM |
+ * | `"interference"`   | `−0.05 mm` | Heated-in metal inserts or CNC-machined pockets |
+ * | `number`           | as-is      | Raw radial override in mm |
+ */
+export type BearingFit = "slip" | "press" | "interference" | number;
+
+function normalizeFit(fit: BearingFit | undefined): number {
+  if (typeof fit === "number") return fit;
+  switch (fit) {
+    case "press":
+      return 0.0;
+    case "interference":
+      return -0.05;
+    case "slip":
+    case undefined:
+      return 0.1;
+    default: {
+      const _exhaustive: never = fit;
+      throw new Error(`Unknown bearing fit preset: ${_exhaustive}`);
+    }
+  }
+}
 
 function ballBearing(designation: string) {
   const spec = BALL_BEARING[designation];
@@ -45,8 +78,8 @@ function linearBearing(designation: string) {
 }
 
 /**
- * Cut-tool for a press-fit ball-bearing pocket. Axis is Z; pocket top at Z=0,
- * cavity extends into -Z. Designation like "608", "625".
+ * Cut-tool for a ball-bearing pocket. Axis is Z; pocket top at Z=0, cavity
+ * extends into -Z. Designation like "608", "625".
  *
  * With `throughHole: false` (default) the pocket has a shoulder step at
  * `depth = bearing width` so the bearing's back rests against the shelf; a
@@ -54,9 +87,21 @@ function linearBearing(designation: string) {
  * shaft. With `throughHole: true` the pocket is a straight cylinder all the
  * way through.
  *
- * The pocket diameter is `od + 2 · FIT.press` — a slight interference fit so
- * the bearing is gripped when pressed in. Tune `FIT.press` for your printer
- * if needed.
+ * The pocket diameter is `od + 2 · allowance` where `allowance` comes from
+ * the `fit` option. See {@link BearingFit}:
+ *
+ * | preset | radial allowance | usage |
+ * |--------|-----------------:|-------|
+ * | `"slip"` (DEFAULT) | `+0.10 mm` | FDM drop-in, no reaming needed |
+ * | `"press"`          | ` 0.00 mm` | Nominal, needs finishing on FDM |
+ * | `"interference"`   | `−0.05 mm` | Heated-in inserts / CNC pockets |
+ * | `number`           | as-is      | Raw radial override in mm |
+ *
+ * **Migration note (v2 breaking change).** The default changed to slip-fit.
+ * Previous behavior was press-fit (`-0.05 mm` interference) which requires
+ * reaming on FDM and silently produced unachievable parts. Pass
+ * `fit: "interference"` to restore the prior behavior — appropriate for
+ * heated-in metal-inserted applications only.
  *
  * @param designation Bearing code from BALL_BEARING (e.g. `"608"`, `"625"`).
  * @param opts.throughHole When true, the pocket is a straight cylinder with
@@ -64,6 +109,8 @@ function linearBearing(designation: string) {
  * @param opts.depth Override the straight-through depth (mm). Used as the
  *   through-hole height when `throughHole: true`, and as the relief-bore
  *   length when `throughHole: false`. Default 50mm.
+ * @param opts.fit Fit preset or raw radial allowance in mm. Default `"slip"`
+ *   (+0.10 mm, FDM drop-in).
  * @param opts.axis Pocket direction (default `"+Z"` — cavity opens upward,
  *   tool extends into -Z). Pass `"+X"`/`"-X"`/`"+Y"`/`"-Y"`/`"-Z"` for a
  *   sideways or upward-facing pocket. The axis rotation happens around the
@@ -75,10 +122,16 @@ function linearBearing(designation: string) {
  */
 export function seat(
   designation: string,
-  opts?: { throughHole?: boolean; depth?: number; axis?: HoleAxis }
+  opts?: {
+    throughHole?: boolean;
+    depth?: number;
+    fit?: BearingFit;
+    axis?: HoleAxis;
+  }
 ): Shape3D {
   const spec = ballBearing(designation);
-  const pocketRadius = (spec.od + FIT.press * 2) / 2;
+  const allowance = normalizeFit(opts?.fit);
+  const pocketRadius = (spec.od + allowance * 2) / 2;
 
   if (opts?.throughHole) {
     const depth = opts.depth ?? DEFAULT_THROUGH_DEPTH;
@@ -132,10 +185,17 @@ export function body(designation: string): Shape3D {
  * at Z=0, cavity extends into -Z for `length` mm (from LINEAR_BEARING).
  *
  * No shoulder — linear bearings are typically held by retaining rings or
- * press-fit at both ends, so the pocket is a straight bore of
- * `od + 2 · FIT.press` (press fit).
+ * pressed in at both ends, so the pocket is a straight bore of
+ * `od + 2 · allowance` (see `fit`).
+ *
+ * **Migration note (v2 breaking change).** The default changed to slip-fit
+ * (`+0.10 mm` radial). Previous behavior was press-fit (`−0.05 mm`
+ * interference) which is unachievable on FDM without reaming. Pass
+ * `fit: "interference"` to restore the prior behavior.
  *
  * @param designation Bearing code from LINEAR_BEARING (e.g. `"LM8UU"`).
+ * @param opts.fit Fit preset or raw radial allowance in mm. Default `"slip"`
+ *   (+0.10 mm, FDM drop-in). See {@link BearingFit}.
  * @param opts.axis Pocket direction (default `"+Z"`). Pass "+X"/"-X"/"+Y"/
  *   "-Y"/"-Z" for a horizontal or upward-facing bore. Rotation happens
  *   around the origin — translate to the bearing center AFTER axis.
@@ -143,10 +203,11 @@ export function body(designation: string): Shape3D {
  */
 export function linearSeat(
   designation: string,
-  opts?: { axis?: HoleAxis }
+  opts?: { fit?: BearingFit; axis?: HoleAxis }
 ): Shape3D {
   const spec = linearBearing(designation);
-  const pocketRadius = (spec.od + FIT.press * 2) / 2;
+  const allowance = normalizeFit(opts?.fit);
+  const pocketRadius = (spec.od + allowance * 2) / 2;
   const tool = makeCylinder(
     pocketRadius,
     spec.length,

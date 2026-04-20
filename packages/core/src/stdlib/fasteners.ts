@@ -37,6 +37,22 @@
  *   - "Top" face (head or nut top) sits at Z = 0.
  *   - Shaft extends into −Z (for screws/bolts); body extends into −Z (nuts).
  *
+ * ## Flipping orientation — `{ headAt: "+Z" }`
+ *
+ * Every bolt/screw factory accepts an optional `{ headAt }` that picks which
+ * side of `Z=0` the head lives on:
+ *
+ *   - `"-Z"` (default) — head body at Z ∈ [−headH, 0], shaft into −Z. This is
+ *     the cut-tool-friendly convention used everywhere else in the stdlib.
+ *   - `"+Z"` — shape is rotated 180° about the world +X axis through the
+ *     origin. Head body ends up at Z ∈ [0, +headH] and the shaft extends up
+ *     into +Z. Useful when you want `.translate(0, 0, plateThickness)` to
+ *     seat the drive side at the top of a plate (the reviewer's "bolt on
+ *     top of plate" mental model) without doing the flip manually.
+ *
+ * For the even-less-fiddly version see {@link seatedOnPlate}, which
+ * computes the seating translation (and rotation for non-Z axes) automatically.
+ *
  * ## Mixing mesh and B-Rep
  *
  * `bolts.nut("M3")` returns a `MeshShape` — it can only fuse/cut with other
@@ -77,6 +93,57 @@ function parseWithLength(spec: string): { size: MetricSize; length: number } {
     );
   }
   return { size: parsed.size, length: parsed.length };
+}
+
+// ── Orientation option (headAt) ────────────────────────────────────────────
+
+/**
+ * Options accepted by every bolt/screw factory. `headAt` picks which side of
+ * Z=0 the head lives on (see module-level Orientation docblock).
+ */
+export interface FastenerOrientOpts {
+  /**
+   * `"-Z"` (default) keeps the stdlib-wide convention: head body at
+   * Z ∈ [−headH, 0], shaft into −Z. `"+Z"` rotates the assembled fastener
+   * 180° about the world +X axis through the origin, putting the head body
+   * at Z ∈ [0, +headH] with the shaft extending into +Z. The rotation is
+   * intentionally applied after the whole fastener is built so head /
+   * shaft / recess stay coherent relative to each other.
+   */
+  headAt?: "+Z" | "-Z";
+}
+
+function assertHeadAt(opts: FastenerOrientOpts | undefined, fn: string): "+Z" | "-Z" {
+  const raw = opts?.headAt;
+  if (raw === undefined) return "-Z";
+  if (raw !== "+Z" && raw !== "-Z") {
+    throw new Error(
+      `${fn}: headAt must be "+Z" or "-Z", got ${JSON.stringify(raw)}. ` +
+        `Default is "-Z" (head body in −Z, shaft into −Z).`,
+    );
+  }
+  return raw;
+}
+
+/**
+ * Apply the `{ headAt }` flip to a just-built fastener. The input shape is
+ * locally owned by the factory that calls this, so the in-place rotate is
+ * safe (no clone needed — see `project_replicad_destructive_translate` note).
+ *
+ * Rotation: `.rotate(180, [0,0,0], [1,0,0])` — 180° about the world +X axis
+ * through the origin. Geometrically this maps `(x, y, z) → (x, −y, −z)`, so
+ * a bolt with head at Z ∈ [−headH, 0] and shaft at Z ∈ [−headH−L, −headH]
+ * becomes head at Z ∈ [0, +headH] and shaft at Z ∈ [+headH, +headH+L]. Trace
+ * for M3×10 (headH ≈ 3): head [−3, 0] → [0, 3]; shaft [−13, −3] → [3, 13].
+ * Shape stays coherent — no double-negative — because every internal cut
+ * (hex recess, cone, thread) is applied before the rotation.
+ */
+function applyHeadAt<S extends { rotate(angle: number, position?: [number, number, number], direction?: [number, number, number]): S }>(
+  shape: S,
+  headAt: "+Z" | "-Z",
+): S {
+  if (headAt === "-Z") return shape;
+  return shape.rotate(180, [0, 0, 0], [1, 0, 0]);
 }
 
 // ── Head builders (shared between screws.* and bolts.*) ────────────────────
@@ -168,31 +235,228 @@ function plainShaft(size: MetricSize, length: number, startZ: number): Shape3D {
   return makeCylinder(shaftR, length, [0, 0, startZ - length], [0, 0, 1]);
 }
 
+// ── seatedOnPlate — place a fastener so its head seats on a plate face ─────
+
+/** Signed-axis argument accepted by {@link seatedOnPlate}. */
+export type SeatAxis = "+Z" | "-Z" | "+X" | "-X" | "+Y" | "-Y";
+
+const SEAT_AXIS_VALUES: SeatAxis[] = ["+Z", "-Z", "+X", "-X", "+Y", "-Y"];
+
+function isSeatAxis(x: unknown): x is SeatAxis {
+  return typeof x === "string" && (SEAT_AXIS_VALUES as string[]).includes(x);
+}
+
+/**
+ * Read a 3D bounding box into `{min, max}` vectors. Returns undefined when
+ * the bbox is missing or malformed; callers treat that as a degenerate shape
+ * and throw with a user-friendly message.
+ */
+function read3dBounds(
+  shape: unknown,
+): { min: [number, number, number]; max: [number, number, number] } | undefined {
+  try {
+    const bb = (shape as { boundingBox?: { bounds?: unknown } })?.boundingBox;
+    const bounds = bb?.bounds as unknown;
+    if (
+      !Array.isArray(bounds) ||
+      bounds.length !== 2 ||
+      !Array.isArray(bounds[0]) ||
+      !Array.isArray(bounds[1]) ||
+      bounds[0].length !== 3 ||
+      bounds[1].length !== 3
+    ) {
+      return undefined;
+    }
+    const [[x0, y0, z0], [x1, y1, z1]] = bounds as [
+      [number, number, number],
+      [number, number, number],
+    ];
+    if (
+      !Number.isFinite(x0) || !Number.isFinite(y0) || !Number.isFinite(z0) ||
+      !Number.isFinite(x1) || !Number.isFinite(y1) || !Number.isFinite(z1)
+    ) {
+      return undefined;
+    }
+    return { min: [x0, y0, z0], max: [x1, y1, z1] };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Rotation that takes the fastener's built-in +Z axis and aligns it with the
+ * requested world axis. All rotations are about the origin — the fastener's
+ * central axis passes through the origin by construction, so this pivots the
+ * shape about that axis. Returns `undefined` for `"+Z"` (identity).
+ */
+function axisRotation(axis: SeatAxis):
+  | { angle: number; direction: [number, number, number] }
+  | undefined {
+  switch (axis) {
+    case "+Z": return undefined;                                      // identity
+    case "-Z": return { angle: 180, direction: [1, 0, 0] };           // flip about X
+    case "+X": return { angle: 90,  direction: [0, 1, 0] };           // +Z → +X
+    case "-X": return { angle: -90, direction: [0, 1, 0] };           // +Z → -X
+    case "+Y": return { angle: -90, direction: [1, 0, 0] };           // +Z → +Y
+    case "-Y": return { angle: 90,  direction: [1, 0, 0] };           // +Z → -Y
+  }
+}
+
+/** Index into a [x, y, z] tuple by axis letter. */
+const AXIS_INDEX: Record<"X" | "Y" | "Z", 0 | 1 | 2> = { X: 0, Y: 1, Z: 2 };
+
+/**
+ * Place a freshly-built fastener so its head-top face lands on the given
+ * plate's seating surface.
+ *
+ * ### Contract
+ *
+ * - `plate` must be a Shape3D with a readable non-degenerate bounding box.
+ * - `fastener` is expected in the stdlib's default `headAt: "-Z"` orientation
+ *   (head body at Z ∈ [−headH, 0], shaft into −Z). The head-top face is at
+ *   `fastener.boundingBox.max.z` in that convention.
+ * - `axis` picks which face of the plate to seat on (default `"+Z"`, the
+ *   top face). Positive axes use `plate.bbox.max.<axis>`; negative axes use
+ *   `plate.bbox.min.<axis>`. For non-Z axes the fastener is rotated so its
+ *   central axis aligns with the target world axis BEFORE being translated.
+ *
+ * ### Ownership & destructive transforms
+ *
+ * Replicad's `.translate()` and `.rotate()` CONSUME their input — they
+ * destroy the OCCT handle on the operand. `seatedOnPlate` therefore expects
+ * to OWN the `fastener` shape: pass a freshly-constructed fastener (e.g.
+ * `bolts.socket("M3x10")` directly), or `.clone()` a shape you intend to
+ * keep using elsewhere. The `plate` is only read (via `.boundingBox`) and
+ * is NOT consumed. See the `project_replicad_destructive_translate` memory
+ * note for the detailed rationale.
+ *
+ * ### Usage
+ *
+ * ```ts
+ * // Bolt on top of plate, shaft pointing up:
+ * const seated = seatedOnPlate(bolts.socket("M3x10"), plate);
+ *
+ * // Bolt installed through the −Y face of a vertical wall:
+ * const side = seatedOnPlate(bolts.socket("M3x10"), wall, "-Y");
+ * ```
+ *
+ * @param fastener A freshly-constructed fastener (default `headAt: "-Z"`).
+ *   Will be consumed by rotate/translate.
+ * @param plate A Shape3D whose bounding box provides the seating face.
+ * @param axis Which face of the plate to seat on. Default `"+Z"` (top).
+ * @returns The fastener translated (and for non-Z axes, rotated) so its
+ *   head-top face sits flush on the chosen plate face.
+ */
+export function seatedOnPlate<S extends Shape3D | MeshShape>(
+  fastener: S,
+  plate: Shape3D,
+  axis: SeatAxis = "+Z",
+): S {
+  const fn = "seatedOnPlate";
+
+  if (!isSeatAxis(axis)) {
+    throw new Error(
+      `${fn}: axis must be one of "+Z" | "-Z" | "+X" | "-X" | "+Y" | "-Y", ` +
+        `got ${JSON.stringify(axis)}.`,
+    );
+  }
+
+  const plateBB = read3dBounds(plate);
+  if (!plateBB) {
+    throw new Error(
+      `${fn}: plate has no readable boundingBox — pass a Shape3D (e.g. ` +
+        `a finished extrude/revolve), not a Drawing or raw topology handle.`,
+    );
+  }
+  const plateExtent = [
+    plateBB.max[0] - plateBB.min[0],
+    plateBB.max[1] - plateBB.min[1],
+    plateBB.max[2] - plateBB.min[2],
+  ];
+  // A zero-thickness plate has no meaningful top/bottom face to seat on.
+  // Reject degenerate bboxes up front with a clear message instead of
+  // silently producing a coplanar fastener + plate.
+  const EPS = 1e-9;
+  if (plateExtent[0] < EPS || plateExtent[1] < EPS || plateExtent[2] < EPS) {
+    throw new Error(
+      `${fn}: plate boundingBox is degenerate (extents = ` +
+        `[${plateExtent.map((n) => n.toFixed(4)).join(", ")}]). ` +
+        `Pass a non-zero-volume Shape3D.`,
+    );
+  }
+
+  // --- 1. Rotate the fastener to align its +Z axis with the target axis ---
+  // This runs BEFORE we read the fastener bbox, because the bbox in the
+  // pre-rotation local frame is not the bbox we need to translate on.
+  const rot = axisRotation(axis);
+  const oriented = (rot
+    ? (fastener as unknown as {
+        rotate: (a: number, p: [number, number, number], d: [number, number, number]) => S;
+      }).rotate(rot.angle, [0, 0, 0], rot.direction)
+    : fastener) as S;
+
+  // --- 2. Read the rotated fastener's bbox along the target axis ---------
+  const orientedBB = read3dBounds(oriented);
+  if (!orientedBB) {
+    throw new Error(
+      `${fn}: fastener has no readable boundingBox — pass a fresh ` +
+        `screws.*/bolts.* shape, not a Drawing or a raw topology handle.`,
+    );
+  }
+
+  const axisLetter = axis[1] as "X" | "Y" | "Z";
+  const axisIdx = AXIS_INDEX[axisLetter];
+  const wantPositive = axis[0] === "+";
+
+  // Plate seating face: max for +axis, min for -axis.
+  const plateFace = wantPositive ? plateBB.max[axisIdx] : plateBB.min[axisIdx];
+
+  // Fastener head-top face: after rotation the head-top sits at the extreme
+  // of the target axis matching `wantPositive`. For +axis the head-top is at
+  // bbox.max[axisIdx]; for -axis it's at bbox.min[axisIdx]. (The rotation
+  // tables above were chosen so that "head points along +axis" holds.)
+  const headTop = wantPositive ? orientedBB.max[axisIdx] : orientedBB.min[axisIdx];
+
+  const shift = plateFace - headTop;
+  if (shift === 0) return oriented;
+
+  const dx = axisIdx === 0 ? shift : 0;
+  const dy = axisIdx === 1 ? shift : 0;
+  const dz = axisIdx === 2 ? shift : 0;
+  return (oriented as unknown as {
+    translate: (x: number, y: number, z: number) => S;
+  }).translate(dx, dy, dz);
+}
+
 // ── Cosmetic fasteners — screws.* ──────────────────────────────────────────
 
 export const screws = {
   /** ISO 4762 socket-head cap screw with plain (unthreaded) shaft. */
-  socket(spec: string): Shape3D {
+  socket(spec: string, opts?: FastenerOrientOpts): Shape3D {
     const { size, length } = parseWithLength(spec);
     const { head, shaftStartZ } = socketHeadBody(size);
-    return head.fuse(plainShaft(size, length, shaftStartZ));
+    const body = head.fuse(plainShaft(size, length, shaftStartZ));
+    return applyHeadAt(body, assertHeadAt(opts, "screws.socket"));
   },
   /** ISO 7380 button-head cap screw with plain shaft. */
-  button(spec: string): Shape3D {
+  button(spec: string, opts?: FastenerOrientOpts): Shape3D {
     const { size, length } = parseWithLength(spec);
     const { head, shaftStartZ } = buttonHeadBody(size);
-    return head.fuse(plainShaft(size, length, shaftStartZ));
+    const body = head.fuse(plainShaft(size, length, shaftStartZ));
+    return applyHeadAt(body, assertHeadAt(opts, "screws.button"));
   },
   /** ISO 10642 flat-head (countersunk) cap screw with plain shaft. */
-  flat(spec: string): Shape3D {
+  flat(spec: string, opts?: FastenerOrientOpts): Shape3D {
     const { size, length } = parseWithLength(spec);
-    return flatHeadFull(size, length, /* includeShaft */ true);
+    const body = flatHeadFull(size, length, /* includeShaft */ true);
+    return applyHeadAt(body, assertHeadAt(opts, "screws.flat"));
   },
   /** ISO 4017 hex-head bolt with plain shaft. */
-  hex(spec: string): Shape3D {
+  hex(spec: string, opts?: FastenerOrientOpts): Shape3D {
     const { size, length } = parseWithLength(spec);
     const { head, shaftStartZ } = hexHeadBody(size);
-    return head.fuse(plainShaft(size, length, shaftStartZ));
+    const body = head.fuse(plainShaft(size, length, shaftStartZ));
+    return applyHeadAt(body, assertHeadAt(opts, "screws.hex"));
   },
   /** DIN 934 hex nut with a clean cylindrical bore (no thread geometry). */
   nut(size: MetricSize): Shape3D {
@@ -235,9 +499,10 @@ export const bolts = {
    * fuse/cut workflows, use {@link bolts.socketMesh} which returns a
    * watertight `MeshShape`.
    */
-  socket(spec: string): Shape3D {
+  socket(spec: string, opts?: FastenerOrientOpts): Shape3D {
     const { size, length } = parseWithLength(spec);
-    return threadedScrew(socketHeadBody, size, length);
+    const body = threadedScrew(socketHeadBody, size, length);
+    return applyHeadAt(body, assertHeadAt(opts, "bolts.socket"));
   },
   /**
    * Button-head cap screw with real helical thread.
@@ -245,9 +510,10 @@ export const bolts = {
    * **Returns a Compound. Not fuse-safe.** See {@link bolts.socket} — use
    * {@link bolts.buttonMesh} for fuse/cut workflows.
    */
-  button(spec: string): Shape3D {
+  button(spec: string, opts?: FastenerOrientOpts): Shape3D {
     const { size, length } = parseWithLength(spec);
-    return threadedScrew(buttonHeadBody, size, length);
+    const body = threadedScrew(buttonHeadBody, size, length);
+    return applyHeadAt(body, assertHeadAt(opts, "bolts.button"));
   },
   /**
    * Flat-head (countersunk) cap screw with real helical thread.
@@ -255,12 +521,13 @@ export const bolts = {
    * **Returns a Compound. Not fuse-safe.** See {@link bolts.socket} — use
    * {@link bolts.flatMesh} for fuse/cut workflows.
    */
-  flat(spec: string): Shape3D {
+  flat(spec: string, opts?: FastenerOrientOpts): Shape3D {
     const { size, length } = parseWithLength(spec);
     const head = flatHeadFull(size, length, /* includeShaft */ false);
     const f = FLAT_HEAD[size]!;
     const shaft = threadedShaft(size, length).translate(0, 0, -f.headD / 2 - length);
-    return makeCompound([head, shaft]) as Shape3D;
+    const body = makeCompound([head, shaft]) as Shape3D;
+    return applyHeadAt(body, assertHeadAt(opts, "bolts.flat"));
   },
   /**
    * Hex-head (ISO 4017) bolt with real helical thread.
@@ -268,9 +535,10 @@ export const bolts = {
    * **Returns a Compound. Not fuse-safe.** See {@link bolts.socket} — use
    * {@link bolts.hexMesh} for fuse/cut workflows.
    */
-  hex(spec: string): Shape3D {
+  hex(spec: string, opts?: FastenerOrientOpts): Shape3D {
     const { size, length } = parseWithLength(spec);
-    return threadedScrew(hexHeadBody, size, length);
+    const body = threadedScrew(hexHeadBody, size, length);
+    return applyHeadAt(body, assertHeadAt(opts, "bolts.hex"));
   },
   /**
    * Hex nut with real helical internal thread. Returns a `MeshShape` because
@@ -295,34 +563,37 @@ export const bolts = {
    * fused in the Manifold kernel, so the result can be cleanly `.fuse()`d or
    * `.cut()` against other MeshShapes (or mesh-converted Shape3Ds).
    */
-  socketMesh(spec: string): MeshShape {
+  socketMesh(spec: string, opts?: FastenerOrientOpts): MeshShape {
     const { size, length } = parseWithLength(spec);
     const { head, shaftStartZ } = socketHeadBody(size);
     const headMesh = head.meshShape({ tolerance: 0.01 });
     const threadMesh = metricMesh(size, length).translate(0, 0, shaftStartZ - length);
-    return headMesh.fuse(threadMesh);
+    const body = headMesh.fuse(threadMesh);
+    return applyHeadAt(body, assertHeadAt(opts, "bolts.socketMesh"));
   },
   /**
    * Button-head cap screw as a `MeshShape` — fuse-safe counterpart to
    * {@link bolts.button}.
    */
-  buttonMesh(spec: string): MeshShape {
+  buttonMesh(spec: string, opts?: FastenerOrientOpts): MeshShape {
     const { size, length } = parseWithLength(spec);
     const { head, shaftStartZ } = buttonHeadBody(size);
     const headMesh = head.meshShape({ tolerance: 0.01 });
     const threadMesh = metricMesh(size, length).translate(0, 0, shaftStartZ - length);
-    return headMesh.fuse(threadMesh);
+    const body = headMesh.fuse(threadMesh);
+    return applyHeadAt(body, assertHeadAt(opts, "bolts.buttonMesh"));
   },
   /**
    * Hex-head bolt as a `MeshShape` — fuse-safe counterpart to
    * {@link bolts.hex}.
    */
-  hexMesh(spec: string): MeshShape {
+  hexMesh(spec: string, opts?: FastenerOrientOpts): MeshShape {
     const { size, length } = parseWithLength(spec);
     const { head, shaftStartZ } = hexHeadBody(size);
     const headMesh = head.meshShape({ tolerance: 0.01 });
     const threadMesh = metricMesh(size, length).translate(0, 0, shaftStartZ - length);
-    return headMesh.fuse(threadMesh);
+    const body = headMesh.fuse(threadMesh);
+    return applyHeadAt(body, assertHeadAt(opts, "bolts.hexMesh"));
   },
   /**
    * Flat-head cap screw as a `MeshShape` — fuse-safe counterpart to
@@ -330,13 +601,14 @@ export const bolts = {
    * the thread separately), so the cone-to-shaft transition happens in the
    * Manifold mesh union instead of OCCT.
    */
-  flatMesh(spec: string): MeshShape {
+  flatMesh(spec: string, opts?: FastenerOrientOpts): MeshShape {
     const { size, length } = parseWithLength(spec);
     const head = flatHeadFull(size, length, /* includeShaft */ false);
     const f = FLAT_HEAD[size]!;
     const headMesh = head.meshShape({ tolerance: 0.01 });
     const threadMesh = metricMesh(size, length).translate(0, 0, -f.headD / 2 - length);
-    return headMesh.fuse(threadMesh);
+    const body = headMesh.fuse(threadMesh);
+    return applyHeadAt(body, assertHeadAt(opts, "bolts.flatMesh"));
   },
 };
 

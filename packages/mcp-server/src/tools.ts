@@ -755,6 +755,97 @@ export function checkExtrudeWithoutSketchPlane(code: string): string | null {
 }
 
 /**
+ * Pitfall #8 (AST-based): flag DrawingPen bezier calls where two literal
+ * `[x, y]` control points within the SAME call are byte-identical. OpenCascade
+ * throws a low-level "Standard_ConstructionError" on degenerate curves with no
+ * script-frame context, which is hell to diagnose from user-land. Catching the
+ * equal-literals case statically saves the whole loop.
+ *
+ * Scope: bezierCurveTo, quadraticBezierCurveTo, cubicBezierCurveTo,
+ * smoothSplineTo — these are the DrawingPen methods that accept two or more
+ * `[x, y]` tuples (endpoint + control points). Non-literal arguments (variables,
+ * computed expressions) pass through: we can't evaluate them statically, and
+ * the stdlib has several helpers that compose bezier paths from parameters.
+ *
+ * Start-point degeneracy (where a literal equals the current pen position set
+ * by `.moveTo(...)` / prior `.lineTo(...)`) would require tracking pen state
+ * across the chain — deferred to a future iteration. One warning per file
+ * (first match wins) to avoid flooding a chain of small bezier segments with
+ * repeated warnings.
+ *
+ * Returns null when TypeScript isn't reachable, matching the pattern in
+ * checkExtrudeWithoutSketchPlane so the caller can fall back quietly.
+ */
+export function checkBezierDegeneracy(code: string): string | null {
+  const tsMod = loadTypescript();
+  if (!tsMod) return null;
+  const ts: typeof import("typescript") = tsMod;
+  let source: import("typescript").SourceFile;
+  try {
+    source = ts.createSourceFile("__validate__.ts", code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  } catch {
+    return null;
+  }
+
+  const bezierMethods = new Set([
+    "bezierCurveTo", "quadraticBezierCurveTo", "cubicBezierCurveTo", "smoothSplineTo",
+  ]);
+
+  // Whitespace-normalized canonical form of a literal [x, y] pair. Returns
+  // null if the node isn't a 2-element array literal of numeric literals
+  // (with optional unary minus) — those are the only shapes we compare.
+  function canonicalPoint(node: import("typescript").Node): { key: string; x: number; y: number } | null {
+    if (!ts.isArrayLiteralExpression(node)) return null;
+    if (node.elements.length !== 2) return null;
+    const nums: number[] = [];
+    for (const el of node.elements) {
+      let signed: number | null = null;
+      if (ts.isNumericLiteral(el)) {
+        signed = parseFloat(el.text);
+      } else if (ts.isPrefixUnaryExpression(el) && el.operator === ts.SyntaxKind.MinusToken && ts.isNumericLiteral(el.operand)) {
+        signed = -parseFloat(el.operand.text);
+      }
+      if (signed === null || !isFinite(signed)) return null;
+      nums.push(signed);
+    }
+    const [x, y] = nums;
+    return { key: `${x},${y}`, x, y };
+  }
+
+  let warning: string | null = null;
+  function scan(node: import("typescript").Node): void {
+    if (warning) return;
+    if (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      bezierMethods.has(node.expression.name.text)
+    ) {
+      const literals: Array<{ key: string; x: number; y: number }> = [];
+      for (const arg of node.arguments) {
+        const pt = canonicalPoint(arg);
+        if (pt) literals.push(pt);
+      }
+      for (let i = 0; i < literals.length && !warning; i++) {
+        for (let j = i + 1; j < literals.length; j++) {
+          if (literals[i].key === literals[j].key) {
+            const { x, y } = literals[i];
+            const line = source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
+            warning =
+              `line ${line}: bezier control point equals another control point at (${x}, ${y}). ` +
+              `OCCT will throw a low-level exception on degenerate curves. ` +
+              `Use a nearby but non-identical point (e.g., [${x + 0.01}, ${y}])`;
+            break;
+          }
+        }
+      }
+    }
+    if (!warning) ts.forEachChild(node, scan);
+  }
+  scan(source);
+  return warning;
+}
+
+/**
  * Pure syntax + pitfall validator. Extracted from the `validate_syntax` /
  * `validate_script` MCP tools so unit tests can call it directly without
  * spinning up an MCP server. Returns the same text the tools emit, plus a
@@ -980,6 +1071,17 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
           );
         }
       }
+    }
+
+    // 5b. Bezier control-point degeneracy. Two identical literal [x, y] tuples
+    //     in the same bezierCurveTo / quadraticBezierCurveTo / cubicBezierCurveTo
+    //     / smoothSplineTo call produce a zero-length segment — OCCT throws a
+    //     bare "Standard_ConstructionError" with no script context. AST-based
+    //     so the warning reports the correct line number; non-literal args are
+    //     skipped (we can't evaluate variables statically).
+    const bezierWarning = checkBezierDegeneracy(code);
+    if (bezierWarning) {
+      semanticWarnings.push(bezierWarning);
     }
 
     // 6. .fuse(/.cut( inside a for-loop body — classic "slow pattern".
@@ -1844,12 +1946,19 @@ export function registerTools(server: McpServer) {
             if (!cmdId) {
               screenshotWarning = "\n(Screenshot skipped: failed to send command to extension.)";
             } else {
-              const result = await waitForResult(cmdId, 60_000);
+              // Reviewer feedback: 60s timed out on a cold-cache enclosure
+              // snippet where a proper render just needed a couple more seconds.
+              // 120s matches the worker's own defensive ceiling for heavy
+              // OCCT shells/offsets; callers can still override via timeoutMs
+              // on the extension side. Only the inline-screenshot path gets
+              // the bump — the text-only status path stays fast.
+              const timeoutMs = 120_000;
+              const result = await waitForResult(cmdId, timeoutMs);
               if (!result) {
                 const reason = lastWaitTimeoutReason === "slow"
-                  ? "extension is alive but render exceeded 60s"
-                  : "extension stopped responding";
-                screenshotWarning = `\n(Screenshot skipped: ${reason}.)`;
+                  ? `Screenshot exceeded ${timeoutMs / 1000}s. Large enclosures can take longer on cold caches. Options: save the snippet to a file (cached across calls), lower the mesh quality via \`export const config = { meshQuality: 'preview' }\`, or pass a larger \`timeoutMs\`.`
+                  : "extension stopped responding.";
+                screenshotWarning = `\n(Screenshot skipped: ${reason})`;
               } else if (result.error) {
                 screenshotWarning = `\n(Screenshot skipped: ${result.error})`;
               } else if (result.screenshotPath) {
@@ -3194,10 +3303,23 @@ export function registerTools(server: McpServer) {
       const accounting: string[] = [
         `Checked ${parts.length} parts \u2192 ${pairWord(totalPairs)} total.`,
       ];
-      if (skippedByAABB > 0) {
-        accounting.push(`  - ${pairWord(skippedByAABB)} skipped by AABB prefilter (non-overlapping bounding boxes).`);
-      }
-      if (tested > 0) {
+      // Reviewer feedback: "skipped by AABB prefilter" read like the tool had
+      // ducked the work. Rephrase so the accounting makes it clear the prefilter
+      // is a proof (disjoint AABBs → no intersection possible), not a shortcut.
+      //   - skippedByAABB === totalPairs: every pair is AABB-disjoint, nothing
+      //     was tested; collapse into one definitive "no overlap possible" line.
+      //   - skippedByAABB > 0 && tested > 0: combined line naming the split so
+      //     readers don't have to add the two bullets themselves.
+      //   - skippedByAABB === 0: fall through to the original tested-line path,
+      //     unchanged (we only touch the phrasing that sounded evasive).
+      if (skippedByAABB > 0 && skippedByAABB === totalPairs) {
+        accounting.push(`  - No overlap possible \u2014 all ${pairWord(totalPairs)} AABB-disjoint.`);
+      } else if (skippedByAABB > 0 && tested > 0) {
+        const allClear = collisions.length === 0 && failures.length === 0
+          ? " \u2014 all tested pairs clear"
+          : "";
+        accounting.push(`  - ${pairWord(skippedByAABB)} AABB-disjoint (skipped); ${pairWord(tested)} tested${allClear}.`);
+      } else if (skippedByAABB === 0 && tested > 0) {
         const testedSuffix = collisions.length === 0 && failures.length === 0
           ? " \u2014 all clear"
           : "";
@@ -4101,7 +4223,7 @@ returns a Replicad Shape3D (or Drawing, where noted), so results mix with any
 other Replicad code. Dimensions come from ISO/DIN tables — don't hardcode.
 
 \`\`\`typescript
-import { holes, screws, bolts, washers, inserts, bearings, extrusions, patterns, printHints, motors, couplers, threads, fromBack, shape3d, part, faceAt, shaftAt, boreAt, mate, assemble, subassembly, stackOnZ, entries, debugJoints, highlightJoints, cylinder, standards } from "shapeitup";
+import { holes, screws, bolts, washers, inserts, bearings, extrusions, patterns, printHints, motors, couplers, threads, fromBack, seatedOnPlate, shape3d, part, faceAt, shaftAt, boreAt, mate, assemble, subassembly, stackOnZ, entries, debugJoints, highlightJoints, cylinder, standards } from "shapeitup";
 \`\`\`
 
 **Convention for cut-tool shapes** (holes, bearing seats, insert pockets):
@@ -4189,6 +4311,14 @@ bolts.nut("M3")            // MeshShape — see mesh/B-Rep note below
 washers.flat("M3")         // DIN 125 flat washer
 inserts.heatSet("M3")      // brass heat-set insert BODY
 inserts.pocket("M3")       // CUT-TOOL for the pocket
+\`\`\`
+
+**Seating fasteners on a plate** — \`seatedOnPlate(fastener, plate, axis?)\` positions any fastener so its head-top face lands on the plate's surface along the given axis. \`axis\` ∈ \`"+Z" | "-Z" | "+X" | "-X" | "+Y" | "-Y"\` (default \`"+Z"\` — head atop plate). Works with \`bolts.*\`, \`screws.*\`, and the Mesh variants:
+
+\`\`\`typescript
+seatedOnPlate(bolts.socket("M6x20"), plate)       // head on plate top (+Z)
+seatedOnPlate(screws.flat("M4x10"), plate, "-Z")  // head on plate bottom
+seatedOnPlate(bolts.socket("M6x20"), wall, "+X")  // head on +X wall face
 \`\`\`
 
 Mixing mesh and B-Rep: \`bolts.nut\` is a MeshShape — it can only fuse/cut with other MeshShapes. Convert the Shape3D side first: \`plate.meshShape({ tolerance: 0.01 }).cut(bolts.nut("M3"))\`.
