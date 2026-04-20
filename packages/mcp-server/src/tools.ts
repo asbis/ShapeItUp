@@ -8,11 +8,13 @@ import {
   exportLastToFile,
   getCore,
   getLastFileName,
+  getLastParts,
   resetCore,
   type EngineStatus,
   type ShapeProperties,
 } from "./engine.js";
 import { autoBootstrapIfNeeded, setupShapeProject } from "./project-setup.js";
+import { renderPartsToSvg } from "./svg-renderer.js";
 
 /**
  * Shared globalStorage dir with the VSCode extension. Both processes write and
@@ -192,9 +194,19 @@ function readAllHeartbeats(): WindowHeartbeat[] {
 }
 
 function isExtensionAlive(): boolean {
+  // Aggregate across per-pid heartbeats — multi-window setups often have one
+  // stale window (minimized / background) alongside a fresh foreground one,
+  // and we want ANY live window to count as "extension alive". Raised from
+  // 5s to 15s because 5s fires false-negatives during momentary system stalls
+  // (Docker/VM starts, browser GC, macOS App Nap on backgrounded VS Code).
+  const all = readAllHeartbeats();
+  const now = Date.now();
+  if (all.length > 0) {
+    return all.some((hb) => now - (hb.timestamp ?? 0) < 15_000);
+  }
   const hb = readHeartbeat();
   if (!hb) return false;
-  return Date.now() - (hb.timestamp ?? 0) < 5000;
+  return now - (hb.timestamp ?? 0) < 15_000;
 }
 
 /**
@@ -2216,12 +2228,48 @@ export function registerTools(server: McpServer) {
       }
 
       if (!isExtensionAlive()) {
+        // Headless fallback: render a 4-view SVG wireframe from the
+        // OCCT-tessellated edges we already have. Not as pretty as the
+        // Three.js viewer, but lets agents verify silhouette and proportions
+        // without any running VS Code window.
+        const parts = getLastParts();
+        if (parts.length === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text:
+                `render_preview: no tessellated parts available and VS Code extension isn't running. ` +
+                `Run create_shape / modify_shape / open_shape first so the engine has geometry to render.`,
+            }],
+            isError: true,
+          };
+        }
+
+        const svgOut = renderPartsToSvg(parts);
+        const svgPath = join(GLOBAL_STORAGE, "shapeitup-previews", `headless-${Date.now()}.svg`);
+        try {
+          mkdirSync(dirname(svgPath), { recursive: true });
+          writeFileSync(svgPath, svgOut.svg, "utf-8");
+        } catch (e: any) {
+          return {
+            content: [{ type: "text" as const, text: `Failed to write headless SVG preview: ${e.message}` }],
+            isError: true,
+          };
+        }
+
+        const liveRoots = getHeartbeatWorkspaceRoots();
+        const rootHint = liveRoots.length > 0
+          ? `\nFor the richer Three.js preview, focus a VS Code window with one of these workspaces open: ${liveRoots.join(", ")}`
+          : "\nFor the richer Three.js preview, open the .shape.ts file in VS Code with the ShapeItUp extension.";
+
         return {
           content: [{
             type: "text" as const,
-            text: `render_preview requires the VSCode extension to be running. Open VSCode with the ShapeItUp extension and retry.\n\nFor headless verification, use get_render_status — it returns volume, surface area, center of mass, and bounding box without needing a screenshot.`,
+            text:
+              `Headless wireframe preview (VS Code extension not running): ${svgPath}\n` +
+              `${svgOut.summary}${rootHint}`,
           }],
-          isError: true,
+          isError: false,
         };
       }
 
