@@ -1415,9 +1415,15 @@ function mergeSidecarOverrides(
 async function executeWithPersistedParams(
   absPath: string,
   callOverrides?: Record<string, number>,
+  /**
+   * Forwarded to {@link executeShapeFile}. Only `export_shape`'s BOM sidecar
+   * currently opts in to `"full"` — every other caller omits the arg so the
+   * default fast path stays in play.
+   */
+  opts?: { partStats?: "none" | "bbox" | "full" },
 ): ReturnType<typeof executeShapeFile> {
   const merged = mergeSidecarOverrides(absPath, callOverrides);
-  return executeShapeFile(absPath, GLOBAL_STORAGE, merged);
+  return executeShapeFile(absPath, GLOBAL_STORAGE, merged, opts);
 }
 
 export function registerTools(server: McpServer) {
@@ -1734,7 +1740,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "export_shape",
-    "Export the last executed shape to STEP or STL. Optionally pass `filePath` to execute and export a specific file in one call. For multi-part assemblies, pass `partName` to export a single named part instead of the whole assembly.",
+    "Export the last executed shape to STEP or STL. Optionally pass `filePath` to execute and export a specific file in one call. For multi-part assemblies, pass `partName` to export a single named part instead of the whole assembly. Pass `bom: true` to write a `*.bom.json` sidecar next to the exported file with per-part volume, mass, qty, material, and bounding box.",
     {
       format: z.enum(["step", "stl"]).describe("'step' for CNC/manufacturing or CAD, 'stl' for 3D printing"),
       outputPath: z.string().optional().describe("Output file path. Auto-derived from the source .shape.ts filename if omitted."),
@@ -1744,8 +1750,9 @@ export function registerTools(server: McpServer) {
         .enum(["prusaslicer", "cura", "bambustudio", "orcaslicer", "freecad", "fusion360"])
         .optional()
         .describe("If set, open the exported file in this app after saving. Requires VSCode + the extension."),
+      bom: z.boolean().optional().describe("When true, also write a `*.bom.json` sidecar next to the exported file describing each part's volume_mm3, mass_g (if material declared), qty, material, and min/max bounding box. Basename tracks the source `.shape.ts` (one sidecar per export call, even when per-part STL files are written)."),
     },
-    safeHandler("export_shape", async ({ format, outputPath, filePath, partName, openIn }) => {
+    safeHandler("export_shape", async ({ format, outputPath, filePath, partName, openIn, bom }) => {
       // Figure out which file we're exporting. Precedence: explicit arg →
       // in-process last file → status file's fileName (set by VSCode/prior runs).
       let source: string | undefined = filePath ? resolveShapePath(filePath) : getLastFileName();
@@ -1763,8 +1770,15 @@ export function registerTools(server: McpServer) {
       }
 
       // Always re-execute — guarantees correctness even if something mutated
-      // OCCT state between the last render and now.
-      const { status } = await executeWithPersistedParams(source);
+      // OCCT state between the last render and now. When `bom` is requested we
+      // force `partStats: "full"` so the tessellation loop populates
+      // volume/mass via OCCT measurement; otherwise the fast `"bbox"` default
+      // stays in play (a BOM with every volume = undefined would be useless).
+      const { status, parts: execParts } = await executeWithPersistedParams(
+        source,
+        undefined,
+        bom === true ? { partStats: "full" } : undefined,
+      );
       if (!status.success) {
         return {
           content: [{ type: "text" as const, text: `Cannot export — render failed.\n${formatStatusText(status)}` }],
@@ -1829,6 +1843,107 @@ export function registerTools(server: McpServer) {
         ? `${(fileSize / 1024 / 1024).toFixed(1)}MB`
         : `${Math.round(fileSize / 1024)}KB`;
 
+      // Optional BOM sidecar. Mirrors the spec from cad-review-feedback:
+      // one `*.bom.json` per export call, basenamed after the exported file's
+      // source `.shape.ts`. For per-part STL flows (same call, one sidecar)
+      // the sidecar still lives in the same directory as savePath. Omitted
+      // for failed exports so we never ship a BOM describing a missing file.
+      let bomLine = "";
+      if (bom === true) {
+        try {
+          const props = (status as any).properties as ShapeProperties | undefined;
+          const propsParts = (props?.parts ?? []) as NonNullable<ShapeProperties["parts"]>;
+          const sourceBase = basename(source).replace(/\.shape\.ts$/, "");
+          const bomPath = join(dirname(savePath), `${sourceBase}.bom.json`);
+
+          type BomPartEntry = {
+            name: string;
+            qty: number;
+            material?: { density: number; name?: string };
+            volume_mm3?: number;
+            mass_g?: number;
+            boundingBox?: { min: [number, number, number]; max: [number, number, number] };
+          };
+
+          // Recompute per-part min/max AABB from the live vertex buffers. The
+          // existing `properties.boundingBox` stores {x,y,z} *extent* — BOMs
+          // need corners so downstream tooling (pack-on-bed, fit-in-box) can
+          // check clearance against a print bed origin.
+          const bboxFor = (i: number): BomPartEntry["boundingBox"] | undefined => {
+            const v = execParts?.[i]?.vertices;
+            if (!v || v.length < 3) return undefined;
+            let minX = Infinity, minY = Infinity, minZ = Infinity;
+            let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+            for (let j = 0; j < v.length; j += 3) {
+              if (v[j] < minX) minX = v[j];
+              if (v[j] > maxX) maxX = v[j];
+              if (v[j + 1] < minY) minY = v[j + 1];
+              if (v[j + 1] > maxY) maxY = v[j + 1];
+              if (v[j + 2] < minZ) minZ = v[j + 2];
+              if (v[j + 2] > maxZ) maxZ = v[j + 2];
+            }
+            const r = (n: number) => Math.round(n * 1000) / 1000;
+            return { min: [r(minX), r(minY), r(minZ)], max: [r(maxX), r(maxY), r(maxZ)] };
+          };
+
+          // Filter to the same subset exportLastToFile wrote — when partName
+          // is set, only that part's row appears; otherwise every part.
+          const filtered = partName
+            ? propsParts.filter((p) => p.name === partName)
+            : propsParts;
+
+          const bomParts: BomPartEntry[] = filtered.map((p, idx) => {
+            const origIdx = partName
+              ? propsParts.findIndex((q) => q.name === p.name)
+              : idx;
+            // Resolve effective material per the spec: per-part override wins,
+            // otherwise inherit the script-level material from status.
+            const effectiveMaterial = p.material ?? (status as any).material;
+            const entry: BomPartEntry = {
+              name: p.name,
+              qty: typeof p.qty === "number" && p.qty > 0 ? p.qty : 1,
+            };
+            if (effectiveMaterial && typeof effectiveMaterial.density === "number") {
+              entry.material = {
+                density: effectiveMaterial.density,
+                ...(effectiveMaterial.name ? { name: effectiveMaterial.name } : {}),
+              };
+            }
+            if (typeof p.volume === "number" && Number.isFinite(p.volume)) {
+              entry.volume_mm3 = Math.round(p.volume * 100) / 100;
+              if (entry.material) {
+                // mass_g = density(g/cm³) * volume(mm³) / 1000. Round to 0.01g
+                // so slicer-bound JSON doesn't carry phoney precision.
+                const raw = (entry.material.density * p.volume) / 1000;
+                entry.mass_g = Math.round(raw * 100) / 100;
+              }
+            }
+            const bb = bboxFor(origIdx);
+            if (bb) entry.boundingBox = bb;
+            return entry;
+          });
+
+          const totalMass = bomParts.reduce(
+            (s, e) => s + (typeof e.mass_g === "number" ? e.mass_g * (e.qty ?? 1) : 0),
+            0,
+          );
+          const everyHasMass = bomParts.length > 0 && bomParts.every((e) => typeof e.mass_g === "number");
+
+          const bomDoc = {
+            source: basename(source),
+            exportedAt: new Date().toISOString(),
+            format,
+            parts: bomParts,
+            ...(everyHasMass ? { totalMass_g: Math.round(totalMass * 100) / 100 } : {}),
+          };
+          writeFileSync(bomPath, JSON.stringify(bomDoc, null, 2), "utf-8");
+          bomLine = `\nBOM: ${bomPath}`;
+        } catch (e: any) {
+          // Best-effort: a sidecar write failure never fails the export.
+          bomLine = `\nBOM: write failed (${e?.message ?? e}) — main export succeeded.`;
+        }
+      }
+
       // open-in-app still needs the VSCode extension for app detection +
       // launching. Best-effort — never fails the export itself.
       let openLine = "";
@@ -1860,7 +1975,7 @@ export function registerTools(server: McpServer) {
       }
 
       return {
-        content: [{ type: "text" as const, text: `Exported to: ${savePath}\nFormat: ${format.toUpperCase()}\nSize: ${sizeStr}\nSource: ${source}${contentsLine}${openLine}${multiPartWarning}` }],
+        content: [{ type: "text" as const, text: `Exported to: ${savePath}\nFormat: ${format.toUpperCase()}\nSize: ${sizeStr}\nSource: ${source}${contentsLine}${bomLine}${openLine}${multiPartWarning}` }],
       };
     })
   );
@@ -2534,13 +2649,23 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "render_preview",
-    "Capture a PNG screenshot of the current shape. Requires VSCode + the ShapeItUp extension to be running (the extension renders via its webview, which works regardless of window size — the canvas is temporarily resized to the requested resolution). Preview PNGs are written to `{workspace}/shapeitup-previews/` — Read the returned absolute path to view the image. For headless verification without VSCode, use get_render_status which returns volume, surface area, center of mass, and bounding box. Pass `finder` to paint pink highlight spheres on the matched edges/faces in the screenshot (for just a text match count with no PNG, use `preview_finder`). Pass `meshQuality: 'preview'` to speed up first-render on large assemblies at the cost of coarser facets; defaults to auto-degrade (preview for 15+ parts, final otherwise).",
+    "Capture a PNG screenshot of the current shape. Requires VSCode + the ShapeItUp extension to be running (the extension renders via its webview, which works regardless of window size — the canvas is temporarily resized to the requested resolution). Preview PNGs are written to `{workspace}/shapeitup-previews/` — Read the returned absolute path to view the image. For headless verification without VSCode, use get_render_status which returns volume, surface area, center of mass, and bounding box. Pass `finder` to paint pink highlight spheres on the matched edges/faces in the screenshot (for just a text match count with no PNG, use `preview_finder`). Pass `meshQuality: 'preview'` to speed up first-render on large assemblies at the cost of coarser facets; defaults to auto-degrade (preview for 15+ parts, final otherwise). Pass `cameraAngle` as an array (e.g. ['isometric', 'front', 'right']) or `grid: true` to composite multiple angles into a single labelled collage PNG.",
     {
       filePath: z.string().optional().describe("Optional .shape.ts to execute first. Defaults to the last-executed shape."),
       cameraAngle: z
-        .enum(["isometric", "top", "bottom", "front", "right", "back", "left"])
+        .union([
+          z.enum(["isometric", "top", "bottom", "front", "right", "back", "left"]),
+          z
+            .array(z.enum(["isometric", "top", "bottom", "front", "right", "back", "left"]))
+            .min(1)
+            .max(4),
+        ])
         .optional()
-        .describe("Camera angle preset (default: 'isometric')"),
+        .describe("Camera angle preset (default: 'isometric'). Also accepts an array of 1–4 angles — each is captured separately and composited into one collage PNG (1×N strip for 2–3 angles, 2×2 grid for 4)."),
+      grid: z
+        .boolean()
+        .optional()
+        .describe("Shortcut for cameraAngle: ['isometric', 'front', 'right', 'top']. Ignored when an explicit cameraAngle array is also passed."),
       showDimensions: z.boolean().optional().describe("Overlay bounding-box dimensions (default: true)"),
       showAxes: z.boolean().optional().describe("Overlay X/Y/Z coordinate axes in the screenshot (default: true). Helpful for orienting symmetric or complex models. Pass false to suppress."),
       renderMode: z.enum(["ai", "dark"]).optional().describe("'ai' for high-contrast light background (default), 'dark' for dark mode"),
@@ -2563,7 +2688,7 @@ export function registerTools(server: McpServer) {
         .describe("Tessellation-quality preset. `'final'` (default for <15-part assemblies) matches the pre-existing render quality. `'preview'` coarsens the mesh ~2.5× for faster first-render on large assemblies, at the cost of visibly chunkier facets — choose this for layout checks on 15+ part assemblies. If omitted, the extension auto-degrades to `'preview'` when the part count is >= 15 and uses `'final'` otherwise."),
       inline: z.boolean().optional().describe("Return the rendered PNG inline as base64 image content on top of the usual text + file path. Default true — agents see the image directly without an extra `get_preview` round trip. Skipped inline if the file exceeds 10 MB. Pass false to skip the base64 payload (saves ~30% response size) when you only need the path."),
     },
-    safeHandler("render_preview", async ({ filePath, cameraAngle, showDimensions, showAxes, renderMode, width, height, timeoutMs, focusPart, hideParts, finder, partName, partIndex, meshQuality, inline }) => {
+    safeHandler("render_preview", async ({ filePath, cameraAngle, grid, showDimensions, showAxes, renderMode, width, height, timeoutMs, focusPart, hideParts, finder, partName, partIndex, meshQuality, inline }) => {
       // Resolve which file to render: explicit > engine's last-executed > status file.
       const explicitFilePath = filePath !== undefined && filePath !== null;
       let source: string | undefined = filePath ? resolveShapePath(filePath) : getLastFileName();
@@ -2701,6 +2826,185 @@ export function registerTools(server: McpServer) {
         }
       }
 
+      // --- Multi-angle collage branch -----------------------------------------
+      // When the caller supplies an array of angles (or `grid: true`) we
+      // capture each angle via the existing single-angle IPC, then composite
+      // the intermediate PNGs into one labelled collage through resvg (same
+      // path the headless fallback uses). Intermediate PNGs are deleted after
+      // compositing so callers are left with a single file.
+      //
+      // Deliberately incompatible with `finder` — a finder collage would need
+      // N wrapper files and its own stamping logic, and nobody's asked. Fail
+      // loud if both are supplied.
+      const gridDefault: Array<"isometric" | "front" | "right" | "top"> = [
+        "isometric",
+        "front",
+        "right",
+        "top",
+      ];
+      let angleList: string[] | undefined;
+      if (Array.isArray(cameraAngle)) {
+        angleList = cameraAngle;
+      } else if (grid === true && cameraAngle === undefined) {
+        angleList = gridDefault.slice();
+      }
+      if (angleList && angleList.length > 1) {
+        if (finder !== undefined && finder.trim().length > 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: "render_preview: multi-angle (array cameraAngle or grid:true) is not compatible with `finder`. Pass a single cameraAngle when using finder, or drop finder to build a collage.",
+            }],
+            isError: true,
+          };
+        }
+
+        const perW = width || 1280;
+        const perH = height || 960;
+        const previewsDir = join(dirname(source), "shapeitup-previews");
+        const userBase = basename(source).replace(/\.shape\.ts$/, "");
+        const capturedPaths: string[] = [];
+        const effectiveTimeout = timeoutMs ?? 60_000;
+
+        try {
+          for (const angle of angleList) {
+            const outPath = join(previewsDir, `shapeitup-preview-${userBase}-collage-${angle}.png`);
+            const cmdId = sendExtensionCommand("render-preview", {
+              filePath: source,
+              outputPath: outPath,
+              targetWorkspaceRoot: computeTargetWorkspaceRoot(source),
+              renderMode: renderMode || "ai",
+              showDimensions: showDimensions !== false,
+              showAxes: showAxes !== false,
+              cameraAngle: angle,
+              width: perW,
+              height: perH,
+              focusPart,
+              hideParts,
+              meshQuality,
+            });
+            if (!cmdId) {
+              return { content: [{ type: "text" as const, text: "Failed to send command to extension" }], isError: true };
+            }
+            const result = await waitForResult(cmdId, effectiveTimeout);
+            if (!result) {
+              return {
+                content: [{ type: "text" as const, text: `render_preview (multi-angle): timed out on angle '${angle}' after ${effectiveTimeout}ms.` }],
+                isError: true,
+              };
+            }
+            if (result.error) {
+              return {
+                content: [{ type: "text" as const, text: `Screenshot failed for angle '${angle}': ${result.error}` }],
+                isError: true,
+              };
+            }
+            const capturedPath = result.screenshotPath;
+            if (!capturedPath || typeof capturedPath !== "string" || !existsSync(capturedPath)) {
+              return {
+                content: [{ type: "text" as const, text: `render_preview (multi-angle): extension did not write a PNG for angle '${angle}' (expected at ${outPath}).` }],
+                isError: true,
+              };
+            }
+            capturedPaths.push(capturedPath);
+          }
+
+          // Layout: 2 → 1×2 strip, 3 → 1×3 strip, 4 → 2×2 grid.
+          const n = capturedPaths.length;
+          let cols: number, rows: number;
+          if (n === 2) { cols = 2; rows = 1; }
+          else if (n === 3) { cols = 3; rows = 1; }
+          else if (n === 4) { cols = 2; rows = 2; }
+          else { cols = n; rows = 1; } // fallback for 1 (shouldn't happen — single-angle path owns n=1)
+
+          const labelH = 28; // px of space below each tile for the angle label
+          const totalW = perW * cols;
+          const totalH = (perH + labelH) * rows;
+
+          // Build an SVG that references each captured PNG as base64. Fonts
+          // are suppressed in svg-to-png.ts (font: { loadSystemFonts: false }),
+          // so we use SVG's default font which renders as the platform generic
+          // sans. Good enough for a small label — these aren't for print.
+          let svg = `<?xml version="1.0" encoding="UTF-8"?>\n`;
+          svg += `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${totalW}" height="${totalH}" viewBox="0 0 ${totalW} ${totalH}">\n`;
+          svg += `<rect width="${totalW}" height="${totalH}" fill="white"/>\n`;
+          for (let i = 0; i < n; i++) {
+            const col = i % cols;
+            const row = Math.floor(i / cols);
+            const x = col * perW;
+            const y = row * (perH + labelH);
+            const b64 = readFileSync(capturedPaths[i]).toString("base64");
+            svg += `<image x="${x}" y="${y}" width="${perW}" height="${perH}" xlink:href="data:image/png;base64,${b64}"/>\n`;
+            const label = angleList[i];
+            const labelX = x + perW / 2;
+            const labelY = y + perH + labelH * 0.7;
+            svg += `<text x="${labelX}" y="${labelY}" text-anchor="middle" font-family="sans-serif" font-size="18" fill="#222">${label}</text>\n`;
+          }
+          svg += `</svg>\n`;
+
+          const collagePath = join(previewsDir, `shapeitup-preview-${userBase}-collage.png`);
+          let collageBytes: Buffer;
+          try {
+            collageBytes = await svgToPng(svg, totalW);
+          } catch (e: any) {
+            return {
+              content: [{ type: "text" as const, text: `Collage rasterization failed: ${e?.message ?? e}. Intermediate PNGs: ${capturedPaths.join(", ")}` }],
+              isError: true,
+            };
+          }
+          try { mkdirSync(previewsDir, { recursive: true }); } catch {}
+          writeFileSync(collagePath, collageBytes);
+
+          // Clean up intermediates — the caller wanted a collage, not N files.
+          for (const p of capturedPaths) {
+            try { unlinkSync(p); } catch { /* best effort */ }
+          }
+
+          // Intentionally skip status-file writes here. The single-angle
+          // branch currently doesn't append screenshot metadata to
+          // shapeitup-status.json (there is no shared helper in this file),
+          // so the collage branch follows suit — staying consistent beats
+          // introducing a one-off observability write.
+
+          const textBlock = {
+            type: "text" as const,
+            text: `Collage saved to: ${collagePath}\nLayout: ${cols}x${rows} (${angleList.join(", ")})\nRender mode: ${renderMode || "ai"}, Per-tile: ${perW}x${perH}, Total: ${totalW}x${totalH}\nFile: ${source}\nUse the Read tool to view this image.`,
+          };
+          if (inline !== false) {
+            if (collageBytes.length > 10 * 1024 * 1024) {
+              return {
+                content: [
+                  textBlock,
+                  { type: "text" as const, text: `\n(collage is ${(collageBytes.length / 1024 / 1024).toFixed(1)} MB, exceeding the 10 MB inline limit. Use the Read tool on the saved path.)` },
+                ],
+              };
+            }
+            return {
+              content: [
+                textBlock,
+                { type: "image" as const, data: collageBytes.toString("base64"), mimeType: "image/png" },
+              ],
+            };
+          }
+          return { content: [textBlock] };
+        } catch (e: any) {
+          // Best-effort cleanup on unexpected failures so we don't leak
+          // half-rendered per-angle PNGs into the user's workspace.
+          for (const p of capturedPaths) {
+            try { unlinkSync(p); } catch {}
+          }
+          return {
+            content: [{ type: "text" as const, text: `render_preview (multi-angle): unexpected failure: ${e?.message ?? e}` }],
+            isError: true,
+          };
+        }
+      }
+
+      // Past this point, cameraAngle is either undefined or a single string.
+      // Narrow the variable so the rest of the handler (which was written
+      // before the union type) doesn't choke on the array branch.
+      const singleAngle: string | undefined = Array.isArray(cameraAngle) ? cameraAngle[0] : cameraAngle;
+
       // --- Optional finder branch ---------------------------------------------
       // When `finder` is set, we don't ship the user's file to the extension as
       // usual; we generate a wrapper .shape.ts next to it that applies
@@ -2817,7 +3121,7 @@ export function registerTools(server: McpServer) {
       // back-to-back calls to land in different directories.
       const previewsDir = join(dirname(source), "shapeitup-previews");
       const userBase = basename(source).replace(/\.shape\.ts$/, "");
-      const angleForName = cameraAngle || "isometric";
+      const angleForName = singleAngle || "isometric";
       const expectedOutputPath = join(previewsDir, `shapeitup-preview-${userBase}-${angleForName}.png`);
 
       try {
@@ -2835,7 +3139,7 @@ export function registerTools(server: McpServer) {
           // Default flipped to ON — iso views on complex parts are otherwise
           // ambiguous. Only suppress when the caller explicitly passes false.
           showAxes: showAxes !== false,
-          cameraAngle: cameraAngle || "isometric",
+          cameraAngle: singleAngle || "isometric",
           width: width || 1280,
           height: height || 960,
           focusPart,
@@ -2931,7 +3235,7 @@ export function registerTools(server: McpServer) {
         if (wrapperPath && screenshotPath && existsSync(screenshotPath)) {
           try {
             const userBase = basename(source).replace(/\.shape\.ts$/, "");
-            const angle = cameraAngle || "isometric";
+            const angle = singleAngle || "isometric";
             const renamedPath = join(dirname(screenshotPath), `shapeitup-preview-${userBase}-finder-${angle}.png`);
             if (renamedPath !== screenshotPath) {
               renameSync(screenshotPath, renamedPath);
@@ -2971,7 +3275,7 @@ export function registerTools(server: McpServer) {
 
         const textBlock = {
           type: "text" as const,
-          text: `Screenshot saved to: ${screenshotPath}\nRender mode: ${renderMode || "ai"}, Camera: ${cameraAngle || "isometric"}, Axes: ${showAxes !== false ? "ON" : "OFF"}, Size: ${width || 1280}x${height || 960}\nFile: ${source}${partsLine}${partWarnLine}${finderLine}${statusText}\nUse the Read tool to view this image. Or call the \`get_preview\` MCP tool to receive the PNG data inline without needing filesystem access.`,
+          text: `Screenshot saved to: ${screenshotPath}\nRender mode: ${renderMode || "ai"}, Camera: ${singleAngle || "isometric"}, Axes: ${showAxes !== false ? "ON" : "OFF"}, Size: ${width || 1280}x${height || 960}\nFile: ${source}${partsLine}${partWarnLine}${finderLine}${statusText}\nUse the Read tool to view this image. Or call the \`get_preview\` MCP tool to receive the PNG data inline without needing filesystem access.`,
         };
 
         // Bug #8: when inline is requested, read the PNG off disk and append

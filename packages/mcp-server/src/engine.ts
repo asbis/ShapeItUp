@@ -196,6 +196,10 @@ export interface ShapeProperties {
     };
     /** Mass in grams — present only when the script supplied a material density. */
     mass?: number;
+    /** Per-part print quantity (propagated from `PartInput.qty`). */
+    qty?: number;
+    /** Per-part material override (propagated from `PartInput.material`). */
+    material?: { density: number; name?: string };
   }>;
   totalVolume?: number;
   totalSurfaceArea?: number;
@@ -306,7 +310,14 @@ export function getLastFileName(): string | undefined {
 export async function executeShapeFile(
   filePath: string,
   globalStorageDir: string,
-  paramOverrides?: Record<string, number>
+  paramOverrides?: Record<string, number>,
+  /**
+   * Tessellation-time policy override. Used by `export_shape` when the caller
+   * asks for a BOM sidecar — BOM rows need real volume / mass, which cost the
+   * ~200 ms/part OCCT measurement. Default undefined → `core.execute` picks
+   * its own (currently `"bbox"`), so normal renders keep their fast path.
+   */
+  opts?: { partStats?: "none" | "bbox" | "full" }
 ): Promise<ExecuteOutcome> {
   const absPath = resolve(filePath);
   const status: EngineStatus = {
@@ -419,7 +430,11 @@ export async function executeShapeFile(
   }
 
   try {
-    const result = await core.execute(js, paramOverrides);
+    // Thread the caller's `partStats` override (when supplied) into core's
+    // streaming options. Only `"full"` is observably more expensive, so
+    // callers opt in explicitly — e.g. the BOM sidecar path in export_shape.
+    const streaming = opts?.partStats ? { partStats: opts.partStats } : undefined;
+    const result = await core.execute(js, paramOverrides, streaming);
     lastParts = result.parts;
     lastFileName = absPath;
 
@@ -652,6 +667,11 @@ function aggregateProperties(parts: ExecutedPart[]): ShapeProperties {
       // render a misleading "0x0x0".
       ...(bbox ? { boundingBox: bbox } : {}),
       ...(typeof p.mass === "number" ? { mass: p.mass } : {}),
+      // Propagate optional BOM metadata from PartInput so consumers
+      // (export_shape bom sidecar, future BOM-aware tools) don't have to
+      // walk a second data source. Absent when the script didn't declare them.
+      ...(typeof p.qty === "number" ? { qty: p.qty } : {}),
+      ...(p.material ? { material: p.material } : {}),
     };
   });
   let totalVolume = 0;
