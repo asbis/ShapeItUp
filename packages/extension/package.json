@@ -2,7 +2,7 @@
   "name": "shapeitup-vscode",
   "displayName": "ShapeItUp",
   "description": "Scripted CAD for VS Code — write TypeScript, see 3D, export STEP/STL. AI-powered with Claude Code MCP integration.",
-  "version": "1.4.2",
+  "version": "1.5.0",
   "publisher": "shapeitup",
   "license": "MIT",
   "icon": "icon.png",
