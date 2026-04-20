@@ -546,6 +546,162 @@ export default function main(p: Record<string, number>) {
 }
 
 /**
+ * Lazy-loaded TypeScript compiler handle. We reach for it only to power the
+ * AST-based `extrude()`-without-`sketchOnPlane()` check in `validateSyntaxPure`;
+ * the regex passes don't need it. Kept behind an indirect `require` so esbuild
+ * doesn't pull the entire compiler into the MCP server bundle — TS is resolved
+ * at runtime from the user's node_modules (it's already reachable transitively
+ * in this workspace). If the lookup fails (no TS installed), the AST check is
+ * silently skipped and the existing regex-based pitfall #2 still fires on the
+ * simple `drawXxx(...).extrude()` case.
+ */
+let _tsModule: typeof import("typescript") | null = null;
+let _tsLoadAttempted = false;
+function loadTypescript(): typeof import("typescript") | null {
+  if (_tsModule) return _tsModule;
+  if (_tsLoadAttempted) return null;
+  _tsLoadAttempted = true;
+  try {
+    // Assemble the module name at runtime so esbuild treats this as a dynamic
+    // require and does not inline the compiler source.
+    const name = ["type", "script"].join("");
+    _tsModule = require(name);
+    return _tsModule;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Pitfall #7 (AST-based): flag `.extrude(...)` calls whose receiver chain
+ * traces back to a `drawXxx(...)` call without an intervening
+ * `.sketchOnPlane()` or `.sketchOnFace()`.
+ *
+ * The regex-only pitfall #2 catches the inline case
+ * (`drawRectangle(10,10).extrude(5)`) but misses the split-variable case:
+ *
+ *   const r = drawRectangle(10, 10);
+ *   const s = r.extrude(5);   // r is a Drawing — extrude will throw
+ *
+ * Catching this by regex is fragile (we'd need to track identifier types
+ * through reassignment). The AST walker follows variable initializers back
+ * to the draw-factory root and reports when no sketchOnPlane/sketchOnFace
+ * sits between the draw call and the extrude. Returns null when TypeScript
+ * isn't reachable (so the caller can fall back quietly to the regex output).
+ */
+export function checkExtrudeWithoutSketchPlane(code: string): string | null {
+  const tsMod = loadTypescript();
+  if (!tsMod) return null;
+  // Alias to a non-null const so the nested walkers keep type narrowing —
+  // TypeScript otherwise re-widens `tsMod` back to `typeof ts | null` on
+  // every closure boundary.
+  const ts: typeof import("typescript") = tsMod;
+  let source: import("typescript").SourceFile;
+  try {
+    source = ts.createSourceFile("__validate__.ts", code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  } catch {
+    return null;
+  }
+
+  const drawFactories = new Set([
+    "drawRectangle", "drawRoundedRectangle", "drawCircle", "drawEllipse",
+    "drawPolysides", "drawText", "draw",
+  ]);
+
+  // First pass: record the most recent initializer for every identifier
+  // bound via `const/let/var` or top-level reassignment. We don't try to
+  // model control flow — we just want a best-effort "what was this name
+  // last assigned?". Matches the conservative tone of the other checks.
+  const latestInit = new Map<string, import("typescript").Expression>();
+  function collect(node: import("typescript").Node): void {
+    if (ts.isVariableDeclaration(node) && node.initializer && ts.isIdentifier(node.name)) {
+      latestInit.set(node.name.text, node.initializer);
+    } else if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(node.left)
+    ) {
+      latestInit.set(node.left.text, node.right);
+    }
+    ts.forEachChild(node, collect);
+  }
+  collect(source);
+
+  // Given the receiver expression of a `.extrude(...)` call, walk backwards
+  // through property accesses, call expressions, and identifier lookups.
+  // Return true iff the chain originates at a drawXxx(...) call with no
+  // sketchOnPlane / sketchOnFace in between. `seen` guards against
+  // pathological cyclic assignments (`x = x.translate(…)`) — we stop after
+  // the first revisit rather than looping forever.
+  function chainStartsAtDrawWithoutSketch(
+    expr: import("typescript").Expression,
+    seen: Set<string>,
+  ): boolean {
+    let cur: import("typescript").Expression = expr;
+    for (let guard = 0; guard < 64; guard++) {
+      if (ts.isParenthesizedExpression(cur)) {
+        cur = cur.expression;
+        continue;
+      }
+      if (ts.isCallExpression(cur)) {
+        // X.method(...) — inspect the method name, then descend to X.
+        if (ts.isPropertyAccessExpression(cur.expression)) {
+          const methodName = cur.expression.name.text;
+          if (methodName === "sketchOnPlane" || methodName === "sketchOnFace") {
+            return false; // chain is already planar — safe.
+          }
+          cur = cur.expression.expression;
+          continue;
+        }
+        // Bare Identifier(...) call — likely a factory. drawXxx without
+        // a sketchOnPlane in the chain above means "needs sketch".
+        if (ts.isIdentifier(cur.expression)) {
+          return drawFactories.has(cur.expression.text);
+        }
+        // Anything else (computed callee, IIFE, etc.) — bail conservatively.
+        return false;
+      }
+      if (ts.isPropertyAccessExpression(cur)) {
+        cur = cur.expression;
+        continue;
+      }
+      if (ts.isIdentifier(cur)) {
+        const name = cur.text;
+        if (seen.has(name)) return false;
+        seen.add(name);
+        const init = latestInit.get(name);
+        if (!init) return false;
+        return chainStartsAtDrawWithoutSketch(init, seen);
+      }
+      return false;
+    }
+    return false;
+  }
+
+  let flagged = false;
+  function scan(node: import("typescript").Node): void {
+    if (flagged) return;
+    if (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      node.expression.name.text === "extrude"
+    ) {
+      const receiver = node.expression.expression;
+      if (chainStartsAtDrawWithoutSketch(receiver, new Set())) {
+        flagged = true;
+        return;
+      }
+    }
+    ts.forEachChild(node, scan);
+  }
+  scan(source);
+
+  return flagged
+    ? "extrude() called without prior sketchOnPlane() or sketchOnFace() — the 2D drawing must be placed on a 3D plane before extrusion"
+    : null;
+}
+
+/**
  * Pure syntax + pitfall validator. Extracted from the `validate_syntax` /
  * `validate_script` MCP tools so unit tests can call it directly without
  * spinning up an MCP server. Returns the same text the tools emit, plus a
@@ -559,9 +715,9 @@ export default function main(p: Record<string, number>) {
  *      whitelist. Method calls whose receiver was imported from "shapeitup"
  *      are trusted unconditionally (so stdlib additions don't need to be
  *      mirrored here). Warnings only; isError stays false.
- *   3. Six well-known CAD pitfalls (sketch mischain, missing sketchOnPlane,
- *      unclosed pen, non-uniform scale, oversized fillet, booleans in loop).
- *      Warnings only.
+ *   3. Seven well-known CAD pitfalls (sketch mischain, missing sketchOnPlane,
+ *      unclosed pen, non-uniform scale, oversized fillet, booleans in loop,
+ *      and the AST-based variable-assigned `extrude` variant). Warnings only.
  */
 export function validateSyntaxPure(code: string): { text: string; isError: boolean } {
   try {
@@ -682,10 +838,22 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
     //    Match is deliberately non-greedy and bounded to a single chain
     //    expression (method calls with balanced-ish parens).
     const drawExtrudePattern = /\b(drawRectangle|drawRoundedRectangle|drawCircle|drawEllipse|drawPolysides|drawText)\s*\(([^()]|\([^()]*\))*\)((?:\s*\.\s*(?:fuse|cut|intersect|offset|translate|rotate|mirror)\s*\(([^()]|\([^()]*\))*\))*)\s*\.\s*extrude\s*\(/;
-    if (drawExtrudePattern.test(code)) {
+    const drawExtrudeInlineHit = drawExtrudePattern.test(code);
+    if (drawExtrudeInlineHit) {
       semanticWarnings.push(
         "Drawings must be placed on a plane before extruding — add `.sketchOnPlane(\"XY\")` between the draw call and `.extrude()`."
       );
+    }
+
+    // Pitfall #7 (AST): catches the split-variable case the inline regex
+    // above cannot see — `const r = drawRectangle(10, 10); r.extrude(5);`.
+    // Only runs if TypeScript is resolvable at runtime; returns null when
+    // unavailable and we fall back to the inline regex alone. Skip when
+    // pitfall #2 already fired on the same file — the two warnings describe
+    // the same bug, and two bullets for one problem just clutters output.
+    if (!drawExtrudeInlineHit) {
+      const astWarning = checkExtrudeWithoutSketchPlane(code);
+      if (astWarning) semanticWarnings.push(astWarning);
     }
 
     // 3. Non-uniform .scale(). Replicad's shape.scale is uniform-only.
@@ -827,6 +995,12 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
 type ToolResponse = {
   content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>;
   isError?: boolean;
+  // Optional absolute path surfaced by path-resolving handlers (read_shape,
+  // and any future tool that accepts a relative filePath). Callers whose
+  // state tracking keys on absolute paths (e.g. the Claude Code Edit tool)
+  // can use this to align downstream operations with the path we actually
+  // opened, instead of re-resolving the relative input themselves.
+  resolvedPath?: string;
 };
 
 /**
@@ -1068,10 +1242,20 @@ export function registerTools(server: McpServer) {
         return {
           content: [{ type: "text" as const, text: `File not found: ${absPath}` }],
           isError: true,
+          resolvedPath: absPath,
         };
       }
       const content = readFileSync(absPath, "utf-8");
-      return { content: [{ type: "text" as const, text: content }] };
+      // Issue #7: surface the fully-resolved absolute path alongside the file
+      // content. Callers that passed a relative path (e.g. "cad-review/x.shape.ts")
+      // otherwise have no way to know which workspace root the probe matched —
+      // and downstream tools whose state tracking keys on absolute paths (the
+      // Claude Code Edit tool is one) would then refuse edits after a relative-
+      // path read. Keeping `content` identical preserves the textual contract.
+      return {
+        content: [{ type: "text" as const, text: content }],
+        resolvedPath: absPath,
+      };
     })
   );
 
@@ -1718,8 +1902,9 @@ export function registerTools(server: McpServer) {
         .enum(["preview", "final"])
         .optional()
         .describe("Tessellation-quality preset. `'final'` (default for <15-part assemblies) matches the pre-existing render quality. `'preview'` coarsens the mesh ~2.5× for faster first-render on large assemblies, at the cost of visibly chunkier facets — choose this for layout checks on 15+ part assemblies. If omitted, the extension auto-degrades to `'preview'` when the part count is >= 15 and uses `'final'` otherwise."),
+      inline: z.boolean().optional().describe("When true, also returns the rendered PNG inline as base64 image content on top of the usual text + file path — saves an extra `get_preview` round trip. The PNG is still written to disk. Skipped inline if the file exceeds 10 MB. Default false."),
     },
-    safeHandler("render_preview", async ({ filePath, cameraAngle, showDimensions, showAxes, renderMode, width, height, timeoutMs, focusPart, hideParts, finder, partName, partIndex, meshQuality }) => {
+    safeHandler("render_preview", async ({ filePath, cameraAngle, showDimensions, showAxes, renderMode, width, height, timeoutMs, focusPart, hideParts, finder, partName, partIndex, meshQuality, inline }) => {
       // Resolve which file to render: explicit > engine's last-executed > status file.
       const explicitFilePath = filePath !== undefined && filePath !== null;
       let source: string | undefined = filePath ? resolveShapePath(filePath) : getLastFileName();
@@ -2034,11 +2219,51 @@ export function registerTools(server: McpServer) {
           ? `\nFinder: ${finder}${finderAppliedLine}${finderWarnLine}`
           : "";
 
+        const textBlock = {
+          type: "text" as const,
+          text: `Screenshot saved to: ${screenshotPath}\nRender mode: ${renderMode || "ai"}, Camera: ${cameraAngle || "isometric"}, Axes: ${showAxes === true ? "ON" : "OFF"}, Size: ${width || 1280}x${height || 960}\nFile: ${source}${partsLine}${partWarnLine}${finderLine}${statusText}\nUse the Read tool to view this image. Or call the \`get_preview\` MCP tool to receive the PNG data inline without needing filesystem access.`,
+        };
+
+        // Bug #8: when inline is requested, read the PNG off disk and append
+        // it as an image content block so the caller gets bytes + path in a
+        // single round trip. Mirrors get_preview's 10 MB size guard to avoid
+        // blowing past MCP response limits.
+        if (inline === true) {
+          try {
+            const st = statSync(screenshotPath);
+            if (st.size > 10 * 1024 * 1024) {
+              return {
+                content: [
+                  textBlock,
+                  {
+                    type: "text" as const,
+                    text: `\n(inline=true requested but PNG is ${(st.size / 1024 / 1024).toFixed(1)} MB, exceeding the 10 MB inline limit. Reduce width/height or use the Read tool on the saved path.)`,
+                  },
+                ],
+              };
+            }
+            const data = readFileSync(screenshotPath).toString("base64");
+            return {
+              content: [
+                textBlock,
+                { type: "image" as const, data, mimeType: "image/png" },
+              ],
+            };
+          } catch (e: any) {
+            return {
+              content: [
+                textBlock,
+                {
+                  type: "text" as const,
+                  text: `\n(inline=true requested but failed to read PNG at ${screenshotPath}: ${e?.message ?? e}. Use the Read tool on the saved path instead.)`,
+                },
+              ],
+            };
+          }
+        }
+
         return {
-          content: [{
-            type: "text" as const,
-            text: `Screenshot saved to: ${screenshotPath}\nRender mode: ${renderMode || "ai"}, Camera: ${cameraAngle || "isometric"}, Axes: ${showAxes === true ? "ON" : "OFF"}, Size: ${width || 1280}x${height || 960}\nFile: ${source}${partsLine}${partWarnLine}${finderLine}${statusText}\nUse the Read tool to view this image. Or call the \`get_preview\` MCP tool to receive the PNG data inline without needing filesystem access.`,
-          }],
+          content: [textBlock],
         };
       } finally {
         if (wrapperPath) {
@@ -2335,6 +2560,20 @@ export function registerTools(server: McpServer) {
         try {
           if (!isFace && typeof m.length === "number") extra = `, length=${fmt(m.length)}mm`;
         } catch {}
+        // P-5: edge-vs-seam classification. Replicad's Edge class does
+        // not expose face adjacency (no `.adjacentFaces()` / `.faces`
+        // accessor on `_1DShape<TopoDS_Edge>`), so we can't reliably
+        // tell an outer-boundary edge from a seam left behind by a fuse.
+        // Rather than guess (a wrong tag here would actively mislead the
+        // agent), we mark every edge as `unknown` and document the
+        // limitation. If a future Replicad version surfaces adjacency,
+        // replace the literal below with the real lookup. Field is
+        // intentionally optional — face matches don't need it.
+        let matchType: "outer" | "seam" | "unknown" | undefined;
+        if (!isFace) {
+          matchType = "unknown";
+          extra += `, matchType=${matchType}`;
+        }
         // Face matches carry richer info — surface area (via the top-level
         // `measureArea` helper) and the outward normal at the face center
         // (via `.normalAt()` — optional argument, defaults to the face
@@ -2598,17 +2837,34 @@ export function registerTools(server: McpServer) {
 
       // Step 5: format the summary.
       const fmt = (n: number) => (Math.abs(n) >= 1000 ? n.toFixed(0) : n.toFixed(2));
-      const header = `Collision check: ${parts.length} parts, ${tested} pair${tested === 1 ? "" : "s"} tested (${skippedByAABB} skipped by AABB prefilter), ${collisions.length} collision${collisions.length === 1 ? "" : "s"} found, ${failures.length} intersect call${failures.length === 1 ? "" : "s"} failed.`;
+      const pairWord = (n: number) => `${n} pair${n === 1 ? "" : "s"}`;
 
-      const sections: string[] = [header];
+      // Full pair accounting — always show total/skipped/tested so callers
+      // never see a bare "1 pair" and wonder where the other 5 went. Bug #3:
+      // for a 4-part assembly where 5 of 6 pairs are AABB-prefiltered, the
+      // previous "all 1 tested pair clear" phrasing made the tool look broken.
+      const accounting: string[] = [
+        `Checked ${parts.length} parts \u2192 ${pairWord(totalPairs)} total.`,
+      ];
+      if (skippedByAABB > 0) {
+        accounting.push(`  - ${pairWord(skippedByAABB)} skipped by AABB prefilter (non-overlapping bounding boxes).`);
+      }
+      if (tested > 0) {
+        const testedSuffix = collisions.length === 0 && failures.length === 0
+          ? " \u2014 all clear"
+          : "";
+        accounting.push(`  - ${pairWord(tested)} tested for 3D intersection${testedSuffix}.`);
+      }
+
+      const sections: string[] = [accounting.join("\n")];
 
       if (collisions.length > 0) {
-        const lines = collisions.map((c) => `  - ${c.a} ↔ ${c.b}: ${fmt(c.volume)} mm³ overlap`);
+        const lines = collisions.map((c) => `  - ${c.a} \u2194 ${c.b}: ${fmt(c.volume)} mm\u00b3 overlap`);
         sections.push(`\nCollisions:\n${lines.join("\n")}`);
       }
 
       if (failures.length > 0) {
-        const lines = failures.map((f) => `  - ${f.a} ↔ ${f.b}: ${f.error}`);
+        const lines = failures.map((f) => `  - ${f.a} \u2194 ${f.b}: ${f.error}`);
         sections.push(`\nIntersect failures (retry with mold-cut or report to developer):\n${lines.join("\n")}`);
       }
 
@@ -2616,13 +2872,11 @@ export function registerTools(server: McpServer) {
         sections.push(`\nWarnings:\n${degenerateWarnings.join("\n")}`);
       }
 
-      // Clean "all clear" message when nothing collided, nothing failed, and
-      // at least one pair was actually tested (otherwise the AABB prefilter
-      // skipped everything and "no collisions detected" would be misleading).
+      // All-clear footer when nothing collided, nothing failed, and at least
+      // one pair was actually tested (otherwise the AABB prefilter skipped
+      // everything and "no collisions detected" would be misleading).
       if (collisions.length === 0 && failures.length === 0 && skippedByAABB < totalPairs) {
-        return {
-          content: [{ type: "text" as const, text: `No collisions detected (all ${tested} tested pair${tested === 1 ? "" : "s"} clear).${degenerateWarnings.length ? `\n\nWarnings:\n${degenerateWarnings.join("\n")}` : ""}` }],
-        };
+        sections.push(`\nNo collisions detected.`);
       }
 
       return {
@@ -2689,25 +2943,34 @@ function findShapeFiles(dir: string, depth = 3): string[] {
  * Strip a category body down to honest-to-goodness signature lines — not
  * recipe prose and not every line that happens to contain a `(`.
  *
- * A line qualifies as a signature if (stripped of leading bullets / backticks
- * / whitespace) it matches ONE of:
+ * Tightened (P-3 fix) so the signatures-only view doesn't leak example
+ * invocations like `console.log(debugJoints(positioned))` or bare
+ * `mate(a.joints.x, b.joints.y)` — both matched the old "clean call" shape
+ * even though they are recipe calls, not API signatures.
+ *
+ * A line qualifies if it matches ONE of:
  *
  *   - Heading (`#`..`####`) — kept as a section marker only.
- *   - Arrow form `name(args) → ReturnType` anywhere on the line (the canonical
- *     Replicad signature style in this file).
- *   - Bare top-level call: `ident(args)` or `a.b.c(args)` possibly followed
- *     only by an inline comment (`// ...` or `— ...`) — no lambda bodies,
- *     no trailing English prose tails.
- *   - Leading-dot method signature: `.method(args)` — chainable method style
- *     used in the finders reference.
- *   - Inside a code fence: `export function`, `function`, `const NAME = `,
- *     `class`, `interface`, `type` declarations (TS/JS signature shapes).
+ *   - Top-level declaration: `^(export )?(function|const|type|interface|class)\s+Name`.
+ *     The leading-whitespace requirement keeps indented example assignments
+ *     out (`  const sketch = drawCircle(5)` inside a fence).
+ *   - Arrow-form signature: `name(args) → ReturnType` or
+ *     `name(args): ReturnType` or `name(args) => ReturnType` — the three
+ *     ways Replicad / the stdlib docs annotate a return shape.
+ *   - Leading-dot chain signature followed by an arrow/colon: `.method(...)
+ *     → Result` (used in finder DSL reference).
  *
- * Recipe-style lines that embed a full call with a lambda (e.g.
- * `` `shape.fillet(2, e => e.inDirection("Z"))` ``) are dropped — those are
- * examples, not signatures. When a category has zero qualifying lines, the
- * helper returns a short note saying so rather than a misleading "here are
- * the signatures" wrapper around prose.
+ * Everything else is dropped. That includes:
+ *   - `console.*(...)` / `return ...` / bare example calls without a
+ *     `→` / `:` / `=>` return-type marker.
+ *   - Lines containing recipe-shape method calls — `.translate(`,
+ *     `.rotate(`, `.fuse(`, `.cut(`, `.fillet(`, `.extrude(`, etc. — when
+ *     the line is not a signature declaration.
+ *   - Indented `const`/`let`/`var` assignments inside code fences (examples).
+ *
+ * When a category has zero qualifying lines, the helper returns a short
+ * note saying so rather than a misleading "here are the signatures" wrapper
+ * around prose.
  */
 export function extractSignatures(body: string, category: string): string {
   const lines = body.split("\n");
@@ -2721,15 +2984,37 @@ export function extractSignatures(body: string, category: string): string {
   const normalize = (raw: string): string =>
     raw.trim().replace(/^[-*]\s*/, "").replace(/^`|`$/g, "").trim();
 
-  // A "clean" signature line has no arrow-function lambda body and no
-  // prose tail after the closing paren (inline `//` or `— ...` comments
-  // are fine).
-  const isCleanSignature = (s: string): boolean => {
-    if (/=>/.test(s)) return false; // lambda body = recipe, not signature
-    // Pattern: optional leading dot, dotted identifier, parens (may nest
-    // one level), optional trailing comment/em-dash note.
-    const sigBody = /^\.?[A-Za-z_][\w.]*\s*\(([^()]|\([^()]*\))*\)\s*(?:→[^\n]*)?(?:\s*(?:\/\/.*|—\s*.*|-\s+.*))?$/;
-    return sigBody.test(s);
+  // Declaration-form line (TS/JS). Matches `export function foo(…)`,
+  // `class Foo`, `interface Foo`, `type Foo = …`, `const foo =` / `export
+  // const foo =`. Must sit at column 0 — indented repeats inside code
+  // fences are treated as examples, not API surface.
+  const isTopLevelDeclaration = (rawLine: string): boolean =>
+    /^(?:export\s+)?(?:function|const|class|interface|type)\s+\w/.test(rawLine);
+
+  // Signature with a return-type marker (→ / : / =>). The marker is what
+  // differentiates "signature" from "invocation" — a bare `foo(x)` could
+  // be either, but `foo(x) → Bar` / `foo(x): Bar` / `foo(x) => Bar` can
+  // only be documentation.
+  //
+  // Parens may nest one level deep (covers `foo(opts: { x: number })` and
+  // `foo(x: Array<number>)` since `<` / `>` are just word-chars for us).
+  const sigWithReturn = /^\.?[A-Za-z_][\w.]*\s*\(([^()]|\([^()]*\))*\)\s*(?:→|=>|:)\s*\S/;
+  const isSignatureLine = (s: string): boolean => sigWithReturn.test(s);
+
+  // Obvious non-signature shapes. Dropping these even if they accidentally
+  // look like a signature keeps the output honest — erring on the side of
+  // dropping prose over leaking it (per the P-3 brief).
+  const looksLikeExampleCall = (s: string): boolean => {
+    if (/^(console|return|let|var|throw|await|yield|if|for|while)\b/.test(s)) return true;
+    // Indented `const`/`let`/`var` assignments — only `export const` /
+    // top-level `const Name = …` should survive (handled by
+    // isTopLevelDeclaration above; anything else is an example).
+    if (/\.(translate|rotate|mirror|scale|fuse|cut|intersect|fillet|chamfer|shell|extrude|revolve|sketchOnPlane|sketchOnFace)\s*\(/.test(s)) {
+      // A signature for `.fillet()` etc. would include `→`/`:`/`=>`.
+      // Without that marker, it's a recipe invocation.
+      if (!isSignatureLine(s)) return true;
+    }
+    return false;
   };
 
   for (const raw of lines) {
@@ -2737,25 +3022,17 @@ export function extractSignatures(body: string, category: string): string {
     if (/^```/.test(line)) { inFence = !inFence; continue; }
 
     if (inFence) {
-      // Inside a code fence: keep TS/JS declaration forms + any arrow-style
-      // signature. Recipe code (call expressions with lambdas, chained
-      // boolean sequences) is dropped.
-      //
-      // Declarations must be `export`-prefixed, or be one of
-      // function/class/interface/type (which are always declarations — no
-      // assignment ambiguity). A bare `const sketch = drawCircle(5)` is a
-      // recipe assignment, not an API signature, so it falls through.
-      if (/^\s*export\s+(?:function|const|class|interface|type)\s+\w/.test(line)) {
+      // Top-level declarations only — indented repeats are examples.
+      if (isTopLevelDeclaration(line)) {
         kept.push(line.trim());
         continue;
       }
-      if (/^\s*(?:function|class|interface|type)\s+\w/.test(line)) {
-        kept.push(line.trim());
-        continue;
+      // Arrow-form annotations anywhere in a code fence are signatures.
+      const nFence = normalize(line);
+      if (!nFence) continue;
+      if (isSignatureLine(nFence) && !looksLikeExampleCall(nFence)) {
+        kept.push(nFence);
       }
-      if (/→/.test(line)) { kept.push(line.trim()); continue; }
-      const n = normalize(line);
-      if (isCleanSignature(n)) kept.push(n);
       continue;
     }
 
@@ -2764,10 +3041,9 @@ export function extractSignatures(body: string, category: string): string {
 
     const n = normalize(line);
     if (!n) continue;
-    // Arrow form anywhere (e.g. prose that embeds `foo() → Bar`). Keep only
-    // the substring up through the arrow result to avoid dragging in prose.
-    if (/→/.test(n) && isCleanSignature(n)) { kept.push(n); continue; }
-    if (isCleanSignature(n)) kept.push(n);
+    if (isTopLevelDeclaration(n)) { kept.push(n); continue; }
+    if (looksLikeExampleCall(n)) continue;
+    if (isSignatureLine(n)) kept.push(n);
   }
 
   // Collapse consecutive blank sections and strip headings that now have no
