@@ -59,6 +59,46 @@ let lastWaitTimeoutReason: "dead" | "slow" | null = null;
 // collide correctly.
 const _emittedWorkspaceRoots = new Set<string>();
 
+/**
+ * Version tag appended to every response that routes through `formatStatusText`.
+ * Read from `packages/extension/package.json` at MCP-server startup so agents
+ * can tell at a glance which extension release they're talking to — hard bug
+ * reports otherwise conflate "fixed on tip" with "old build still installed".
+ *
+ * Probes a few candidate locations for the package.json because the MCP server
+ * ships bundled (dist/ layout is flat) but during `tsc --noEmit` / dev mode we
+ * run from source. If we can't find it, fall back to `unknown` rather than
+ * throwing — a missing version is informational, not load-bearing.
+ */
+const SHAPEITUP_VERSION: string = (() => {
+  const candidates: string[] = [];
+  try {
+    // From compiled dist (packages/mcp-server/dist/*.js or bundled single file).
+    candidates.push(join(__dirname, "..", "..", "extension", "package.json"));
+    candidates.push(join(__dirname, "..", "..", "..", "extension", "package.json"));
+    // From source tree (packages/mcp-server/src/tools.ts) during dev / tsc.
+    candidates.push(join(__dirname, "..", "..", "..", "packages", "extension", "package.json"));
+    // Bundled alongside in globalStorage layouts (defensive).
+    candidates.push(resolve(process.cwd(), "packages", "extension", "package.json"));
+  } catch {
+    // __dirname shouldn't throw but be defensive — fall through to "unknown".
+  }
+  for (const p of candidates) {
+    try {
+      if (existsSync(p)) {
+        const pkg = JSON.parse(readFileSync(p, "utf-8"));
+        if (pkg && typeof pkg.version === "string" && pkg.version.length > 0) {
+          return pkg.version;
+        }
+      }
+    } catch {
+      // ignore and try the next candidate
+    }
+  }
+  return "unknown";
+})();
+const SHAPEITUP_VERSION_TAG = `\n[shapeitup v${SHAPEITUP_VERSION}]`;
+
 function nextCommandId(): string {
   return ID_PREFIX + (++commandCounter);
 }
@@ -459,7 +499,7 @@ function formatStatusText(status: EngineStatus): string {
     const resetNote = status.engineReset
       ? `\nEngine was re-initialized after a WASM exception. Next call will take ~500ms.`
       : "";
-    return `Render FAILED\nError: ${status.error}${hint}${operation}${stack}${resetNote}\nFile: ${status.fileName || "unknown"}\nTip: call get_preview to view the last successful render for visual comparison (the PNG is NOT overwritten on failure).\nTime: ${status.timestamp}`;
+    return `Render FAILED\nError: ${status.error}${hint}${operation}${stack}${resetNote}\nFile: ${status.fileName || "unknown"}\nTip: call get_preview to view the last successful render for visual comparison (the PNG is NOT overwritten on failure).\nTime: ${status.timestamp}${SHAPEITUP_VERSION_TAG}`;
   }
   const parts = status.partNames?.length ? `\nParts: ${status.partNames.join(", ")}` : "";
   const paramEntries = status.currentParams ? Object.entries(status.currentParams) : [];
@@ -494,9 +534,9 @@ function formatStatusText(status: EngineStatus): string {
   if (geomInvalid) {
     // Hoist the warnings block above stats so the structural problem is the
     // first thing the reader sees, not an otherwise-normal-looking summary.
-    return `${headline}\nFile: ${status.fileName || "unknown"}${warnings}\nStats: ${status.stats}${parts}${bbox}${material}${properties}${currentParams}${timings}\nTime: ${status.timestamp}`;
+    return `${headline}\nFile: ${status.fileName || "unknown"}${warnings}\nStats: ${status.stats}${parts}${bbox}${material}${properties}${currentParams}${timings}\nTime: ${status.timestamp}${SHAPEITUP_VERSION_TAG}`;
   }
-  return `${headline}\nFile: ${status.fileName || "unknown"}\nStats: ${status.stats}${parts}${bbox}${material}${properties}${currentParams}${timings}${warnings}\nTime: ${status.timestamp}`;
+  return `${headline}\nFile: ${status.fileName || "unknown"}\nStats: ${status.stats}${parts}${bbox}${material}${properties}${currentParams}${timings}${warnings}\nTime: ${status.timestamp}${SHAPEITUP_VERSION_TAG}`;
 }
 
 /**
@@ -1086,6 +1126,81 @@ export function computePartsLine(
   return "";
 }
 
+// --- Persisted param overrides -------------------------------------------
+// `tune_params` with `persist: true` writes the override map to a
+// `.shapeitup-params.json` sidecar next to the shape file(s). Subsequent
+// executeShapeFile() calls merge those overrides in BEFORE any per-call
+// overrides win — the precedence is defaults (from the script) → sidecar →
+// call-time overrides. Namespaced by basename so multiple files in one dir
+// coexist. Documented in the `clear_params` tool description for discoverability.
+
+const SIDECAR_FILENAME = ".shapeitup-params.json";
+
+type SidecarMap = Record<string, Record<string, number>>;
+
+function readSidecar(dir: string): SidecarMap {
+  try {
+    const p = join(dir, SIDECAR_FILENAME);
+    if (!existsSync(p)) return {};
+    const parsed = JSON.parse(readFileSync(p, "utf-8"));
+    return parsed && typeof parsed === "object" ? parsed as SidecarMap : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeSidecar(dir: string, map: SidecarMap): void {
+  const p = join(dir, SIDECAR_FILENAME);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(p, JSON.stringify(map, null, 2), "utf-8");
+}
+
+/**
+ * Look up persisted overrides for a given shape file and merge them UNDER the
+ * caller-supplied overrides. Defaults (declared in the script) remain the
+ * base layer — they're applied by the engine itself. Returns undefined only
+ * when there's nothing to pass; callers then let `executeShapeFile` use
+ * script defaults unchanged.
+ */
+function mergeSidecarOverrides(
+  absPath: string,
+  callOverrides?: Record<string, number>,
+): Record<string, number> | undefined {
+  const dir = dirname(absPath);
+  const base = basename(absPath);
+  const sidecar = readSidecar(dir);
+  const persisted = sidecar[base];
+  if (!persisted && !callOverrides) return undefined;
+  const merged: Record<string, number> = {};
+  if (persisted) {
+    for (const [k, v] of Object.entries(persisted)) {
+      if (typeof v === "number") merged[k] = v;
+    }
+  }
+  if (callOverrides) {
+    for (const [k, v] of Object.entries(callOverrides)) {
+      if (typeof v === "number") merged[k] = v;
+    }
+  }
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+/**
+ * Thin wrapper around `executeShapeFile` that silently applies any persisted
+ * sidecar overrides before delegating to the engine. Callers that have their
+ * own params to pass (e.g. `tune_params`) supply them via `callOverrides` —
+ * those win over the sidecar. This keeps the new persistence behavior OUT of
+ * engine.ts (single-responsibility: engine doesn't care about sidecars) and
+ * OUT of every individual handler's call-site (no duplicate merge logic).
+ */
+async function executeWithPersistedParams(
+  absPath: string,
+  callOverrides?: Record<string, number>,
+): ReturnType<typeof executeShapeFile> {
+  const merged = mergeSidecarOverrides(absPath, callOverrides);
+  return executeShapeFile(absPath, GLOBAL_STORAGE, merged);
+}
+
 export function registerTools(server: McpServer) {
   server.tool(
     "create_shape",
@@ -1147,17 +1262,46 @@ export function registerTools(server: McpServer) {
         }
       }
 
+      // Idempotent-retry shortcut: if the file already exists and the incoming
+      // code is byte-identical, skip the error and treat this as a no-op
+      // "content unchanged" success. Removes friction for agents that legitimately
+      // call create_shape twice with the same payload (e.g. after a transient
+      // timeout) — they'd otherwise see a misleading "file exists" error.
+      let contentIdenticalNoOp = false;
       if (existsSync(filePath) && !overwrite) {
-        return {
-          content: [{ type: "text" as const, text: `File already exists: ${filePath}\nUse modify_shape to update it, or pass overwrite: true to replace it.` }],
-          isError: true,
-        };
+        let existing: string | null = null;
+        try {
+          existing = readFileSync(filePath, "utf-8");
+        } catch {
+          // Readback failed — fall through to the normal error path; we can't
+          // prove the contents match so the safe default is to refuse.
+        }
+        if (existing !== null && existing === code) {
+          contentIdenticalNoOp = true;
+        } else {
+          // Content differs (or unreadable). Enrich the refusal with the on-disk
+          // size + mtime so an agent can decide whether to retry with overwrite
+          // or switch to modify_shape.
+          let sizeMtimeNote = "";
+          try {
+            const st = statSync(filePath);
+            sizeMtimeNote = ` (${st.size} bytes, modified ${st.mtime.toISOString()})`;
+          } catch {}
+          return {
+            content: [{ type: "text" as const, text: `File already exists: ${filePath}${sizeMtimeNote}\nUse modify_shape to update it, or pass overwrite: true to replace it.` }],
+            isError: true,
+          };
+        }
       }
 
       mkdirSync(dirname(filePath), { recursive: true });
-      writeFileSync(filePath, code, "utf-8");
+      // Skip the write when nothing would change — still execute below so the
+      // caller gets stats back and the viewer stays in sync.
+      if (!contentIdenticalNoOp) {
+        writeFileSync(filePath, code, "utf-8");
+      }
 
-      const { status } = await executeShapeFile(filePath, GLOBAL_STORAGE);
+      const { status } = await executeWithPersistedParams(filePath);
       notifyExtensionOfShape(filePath);
 
       const cwd = process.cwd();
@@ -1169,7 +1313,10 @@ export function registerTools(server: McpServer) {
         ? `\n(Resolved to VSCode workspace ${dir}; shell cwd is ${cwd}. Pass 'directory' explicitly to override.)`
         : "";
       const doubledWarning = directory ? detectPathDoubling(dir) : "";
-      const prefix = `${overwrite ? "Overwrote" : "Created"} ${filePath}${cwdNote}${doubledWarning}\n`;
+      const actionWord = contentIdenticalNoOp
+        ? "Unchanged (content-identical re-create)"
+        : overwrite ? "Overwrote" : "Created";
+      const prefix = `${actionWord} ${filePath}${cwdNote}${doubledWarning}\n`;
       return {
         content: [{ type: "text" as const, text: prefix + formatStatusText(status) }],
         isError: !status.success,
@@ -1192,7 +1339,7 @@ export function registerTools(server: McpServer) {
         };
       }
 
-      const { status } = await executeShapeFile(absPath, GLOBAL_STORAGE);
+      const { status } = await executeWithPersistedParams(absPath);
       notifyExtensionOfShape(absPath);
 
       return {
@@ -1219,7 +1366,7 @@ export function registerTools(server: McpServer) {
       }
       writeFileSync(absPath, code, "utf-8");
 
-      const { status } = await executeShapeFile(absPath, GLOBAL_STORAGE);
+      const { status } = await executeWithPersistedParams(absPath);
       notifyExtensionOfShape(absPath);
 
       const prefix = `Updated ${absPath}\n`;
@@ -1317,7 +1464,7 @@ export function registerTools(server: McpServer) {
 
       // Always re-execute — guarantees correctness even if something mutated
       // OCCT state between the last render and now.
-      const { status } = await executeShapeFile(source, GLOBAL_STORAGE);
+      const { status } = await executeWithPersistedParams(source);
       if (!status.success) {
         return {
           content: [{ type: "text" as const, text: `Cannot export — render failed.\n${formatStatusText(status)}` }],
@@ -1730,13 +1877,14 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "tune_params",
-    "Re-execute an existing .shape.ts with ephemeral `params` overrides WITHOUT modifying the file — the file on disk is untouched. Returns the same stats as get_render_status (volume, surface area, bounding box, timings, warnings) so agents can binary-search a design constraint (target volume, bounding box, mass, fit tolerance) before committing the winning value with modify_shape. Pass `captureScreenshot: true` to also render a PNG of the tuned configuration via the VSCode extension.",
+    "Re-execute an existing .shape.ts with ephemeral `params` overrides WITHOUT modifying the file — the file on disk is untouched. Returns the same stats as get_render_status (volume, surface area, bounding box, timings, warnings) so agents can binary-search a design constraint (target volume, bounding box, mass, fit tolerance) before committing the winning value with modify_shape. Pass `captureScreenshot: true` to also render a PNG of the tuned configuration via the VSCode extension. Pass `persist: true` to also write the override map to a `.shapeitup-params.json` sidecar next to the file so every later execution (render_preview, open_shape, export_shape, etc.) picks them up automatically; clear with `clear_params`.",
     {
       filePath: z.string().describe("Path to the .shape.ts file. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
       params: z.record(z.string(), z.number()).describe("Map of param name → override value. Only listed params are overridden; others fall back to the file's declared defaults. Values must be numbers."),
       captureScreenshot: z.boolean().optional().describe("If true, also capture a PNG screenshot of the tuned configuration via the VSCode extension. Default: false. Requires the extension to be running."),
+      persist: z.boolean().optional().describe("If true AND the render succeeds, write the override map to `.shapeitup-params.json` next to the file so subsequent render_preview/open_shape/export_shape/etc. calls pick them up automatically. Default: false (stateless, legacy behavior). Precedence: script defaults < sidecar < call-time params. Clear with `clear_params`."),
     },
-    safeHandler("tune_params", async ({ filePath, params, captureScreenshot }) => {
+    safeHandler("tune_params", async ({ filePath, params, captureScreenshot, persist }) => {
       const absPath = resolveShapePath(filePath);
       if (!existsSync(absPath)) {
         return {
@@ -1758,7 +1906,13 @@ export function registerTools(server: McpServer) {
         ? entries.map(([k, v]) => `${k}=${v}`).join(", ")
         : "(none)";
 
-      const { status } = await executeShapeFile(absPath, GLOBAL_STORAGE, params);
+      // Honor any existing persisted sidecar as the middle layer — call-time
+      // `params` still win at the top. This matters when an agent starts a
+      // tuning session with `persist: true` on one param, then iterates on a
+      // second param via plain `tune_params` calls: the first param stays
+      // pinned in the sidecar, the second stays ephemeral, and the render
+      // reflects both.
+      const { status } = await executeWithPersistedParams(absPath, params);
 
       // Warn about keys that aren't declared in the script's `params` object.
       // The engine silently accepts unknown keys (they just don't do anything);
@@ -1788,6 +1942,37 @@ export function registerTools(server: McpServer) {
       const header = `Tuned (file NOT modified) with: ${paramsSummary}\n`;
       const warningBlock = warningLines.length > 0 ? warningLines.join("\n") + "\n" : "";
       let responseText = header + warningBlock + formatStatusText(status);
+
+      // Persistence branch — write the sidecar AFTER a successful render so a
+      // broken parameter set doesn't get locked in. Only the declared keys
+      // are persisted (unknown-key warnings were surfaced above; persisting
+      // them would be a trap). Existing entries for OTHER files in the same
+      // directory are preserved. Skipped on empty `params` to avoid writing
+      // an empty record.
+      if (persist === true && status.success && entries.length > 0) {
+        try {
+          const dir = dirname(absPath);
+          const base = basename(absPath);
+          const existing = readSidecar(dir);
+          const declaredSet = new Set(declaredKeys);
+          const toPersist: Record<string, number> = { ...(existing[base] ?? {}) };
+          for (const [k, v] of entries) {
+            // Only persist declared keys — unknown keys were already flagged
+            // as ignored; saving them would create phantom overrides that
+            // never take effect.
+            if (declaredSet.has(k) && typeof v === "number") {
+              toPersist[k] = v;
+            }
+          }
+          existing[base] = toPersist;
+          writeSidecar(dir, existing);
+          responseText += `\n(Persisted to ${join(dir, SIDECAR_FILENAME)}. Clear with clear_params.)`;
+        } catch (e: any) {
+          responseText += `\n(Persist failed: ${e?.message ?? e}. Render still succeeded.)`;
+        }
+      } else if (persist === true && !status.success) {
+        responseText += "\n(Persist skipped: render failed; sidecar unchanged.)";
+      }
 
       // Optional screenshot branch — only meaningful on a successful render
       // AND when the extension is running. Mirrors the preview_shape pattern
@@ -1843,6 +2028,88 @@ export function registerTools(server: McpServer) {
   );
 
   server.tool(
+    "clear_params",
+    "Clear persisted param overrides written by `tune_params({ persist: true })`. Persistence model: `tune_params` with `persist: true` writes a `.shapeitup-params.json` sidecar alongside the shape file; subsequent executions (render_preview, open_shape, export_shape, modify_shape, preview_finder, check_collisions) merge those overrides on top of the script's declared defaults. Call-time overrides always win over the sidecar. Pass `filePath` to remove a single file's entry (other files in the same directory keep theirs). Pass `all: true` to delete the sidecar entirely (requires either `filePath` OR `workingDir` to locate it — when only `all` is given without a locator, the current VSCode workspace root is used).",
+    {
+      filePath: z.string().optional().describe("Path to the .shape.ts file whose sidecar entry should be removed. Absolute or relative (probes workspace roots). Mutually exclusive with `all`."),
+      all: z.boolean().optional().describe("When true, delete the entire sidecar in the resolved directory (all files' overrides). Use `filePath` or `workingDir` to pick the directory. Mutually exclusive with a bare `filePath` unless you want to clear the whole sidecar located at dirname(filePath)."),
+      workingDir: z.string().optional().describe("Directory containing the `.shapeitup-params.json` sidecar. Only used with `all: true` when no `filePath` is supplied. Defaults to the active VSCode workspace root."),
+    },
+    safeHandler("clear_params", async ({ filePath, all, workingDir }) => {
+      if (!filePath && !all) {
+        return {
+          content: [{ type: "text" as const, text: "clear_params: pass `filePath` (clear one entry) or `all: true` (delete the whole sidecar)." }],
+          isError: true,
+        };
+      }
+
+      // Resolve the sidecar directory. For a filePath, use its dirname; for a
+      // plain `all: true`, honor workingDir or fall back to the workspace root.
+      let sidecarDir: string;
+      let targetBase: string | undefined;
+      if (filePath) {
+        const absPath = resolveShapePath(filePath);
+        sidecarDir = dirname(absPath);
+        targetBase = basename(absPath);
+      } else if (workingDir) {
+        sidecarDir = resolveShapePath(workingDir);
+      } else {
+        sidecarDir = getDefaultDirectory();
+      }
+
+      const sidecarPath = join(sidecarDir, SIDECAR_FILENAME);
+      if (!existsSync(sidecarPath)) {
+        return {
+          content: [{ type: "text" as const, text: `No sidecar to clear — ${sidecarPath} doesn't exist.` }],
+        };
+      }
+
+      if (all === true) {
+        // Nuke the whole file. Simpler than rewriting to `{}` and surfaces
+        // the removal clearly in a diff/listing.
+        try {
+          unlinkSync(sidecarPath);
+          return {
+            content: [{ type: "text" as const, text: `Deleted sidecar ${sidecarPath}.` }],
+          };
+        } catch (e: any) {
+          return {
+            content: [{ type: "text" as const, text: `Failed to delete ${sidecarPath}: ${e?.message ?? e}` }],
+            isError: true,
+          };
+        }
+      }
+
+      // Per-file removal. Rewrite the sidecar without the target key; if that
+      // leaves it empty, delete the whole file so the directory stays tidy.
+      try {
+        const map = readSidecar(sidecarDir);
+        if (!targetBase || !(targetBase in map)) {
+          return {
+            content: [{ type: "text" as const, text: `No entry for ${targetBase ?? filePath} in ${sidecarPath} — nothing to clear.` }],
+          };
+        }
+        delete map[targetBase];
+        if (Object.keys(map).length === 0) {
+          unlinkSync(sidecarPath);
+          return {
+            content: [{ type: "text" as const, text: `Cleared entry for ${targetBase} and removed empty sidecar ${sidecarPath}.` }],
+          };
+        }
+        writeSidecar(sidecarDir, map);
+        return {
+          content: [{ type: "text" as const, text: `Cleared entry for ${targetBase} in ${sidecarPath}. Remaining entries: ${Object.keys(map).join(", ")}.` }],
+        };
+      } catch (e: any) {
+        return {
+          content: [{ type: "text" as const, text: `Failed to update ${sidecarPath}: ${e?.message ?? e}` }],
+          isError: true,
+        };
+      }
+    })
+  );
+
+  server.tool(
     "get_api_reference",
     "Get Replicad API reference. Call without category to list available categories, pass `search` to find the most relevant sections across all categories, or pass `signaturesOnly: true` to get just the method signatures (token-efficient lookup).",
     {
@@ -1883,7 +2150,7 @@ export function registerTools(server: McpServer) {
         .optional()
         .describe("Camera angle preset (default: 'isometric')"),
       showDimensions: z.boolean().optional().describe("Overlay bounding-box dimensions (default: true)"),
-      showAxes: z.boolean().optional().describe("Overlay X/Y/Z coordinate axes in the screenshot (default: false). Helpful for orienting symmetric or complex models."),
+      showAxes: z.boolean().optional().describe("Overlay X/Y/Z coordinate axes in the screenshot (default: true). Helpful for orienting symmetric or complex models. Pass false to suppress."),
       renderMode: z.enum(["ai", "dark"]).optional().describe("'ai' for high-contrast light background (default), 'dark' for dark mode"),
       width: z.number().optional().describe("Output width in pixels (default 1280)"),
       height: z.number().optional().describe("Output height in pixels (default 960)"),
@@ -1992,7 +2259,7 @@ export function registerTools(server: McpServer) {
         // expression. Matches preview_finder: lets us produce clean error
         // messages ("no part named X", "finder failed to evaluate") *before*
         // burning a full extension render.
-        const { status: preStatus, parts } = await executeShapeFile(source, GLOBAL_STORAGE);
+        const { status: preStatus, parts } = await executeWithPersistedParams(source);
         if (!preStatus.success || !parts || parts.length === 0) {
           return {
             content: [{ type: "text" as const, text: `Cannot render finder preview — script failed to render.\n${formatStatusText(preStatus)}` }],
@@ -2107,7 +2374,9 @@ export function registerTools(server: McpServer) {
           targetWorkspaceRoot: computeTargetWorkspaceRoot(source),
           renderMode: renderMode || "ai",
           showDimensions: showDimensions !== false,
-          showAxes: showAxes === true,
+          // Default flipped to ON — iso views on complex parts are otherwise
+          // ambiguous. Only suppress when the caller explicitly passes false.
+          showAxes: showAxes !== false,
           cameraAngle: cameraAngle || "isometric",
           width: width || 1280,
           height: height || 960,
@@ -2221,7 +2490,7 @@ export function registerTools(server: McpServer) {
 
         const textBlock = {
           type: "text" as const,
-          text: `Screenshot saved to: ${screenshotPath}\nRender mode: ${renderMode || "ai"}, Camera: ${cameraAngle || "isometric"}, Axes: ${showAxes === true ? "ON" : "OFF"}, Size: ${width || 1280}x${height || 960}\nFile: ${source}${partsLine}${partWarnLine}${finderLine}${statusText}\nUse the Read tool to view this image. Or call the \`get_preview\` MCP tool to receive the PNG data inline without needing filesystem access.`,
+          text: `Screenshot saved to: ${screenshotPath}\nRender mode: ${renderMode || "ai"}, Camera: ${cameraAngle || "isometric"}, Axes: ${showAxes !== false ? "ON" : "OFF"}, Size: ${width || 1280}x${height || 960}\nFile: ${source}${partsLine}${partWarnLine}${finderLine}${statusText}\nUse the Read tool to view this image. Or call the \`get_preview\` MCP tool to receive the PNG data inline without needing filesystem access.`,
         };
 
         // Bug #8: when inline is requested, read the PNG off disk and append
@@ -2462,7 +2731,7 @@ export function registerTools(server: McpServer) {
       }
 
       // Step 1: execute the user's script to get the live OCCT parts.
-      const { status, parts } = await executeShapeFile(absPath, GLOBAL_STORAGE);
+      const { status, parts } = await executeWithPersistedParams(absPath);
       if (!status.success || !parts || parts.length === 0) {
         return {
           content: [{ type: "text" as const, text: `Cannot preview finder — script failed to render.\n${formatStatusText(status)}` }],
@@ -2610,11 +2879,29 @@ export function registerTools(server: McpServer) {
 
       if (matches.length === 0) {
         const zeroHint = `\nThe finder matched nothing — double-check the filters (e.g. plane offset, direction axis, length constraint). ${isFace ? "FaceFinder" : "EdgeFinder"} DSL: .inDirection('X'|'Y'|'Z'), .inPlane('XY'|'XZ'|'YZ', offset?), .ofLength(n|fn), .containsPoint([x,y,z]), .atAngleWith(dir, deg), .parallelTo(plane), .not(f), .either([f1, f2]).`;
+
+        // Edge-consuming-op hint: when the user's script contains
+        // `.fillet()/.chamfer()/.shell()`, the targeted edge may have been
+        // destroyed by the op itself. Surface this specifically since it's a
+        // common gotcha — the finder's filters are fine but the edge it's
+        // looking for no longer exists post-op. Read source from disk when we
+        // have a filePath; otherwise reuse the inline `code` argument.
+        let hintBlock = "";
+        try {
+          const scannedSource = code ?? readFileSync(absPath, "utf-8");
+          if (/\.(fillet|chamfer|shell)\s*\(/.test(scannedSource)) {
+            hintBlock =
+              "\nFinder matched 0 edges. The script contains .fillet()/.chamfer()/.shell() operations — these consume edges. If your finder targets edges that exist BEFORE that operation, the target may no longer exist after the op completes. Try passing inline `code` with the op commented out to preview the pre-op geometry.";
+          }
+        } catch {
+          // Can't read source — skip the hint rather than guess.
+        }
+
         // No render-preview when there are no matches — the viewer would just
         // show the raw shape which is visually indistinguishable from "script
         // loaded fine".
         return {
-          content: [{ type: "text" as const, text: header + zeroHint }],
+          content: [{ type: "text" as const, text: header + zeroHint + hintBlock }],
         };
       }
 
@@ -2707,7 +2994,7 @@ export function registerTools(server: McpServer) {
       // Step 1: execute the script to get live OCCT parts. Failure here is
       // surfaced via formatStatusText so the agent sees the engine's own
       // error hint (fillet too large, wire not closed, etc.).
-      const { status, parts } = await executeShapeFile(absPath, GLOBAL_STORAGE);
+      const { status, parts } = await executeWithPersistedParams(absPath);
       if (!status.success || !parts) {
         return {
           content: [{ type: "text" as const, text: `Cannot check collisions — script failed to render.\n${formatStatusText(status)}` }],
@@ -2883,6 +3170,344 @@ export function registerTools(server: McpServer) {
         content: [{ type: "text" as const, text: sections.join("\n") }],
       };
       }); // close withShapeFile callback
+    })
+  );
+
+  server.tool(
+    "describe_geometry",
+    "Enumerate the faces and/or edges of a rendered shape with per-entity geometry (normal, centroid, area, type; edges: start/end/length/type) plus a bounding box and a grouped-count `summary`. Use `format: 'summary'` (default) for a compact overview — counts per face type + per quantized normal direction + per edge type. Use `format: 'full'` to dump the raw per-entity arrays (respecting `limit`, default 50). Filter faces by `planar` / `curved` and edges by `outer` / `none`. Pass either `filePath` or inline `code` (mutually exclusive) — identical resolution rules as `preview_finder`. Useful before a chamfer/shell to confirm which faces/edges exist and their orientations.",
+    {
+      filePath: z.string().optional().describe("Path to the .shape.ts file to describe. Absolute paths pass through; relative paths probe workspace roots. Mutually exclusive with `code`."),
+      code: z.string().optional().describe("Inline .shape.ts source — executed in a temp file like preview_finder. Mutually exclusive with `filePath`."),
+      workingDir: z.string().optional().describe("Directory to write the inline snippet file in when `code` is provided. Defaults to a private globalStorage path."),
+      partName: z.string().optional().describe("For multi-part assemblies: name of the part to describe. If omitted, every part is described."),
+      format: z.enum(["summary", "full"]).optional().describe("'summary' (default) returns grouped counts only. 'full' returns the per-face/per-edge arrays up to `limit`."),
+      faces: z.enum(["all", "planar", "curved"]).optional().describe("Face filter (default 'all'). 'planar' = only PLANE surface type; 'curved' = everything else."),
+      edges: z.enum(["all", "outer", "none"]).optional().describe("Edge filter (default 'none'). 'all' = every edge; 'outer' = same as 'all' (Replicad doesn't expose seam/outer adjacency)."),
+      limit: z.number().int().positive().optional().describe("Max entities per category in 'full' format (default 50). Truncation is flagged in summary.truncated."),
+    },
+    safeHandler("describe_geometry", async ({ filePath, code, workingDir, partName, format, faces, edges, limit }) => {
+      if (filePath !== undefined && code !== undefined) {
+        return {
+          content: [{ type: "text" as const, text: "describe_geometry: pass either `filePath` OR `code`, not both." }],
+          isError: true,
+        };
+      }
+      if (filePath === undefined && code === undefined) {
+        return {
+          content: [{ type: "text" as const, text: "describe_geometry: provide either `filePath` (existing shape) or `code` (inline snippet)." }],
+          isError: true,
+        };
+      }
+
+      const effectiveFormat: "summary" | "full" = format ?? "summary";
+      const effectiveFaces: "all" | "planar" | "curved" = faces ?? "all";
+      const effectiveEdges: "all" | "outer" | "none" = edges ?? "none";
+      const effectiveLimit = typeof limit === "number" && limit > 0 ? Math.floor(limit) : 50;
+
+      return withShapeFile({ filePath, code, workingDir }, async (absPath) => {
+        if (!existsSync(absPath)) {
+          return {
+            content: [{ type: "text" as const, text: `File not found: ${absPath}` }],
+            isError: true,
+          };
+        }
+
+        // Step 1: execute the user's script.
+        const { status, parts } = await executeWithPersistedParams(absPath);
+        if (!status.success || !parts || parts.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: `Cannot describe geometry — script failed to render.\n${formatStatusText(status)}` }],
+            isError: true,
+          };
+        }
+
+        // Resolve target parts: single-by-name or all.
+        let targets: typeof parts;
+        if (partName !== undefined) {
+          const found = parts.find((p) => p.name === partName);
+          if (!found) {
+            return {
+              content: [{ type: "text" as const, text: `No part named "${partName}" in ${basename(absPath)}. Available: ${parts.map((p) => p.name).join(", ") || "(none)"}` }],
+              isError: true,
+            };
+          }
+          targets = [found];
+        } else {
+          targets = parts;
+        }
+
+        // --- Helpers ------------------------------------------------------
+        const round3 = (n: number): number =>
+          (typeof n === "number" && isFinite(n)) ? Math.round(n * 1000) / 1000 : n;
+        const round3pt = (p: { x: number; y: number; z: number }): [number, number, number] =>
+          [round3(p.x), round3(p.y), round3(p.z)];
+
+        // Quantize a normal vector to the 8-point compass. Any axis whose
+        // magnitude is below 0.5 is treated as zero (so a mostly-+Z face with
+        // negligible X/Y drift still groups under "+Z"). Faces with no dominant
+        // direction return "oblique" so the summary doesn't falsely claim
+        // alignment. The returned string is sorted by axis (X < Y < Z) so
+        // "+X+Z" and "+Z+X" collapse to one bucket.
+        const quantizeNormal = (nx: number, ny: number, nz: number): string => {
+          const thresh = 0.5;
+          const parts: string[] = [];
+          if (Math.abs(nx) >= thresh) parts.push(nx > 0 ? "+X" : "-X");
+          if (Math.abs(ny) >= thresh) parts.push(ny > 0 ? "+Y" : "-Y");
+          if (Math.abs(nz) >= thresh) parts.push(nz > 0 ? "+Z" : "-Z");
+          if (parts.length === 0) return "oblique";
+          return parts.join("");
+        };
+
+        interface FaceRecord {
+          part: string;
+          id: number;
+          type?: string;
+          normal?: [number, number, number];
+          normalDir?: string;
+          centroid?: [number, number, number];
+          area?: number;
+        }
+        interface EdgeRecord {
+          part: string;
+          id: number;
+          type?: string;
+          start?: [number, number, number];
+          end?: [number, number, number];
+          length?: number;
+        }
+
+        const core = await getCore();
+        const replicad: any = core.replicad();
+        const measureArea = replicad?.measureArea;
+
+        const faceRecords: FaceRecord[] = [];
+        const edgeRecords: EdgeRecord[] = [];
+        const faceTypeCounts: Record<string, number> = {};
+        const faceNormalCounts: Record<string, number> = {};
+        const edgeTypeCounts: Record<string, number> = {};
+
+        let totalFacesSeen = 0;
+        let totalEdgesSeen = 0;
+        let facesTruncated = false;
+        let edgesTruncated = false;
+        let globalMinX = Infinity, globalMinY = Infinity, globalMinZ = Infinity;
+        let globalMaxX = -Infinity, globalMaxY = -Infinity, globalMaxZ = -Infinity;
+
+        // Accumulate the per-part bounding box using the tessellated vertices
+        // we already have (no need for OCCT's BoundingBox — vertex AABB is
+        // already precise enough for this tool's "rough orientation" use case
+        // and avoids handing a WrappingObj between worker hops). Matches the
+        // pattern used by check_collisions.
+        for (const part of targets) {
+          const v = part.vertices;
+          if (v && v.length >= 3) {
+            for (let i = 0; i < v.length; i += 3) {
+              if (v[i] < globalMinX) globalMinX = v[i];
+              if (v[i] > globalMaxX) globalMaxX = v[i];
+              if (v[i + 1] < globalMinY) globalMinY = v[i + 1];
+              if (v[i + 1] > globalMaxY) globalMaxY = v[i + 1];
+              if (v[i + 2] < globalMinZ) globalMinZ = v[i + 2];
+              if (v[i + 2] > globalMaxZ) globalMaxZ = v[i + 2];
+            }
+          }
+        }
+
+        // --- Per-part iteration ------------------------------------------
+        for (const part of targets) {
+          const shape: any = part.shape;
+          // FACES
+          let faceList: any[] = [];
+          try {
+            faceList = shape.faces ?? [];
+          } catch {
+            faceList = [];
+          }
+          for (let i = 0; i < faceList.length; i++) {
+            const f = faceList[i];
+            totalFacesSeen++;
+            let type: string | undefined;
+            try {
+              const t = f.geomType;
+              if (typeof t === "string") type = t;
+            } catch {}
+
+            // Face filter: skip non-matching early (still count in total / type
+            // summary? No — filtered entries shouldn't inflate counts either,
+            // that would be confusing. Skip before any tallies.)
+            const isPlanar = type === "PLANE";
+            if (effectiveFaces === "planar" && !isPlanar) { try { f.delete?.(); } catch {}; continue; }
+            if (effectiveFaces === "curved" && isPlanar) { try { f.delete?.(); } catch {}; continue; }
+
+            if (type) faceTypeCounts[type] = (faceTypeCounts[type] ?? 0) + 1;
+
+            // Centroid.
+            let centroid: [number, number, number] | undefined;
+            try {
+              const c = f.center;
+              if (c && typeof c.x === "number" && typeof c.y === "number" && typeof c.z === "number") {
+                centroid = round3pt(c);
+              }
+              try { c?.delete?.(); } catch {}
+            } catch {}
+
+            // Normal (evaluated at the face center by default).
+            let normal: [number, number, number] | undefined;
+            let normalDir: string | undefined;
+            try {
+              if (typeof f.normalAt === "function") {
+                const n = f.normalAt();
+                if (n && typeof n.x === "number" && typeof n.y === "number" && typeof n.z === "number") {
+                  normal = round3pt(n);
+                  normalDir = quantizeNormal(n.x, n.y, n.z);
+                  faceNormalCounts[normalDir] = (faceNormalCounts[normalDir] ?? 0) + 1;
+                }
+                try { n?.delete?.(); } catch {}
+              }
+            } catch {
+              // Omit normal — don't fake it
+            }
+
+            // Area.
+            let area: number | undefined;
+            try {
+              if (typeof measureArea === "function") {
+                const a = measureArea(f);
+                if (typeof a === "number" && isFinite(a)) area = round3(a);
+              }
+            } catch {
+              // Some surface types throw; omit rather than invent a value.
+            }
+
+            if (effectiveFormat === "full") {
+              if (faceRecords.length < effectiveLimit) {
+                faceRecords.push({
+                  part: part.name,
+                  id: i,
+                  type,
+                  normal,
+                  normalDir,
+                  centroid,
+                  area,
+                });
+              } else {
+                facesTruncated = true;
+              }
+            }
+
+            try { f.delete?.(); } catch {}
+          }
+
+          // EDGES
+          if (effectiveEdges !== "none") {
+            let edgeList: any[] = [];
+            try {
+              edgeList = shape.edges ?? [];
+            } catch {
+              edgeList = [];
+            }
+            for (let i = 0; i < edgeList.length; i++) {
+              const e = edgeList[i];
+              totalEdgesSeen++;
+              let type: string | undefined;
+              try {
+                const t = e.geomType;
+                if (typeof t === "string") type = t;
+              } catch {}
+              if (type) edgeTypeCounts[type] = (edgeTypeCounts[type] ?? 0) + 1;
+
+              let start: [number, number, number] | undefined;
+              let end: [number, number, number] | undefined;
+              let length: number | undefined;
+              try {
+                const s = e.startPoint;
+                if (s && typeof s.x === "number") start = round3pt(s);
+                try { s?.delete?.(); } catch {}
+              } catch {}
+              try {
+                const ep = e.endPoint;
+                if (ep && typeof ep.x === "number") end = round3pt(ep);
+                try { ep?.delete?.(); } catch {}
+              } catch {}
+              try {
+                const l = e.length;
+                if (typeof l === "number" && isFinite(l)) length = round3(l);
+              } catch {}
+
+              if (effectiveFormat === "full") {
+                if (edgeRecords.length < effectiveLimit) {
+                  edgeRecords.push({ part: part.name, id: i, type, start, end, length });
+                } else {
+                  edgesTruncated = true;
+                }
+              }
+
+              try { e.delete?.(); } catch {}
+            }
+          }
+        }
+
+        // Token guard: in full mode, rough-estimate response size from the
+        // face+edge record counts. Each record serializes to ~40 tokens when
+        // JSON-stringified with the field set above; bail out and emit a
+        // warning if the projection exceeds 20k tokens.
+        const FULL_TOKEN_BUDGET = 20_000;
+        const approxTokens = (faceRecords.length + edgeRecords.length) * 40;
+        let tokenGuardNote: string | undefined;
+        let forcedDowngrade = false;
+        if (effectiveFormat === "full" && approxTokens > FULL_TOKEN_BUDGET) {
+          tokenGuardNote =
+            `Response would exceed ~${FULL_TOKEN_BUDGET.toLocaleString()}-token budget ` +
+            `(estimated ${approxTokens.toLocaleString()} tokens for ${faceRecords.length} faces + ${edgeRecords.length} edges). ` +
+            `Auto-downgraded to summary. Re-run with a smaller \`limit\` (current ${effectiveLimit}) or a tighter \`faces\`/\`edges\` filter to get full arrays.`;
+          forcedDowngrade = true;
+        }
+
+        const boundingBox = globalMinX !== Infinity
+          ? {
+              min: [round3(globalMinX), round3(globalMinY), round3(globalMinZ)] as [number, number, number],
+              max: [round3(globalMaxX), round3(globalMaxY), round3(globalMaxZ)] as [number, number, number],
+              size: [
+                round3(globalMaxX - globalMinX),
+                round3(globalMaxY - globalMinY),
+                round3(globalMaxZ - globalMinZ),
+              ] as [number, number, number],
+            }
+          : undefined;
+
+        const summary: any = {
+          partNames: targets.map((p) => p.name),
+          faceCount: totalFacesSeen,
+          edgeCount: effectiveEdges === "none" ? undefined : totalEdgesSeen,
+          facesByType: faceTypeCounts,
+          facesByNormalDir: faceNormalCounts,
+          edgesByType: effectiveEdges === "none" ? undefined : edgeTypeCounts,
+          truncated: effectiveFormat === "full" && !forcedDowngrade
+            ? { faces: facesTruncated, edges: edgesTruncated }
+            : undefined,
+        };
+
+        const payload: any = {
+          summary,
+          boundingBox,
+        };
+        if (effectiveFormat === "full" && !forcedDowngrade) {
+          payload.faces = faceRecords;
+          if (effectiveEdges !== "none") payload.edges = edgeRecords;
+        }
+        if (tokenGuardNote) payload.warning = tokenGuardNote;
+
+        // Serialize as pretty JSON so the agent can parse it programmatically
+        // while still being readable in a transcript. Prefix with a one-line
+        // header so the tool response is legible even without JSON tooling.
+        const header = [
+          `describe_geometry: ${targets.length} part${targets.length === 1 ? "" : "s"} (${targets.map((p) => p.name).join(", ")}) from ${basename(absPath)}`,
+          `format=${forcedDowngrade ? "summary (auto-downgraded)" : effectiveFormat}, faces=${effectiveFaces}, edges=${effectiveEdges}, limit=${effectiveLimit}`,
+        ].join("\n");
+        return {
+          content: [{ type: "text" as const, text: `${header}\n${JSON.stringify(payload, null, 2)}` }],
+        };
+      });
     })
   );
 }
