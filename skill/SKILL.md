@@ -97,6 +97,22 @@ YZ → extrudes +X
 
 No exceptions, no flags, no "it depends". To flip direction, use the reverse-named plane (`YX` → -Z, `ZX` → +Y, `ZY` → -X) or pass a negative extrude depth (`.extrude(-L)`). `sketchOnPlane("XZ", [0, 0, 20])`'s origin offset is in WORLD coordinates, so the `[0, 0, 20]` raises along world Z, NOT along the XZ plane's local axis.
 
+### Pen axis mapping (`draw().hLine` / `.vLine`, `Sketcher`)
+
+The 2D pen's horizontal axis (`hLine`, right movement) and vertical axis (`vLine`, up movement) map to different world axes depending on the plane. Read this table before sketching on anything other than XY.
+
+```
+Plane    pen h → world    pen v → world    extrudes
+XY       +X               +Y               +Z
+YX       +Y               +X               -Z
+XZ       +X               +Z               -Y
+ZX       +Z               +X               +Y
+YZ       +Y               +Z               +X
+ZY       +Z               +Y               -X
+```
+
+Concrete footgun: `draw().hLine(60).sketchOnPlane("ZX")` moves the pen 60 mm along **world Z**, not world X. If you expected `hLine` to walk along world X, you want plane `"XZ"` (where pen h → +X).
+
 ---
 
 ## Top Best Practices
@@ -203,7 +219,7 @@ Signatures only — full reference: `get_api_reference({ category: "drawing" })`
 drawRectangle(50, 30).sketchOnPlane("XY");              // on top
 drawCircle(10).sketchOnPlane("XY", [0, 0, 20]);         // raised to Z=20 (world coords)
 sketchCircle(10, { plane: "XY" });                       // one-liner; already a Sketch
-new Sketcher("XZ").hLine(20).vLine(10).hLine(-20).close(); // freeform
+new Sketcher("XZ").hLine(20).vLine(10).hLine(-20).close(); // freeform; on XZ, hLine → world X, vLine → world Z (see Pen axis mapping)
 ```
 
 ---
@@ -396,7 +412,32 @@ export default function main() {
 
 Options: `{ color?, shapeColor?, radius? }`. Works with both EdgeFinder and FaceFinder. Prefer the `preview_finder` MCP tool when you don't want to edit the file.
 
-**Debugging finder selectors on a failing script.** `preview_finder` needs a shape to match against, so it can't run on a script that crashes before the finder target exists. Workaround: pass a modified script via the `code` parameter with the failing operation commented out or replaced with a benign stub. The finder then runs against whatever shape exists at the point you choose — ideal for iterating on a selector before re-enabling the fillet/chamfer that was crashing.
+### Debugging finders when the script fails before the finder
+
+If the script crashes at the very op you're trying to fix — say a fillet throws "no edge selected":
+
+```typescript
+// part.shape.ts — crashes: nothing matches this filter
+return shape.fillet(3, e => e.inDirection("Y").containsPoint([4, 0, 4]));
+```
+
+then `preview_finder({ filePath })` can't help — the file blows up before the finder target exists. Pass an **inline `code` snippet** instead, with the failing op commented out so the shape renders up to the point you want to inspect:
+
+```ts
+preview_finder({
+  code: `
+    import { drawRectangle, EdgeFinder } from "replicad";
+    export default function main() {
+      const shape = drawRectangle(10, 10).sketchOnPlane("XY").extrude(8);
+      // shape.fillet(3, e => e.inDirection("Y").containsPoint([4, 0, 4]));
+      return shape;
+    }
+  `,
+  finder: 'new EdgeFinder().inDirection("Y").containsPoint([4, 0, 4])',
+});
+```
+
+The finder paints pink spheres at each match. Zero spheres means the filter didn't select anything — iterate on the predicate (loosen `containsPoint`, drop `inDirection`, try `ofLength`) until the count looks right, then re-enable the real fillet. Avoids re-running the whole CAD chain on every selector tweak.
 
 ---
 
