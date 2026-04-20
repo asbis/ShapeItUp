@@ -176,20 +176,37 @@ export function getPredictedExtrudeBbox(
 // the warning when the predicted interval is still substantially inside the
 // final bbox. If the user translated the part out of the predicted region, the
 // hint is silently discarded.
-const pendingExtrudeHints: Array<{
+interface PendingExtrudeHint {
   plane: string;
   length: number;
   predicted: { axis: "x" | "y" | "z"; lo: number; hi: number };
-}> = [];
+  origin: "user" | "stdlib";
+}
+
+const pendingExtrudeHints: PendingExtrudeHint[] = [];
 
 /**
  * Stash an extrude hint for later cross-check at drain time. No-op when
  * `getPredictedExtrudeBbox` returns null (XY plane, zero length, etc.).
+ *
+ * The hint is tagged `origin: "stdlib"` when the call stack shows any frame
+ * from `/stdlib/` (e.g. `holes.countersink()` or `fasteners.socketHeadBody()`
+ * which legitimately sketch on non-XY planes to revolve a profile). Those
+ * are dropped silently at drain time — the bbox heuristic can't distinguish
+ * an intentional stdlib revolve-profile extrude from a user footgun, so we
+ * use the callsite instead. User-origin hints keep going through the normal
+ * >50% overlap check in `drainExtrudeHints`.
  */
 export function enqueueExtrudeHint(plane: string, length: number): void {
   const predicted = getPredictedExtrudeBbox(plane, length);
   if (!predicted) return;
-  pendingExtrudeHints.push({ plane, length, predicted });
+  const stack = new Error().stack ?? "";
+  // Match both POSIX `/stdlib/` and Windows `\stdlib\` path separators. V8's
+  // `file:///C:/...` URL form normalises to forward slashes in the stack, so
+  // a single `/` branch also handles Windows-style `file://` frames; the `\\`
+  // branch handles native Node stack frames on Windows.
+  const origin = /[\\/]stdlib[\\/]/.test(stack) ? "stdlib" : "user";
+  pendingExtrudeHints.push({ plane, length, predicted, origin });
 }
 
 /** Reset the pending-hint queue. Called from resetRuntimeWarnings(). */
@@ -227,6 +244,12 @@ export function drainExtrudeHints(
   const hints = pendingExtrudeHints.slice();
   pendingExtrudeHints.length = 0;
   for (const hint of hints) {
+    // Stdlib-internal sketches (e.g. holes.countersink(), fasteners
+    // .socketHeadBody()) legitimately sketch on XZ/ZX to revolve a profile.
+    // The overlap criterion can't distinguish those from user footguns —
+    // the revolved cutter's final bbox legitimately covers the predicted
+    // region — so filter by callsite instead. Tagged at enqueue time.
+    if (hint.origin === "stdlib") continue;
     const { axis, lo, hi } = hint.predicted;
     const width = hi - lo;
     if (!(width > 0)) continue;
