@@ -219,6 +219,31 @@ function copyExtensionTypings() {
   }
 }
 
+/**
+ * Duplicate the bundled typings into packages/mcp-server/dist/typings/ so the
+ * npm-published @shapeitup/mcp-server can bootstrap fresh projects without
+ * depending on the VSIX install. The extension build already emits them into
+ * packages/extension/dist/typings/ — this mirrors that output next to
+ * packages/mcp-server/dist/index.js for the standalone install.
+ */
+function copyTypingsToMcpServer() {
+  const src = resolve(__dirname, "packages/extension/dist/typings");
+  const dest = resolve(__dirname, "packages/mcp-server/dist/typings");
+  if (!existsSync(src)) {
+    console.warn("Warning: extension/dist/typings not generated — mcp-server bootstrap will fail.");
+    return;
+  }
+  mkdirSync(dest, { recursive: true });
+  cpSync(src, dest, { recursive: true, force: true });
+  console.log("Copied typings to packages/mcp-server/dist/typings/");
+}
+
+/**
+ * Duplicate typings into the extension's dist as well (for the VSIX-bundled
+ * mcp-server.mjs). Already lives at packages/extension/dist/typings thanks to
+ * copyExtensionTypings() — nothing extra to do there.
+ */
+
 function copySkillFiles() {
   // Bundle the Claude Code skill with the extension so it can be installed
   // on activation (~/.claude/skills/shapeitup/SKILL.md).
@@ -237,6 +262,7 @@ async function build() {
   copyWasmFiles();
   copySkillFiles();
   copyExtensionTypings();
+  copyTypingsToMcpServer();
 
   if (watch) {
     const contexts = await Promise.all([

@@ -12,6 +12,7 @@ import {
   type EngineStatus,
   type ShapeProperties,
 } from "./engine.js";
+import { autoBootstrapIfNeeded, setupShapeProject } from "./project-setup.js";
 
 /**
  * Shared globalStorage dir with the VSCode extension. Both processes write and
@@ -1203,6 +1204,26 @@ async function executeWithPersistedParams(
 
 export function registerTools(server: McpServer) {
   server.tool(
+    "setup_shape_project",
+    "Bootstrap a folder so `.shape.ts` files get correct types in editors. Writes node_modules/shapeitup and node_modules/replicad type stubs + a minimal tsconfig.json if missing. Idempotent — safe to call repeatedly. Does NOT run npm install; replicad and OCCT are bundled inside this MCP server at runtime. Typically you don't need to call this manually: create_shape auto-bootstraps on first write.",
+    {
+      directory: z.string().describe("Absolute path to the project folder to bootstrap."),
+    },
+    safeHandler("setup_shape_project", async ({ directory }) => {
+      const r = setupShapeProject(directory);
+      const parts: string[] = [`Project: ${r.cwd}`];
+      if (r.created.length > 0) parts.push(`Created:\n  ${r.created.join("\n  ")}`);
+      if (r.skipped.length > 0) parts.push(`Skipped:\n  ${r.skipped.join("\n  ")}`);
+      if (r.note) parts.push(r.note);
+      if (r.created.length === 0 && !r.note) parts.push("Nothing to do — project is already bootstrapped.");
+      return {
+        content: [{ type: "text" as const, text: parts.join("\n\n") }],
+        isError: !!r.note && r.created.length === 0 && r.skipped.length === 0,
+      };
+    }),
+  );
+
+  server.tool(
     "create_shape",
     "Create a new .shape.ts CAD script file and execute it. Fails if file already exists — use modify_shape to update existing files. Path resolution precedence: absolute `directory` used as-is; relative `directory` probed against each heartbeat-reported VSCode workspace root (first match wins), else `process.cwd()`; omitted `directory` defaults to the first active VSCode workspace root (or cwd if no extension is running).",
     {
@@ -1301,6 +1322,11 @@ export function registerTools(server: McpServer) {
         writeFileSync(filePath, code, "utf-8");
       }
 
+      // Auto-bootstrap types on first write in a fresh project so agents/
+      // editors don't see phantom "Cannot find module 'replicad'" errors.
+      // Cheap and idempotent — returns undefined after the first call.
+      const bootstrapNote = autoBootstrapIfNeeded(filePath);
+
       const { status } = await executeWithPersistedParams(filePath);
       notifyExtensionOfShape(filePath);
 
@@ -1316,7 +1342,8 @@ export function registerTools(server: McpServer) {
       const actionWord = contentIdenticalNoOp
         ? "Unchanged (content-identical re-create)"
         : overwrite ? "Overwrote" : "Created";
-      const prefix = `${actionWord} ${filePath}${cwdNote}${doubledWarning}\n`;
+      const bootstrapPrefix = bootstrapNote ? `${bootstrapNote}\n` : "";
+      const prefix = `${bootstrapPrefix}${actionWord} ${filePath}${cwdNote}${doubledWarning}\n`;
       return {
         content: [{ type: "text" as const, text: prefix + formatStatusText(status) }],
         isError: !status.success,
