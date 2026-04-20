@@ -25,15 +25,21 @@ jobs:
       - name: Build
         run: pnpm build
 
-      - name: Install runtime dependencies in extension
-        # Install esbuild-wasm directly by name instead of running
-        # `npm install` against the extension's package.json. npm can't
-        # parse the workspace: protocol used by pnpm workspaces, so
-        # reading package.json here would error. esbuild-wasm is the only
-        # runtime dep that isn't bundled by esbuild at build time, so we
-        # install just that one package without writing package.json or
-        # creating a lockfile.
-        run: cd packages/extension && npm install esbuild-wasm@^0.28.0 --no-save --no-package-lock
+      - name: Dereference esbuild-wasm symlink for VSIX packaging
+        # pnpm's `install` at the repo root already places esbuild-wasm in
+        # packages/extension/node_modules/, but as a symlink into the pnpm
+        # store. vsce's VSIX packager does not follow symlinks cleanly on
+        # all runners, so replace the symlink with a real copy of the
+        # package. We can't use `npm install` here — npm trips on the
+        # workspace: protocol used by the extension's devDependencies
+        # even when filtering devDeps out.
+        run: |
+          cd packages/extension/node_modules
+          if [ -L esbuild-wasm ]; then
+            target=$(readlink -f esbuild-wasm)
+            rm esbuild-wasm
+            cp -r "$target" esbuild-wasm
+          fi
 
       - name: Publish to VS Marketplace
         run: cd packages/extension && npx @vscode/vsce publish
