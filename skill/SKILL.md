@@ -936,6 +936,19 @@ Catches wrong-size bolts + misaligned conventions before you render anything. `g
 
 For simple coaxial stacks (4 cylinders pancaked on each other), `stackOnZ([parts], { gap? })` is a zero-ceremony alternative — it positions each part's bounding-box bottom on the previous part's top via pure geometry. No joint declarations needed. Use joints when you need role/diameter checking, non-Z axes, or want to expose named mating points for reuse.
 
+### Print orientation — `printHints.flatForPrint` + `printHints.layoutOnBed`
+
+For the inverse of assembly posing — re-orient a part so its largest flat face sits on the print bed, then pack several parts onto one build plate:
+
+```typescript
+import { printHints } from "shapeitup";
+
+const laidFlat = [bracket, lid, shaft].map(printHints.flatForPrint);
+return printHints.layoutOnBed(laidFlat, { spacing: 5, bedWidth: 220 });
+```
+
+`flatForPrint(shape)` picks the largest planar face, rotates its outward normal to -Z, and translates the shape so `bbox.min.z === 0`. `layoutOnBed(shapes, { spacing, bedWidth })` shelf-packs shapes on the XY plane, wrapping to a new Y-shelf when `bedWidth` is exceeded. Both clone their inputs — the original assembly-posed shapes survive unchanged, so you can reuse the same `Part` in an `assemble()` result AND in a print-layout return value from `main()` without double-transforming.
+
 ### cylinder() — orientation-explicit alternative to makeCylinder
 
 `makeCylinder(r, h, [base], [dir])` from replicad anchors at the base. The stdlib's `cylinder({ top?, bottom?, length, diameter, direction? })` wrapper matches the stdlib cut-tool convention (top-at-Z=0 style) and takes named args so the anchor is unambiguous.
