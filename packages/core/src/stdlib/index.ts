@@ -20,6 +20,8 @@ import * as motors from "./motors";
 import * as couplers from "./couplers";
 import * as threads from "./threads";
 import * as gears from "./gears";
+import * as pins from "./pins";
+import * as cradles from "./cradles";
 import * as standardsRaw from "./standards";
 import { guardUnknownKeys } from "./standards";
 import { ensureFinderAndPatched } from "./finder-patch";
@@ -94,6 +96,8 @@ export {
   couplers,
   threads,
   gears,
+  pins,
+  cradles,
 };
 
 /**
@@ -133,6 +137,8 @@ export const shapeitupStdlib = {
   couplers,
   threads,
   gears,
+  pins,
+  cradles,
   standards,
 };
 

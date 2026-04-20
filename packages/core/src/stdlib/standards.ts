@@ -286,6 +286,33 @@ export const NEMA14: NemaMotorSpec = {
   mountScrew: "M3",
 };
 
+/**
+ * Standard sports-ball dimensions (diameters only — weights and surface
+ * properties are out of scope for CAD). Used by `cradles.cradle` and any
+ * mechanism that needs to size a pocket or guide to a specific ball.
+ *
+ * Sources:
+ *   - Tennis:   ITF "Rules of Tennis" — 6.54–6.86 cm, using 67 mm midpoint.
+ *   - Ping pong: ITTF 40+ plastic ball (official since 2015).
+ *   - Golf:     R&A / USGA — minimum 42.67 mm (1.68 in).
+ *   - Baseball: MLB — 73 mm (2.86–2.94 in diameter).
+ *   - Soccer:   FIFA size 5 — 68–70 cm circumference → ~216 mm diameter.
+ */
+export interface SportsBallSpec {
+  /** Nominal diameter (mm). */
+  diameter: number;
+  /** Human-readable name (including the governing body). */
+  name: string;
+}
+
+export const SPORTS_BALLS: Record<string, SportsBallSpec> = {
+  tennis:   { diameter: 67,    name: "Tennis ball (ITF)" },
+  pingpong: { diameter: 40,    name: "Table tennis ball" },
+  golf:     { diameter: 42.67, name: "Golf ball (R&A/USGA)" },
+  baseball: { diameter: 73,    name: "Baseball (MLB)" },
+  soccer:   { diameter: 216,   name: "Soccer ball (FIFA size 5)" },
+};
+
 /** Flexible / jaw shaft coupler. Two bores, one per end. */
 export interface FlexibleCouplerSpec {
   od: number;
