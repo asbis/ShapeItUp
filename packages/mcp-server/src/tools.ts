@@ -9,10 +9,14 @@ import {
   exportLastToFile,
   getCore,
   getLastFileName,
+  getLastParts,
   resetCore,
   type EngineStatus,
   type ShapeProperties,
 } from "./engine.js";
+import { autoBootstrapIfNeeded, setupShapeProject } from "./project-setup.js";
+import { renderPartsToSvg } from "./svg-renderer.js";
+import { svgToPng } from "./svg-to-png.js";
 
 /**
  * Shared globalStorage dir with the VSCode extension. Both processes write and
@@ -192,9 +196,19 @@ function readAllHeartbeats(): WindowHeartbeat[] {
 }
 
 function isExtensionAlive(): boolean {
+  // Aggregate across per-pid heartbeats — multi-window setups often have one
+  // stale window (minimized / background) alongside a fresh foreground one,
+  // and we want ANY live window to count as "extension alive". Raised from
+  // 5s to 15s because 5s fires false-negatives during momentary system stalls
+  // (Docker/VM starts, browser GC, macOS App Nap on backgrounded VS Code).
+  const all = readAllHeartbeats();
+  const now = Date.now();
+  if (all.length > 0) {
+    return all.some((hb) => now - (hb.timestamp ?? 0) < 15_000);
+  }
   const hb = readHeartbeat();
   if (!hb) return false;
-  return Date.now() - (hb.timestamp ?? 0) < 5000;
+  return now - (hb.timestamp ?? 0) < 15_000;
 }
 
 /**
@@ -1366,6 +1380,26 @@ async function executeWithPersistedParams(
 
 export function registerTools(server: McpServer) {
   server.tool(
+    "setup_shape_project",
+    "Bootstrap a folder so `.shape.ts` files get correct types in editors. Writes node_modules/shapeitup and node_modules/replicad type stubs + a minimal tsconfig.json if missing. Idempotent — safe to call repeatedly. Does NOT run npm install; replicad and OCCT are bundled inside this MCP server at runtime. Typically you don't need to call this manually: create_shape auto-bootstraps on first write.",
+    {
+      directory: z.string().describe("Absolute path to the project folder to bootstrap."),
+    },
+    safeHandler("setup_shape_project", async ({ directory }) => {
+      const r = setupShapeProject(directory);
+      const parts: string[] = [`Project: ${r.cwd}`];
+      if (r.created.length > 0) parts.push(`Created:\n  ${r.created.join("\n  ")}`);
+      if (r.skipped.length > 0) parts.push(`Skipped:\n  ${r.skipped.join("\n  ")}`);
+      if (r.note) parts.push(r.note);
+      if (r.created.length === 0 && !r.note) parts.push("Nothing to do — project is already bootstrapped.");
+      return {
+        content: [{ type: "text" as const, text: parts.join("\n\n") }],
+        isError: !!r.note && r.created.length === 0 && r.skipped.length === 0,
+      };
+    }),
+  );
+
+  server.tool(
     "create_shape",
     "Create a new .shape.ts CAD script file and execute it. Fails if file already exists — use modify_shape to update existing files. Path resolution precedence: absolute `directory` used as-is; relative `directory` probed against each heartbeat-reported VSCode workspace root (first match wins), else `process.cwd()`; omitted `directory` defaults to the first active VSCode workspace root (or cwd if no extension is running). Refuses to create a file when the resolved path contains a duplicated segment (e.g. `examples/examples/...`) unless `allowPathDuplication: true` is passed.",
     {
@@ -1494,6 +1528,11 @@ export function registerTools(server: McpServer) {
         writeFileSync(filePath, code, "utf-8");
       }
 
+      // Auto-bootstrap types on first write in a fresh project so agents/
+      // editors don't see phantom "Cannot find module 'replicad'" errors.
+      // Cheap and idempotent — returns undefined after the first call.
+      const bootstrapNote = autoBootstrapIfNeeded(filePath);
+
       const { status } = await executeWithPersistedParams(filePath);
       notifyExtensionOfShape(filePath);
 
@@ -1534,7 +1573,8 @@ export function registerTools(server: McpServer) {
       const actionWord = contentIdenticalNoOp
         ? "Unchanged (content-identical re-create)"
         : overwrite ? "Overwrote" : "Created";
-      const prefix = `${actionWord} ${filePath}${cwdNote}${fallbackWarning}${doubledWarning}\n`;
+      const bootstrapPrefix = bootstrapNote ? `${bootstrapNote}\n` : "";
+      const prefix = `${bootstrapPrefix}${actionWord} ${filePath}${cwdNote}${fallbackWarning}${doubledWarning}\n`;
       return {
         content: [{ type: "text" as const, text: prefix + formatStatusText(status) }],
         isError: !status.success,
@@ -2479,7 +2519,7 @@ export function registerTools(server: McpServer) {
         .enum(["preview", "final"])
         .optional()
         .describe("Tessellation-quality preset. `'final'` (default for <15-part assemblies) matches the pre-existing render quality. `'preview'` coarsens the mesh ~2.5× for faster first-render on large assemblies, at the cost of visibly chunkier facets — choose this for layout checks on 15+ part assemblies. If omitted, the extension auto-degrades to `'preview'` when the part count is >= 15 and uses `'final'` otherwise."),
-      inline: z.boolean().optional().describe("When true, also returns the rendered PNG inline as base64 image content on top of the usual text + file path — saves an extra `get_preview` round trip. The PNG is still written to disk. Skipped inline if the file exceeds 10 MB. Default false."),
+      inline: z.boolean().optional().describe("Return the rendered PNG inline as base64 image content on top of the usual text + file path. Default true — agents see the image directly without an extra `get_preview` round trip. Skipped inline if the file exceeds 10 MB. Pass false to skip the base64 payload (saves ~30% response size) when you only need the path."),
     },
     safeHandler("render_preview", async ({ filePath, cameraAngle, showDimensions, showAxes, renderMode, width, height, timeoutMs, focusPart, hideParts, finder, partName, partIndex, meshQuality, inline }) => {
       // Resolve which file to render: explicit > engine's last-executed > status file.
@@ -2499,13 +2539,79 @@ export function registerTools(server: McpServer) {
       }
 
       if (!isExtensionAlive()) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `render_preview requires the VSCode extension to be running. Open VSCode with the ShapeItUp extension and retry.\n\nFor headless verification, use get_render_status — it returns volume, surface area, center of mass, and bounding box without needing a screenshot.`,
-          }],
-          isError: true,
+        // Headless fallback: render a 4-view SVG wireframe from the
+        // OCCT-tessellated edges we already have. Not as pretty as the
+        // Three.js viewer, but lets agents verify silhouette and proportions
+        // without any running VS Code window.
+        const parts = getLastParts();
+        if (parts.length === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text:
+                `render_preview: no tessellated parts available and VS Code extension isn't running. ` +
+                `Run create_shape / modify_shape / open_shape first so the engine has geometry to render.`,
+            }],
+            isError: true,
+          };
+        }
+
+        const svgOut = renderPartsToSvg(parts);
+        const ts = Date.now();
+        const previewsDir = join(GLOBAL_STORAGE, "shapeitup-previews");
+        const svgPath = join(previewsDir, `headless-${ts}.svg`);
+        const pngPath = join(previewsDir, `headless-${ts}.png`);
+        try {
+          mkdirSync(previewsDir, { recursive: true });
+          writeFileSync(svgPath, svgOut.svg, "utf-8");
+        } catch (e: any) {
+          return {
+            content: [{ type: "text" as const, text: `Failed to write headless SVG preview: ${e.message}` }],
+            isError: true,
+          };
+        }
+
+        const liveRoots = getHeartbeatWorkspaceRoots();
+        const rootHint = liveRoots.length > 0
+          ? `\nFor the richer Three.js preview, focus a VS Code window with one of these workspaces open: ${liveRoots.join(", ")}`
+          : "\nFor the richer Three.js preview, open the .shape.ts file in VS Code with the ShapeItUp extension.";
+
+        // Rasterize the SVG → PNG so the agent gets a visible image in the
+        // response, not just a file path. Resvg-wasm pays a ~4 MB first-call
+        // init; after that each render is fast.
+        let pngBuf: Buffer | null = null;
+        let rasterError: string | null = null;
+        try {
+          pngBuf = await svgToPng(svgOut.svg, width ?? 800);
+          writeFileSync(pngPath, pngBuf);
+        } catch (e: any) {
+          rasterError = e?.message ?? String(e);
+        }
+
+        const textBlock = {
+          type: "text" as const,
+          text:
+            `Headless wireframe preview (VS Code extension not running).\n` +
+            `${svgOut.summary}\n` +
+            (pngBuf ? `PNG: ${pngPath}\nSVG: ${svgPath}` : `SVG: ${svgPath}\n(PNG rasterization failed: ${rasterError ?? "unknown"} — read the SVG directly.)`) +
+            rootHint,
         };
+
+        if (pngBuf && pngBuf.length < 10 * 1024 * 1024) {
+          return {
+            content: [
+              textBlock,
+              {
+                type: "image" as const,
+                data: pngBuf.toString("base64"),
+                mimeType: "image/png",
+              },
+            ],
+            isError: false,
+          };
+        }
+
+        return { content: [textBlock], isError: false };
       }
 
       // Bug #10: hard pre-flight check for cross-workspace renders. If the
@@ -2830,7 +2936,9 @@ export function registerTools(server: McpServer) {
         // it as an image content block so the caller gets bytes + path in a
         // single round trip. Mirrors get_preview's 10 MB size guard to avoid
         // blowing past MCP response limits.
-        if (inline === true) {
+        // Default to inlining the PNG so agents see the image without an
+        // extra get_preview round trip. Pass `inline: false` to opt out.
+        if (inline !== false) {
           try {
             const st = statSync(screenshotPath);
             if (st.size > 10 * 1024 * 1024) {

@@ -59,11 +59,12 @@ Start with `create_shape` (or `modify_shape`) — the status from that call tell
 
 ## Available MCP Tools
 
-All 19 tools. Dense reference — use this table to find the right tool fast.
+All 20 tools. Dense reference — use this table to find the right tool fast.
 
 | Tool | Purpose | Key args |
 |------|---------|----------|
-| `create_shape` | Create new `.shape.ts` and execute | `name`, `code`, `directory?`, `overwrite?` |
+| `setup_shape_project` | Bootstrap a folder with `.shape.ts` type stubs + tsconfig. **You usually don't need to call this — `create_shape` auto-bootstraps on first write.** Call explicitly only when editor import errors persist in a brand-new folder. Never runs `npm install` — replicad/OCCT are bundled inside the MCP server itself. | `directory` |
+| `create_shape` | Create new `.shape.ts` and execute (auto-bootstraps types on first write) | `name`, `code`, `directory?`, `overwrite?` |
 | `modify_shape` | Overwrite existing `.shape.ts` and execute | `filePath`, `code` |
 | `read_shape` | Read file contents | `filePath` |
 | `open_shape` | Execute an existing file, bring up in viewer | `filePath` |
