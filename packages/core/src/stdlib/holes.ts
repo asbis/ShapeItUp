@@ -100,6 +100,44 @@ function warnAmbiguousRawDiameter(
 export type HoleAxis = "+Z" | "-Z" | "+X" | "-X" | "+Y" | "-Y";
 
 /**
+ * Flip a HoleAxis sign: +X ↔ -X, +Y ↔ -Y, +Z ↔ -Z.
+ */
+function flipAxis(axis: HoleAxis): HoleAxis {
+  switch (axis) {
+    case "+X": return "-X";
+    case "-X": return "+X";
+    case "+Y": return "-Y";
+    case "-Y": return "+Y";
+    case "+Z": return "-Z";
+    case "-Z": return "+Z";
+  }
+}
+
+/**
+ * Normalize `axis` + `drillDirection` into a single `axis` value.
+ *
+ * `drillDirection` is the inverse alias of `axis`: `drillDirection: "+X"` names
+ * the direction the drill bit points (so the hole opens on -X), which equals
+ * `axis: "-X"`. If both are provided we throw — they are inverse aliases and
+ * specifying both is almost certainly a user error.
+ */
+function resolveHoleAxis(
+  fnName: string,
+  axis: HoleAxis | undefined,
+  drillDirection: HoleAxis | undefined,
+): HoleAxis | undefined {
+  if (axis !== undefined && drillDirection !== undefined) {
+    throw new Error(
+      `${fnName}: both 'axis' (${axis}) and 'drillDirection' (${drillDirection}) were provided. ` +
+        `These are inverse aliases — 'axis' names the face the hole OPENS ON, ` +
+        `while 'drillDirection' names where the drill bit POINTS. Pick one.`
+    );
+  }
+  if (drillDirection !== undefined) return flipAxis(drillDirection);
+  return axis;
+}
+
+/**
  * Rotate a Shape3D from the default +Z orientation to the given axis.
  * Returns the shape unchanged for "+Z".
  *
@@ -154,6 +192,12 @@ function fitAllowance(style: FitStyle | undefined, fallback: FitStyle): number {
  * clearance-sized hole, or a raw number (mm) for a plain cylindrical hole of
  * that diameter. Default depth: 50 mm (use `opts.depth` to match your plate).
  *
+ * @remarks ANCHOR
+ *   Origin: tool opening sits at local Z=0 (or on the named axis face after rotation).
+ *   Penetration: body extends in the opposite direction (into -Z by default).
+ *   Translate target: place the tool opening at the plate's TOP surface.
+ *   Example: plate.cut(holes.through("M5").translate(x, y, plateTopZ))
+ *
  * @remarks Z CONVENTION: the returned cylinder spans `Z ∈ [-depth, 0]` — its
  * top face sits AT Z=0 and it extends DOWNWARD into -Z. This anchors the cut
  * tool so `.translate(x, y, plateTop)` puts the hole's mouth flush with the
@@ -172,12 +216,20 @@ function fitAllowance(style: FitStyle | undefined, fallback: FitStyle): number {
  * @param opts.depth Overall tool length in mm (default 50).
  * @param opts.fit Fit style for metric sizes (default `"clearance"`).
  * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the hole OPENS ON; the body penetrates in the OPPOSITE direction. `"+X"` = opens on +X face, drills -X. See `HoleAxis` docstring for full semantics.
+ * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
  * @returns Cut-tool Shape3D, axis=Z, top at Z=0, extends into -Z.
  */
 export function through(
   size: MetricSize | number,
-  opts: { depth?: number; fit?: FitStyle; axis?: HoleAxis } = {}
+  opts: {
+    depth?: number;
+    fit?: FitStyle;
+    axis?: HoleAxis;
+    // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
+    drillDirection?: HoleAxis;
+  } = {}
 ): Shape3D {
+  const axis = resolveHoleAxis("holes.through", opts.axis, opts.drillDirection);
   const depth = opts.depth ?? 50;
   assertPositiveFinite("holes.through", "opts.depth", depth);
   let diameter: number;
@@ -194,7 +246,7 @@ export function through(
   // makeCylinder(radius, height, location, direction) — location is the base
   // of the cylinder. Put base at -depth so the top sits at Z=0.
   const tool = makeCylinder(diameter / 2, depth, [0, 0, -depth], [0, 0, 1]);
-  return applyAxis(tool, opts.axis);
+  return applyAxis(tool, axis);
 }
 
 /**
@@ -202,6 +254,12 @@ export function through(
  * engineering term "clearance hole". Identical behaviour to `through`, but
  * the `fit` option defaults to `"clearance"` when unspecified (which is
  * already the default for `through`, so calls are fully interchangeable).
+ *
+ * @remarks ANCHOR
+ *   Origin: tool opening sits at local Z=0 (or on the named axis face after rotation).
+ *   Penetration: body extends in the opposite direction (into -Z by default).
+ *   Translate target: place the tool opening at the plate's TOP surface.
+ *   Example: plate.cut(holes.clearance("M5").translate(x, y, plateTopZ))
  *
  * @remarks Z CONVENTION: same as `through` — the cylinder spans `Z ∈ [-depth, 0]`
  * with its top face anchored at Z=0. Translate by `plateTop` to place the
@@ -218,7 +276,13 @@ export function through(
  */
 export function clearance(
   size: MetricSize | number,
-  opts: { depth?: number; fit?: FitStyle; axis?: HoleAxis } = {}
+  opts: {
+    depth?: number;
+    fit?: FitStyle;
+    axis?: HoleAxis;
+    // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
+    drillDirection?: HoleAxis;
+  } = {}
 ): Shape3D {
   return through(size, { ...opts, fit: opts.fit ?? "clearance" });
 }
@@ -227,6 +291,12 @@ export function clearance(
  * Counterbored hole — clearance shaft through the plate plus a flat-bottomed
  * pocket sized for a socket-head cap screw head. Total cut depth = the
  * plate thickness; the pocket depth = `SOCKET_HEAD[size].headH + 0.2 mm`.
+ *
+ * @remarks ANCHOR
+ *   Origin: pocket opening sits at local Z=0 (or on the named axis face after rotation).
+ *   Penetration: shaft+pocket extend in the opposite direction (into -Z by default).
+ *   Translate target: place the pocket opening at the plate's TOP surface.
+ *   Example: plate.cut(holes.counterbore("M5", { plateThickness: t }).translate(x, y, plateTopZ))
  *
  * @remarks Z CONVENTION: the pocket's top face is at Z=0 and the tool extends
  * downward into -Z (shaft spans `Z ∈ [-plateThickness, 0]`, pocket sits just
@@ -244,12 +314,20 @@ export function clearance(
  * @param opts.plateThickness Plate thickness in mm — the clearance shaft spans this.
  * @param opts.fit Fit style for the shaft (default `"clearance"`).
  * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the pocket OPENS ON; the shaft penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
+ * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
  * @returns Cut-tool Shape3D, top of pocket at Z=0.
  */
 export function counterbore(
   spec: string,
-  opts: { plateThickness: number; fit?: FitStyle; axis?: HoleAxis }
+  opts: {
+    plateThickness: number;
+    fit?: FitStyle;
+    axis?: HoleAxis;
+    // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
+    drillDirection?: HoleAxis;
+  }
 ): Shape3D {
+  const axis = resolveHoleAxis("holes.counterbore", opts.axis, opts.drillDirection);
   assertPositiveFinite("holes.counterbore", "opts.plateThickness", opts.plateThickness);
   const { size } = parseScrewDesignator(spec);
   assertSupportedSize(size, SOCKET_HEAD, "socket-head");
@@ -276,12 +354,18 @@ export function counterbore(
     [0, 0, 1]
   );
   const tool = pocket.fuse(shaft);
-  return applyAxis(tool, opts.axis);
+  return applyAxis(tool, axis);
 }
 
 /**
  * Countersunk hole — clearance shaft through the plate plus a 90° cone flare
  * sized to the ISO 10642 head OD. Cone depth = headD/2 (90° included angle).
+ *
+ * @remarks ANCHOR
+ *   Origin: flare opening sits at local Z=0 (or on the named axis face after rotation).
+ *   Penetration: cone+shaft extend in the opposite direction (into -Z by default).
+ *   Translate target: place the flare opening at the plate's TOP surface.
+ *   Example: plate.cut(holes.countersink("M5", { plateThickness: t }).translate(x, y, plateTopZ))
  *
  * @remarks Z CONVENTION: the countersink's top (widest) face is at Z=0 and the
  * tool extends downward into -Z (bottom of the shaft at `Z = -plateThickness`).
@@ -297,12 +381,20 @@ export function counterbore(
  * @param opts.plateThickness Plate thickness in mm.
  * @param opts.fit Fit style for the shaft (default `"clearance"`).
  * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the flare OPENS ON; the shaft penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
+ * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
  * @returns Cut-tool Shape3D, top of countersink at Z=0.
  */
 export function countersink(
   spec: string,
-  opts: { plateThickness: number; fit?: FitStyle; axis?: HoleAxis }
+  opts: {
+    plateThickness: number;
+    fit?: FitStyle;
+    axis?: HoleAxis;
+    // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
+    drillDirection?: HoleAxis;
+  }
 ): Shape3D {
+  const axis = resolveHoleAxis("holes.countersink", opts.axis, opts.drillDirection);
   assertPositiveFinite("holes.countersink", "opts.plateThickness", opts.plateThickness);
   const { size } = parseScrewDesignator(spec);
   const flat = FLAT_HEAD[size];
@@ -339,13 +431,19 @@ export function countersink(
     .sketchOnPlane("XZ")
     .revolve([0, 0, 1], { origin: [0, 0, 0] })
     .asShape3D();
-  return applyAxis(tool, opts.axis);
+  return applyAxis(tool, axis);
 }
 
 /**
  * Tapped hole — a cylinder of `SOCKET_HEAD[size].tapDrill` diameter. Threads
  * are implicit (user taps them in metal) or irrelevant (printed threads are
  * unreliable — prefer `inserts.pocket` for FDM).
+ *
+ * @remarks ANCHOR
+ *   Origin: tap opening sits at local Z=0 (or on the named axis face after rotation).
+ *   Penetration: body extends in the opposite direction (into -Z by default).
+ *   Translate target: place the tap opening at the plate's TOP surface.
+ *   Example: plate.cut(holes.tapped("M5", { depth: 8 }).translate(x, y, plateTopZ))
  *
  * @remarks Z CONVENTION: the cylinder spans `Z ∈ [-depth, 0]` — top face at
  * Z=0, extends downward into -Z. Translate by `plateTop` so the hole mouth
@@ -359,15 +457,25 @@ export function countersink(
  * @param size Metric designator, e.g. `"M3"`.
  * @param opts.depth Tap depth in mm (measured from Z=0 into -Z).
  * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the tap OPENS ON; the body penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
+ * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
  * @returns Cut-tool Shape3D, top at Z=0.
  */
-export function tapped(size: MetricSize, opts: { depth: number; axis?: HoleAxis }): Shape3D {
+export function tapped(
+  size: MetricSize,
+  opts: {
+    depth: number;
+    axis?: HoleAxis;
+    // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
+    drillDirection?: HoleAxis;
+  }
+): Shape3D {
+  const axis = resolveHoleAxis("holes.tapped", opts.axis, opts.drillDirection);
   const { depth } = opts;
   assertPositiveFinite("holes.tapped", "opts.depth", depth);
   assertSupportedSize(size, SOCKET_HEAD, "socket-head");
   const diameter = SOCKET_HEAD[size].tapDrill;
   const tool = makeCylinder(diameter / 2, depth, [0, 0, -depth], [0, 0, 1]);
-  return applyAxis(tool, opts.axis);
+  return applyAxis(tool, axis);
 }
 
 /**
@@ -456,6 +564,15 @@ export function teardrop(
  * Layout: large circle at (0, 0), small circle at (0, -(largeD/2 + smallD/2 + slot)),
  * connected by a slot of width `smallD`.
  *
+ * @remarks ANCHOR
+ *   Origin: keyhole mouth (both circles + neck) sits at local Z=0 (or on the
+ *           named axis face after rotation). The LARGE circle is centred on
+ *           the translate target; the small-circle capture is offset into -Y.
+ *   Penetration: pocket extends in the opposite direction (into -Z by default).
+ *   Translate target: place the keyhole mouth at the plate's TOP surface,
+ *                     centred on the LARGE-circle position.
+ *   Example: plate.cut(holes.keyhole({ largeD: 10, smallD: 4, slot: 6, depth: 4 }).translate(x, y, plateTopZ))
+ *
  * @remarks Z CONVENTION: the profile is sketched on XY at Z=0 then extruded
  * by `-depth`, so the cut tool spans `Z ∈ [-depth, 0]` — top face at Z=0,
  * extending downward into -Z. Translate by `plateTop` to anchor the mouth
@@ -473,6 +590,7 @@ export function teardrop(
  * @param opts.slot Centre-to-centre offset between the two circles in mm.
  * @param opts.depth Hole depth in mm.
  * @param opts.axis Entry-face spec (default "+Z"). Names the face the mouth OPENS ON; the pocket penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
+ * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
  * @returns Cut-tool Shape3D, top at Z=0.
  */
 export function keyhole(opts: {
@@ -481,7 +599,10 @@ export function keyhole(opts: {
   slot: number;
   depth: number;
   axis?: HoleAxis;
+  // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
+  drillDirection?: HoleAxis;
 }): Shape3D {
+  const axis = resolveHoleAxis("holes.keyhole", opts.axis, opts.drillDirection);
   const { largeD, smallD, slot, depth } = opts;
   assertPositiveFinite("holes.keyhole", "opts.largeD", largeD);
   assertPositiveFinite("holes.keyhole", "opts.smallD", smallD);
@@ -498,13 +619,34 @@ export function keyhole(opts: {
 
   const profile = large.fuse(neck).fuse(small);
   const tool = profile.sketchOnPlane("XY").extrude(-depth).asShape3D();
-  return applyAxis(tool, opts.axis);
+  return applyAxis(tool, axis);
 }
 
 /**
  * Slotted hole — elongated hole with rounded ends, used for adjustment. The
  * overall length (tip-to-tip) is `length`; the width (hole diameter / radius
  * of the end-caps × 2) is `width`. The slot runs along the X axis.
+ *
+ * @remarks ANCHOR
+ *   Origin: slot mouth sits at local Z=0 (or on the named axis face after rotation).
+ *   Penetration: pocket extends in the opposite direction (into -Z by default).
+ *   Translate target: place the slot mouth at the plate's TOP surface.
+ *   Example: plate.cut(holes.slot({ length: 20, width: 5, depth: 4 }).translate(x, y, plateTopZ))
+ *
+ * @remarks AXIS SEMANTICS
+ *   Pre-rotation local coords: length runs along X, width along Y, depth into -Z.
+ *   After applyAxis(axis), world dimensions become (verified against applyAxis
+ *   rotation matrices in this file; "depth→±A" names the direction the pocket
+ *   body extends, "cutter A∈[…]" gives the extent along that axis):
+ *     axis="+Z":  length→X, width→Y, depth→-Z   (default; cutter z∈[-depth,0])
+ *     axis="-Z":  length→X, width→Y, depth→+Z   (cutter z∈[0,depth])
+ *     axis="+X":  length→Z, width→Y, depth→-X   (cutter x∈[-depth,0])
+ *     axis="-X":  length→Z, width→Y, depth→+X   (cutter x∈[0,depth])
+ *     axis="+Y":  length→X, width→Z, depth→-Y   (cutter y∈[-depth,0])
+ *     axis="-Y":  length→X, width→Z, depth→+Y   (cutter y∈[0,depth])
+ *   Note: the "length→" / "width→" entries name the WORLD AXIS the dimension
+ *   aligns with after rotation; direction along that axis may be flipped but
+ *   the extent is symmetric, so it doesn't affect where the slot lands.
  *
  * @remarks Z CONVENTION: the profile is sketched on XY at Z=0 then extruded
  * by `-depth`, so the cut tool spans `Z ∈ [-depth, 0]` — top face at Z=0,
@@ -520,7 +662,8 @@ export function keyhole(opts: {
  * @param opts.length Overall length (tip to tip) in mm — must be >= `width`.
  * @param opts.width Slot width in mm (diameter of the rounded ends).
  * @param opts.depth Hole depth in mm.
- * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the slot OPENS ON; the pocket penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
+ * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the slot OPENS ON; the pocket penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics and the AXIS SEMANTICS table above for per-axis world-dimension mapping.
+ * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
  * @returns Cut-tool Shape3D, top at Z=0.
  */
 export function slot(opts: {
@@ -528,7 +671,10 @@ export function slot(opts: {
   width: number;
   depth: number;
   axis?: HoleAxis;
+  // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
+  drillDirection?: HoleAxis;
 }): Shape3D {
+  const axis = resolveHoleAxis("holes.slot", opts.axis, opts.drillDirection);
   const { length, width, depth } = opts;
   assertPositiveFinite("holes.slot", "opts.length", length);
   assertPositiveFinite("holes.slot", "opts.width", width);
@@ -550,5 +696,178 @@ export function slot(opts: {
           .fuse(drawRectangle(centres, width))
           .fuse(drawCircle(r).translate(centres / 2, 0));
   const tool = profile.sketchOnPlane("XY").extrude(-depth).asShape3D();
-  return applyAxis(tool, opts.axis);
+  return applyAxis(tool, axis);
+}
+
+// ---------------------------------------------------------------------------
+// Convenience wrappers — `*At(plate, size, { at: [x,y,z], ... })`
+//
+// The plain factories (`through`, `tapped`, `counterbore`) return a cut tool
+// that the caller must translate AND then pass to `plate.cut(...)`. That's
+// three chained calls for the common "hole at this coord on the top of this
+// plate" idiom. The `*At` wrappers fold the translate + cut into one line:
+//
+//   const drilled = holes.throughAt(plate, "M5", { at: [x, y, plateTopZ] });
+//
+// They also validate that `at[2]` sits at (or very near) the plate's top-Z
+// bounding-box face, warning the user when it doesn't — the #1 silent failure
+// for this idiom is translating the cutter BELOW the plate, which removes no
+// material and leaves the user puzzling over an unchanged model. Tolerance is
+// plate-thickness / 100: any Z within 1% of the plate's Z extent is treated
+// as "near the top" (covers floating-point drift from arithmetic on thickness
+// values without admitting obvious bottom-face translates).
+//
+// Cloning note: `translate` consumes its input handle (Replicad's behaviour),
+// but the cutter here is freshly built by the inner factory on every call, so
+// the wrapper owns it exclusively — no clone needed. `plate.cut(cutter)`
+// returns a new Shape3D without mutating `plate`, mirroring the plain-factory
+// usage pattern already established by `patterns.cutTop`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the plate's top-Z bounding-box face plus its Z extent (thickness).
+ * Returns undefined when the bbox isn't readable (caller falls back to
+ * silently skipping the placement check). Mirrors `patterns.readBounds` —
+ * re-implementing here avoids a cross-file import, and the logic is trivial
+ * enough that duplication is cheaper than the coupling.
+ */
+function readPlateTopZ(plate: Shape3D): { topZ: number; thickness: number } | undefined {
+  try {
+    const bb = (plate as any).boundingBox;
+    if (!bb) return undefined;
+    const bounds = bb.bounds;
+    if (
+      !Array.isArray(bounds) ||
+      bounds.length !== 2 ||
+      !Array.isArray(bounds[0]) ||
+      !Array.isArray(bounds[1]) ||
+      bounds[0].length !== 3 ||
+      bounds[1].length !== 3
+    ) {
+      return undefined;
+    }
+    const zMin = bounds[0][2];
+    const zMax = bounds[1][2];
+    if (!Number.isFinite(zMin) || !Number.isFinite(zMax)) return undefined;
+    return { topZ: zMax, thickness: Math.max(zMax - zMin, 0) };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Warn when `at[2]` is not near the plate's top Z face. Silent when bbox is unreadable. */
+function checkAtOnPlateTop(
+  fnName: string,
+  plate: Shape3D,
+  at: [number, number, number],
+): void {
+  const bbox = readPlateTopZ(plate);
+  if (!bbox) return;
+  const { topZ, thickness } = bbox;
+  // Use an absolute floor for very thin plates (thickness/100 would go to 0
+  // for zero-thickness bbox reads); 1e-6 mm is well below any meaningful
+  // engineering tolerance.
+  const tol = Math.max(thickness / 100, 1e-6);
+  if (Math.abs(at[2] - topZ) > tol) {
+    pushRuntimeWarning(
+      `${fnName}: 'at' Z=${at[2]} is not near plate top (top≈${topZ}, tol=${tol}). Verify coordinates.`,
+    );
+  }
+}
+
+/**
+ * Convenience wrapper: builds a through-hole cutter and cuts it out of `plate`
+ * at the given `at` coordinate in one call.
+ *
+ * Equivalent to:
+ *   plate.cut(holes.through(size, opts).translate(at[0], at[1], at[2]))
+ *
+ * Emits a runtime warning (not an error) when `at[2]` is not near the plate's
+ * top-Z bbox face — a common silent-failure source where the cutter lands
+ * below the plate and removes no material.
+ *
+ * @param plate Target Shape3D (must expose a readable boundingBox for the
+ *   top-Z validation; an unreadable bbox skips the check silently).
+ * @param size Metric designator (`"M3"`) or explicit diameter in mm.
+ * @param opts Same options as `holes.through` plus required `at: [x, y, z]`.
+ * @returns New Shape3D with the through-hole cut from `plate`.
+ */
+export function throughAt(
+  plate: Shape3D,
+  size: MetricSize | number,
+  opts: {
+    depth?: number;
+    fit?: FitStyle;
+    axis?: HoleAxis;
+    drillDirection?: HoleAxis;
+    at: [number, number, number];
+  },
+): Shape3D {
+  const { at, ...throughOpts } = opts;
+  checkAtOnPlateTop("holes.throughAt", plate, at);
+  const cutter = through(size, throughOpts);
+  return plate.cut(cutter.translate(at[0], at[1], at[2]));
+}
+
+/**
+ * Convenience wrapper: builds a tapped-hole cutter and cuts it out of `plate`
+ * at the given `at` coordinate in one call.
+ *
+ * Equivalent to:
+ *   plate.cut(holes.tapped(size, opts).translate(at[0], at[1], at[2]))
+ *
+ * Emits a runtime warning (not an error) when `at[2]` is not near the plate's
+ * top-Z bbox face.
+ *
+ * @param plate Target Shape3D (must expose a readable boundingBox).
+ * @param size Metric designator (`"M3"`).
+ * @param opts Same options as `holes.tapped` plus required `at: [x, y, z]`.
+ * @returns New Shape3D with the tapped hole cut from `plate`.
+ */
+export function tappedAt(
+  plate: Shape3D,
+  size: MetricSize,
+  opts: {
+    depth: number;
+    axis?: HoleAxis;
+    drillDirection?: HoleAxis;
+    at: [number, number, number];
+  },
+): Shape3D {
+  const { at, ...tappedOpts } = opts;
+  checkAtOnPlateTop("holes.tappedAt", plate, at);
+  const cutter = tapped(size, tappedOpts);
+  return plate.cut(cutter.translate(at[0], at[1], at[2]));
+}
+
+/**
+ * Convenience wrapper: builds a counterbore cutter and cuts it out of `plate`
+ * at the given `at` coordinate in one call.
+ *
+ * Equivalent to:
+ *   plate.cut(holes.counterbore(size, opts).translate(at[0], at[1], at[2]))
+ *
+ * Emits a runtime warning (not an error) when `at[2]` is not near the plate's
+ * top-Z bbox face.
+ *
+ * @param plate Target Shape3D (must expose a readable boundingBox).
+ * @param size Metric screw designator, e.g. `"M3"`.
+ * @param opts Same options as `holes.counterbore` plus required `at: [x, y, z]`.
+ * @returns New Shape3D with the counterbored hole cut from `plate`.
+ */
+export function counterboreAt(
+  plate: Shape3D,
+  size: string,
+  opts: {
+    plateThickness: number;
+    fit?: FitStyle;
+    axis?: HoleAxis;
+    drillDirection?: HoleAxis;
+    at: [number, number, number];
+  },
+): Shape3D {
+  const { at, ...counterboreOpts } = opts;
+  checkAtOnPlateTop("holes.counterboreAt", plate, at);
+  const cutter = counterbore(size, counterboreOpts);
+  return plate.cut(cutter.translate(at[0], at[1], at[2]));
 }
