@@ -768,6 +768,20 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           // `Object.<anonymous>:48:52`. Zero extra runtime deps — V8 does
           // all the mapping.
           sourcemap: "inline",
+          // Multi-file .shape.ts disambiguation: stamp the entry file's
+          // `main` and `params` bindings onto globalThis AFTER esbuild's
+          // rename pass. When the entry imports another .shape.ts that also
+          // has `export default main`, esbuild renames the imported one to
+          // `main2` while the entry's stays bare `main`; without this
+          // marker the executor's `typeof main !== "undefined"` lookup
+          // could bind to the wrong one (depending on output ordering) and
+          // render the wrong part with matching-but-wrong stats. Wrapped in
+          // try/catch so a script that doesn't declare one (or runs in a
+          // locked-down global) still loads cleanly.
+          footer: {
+            js: ';try { if (typeof main !== "undefined") globalThis.__SHAPEITUP_ENTRY_MAIN__ = main; } catch(e){}\n'
+              + ';try { if (typeof params !== "undefined") globalThis.__SHAPEITUP_ENTRY_PARAMS__ = params; } catch(e){}',
+          },
           logLevel: "silent",
         });
 

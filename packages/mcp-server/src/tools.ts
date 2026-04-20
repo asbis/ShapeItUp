@@ -516,8 +516,15 @@ function formatStatusText(status: EngineStatus): string {
   }
   const parts = status.partNames?.length ? `\nParts: ${status.partNames.join(", ")}` : "";
   const paramEntries = status.currentParams ? Object.entries(status.currentParams) : [];
+  // Multi-file .shape.ts fix: when the entry file has no `export const params`
+  // but the renderer still produced a non-empty params object, those entries
+  // came from an imported module. Show them — but annotate that they're NOT
+  // the sliders the entry file owns.
+  const importedParamsWarning = status.importedParamsWarning
+    ? `\nWarning: ${status.importedParamsWarning}`
+    : "";
   const currentParams = paramEntries.length
-    ? `\nCurrent params: ${paramEntries.map(([k, v]) => `${k}=${v}`).join(", ")}`
+    ? `\nCurrent params: ${paramEntries.map(([k, v]) => `${k}=${v}`).join(", ")}${importedParamsWarning}`
     : "";
   const timingEntries = status.timings
     ? Object.entries(status.timings).sort((a, b) => b[1] - a[1]).slice(0, 8)
