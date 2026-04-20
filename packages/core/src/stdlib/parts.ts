@@ -99,6 +99,53 @@ export function translateTransform(t: Vec3): Transform {
   };
 }
 
+/**
+ * @internal Mirror about a plane passing through `origin` (or world origin).
+ *
+ * `plane` names the plane whose normal gets flipped: "YZ" mirrors across the
+ * YZ plane (flipping the X component), "XZ" across XZ (flip Y), "XY" across
+ * XY (flip Z). Mirrors are involutions — applying twice is identity.
+ *
+ * Shape mirror: delegates to Replicad's `Shape3D.mirror(plane, origin)`.
+ * IMPORTANT: Replicad's `mirror()` CONSUMES its input shape (calls
+ * `this.delete()` on the original — see replicad.js line 3043). The Part
+ * wrapper around this transform always passes a fresh `.clone()` via
+ * `Transform.shape(shape.clone())`, mirroring the pattern used by
+ * `translate` / `rotate` already.
+ *
+ * Points/vectors: flip the relevant component about the origin's matching
+ * component. For a plane-origin p0:
+ *   YZ: x' = 2·p0.x - x,   YZ vector flip: v.x → -v.x
+ *   XZ: y' = 2·p0.y - y,   XZ vector flip: v.y → -v.y
+ *   XY: z' = 2·p0.z - z,   XY vector flip: v.z → -v.z
+ * (Vectors are direction-only, so the origin offset drops out.)
+ */
+export type MirrorPlane = "YZ" | "XZ" | "XY";
+
+export function mirrorTransform(plane: MirrorPlane, origin: Point3 = [0, 0, 0]): Transform {
+  const [ox, oy, oz] = origin;
+  if (plane === "YZ") {
+    return {
+      shape: (s) => s.mirror("YZ", origin),
+      point: (p) => [2 * ox - p[0], p[1], p[2]],
+      vector: (v) => [-v[0], v[1], v[2]],
+    };
+  }
+  if (plane === "XZ") {
+    return {
+      shape: (s) => s.mirror("XZ", origin),
+      point: (p) => [p[0], 2 * oy - p[1], p[2]],
+      vector: (v) => [v[0], -v[1], v[2]],
+    };
+  }
+  // "XY"
+  return {
+    shape: (s) => s.mirror("XY", origin),
+    point: (p) => [p[0], p[1], 2 * oz - p[2]],
+    vector: (v) => [v[0], v[1], -v[2]],
+  };
+}
+
 /** @internal Rotation about the world origin (Rodrigues' formula for points/vectors). */
 export function rotateTransform(angleDeg: number, axis: Axis): Transform {
   const [ax, ay, az] = normalizeAxis(axis);
@@ -242,6 +289,59 @@ export class Part {
     );
   }
 
+  /**
+   * Mirror the part across a coordinate plane, optionally through a point
+   * other than the world origin. Returns a NEW Part (immutable) — the
+   * receiver is left untouched.
+   *
+   * ```typescript
+   * const leftBracket  = bracket;
+   * const rightBracket = bracket.mirror("YZ");          // flip across x=0
+   * const shifted      = bracket.mirror("YZ", [30, 0, 0]); // flip across x=30
+   * ```
+   *
+   * ### What gets mirrored
+   *
+   * - **Shape**: the underlying Shape3D is cloned and mirrored via Replicad's
+   *   `Shape3D.mirror(plane, origin)`. The clone is load-bearing: Replicad's
+   *   `mirror` consumes (deletes) its input — without the clone, subsequent
+   *   `worldShape()` calls on the original Part would observe a deleted
+   *   handle. Same pattern as `translate` / `rotate` on Part.
+   * - **Joint positions**: each joint's `position` is reflected across the
+   *   chosen plane (through `origin`).
+   * - **Joint axes**: the relevant axis component is flipped (YZ flips `.x`,
+   *   XZ flips `.y`, XY flips `.z`) so the mirrored joint still points
+   *   "outward" from the mirrored geometry.
+   *
+   * ### What does NOT get changed
+   *
+   * - **Joint roles** (`male` / `female` / `face`) are preserved. A shaft on
+   *   the left bracket is still a shaft on the right bracket — mirroring
+   *   produces the mirror-image geometry, not a role inversion. This keeps
+   *   `mate()`'s pre-flight checks correct: a left bracket's male shaft
+   *   continues to mate with a female bore on the frame (the mate engine
+   *   resolves axis direction through alignment math, so axis-flips during
+   *   mirroring are already honoured).
+   * - **Joint names** are preserved. Callers who need disambiguated names on
+   *   a mirrored pair should use `symmetricPair(part, plane, opts)` from
+   *   `./assembly` (or rename via `addJoint` after mirroring).
+   * - **Name / color / children**: passed through unchanged. Subassembly
+   *   children are not recursively re-mirrored — mirroring a subassembly at
+   *   the wrapper level applies the plane reflection to every child's world
+   *   pose via the composed transform.
+   *
+   * @param plane Coordinate plane to mirror across: `"YZ"` (flip x), `"XZ"`
+   *   (flip y), or `"XY"` (flip z).
+   * @param origin Optional point on the mirror plane. Defaults to
+   *   `[0, 0, 0]`. Only the component perpendicular to `plane` matters —
+   *   e.g. for `plane="YZ"` the mirror is through `x = origin[0]`.
+   */
+  mirror(plane: MirrorPlane, origin?: Point3): Part {
+    return this.withTransform(
+      composeTransforms(this._xform, mirrorTransform(plane, origin))
+    );
+  }
+
   /** @internal Replace the accumulated transform wholesale (used by assemble). */
   withTransform(xform: Transform): Part {
     return new Part(this.shape, {
@@ -249,6 +349,46 @@ export class Part {
       color: this.color,
       joints: this._localJoints,
       xform,
+      children: this._children,
+    });
+  }
+
+  /**
+   * Return a new Part whose joints are renamed per `renames`. Keys in
+   * `renames` must be existing joint names; values are the new names.
+   * Joints not listed keep their original names. Throws on an unknown old
+   * name or on a collision between a renamed joint and an existing joint
+   * (left alone or also renamed to the same target).
+   *
+   * Primarily used by `symmetricPair` to suffix joints on mirrored parts;
+   * also useful standalone when a generic Part builder ships joints with
+   * names that clash in a larger assembly.
+   */
+  renameJoints(renames: Record<string, string>): Part {
+    const next: Record<string, JointSpec> = {};
+    const seenTargets = new Set<string>();
+    for (const [oldName, spec] of Object.entries(this._localJoints)) {
+      const newName = renames[oldName] ?? oldName;
+      if (seenTargets.has(newName) || newName in next) {
+        throw new Error(
+          `Part.renameJoints: target name "${newName}" collides with another joint`
+        );
+      }
+      seenTargets.add(newName);
+      next[newName] = spec;
+    }
+    for (const oldName of Object.keys(renames)) {
+      if (!(oldName in this._localJoints)) {
+        throw new Error(
+          `Part.renameJoints: no joint named "${oldName}" on part "${this.name ?? "?"}"`
+        );
+      }
+    }
+    return new Part(this.shape, {
+      name: this.name,
+      color: this.color,
+      joints: next,
+      xform: this._xform,
       children: this._children,
     });
   }
