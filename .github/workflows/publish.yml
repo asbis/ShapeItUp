@@ -26,10 +26,14 @@ jobs:
         run: pnpm build
 
       - name: Install runtime dependencies in extension
-        # --omit=dev: skip devDependencies so npm doesn't try to resolve
-        # workspace: protocol entries (only esbuild-wasm is actually needed
-        # at runtime; everything else is bundled by esbuild at build time).
-        run: cd packages/extension && npm install --omit=dev
+        # Install esbuild-wasm directly by name instead of running
+        # `npm install` against the extension's package.json. npm can't
+        # parse the workspace: protocol used by pnpm workspaces, so
+        # reading package.json here would error. esbuild-wasm is the only
+        # runtime dep that isn't bundled by esbuild at build time, so we
+        # install just that one package without writing package.json or
+        # creating a lockfile.
+        run: cd packages/extension && npm install esbuild-wasm@^0.28.0 --no-save --no-package-lock
 
       - name: Publish to VS Marketplace
         run: cd packages/extension && npx @vscode/vsce publish
