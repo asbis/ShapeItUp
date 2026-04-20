@@ -39,6 +39,7 @@ import {
   assertSupportedSize,
   type MetricSize,
 } from "./standards";
+import { markNonFuseSafeThread } from "./threads-patch";
 
 // ── Profiles ───────────────────────────────────────────────────────────────
 
@@ -317,7 +318,12 @@ export function external(opts: ExternalThreadOpts): Shape3D {
       parts.push(loop.clone().rotate(angle, [0, 0, 0], [0, 0, 1]));
     }
   }
-  return makeCompound(parts) as Shape3D;
+  // Tag the Compound so `_3DShape.prototype.fuse`/`.cut` (patched in
+  // `threads-patch.ts`) can throw a clear call-time error if the user tries
+  // to fuse this thread with a solid — OCCT would otherwise crash deep
+  // inside BRepCheck with a cryptic non-manifold-seam error. Fuse-safe
+  // alternatives are `metricMesh` / `leadscrewMesh` / `fuseThreaded`.
+  return markNonFuseSafeThread(makeCompound(parts) as Shape3D);
 }
 
 // ── Internal threads (tapped holes) ────────────────────────────────────────
@@ -338,11 +344,18 @@ export interface InternalThreadOpts {
  *
  * Convention: top at Z=0, extends into -Z.
  *
- * This is a **cosmetic** clean bore (no ridge geometry). Matches Fusion 360
- * and SolidWorks defaults — internal threads are rarely needed for 3D-printed
- * parts (you tap post-print). For real helical ridges cut into the bore, use
- * `threads.tapInto(plate, ...)` which runs the boolean via the Manifold mesh
- * kernel and returns a MeshShape in ~100 ms.
+ * This is a **cosmetic** clean bore (no helical ridges — use `tapInto` for
+ * those). Matches Fusion 360 and SolidWorks defaults — internal threads are
+ * rarely needed for 3D-printed parts (you tap post-print). For real helical
+ * ridges cut into the bore, use `threads.tapInto(plate, ...)` which runs the
+ * boolean via the Manifold mesh kernel and returns a MeshShape in ~100 ms.
+ *
+ * **Bbox note — 0.2mm overshoot.** The returned cylinder deliberately extends
+ * 0.1mm past each end of the requested `length` (total +0.2mm on Z) so the
+ * boolean cut produces a clean through-face with no coplanar sliver. Users
+ * doing fit-check math off the cut-tool's reported bbox should subtract 0.2
+ * from the Z extent — the *effective* cut depth is `length`, even though the
+ * shape reports Z ∈ [-length-0.1, 0.1].
  */
 export function internal(opts: InternalThreadOpts): Shape3D {
   const profile = opts.profile ?? metricProfile(opts.pitch);
@@ -451,6 +464,111 @@ export function fuseThreaded(
     : [(position as any).x, (position as any).y, (position as any).z];
   const thread = metricMesh(size, length, opts).translate(pos[0], pos[1], pos[2]);
   return meshedInto.fuse(thread);
+}
+
+// ── Custom-diameter mesh thread factories ─────────────────────────────────
+
+/**
+ * Common input shape for {@link externalMesh} and {@link internalMesh}. Lets
+ * callers build threads at *any* diameter/pitch/length — no MetricSize gate —
+ * so jar lids, bottle threads, custom couplers, and acme-ish leadscrews can
+ * all route through the fuse-safe Manifold mesh path.
+ */
+export interface CustomThreadOpts {
+  /** Nominal major diameter (outermost crest), mm. */
+  diameter: number;
+  /** Thread pitch, mm. Must be > 0 and < diameter. */
+  pitch: number;
+  /** Thread length along +Z (external) or into -Z (internal), mm. */
+  length: number;
+  /** Profile shape. Default: metric V-thread (60°) scaled to pitch. */
+  profile?: ThreadProfile;
+  /** Thread starts (≥1). Default 1. */
+  starts?: number;
+}
+
+function validateCustomThreadOpts(
+  fn: "externalMesh" | "internalMesh",
+  opts: CustomThreadOpts,
+): void {
+  if (!(opts.diameter > 0)) {
+    throw new Error(
+      `threads.${fn}: diameter must be > 0, got ${opts.diameter}`,
+    );
+  }
+  if (!(opts.pitch > 0)) {
+    throw new Error(
+      `threads.${fn}: pitch must be > 0, got ${opts.pitch}`,
+    );
+  }
+  if (!(opts.pitch < opts.diameter)) {
+    throw new Error(
+      `threads.${fn}: pitch (${opts.pitch}) must be < diameter (${opts.diameter})`,
+    );
+  }
+  if (!(opts.length > 0)) {
+    throw new Error(
+      `threads.${fn}: length must be > 0, got ${opts.length}`,
+    );
+  }
+  const starts = opts.starts ?? 1;
+  if (!Number.isInteger(starts) || starts < 1) {
+    throw new Error(
+      `threads.${fn}: starts must be a positive integer, got ${opts.starts}`,
+    );
+  }
+}
+
+/**
+ * Externally-threaded rod at any diameter/pitch — returns a fuse-safe
+ * `MeshShape`. The non-ISO escape hatch for {@link metricMesh}: jar lids,
+ * bottle threads, custom couplers, acme-ish leadscrews.
+ *
+ * Convention: Z ∈ [0, length] (positive-shape, same as {@link external}).
+ *
+ *   // Jar thread — 50mm outer diameter, 2.5mm pitch, 10mm tall:
+ *   const jarThread = threads.externalMesh({
+ *     diameter: 50,
+ *     pitch: 2.5,
+ *     length: 10,
+ *   });
+ *   const jarLid = jarThread.fuse(capTopMesh);
+ */
+export function externalMesh(opts: CustomThreadOpts): MeshShape {
+  validateCustomThreadOpts("externalMesh", opts);
+  const profile = opts.profile ?? metricProfile(opts.pitch);
+  const starts = opts.starts ?? 1;
+  const majorR = opts.diameter / 2;
+  const minorR = majorR - profile.depth;
+  return buildExternalRodMesh(profile, opts.pitch, opts.length, minorR, majorR, starts);
+}
+
+/**
+ * Internally-threaded cut-tool at any diameter/pitch — returns a fuse-safe
+ * `MeshShape` of the helical ridges only (use together with your own bore
+ * cylinder, or subtract from a plate then fuse). The non-ISO escape hatch for
+ * {@link tapInto} / {@link tapIntoTrap}.
+ *
+ * Convention: top at Z=0, body extends into -Z (cut-tool, same as
+ * {@link internal}).
+ *
+ *   // Matching jar-lid internal thread — 50mm bore, 2.5mm pitch:
+ *   const ridges = threads.internalMesh({
+ *     diameter: 50,
+ *     pitch: 2.5,
+ *     length: 10,
+ *   });
+ *   // Cut a bore first, then fuse the ridges back into the wall:
+ *   lid = lid.cut(clearanceBore).fuse(ridges.translate(x, y, topZ));
+ */
+export function internalMesh(opts: CustomThreadOpts): MeshShape {
+  validateCustomThreadOpts("internalMesh", opts);
+  const profile = opts.profile ?? metricProfile(opts.pitch);
+  const starts = opts.starts ?? 1;
+  const minorR = opts.diameter / 2;
+  const majorR = minorR + profile.depth;
+  const ridges = buildInternalRidgesMesh(profile, opts.pitch, opts.length, majorR, starts);
+  return ridges.translate(0, 0, -opts.length);
 }
 
 /**
