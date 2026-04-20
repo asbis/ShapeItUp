@@ -2,6 +2,21 @@ export interface PartInput {
   shape: any;
   name: string;
   color: string | null;
+  /**
+   * Optional per-part print-quantity hint. When the user writes
+   * `{ shape, name: "tower", qty: 2 }` they're telling downstream tooling
+   * (BOM, slicer handoff) to produce 2 copies. Defaults to 1 when absent —
+   * every existing script keeps its current semantics.
+   */
+  qty?: number;
+  /**
+   * Optional per-part material override. Takes precedence over the
+   * script-level `export const material = {...}` for this single part so
+   * multi-material assemblies (e.g. a PLA shell with a TPU gasket) can carry
+   * density + name through the pipeline. Absent → inherit the script-level
+   * material (if any).
+   */
+  material?: { density: number; name?: string };
 }
 
 export interface TessellatedPart {
@@ -20,6 +35,10 @@ export interface TessellatedPart {
    * `density * volume / 1000` to convert mm³ → cm³.
    */
   mass?: number;
+  /** Propagated from PartInput — see {@link PartInput.qty}. */
+  qty?: number;
+  /** Propagated from PartInput — see {@link PartInput.material}. */
+  material?: { density: number; name?: string };
 }
 
 export function normalizeParts(result: any): PartInput[] {
@@ -43,11 +62,33 @@ export function normalizeParts(result: any): PartInput[] {
 
   return result.map((item: any, i: number) => {
     if (item && item.shape && typeof item.shape.mesh === "function") {
-      return {
+      const out: PartInput = {
         shape: item.shape,
         name: item.name || `part-${i + 1}`,
         color: item.color || null,
       };
+      // Preserve optional BOM metadata when the script sets it. We validate
+      // minimally here (qty must be a positive finite number; material must
+      // have a positive density) so downstream consumers never have to
+      // re-sanitize.
+      if (typeof item.qty === "number" && Number.isFinite(item.qty) && item.qty > 0) {
+        out.qty = item.qty;
+      }
+      if (
+        item.material &&
+        typeof item.material === "object" &&
+        typeof item.material.density === "number" &&
+        Number.isFinite(item.material.density) &&
+        item.material.density > 0
+      ) {
+        out.material = {
+          density: item.material.density,
+          ...(typeof item.material.name === "string" && item.material.name
+            ? { name: item.material.name }
+            : {}),
+        };
+      }
+      return out;
     }
     if (item && typeof item.mesh === "function") {
       return { shape: item, name: `part-${i + 1}`, color: null };
@@ -170,5 +211,9 @@ export function tessellatePart(part: PartInput, opts: TessellateOptions = {}): T
     normals,
     triangles,
     edgeVertices,
+    // Propagate optional BOM metadata. Omit when absent so downstream
+    // serializers don't render noise (`qty: undefined` / `material: undefined`).
+    ...(typeof part.qty === "number" ? { qty: part.qty } : {}),
+    ...(part.material ? { material: part.material } : {}),
   };
 }

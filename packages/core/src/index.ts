@@ -807,8 +807,12 @@ export async function initCore(
           }
           // Derive mass only when we have both a volume and a positive density.
           // volume is in mm³; density is in g/cm³; so divide by 1000 to convert.
-          if (material && typeof t.volume === "number") {
-            t.mass = (material.density * t.volume) / 1000;
+          // Per-part material (`PartInput.material`, propagated onto `t.material`)
+          // wins over the script-level `material` so mixed-material assemblies
+          // (e.g. PLA shell + TPU gasket) weigh the gasket at TPU's density.
+          const effectiveMaterial = t.material ?? material;
+          if (effectiveMaterial && typeof t.volume === "number") {
+            t.mass = (effectiveMaterial.density * t.volume) / 1000;
           }
         } else if (partStats === "bbox") {
           // Cheap CoM: use the shape's AABB centre (O(1), no OCCT measure).
