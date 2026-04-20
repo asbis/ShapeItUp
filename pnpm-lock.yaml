@@ -42,6 +42,9 @@ importers:
 
   packages/extension:
     dependencies:
+      '@resvg/resvg-wasm':
+        specifier: ^2.6.2
+        version: 2.6.2
       esbuild-wasm:
         specifier: ^0.28.0
         version: 0.28.0
