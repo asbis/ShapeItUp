@@ -128,7 +128,6 @@
     "esbuild-wasm": "^0.28.0"
   },
   "devDependencies": {
-    "@shapeitup/shared": "workspace:*",
     "@types/vscode": "^1.106.0"
   }
 }
