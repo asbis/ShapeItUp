@@ -55,6 +55,16 @@ importers:
 
   packages/mcp-server:
     dependencies:
+      esbuild-wasm:
+        specifier: ^0.28.0
+        version: 0.28.0
+      manifold-3d:
+        specifier: ^3.4.1
+        version: 3.4.1(@gltf-transform/core@4.3.0)(@gltf-transform/extensions@4.3.0)(@gltf-transform/functions@4.3.0)(esbuild-wasm@0.28.0)
+      replicad-opencascadejs:
+        specifier: ^0.23.0
+        version: 0.23.0
+    devDependencies:
       '@modelcontextprotocol/sdk':
         specifier: ^1.0.0
         version: 1.29.0(zod@4.3.6)
@@ -64,13 +74,7 @@ importers:
       '@shapeitup/shared':
         specifier: workspace:*
         version: link:../shared
-      esbuild:
-        specifier: ^0.24.0
-        version: 0.24.2
       replicad:
-        specifier: ^0.23.0
-        version: 0.23.0
-      replicad-opencascadejs:
         specifier: ^0.23.0
         version: 0.23.0
       zod:

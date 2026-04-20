@@ -55,7 +55,7 @@ const workerConfig = {
 
 // replicad-opencascadejs ships a ~30 MB WASM loader that would blow up the
 // bundle — keep it external so it loads from node_modules at runtime.
-const mcpExternal = ["esbuild", "replicad-opencascadejs"];
+const mcpExternal = ["esbuild-wasm", "replicad-opencascadejs"];
 
 // 4. MCP Server (Node.js, ESM) — standalone
 const mcpServerConfig = {

@@ -14,6 +14,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          registry-url: https://registry.npmjs.org
 
       - uses: pnpm/action-setup@v4
         with:
@@ -40,6 +41,16 @@ jobs:
             rm esbuild-wasm
             cp -r "$target" esbuild-wasm
           fi
+
+      - name: Publish @shapeitup/mcp-server to npm
+        # Publishes the standalone server so `npx -y @shapeitup/mcp-server`
+        # works for every MCP client without the VS Code extension installed.
+        # Uses --no-git-checks because pnpm otherwise refuses to publish from
+        # a workspace with uncommitted lockfile tweaks on CI.
+        run: pnpm --filter @shapeitup/mcp-server publish --no-git-checks --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        continue-on-error: true
 
       - name: Publish to VS Marketplace
         run: cd packages/extension && npx @vscode/vsce publish

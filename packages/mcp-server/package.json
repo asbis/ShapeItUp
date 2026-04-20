@@ -1,18 +1,47 @@
 {
   "name": "@shapeitup/mcp-server",
-  "version": "0.1.0",
-  "private": true,
+  "version": "1.0.0",
+  "description": "ShapeItUp MCP server — scripted CAD tools (Replicad/OpenCascade) for Claude Code, Cursor, Claude Desktop, and other MCP clients.",
   "type": "module",
   "bin": {
     "shapeitup-mcp": "./dist/index.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/asbis/ShapeItUp",
+    "directory": "packages/mcp-server"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "cad",
+    "replicad",
+    "opencascade",
+    "3d",
+    "shapeitup"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
+    "esbuild-wasm": "^0.28.0",
+    "manifold-3d": "^3.4.1",
+    "replicad-opencascadejs": "^0.23.0"
+  },
+  "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@shapeitup/core": "workspace:*",
     "@shapeitup/shared": "workspace:*",
-    "esbuild": "^0.24.0",
     "replicad": "^0.23.0",
-    "replicad-opencascadejs": "^0.23.0",
     "zod": "^4.3.6"
   }
 }

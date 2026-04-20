@@ -35,8 +35,12 @@ export function activate(context: vscode.ExtensionContext) {
   registerCommands(context, viewerProvider);
   createFileWatcher(context, viewerProvider);
 
-  // Register MCP server so Claude Code / Copilot can discover it automatically
-  registerMcpServer(context, outputChannel);
+  // Register MCP server via VS Code's native provider API. This gives
+  // Copilot / Agent Mode zero-click access. We no longer silently write to
+  // ~/.claude.json, ~/.claude/skills/, or ~/.gemini/ on activation — those
+  // global writes broke user config on extension upgrades and violated consent.
+  // Users opt in via the `shapeitup.installMcpServer` command / walkthrough.
+  registerMcpServerForCopilot(context, outputChannel);
 
   // Install lightweight node_modules stubs so `import from "shapeitup"` and
   // `import from "replicad"` resolve from ANY `.shape.ts` — including files
@@ -46,11 +50,17 @@ export function activate(context: vscode.ExtensionContext) {
     outputChannel.appendLine(`[types] ensureWorkspaceTypes failed: ${e?.message ?? e}`);
   });
 
-  // Install the `/shapeitup` Claude Code skill (Replicad API reference)
-  installClaudeSkill(context, outputChannel);
-
-  // Install the Gemini CLI extension (bundles MCP server + skill)
-  installGeminiExtension(context, outputChannel);
+  // Consent-based install command for Claude Code / Cursor / Claude Desktop /
+  // Gemini CLI. Surfaces the one-shot AI install prompt that users can paste
+  // into any agentic CLI.
+  context.subscriptions.push(
+    vscode.commands.registerCommand("shapeitup.installMcpServer", () =>
+      showMcpInstallOptions(context, outputChannel),
+    ),
+    vscode.commands.registerCommand("shapeitup.uninstallMcpServer", () =>
+      uninstallMcpServer(outputChannel),
+    ),
+  );
 
   // Manual preview command (still useful for opening the panel tab)
   context.subscriptions.push(
@@ -612,242 +622,207 @@ export function activate(context: vscode.ExtensionContext) {
 export function deactivate() {}
 
 /**
- * Register the ShapeItUp MCP server for Claude Code.
+ * Register the ShapeItUp MCP server with VS Code's native provider API so
+ * Copilot / Agent Mode discovers it without any user configuration. This is
+ * the only silent registration path we keep — VS Code owns the consent UI
+ * and scopes the server to the editor process, so a crash can't corrupt the
+ * user's global Claude / Gemini config.
  *
- * Claude Code reads user-scope MCP servers from ~/.claude.json. We write there
- * directly, which works for both the Claude Code VS Code extension and the
- * standalone native CLI install (e.g. `~/.local/bin/claude` on macOS). We do
- * NOT gate on `vscode.extensions.getExtension("anthropic.claude-code")` because
- * many users install Claude Code as a CLI only — gating on the VS Code
- * extension silently skips MCP setup for them.
- *
- * For GitHub Copilot, we also register via the lm API when available.
+ * For Claude Code, Cursor, Claude Desktop, and Gemini CLI users: see the
+ * `ShapeItUp: Install MCP Server…` command (shapeitup.installMcpServer)
+ * which shows the one-shot AI install prompt for consented setup.
  */
-function registerMcpServer(
+function registerMcpServerForCopilot(
   context: vscode.ExtensionContext,
-  output: vscode.OutputChannel
+  output: vscode.OutputChannel,
 ) {
-  const fs = require("fs");
-  const os = require("os");
-
-  const mcpServerPath = path.join(
-    context.extensionPath,
-    "dist",
-    "mcp-server.mjs"
-  );
-
-  // Register via VS Code API for GitHub Copilot compatibility
+  const mcpServerPath = path.join(context.extensionPath, "dist", "mcp-server.mjs");
   try {
-    // Older VS Code versions don't expose this API — check dynamically.
     if ((vscode.lm as any)?.registerMcpServerDefinitionProvider) {
-      const provider = (vscode.lm as any).registerMcpServerDefinitionProvider("shapeitup-mcp", {
-        provideMcpServerDefinitions: () => {
-          return [
+      const provider = (vscode.lm as any).registerMcpServerDefinitionProvider(
+        "shapeitup-mcp",
+        {
+          provideMcpServerDefinitions: () => [
             new (vscode as any).McpStdioServerDefinition(
               "shapeitup",
               "ShapeItUp CAD",
               "node",
-              [mcpServerPath]
+              [mcpServerPath],
             ),
-          ];
+          ],
         },
-      });
+      );
       context.subscriptions.push(provider);
-      output.appendLine("[mcp] Registered MCP server via VS Code API (Copilot)");
+      output.appendLine("[mcp] Registered MCP server via VS Code API (Copilot / Agent Mode)");
     }
   } catch {
-    // API not available — that's fine
-  }
-
-  // Detect Claude Code (VS Code extension OR native CLI install).
-  const hasClaudeVscode = !!vscode.extensions.getExtension("anthropic.claude-code");
-  const claudeJsonPath = path.join(os.homedir(), ".claude.json");
-  const hasClaudeCli =
-    fs.existsSync(claudeJsonPath) ||
-    fs.existsSync(path.join(os.homedir(), ".claude")) ||
-    fs.existsSync(path.join(os.homedir(), ".local", "bin", "claude")) ||
-    fs.existsSync("/usr/local/bin/claude") ||
-    fs.existsSync("/opt/homebrew/bin/claude");
-
-  if (!hasClaudeVscode && !hasClaudeCli) {
-    output.appendLine("[mcp] Claude Code not detected — skipping ~/.claude.json registration");
-    return;
-  }
-
-  try {
-    let config: any = {};
-    if (fs.existsSync(claudeJsonPath)) {
-      try {
-        config = JSON.parse(fs.readFileSync(claudeJsonPath, "utf-8"));
-      } catch (parseErr: any) {
-        output.appendLine(`[mcp] ~/.claude.json is not valid JSON — aborting to avoid data loss: ${parseErr.message}`);
-        return;
-      }
-    }
-
-    config.mcpServers = config.mcpServers || {};
-
-    const existing = config.mcpServers.shapeitup;
-    if (existing && existing.args?.[0] === mcpServerPath) {
-      output.appendLine("[mcp] Claude Code MCP server already configured");
-      return;
-    }
-
-    config.mcpServers.shapeitup = {
-      type: "stdio",
-      command: "node",
-      args: [mcpServerPath],
-    };
-
-    fs.writeFileSync(claudeJsonPath, JSON.stringify(config, null, 2) + "\n");
-    output.appendLine(`[mcp] Registered MCP server in ~/.claude.json → ${mcpServerPath}`);
-  } catch (e: any) {
-    output.appendLine(`[mcp] Failed to configure Claude Code MCP: ${e.message}`);
+    // API not available on older VS Code versions — users can still install
+    // via the `ShapeItUp: Install MCP Server…` command.
   }
 }
 
 /**
- * Install the `/shapeitup` Claude Code skill into ~/.claude/skills/shapeitup/.
- *
- * Claude Code auto-discovers user-level skills at ~/.claude/skills/<name>/SKILL.md.
- * The bundled SKILL.md is copied there on activation so users don't have to run
- * any manual `cp` command. We only write if the source is newer than the
- * destination (by mtime) to avoid pointless I/O on every activation.
+ * Consented install surface for external MCP clients. We refuse to silently
+ * write to ~/.claude.json, ~/.claude/skills/, or ~/.gemini/ — users pick a
+ * client from the QuickPick and we either (a) copy the `claude mcp add …`
+ * command to the clipboard, (b) open a deep-link to Cursor, or (c) surface
+ * the AI install prompt that any agentic CLI can execute on their behalf.
  */
-function installClaudeSkill(
-  context: vscode.ExtensionContext,
-  output: vscode.OutputChannel
+async function showMcpInstallOptions(
+  _context: vscode.ExtensionContext,
+  output: vscode.OutputChannel,
 ) {
-  const fs = require("fs");
-  const os = require("os");
+  const INSTALL_PROMPT_URL =
+    "https://raw.githubusercontent.com/asbis/ShapeItUp/master/INSTALL.md";
+  const NPM_COMMAND = "npx -y @shapeitup/mcp-server";
 
-  const src = path.join(context.extensionPath, "dist", "skill", "SKILL.md");
-  if (!fs.existsSync(src)) {
-    output.appendLine("[skill] Bundled SKILL.md not found — skipping skill install");
-    return;
-  }
-
-  // Only install if the user has Claude Code (VS Code extension OR CLI install).
-  const hasClaudeVscode = !!vscode.extensions.getExtension("anthropic.claude-code");
-  const home = os.homedir();
-  const hasClaudeCli =
-    fs.existsSync(path.join(home, ".claude.json")) ||
-    fs.existsSync(path.join(home, ".claude")) ||
-    fs.existsSync(path.join(home, ".local", "bin", "claude")) ||
-    fs.existsSync("/usr/local/bin/claude") ||
-    fs.existsSync("/opt/homebrew/bin/claude");
-
-  if (!hasClaudeVscode && !hasClaudeCli) {
-    output.appendLine("[skill] Claude Code not detected — skipping skill install");
-    return;
-  }
-
-  try {
-    const skillDir = path.join(home, ".claude", "skills", "shapeitup");
-    const dest = path.join(skillDir, "SKILL.md");
-
-    const srcMtime = fs.statSync(src).mtimeMs;
-    const destMtime = fs.existsSync(dest) ? fs.statSync(dest).mtimeMs : 0;
-    if (destMtime >= srcMtime) {
-      output.appendLine("[skill] /shapeitup skill already up-to-date");
-      return;
-    }
-
-    fs.mkdirSync(skillDir, { recursive: true });
-    fs.copyFileSync(src, dest);
-    output.appendLine(`[skill] Installed /shapeitup skill → ${dest}`);
-  } catch (e: any) {
-    output.appendLine(`[skill] Failed to install /shapeitup skill: ${e.message}`);
-  }
-}
-
-/**
- * Install the ShapeItUp Gemini CLI extension into ~/.gemini/extensions/shapeitup/.
- *
- * Gemini CLI auto-discovers extensions at ~/.gemini/extensions/<name>/, each
- * containing a gemini-extension.json manifest (which can declare MCP servers
- * just like Claude's ~/.claude.json mcpServers) and an optional skills/
- * subdirectory where SKILL.md files are auto-registered.
- *
- * We bypass `gemini extensions install` and write the three files directly —
- * same pattern as the Claude install above — so users don't need the gemini
- * CLI on PATH and don't have to run any manual command.
- */
-function installGeminiExtension(
-  context: vscode.ExtensionContext,
-  output: vscode.OutputChannel
-) {
-  const fs = require("fs");
-  const os = require("os");
-
-  const srcMcp = path.join(context.extensionPath, "dist", "mcp-server.mjs");
-  const srcSkill = path.join(context.extensionPath, "dist", "skill", "SKILL.md");
-  if (!fs.existsSync(srcMcp) || !fs.existsSync(srcSkill)) {
-    output.appendLine("[gemini] Bundled mcp-server.mjs or SKILL.md missing — skipping");
-    return;
-  }
-
-  const home = os.homedir();
-  const hasGeminiCli =
-    fs.existsSync(path.join(home, ".gemini")) ||
-    fs.existsSync(path.join(home, ".gemini", "settings.json")) ||
-    fs.existsSync(path.join(home, ".local", "bin", "gemini")) ||
-    fs.existsSync("/usr/local/bin/gemini") ||
-    fs.existsSync("/opt/homebrew/bin/gemini");
-
-  if (!hasGeminiCli) {
-    output.appendLine("[gemini] Gemini CLI not detected — skipping extension install");
-    return;
-  }
-
-  try {
-    const extDir = path.join(home, ".gemini", "extensions", "shapeitup");
-    const skillDir = path.join(extDir, "skills", "shapeitup");
-    const destSkill = path.join(skillDir, "SKILL.md");
-    const manifestPath = path.join(extDir, "gemini-extension.json");
-
-    fs.mkdirSync(skillDir, { recursive: true });
-
-    // Point Gemini directly at the VSCode extension's dist/mcp-server.mjs.
-    // Early versions copied the bundle to ~/.gemini/extensions/shapeitup/, but
-    // that directory has no node_modules, so the server crashed at startup
-    // trying to resolve its externalized deps (esbuild, replicad-opencascadejs)
-    // and Gemini silently registered zero tools. Referencing the VSCode
-    // install path means Node uses that location's node_modules — which is
-    // guaranteed to exist because the user had to install the extension first.
-    const version = context.extension?.packageJSON?.version ?? "0.0.0";
-    const serverPath = path.join(context.extensionPath, "dist", "mcp-server.mjs");
-    const manifest = {
-      name: "shapeitup",
-      version,
-      description: "ShapeItUp CAD — scripted 3D modeling with Replicad",
-      mcpServers: {
-        shapeitup: {
-          command: "node",
-          args: [serverPath],
-          cwd: context.extensionPath,
-        },
+  const picked = await vscode.window.showQuickPick(
+    [
+      {
+        label: "$(copy) Copy AI install prompt URL",
+        description: "Paste into Claude Code / Cursor / any agent — it does the setup",
+        id: "ai",
       },
-    };
-    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+      {
+        label: "$(terminal) Copy `claude mcp add` command",
+        description: "For Claude Code CLI users",
+        id: "claude",
+      },
+      {
+        label: "$(link-external) Open Cursor deep-link",
+        description: "One-click install into Cursor",
+        id: "cursor",
+      },
+      {
+        label: "$(file-code) Copy Claude Desktop JSON snippet",
+        description: "Paste into claude_desktop_config.json",
+        id: "desktop",
+      },
+    ],
+    { placeHolder: "Install ShapeItUp MCP server for which client?" },
+  );
+  if (!picked) return;
 
-    const srcSkillMtime = fs.statSync(srcSkill).mtimeMs;
-    const destSkillMtime = fs.existsSync(destSkill) ? fs.statSync(destSkill).mtimeMs : 0;
-    if (destSkillMtime < srcSkillMtime) fs.copyFileSync(srcSkill, destSkill);
-
-    // Clean up stale copies from earlier install versions that copied the
-    // server binary here (now it lives only at the VSCode extension path).
-    for (const stale of ["mcp-server.js", "mcp-server.mjs", "mcp-server.mjs.map", "mcp-server.js.map"]) {
-      const p = path.join(extDir, stale);
-      if (fs.existsSync(p)) {
-        try { fs.unlinkSync(p); } catch {}
-      }
+  switch ((picked as any).id) {
+    case "ai": {
+      await vscode.env.clipboard.writeText(
+        `Please install the ShapeItUp MCP server by following the instructions at ${INSTALL_PROMPT_URL}`,
+      );
+      vscode.window.showInformationMessage(
+        "Copied. Paste into any agentic CLI (Claude Code, Cursor agent, Gemini) and it will install ShapeItUp.",
+      );
+      break;
     }
-
-    output.appendLine(`[gemini] Installed Gemini CLI extension → ${extDir} (server: ${serverPath})`);
-  } catch (e: any) {
-    output.appendLine(`[gemini] Failed to install Gemini CLI extension: ${e.message}`);
+    case "claude": {
+      const cmd = `claude mcp add shapeitup -s user -- ${NPM_COMMAND}`;
+      await vscode.env.clipboard.writeText(cmd);
+      vscode.window.showInformationMessage(`Copied: ${cmd}`);
+      break;
+    }
+    case "cursor": {
+      const config = Buffer.from(
+        JSON.stringify({ command: "npx", args: ["-y", "@shapeitup/mcp-server"] }),
+      ).toString("base64");
+      const url = `cursor://anysphere.cursor-deeplink/mcp/install?name=shapeitup&config=${config}`;
+      await vscode.env.openExternal(vscode.Uri.parse(url));
+      break;
+    }
+    case "desktop": {
+      const snippet = JSON.stringify(
+        { mcpServers: { shapeitup: { command: "npx", args: ["-y", "@shapeitup/mcp-server"] } } },
+        null,
+        2,
+      );
+      await vscode.env.clipboard.writeText(snippet);
+      vscode.window.showInformationMessage(
+        "Copied. Merge into ~/Library/Application Support/Claude/claude_desktop_config.json and restart Claude Desktop.",
+      );
+      break;
+    }
   }
+  output.appendLine(`[mcp] User chose install target: ${(picked as any).id}`);
+}
+
+/**
+ * Remove ShapeItUp entries from any MCP client config on disk. Each removal
+ * is confirmed with the user first — we never auto-delete. Mirrors the
+ * `shapeitup.installMcpServer` command so users who regret the install can
+ * reverse it without hand-editing JSON.
+ */
+async function uninstallMcpServer(output: vscode.OutputChannel) {
+  const fs = require("fs");
+  const os = require("os");
+  const home = os.homedir();
+
+  const targets: Array<{ label: string; file: string; key: string }> = [
+    { label: "Claude Code (~/.claude.json)", file: path.join(home, ".claude.json"), key: "mcpServers.shapeitup" },
+    { label: "Cursor (~/.cursor/mcp.json)", file: path.join(home, ".cursor", "mcp.json"), key: "mcpServers.shapeitup" },
+    {
+      label: "Claude Desktop",
+      file: process.platform === "darwin"
+        ? path.join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
+        : path.join(home, "AppData", "Roaming", "Claude", "claude_desktop_config.json"),
+      key: "mcpServers.shapeitup",
+    },
+  ];
+
+  const found = targets.filter((t) => {
+    if (!fs.existsSync(t.file)) return false;
+    try {
+      const c = JSON.parse(fs.readFileSync(t.file, "utf-8"));
+      return !!c?.mcpServers?.shapeitup;
+    } catch {
+      return false;
+    }
+  });
+
+  const geminiExt = path.join(home, ".gemini", "extensions", "shapeitup");
+  const hasGemini = fs.existsSync(geminiExt);
+  const skill = path.join(home, ".claude", "skills", "shapeitup");
+  const hasSkill = fs.existsSync(skill);
+
+  if (found.length === 0 && !hasGemini && !hasSkill) {
+    vscode.window.showInformationMessage("No ShapeItUp MCP entries found to uninstall.");
+    return;
+  }
+
+  const items = [
+    ...found.map((t) => ({ label: t.label, target: t, kind: "json" as const })),
+    ...(hasGemini ? [{ label: `Gemini CLI (${geminiExt})`, target: geminiExt, kind: "dir" as const }] : []),
+    ...(hasSkill ? [{ label: `Claude Code skill (${skill})`, target: skill, kind: "dir" as const }] : []),
+  ];
+  const picks = await vscode.window.showQuickPick(items, {
+    canPickMany: true,
+    placeHolder: "Select ShapeItUp entries to remove",
+  });
+  if (!picks || picks.length === 0) return;
+
+  const confirm = await vscode.window.showWarningMessage(
+    `Remove ${picks.length} ShapeItUp entr${picks.length === 1 ? "y" : "ies"}?`,
+    { modal: true },
+    "Remove",
+  );
+  if (confirm !== "Remove") return;
+
+  for (const p of picks) {
+    try {
+      if (p.kind === "json") {
+        const t = p.target as typeof targets[number];
+        const c = JSON.parse(fs.readFileSync(t.file, "utf-8"));
+        if (c?.mcpServers?.shapeitup) {
+          delete c.mcpServers.shapeitup;
+          fs.writeFileSync(t.file, JSON.stringify(c, null, 2) + "\n");
+          output.appendLine(`[mcp] Removed shapeitup from ${t.file}`);
+        }
+      } else {
+        fs.rmSync(p.target as string, { recursive: true, force: true });
+        output.appendLine(`[mcp] Removed ${p.target}`);
+      }
+    } catch (e: any) {
+      output.appendLine(`[mcp] Failed to remove ${p.label}: ${e.message}`);
+    }
+  }
+  vscode.window.showInformationMessage("ShapeItUp MCP entries removed.");
 }
 
 /**

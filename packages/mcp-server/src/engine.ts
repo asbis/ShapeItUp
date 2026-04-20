@@ -26,7 +26,21 @@ import {
   type Core,
   type ExecutedPart,
 } from "@shapeitup/core";
-import * as esbuild from "esbuild";
+import * as esbuild from "esbuild-wasm";
+
+// esbuild-wasm requires a one-shot initialize() before the first build().
+// Cross-platform via WASM — avoids shipping native binaries in the VSIX at the
+// cost of ~2-3x slower bundling, which is fine for runtime .shape.ts bundles.
+let esbuildInitPromise: Promise<void> | null = null;
+function ensureEsbuild(): Promise<void> {
+  if (!esbuildInitPromise) {
+    esbuildInitPromise = esbuild.initialize({}).catch((e) => {
+      esbuildInitPromise = null;
+      throw e;
+    });
+  }
+  return esbuildInitPromise;
+}
 import { loadOCCTNode } from "./node-loader.js";
 import { loadManifoldNode } from "./manifold-node-loader.js";
 
@@ -243,6 +257,7 @@ export async function executeShapeFile(
 
   let js: string;
   try {
+    await ensureEsbuild();
     const result = await esbuild.build({
       stdin: {
         contents: code,
