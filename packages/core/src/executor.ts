@@ -1,21 +1,74 @@
 import type { ParamDef } from "@shapeitup/shared";
+import { pushRuntimeWarning } from "./stdlib/warnings";
 
 /**
- * Execute a user .shape.ts script (already transpiled/bundled to JS).
- *
- * Scripts can export a `params` object for slider support:
- *   export const params = { width: 50, height: 30, radius: 5 };
- *   export default function main({ width, height, radius }) { ... }
- *
- * Or use default function params (auto-detected):
- *   export default function main(width = 50, height = 30) { ... }
+ * Named material presets — density in g/cm³, mapped to the same units the rest
+ * of the mass pipeline uses (`mass = density * volume / 1000` with volume in
+ * mm³). Lets users write `export const material = "PLA"` instead of looking up
+ * densities manually. Case-sensitive — "PLA", "ABS", etc. must match exactly;
+ * unknown strings emit a runtime warning listing the known keys so the user
+ * can correct the typo without silently losing mass data.
  */
-export function executeScript(
-  js: string,
-  replicadExports: Record<string, any>,
-  shapeitupExports: Record<string, any>,
-  paramOverrides?: Record<string, number>
-): { result: any; params: ParamDef[]; material?: { density: number; name?: string } } {
+const MATERIAL_PRESETS: Record<string, number> = {
+  PLA: 1.24,
+  ABS: 1.04,
+  PETG: 1.27,
+  Nylon: 1.15,
+  Aluminum: 2.70,
+  Steel: 7.85,
+  Stainless: 8.00,
+  Brass: 8.47,
+  Titanium: 4.50,
+  Copper: 8.96,
+  Wood: 0.60,
+};
+
+/**
+ * Extract `export const params = {...}` names from source code without
+ * executing the script. Falls back to [] if the declaration is absent
+ * or uses a form the regex can't parse (complex computed values, etc.).
+ * This is intentionally loose — callers use it only to report "did the
+ * user's script declare X?" and are fine with occasional false-empties.
+ *
+ * Used by the MCP `tune_params` tool so that when a render fails (e.g. a
+ * WASM crash leaves `status.currentParams` unset), the status file still
+ * carries the declared keys and the agent's "Declared: ..." warning line
+ * stays useful instead of collapsing to "Declared: (none)".
+ */
+export function extractParamsStatic(sourceCode: string): string[] {
+  const match = sourceCode.match(/export\s+const\s+params\s*=\s*\{([^}]*)\}/s);
+  if (!match) return [];
+  const body = match[1];
+  const keys: string[] = [];
+  // Match key: value pairs — key is a plain identifier or quoted string.
+  // Anchor on either start-of-body or a preceding `,` / `{` so we don't
+  // mistake an inner object literal's field for a top-level key.
+  const pairPattern = /(?:^|[,{])\s*(?:"([^"]+)"|'([^']+)'|(\w+))\s*:/g;
+  let m: RegExpExecArray | null;
+  while ((m = pairPattern.exec(body)) !== null) {
+    const name = m[1] || m[2] || m[3];
+    if (name) keys.push(name);
+  }
+  return keys;
+}
+
+/**
+ * Phase A of script execution: rewrite user imports/exports so the bundled JS
+ * can run inside a `new Function(...)` wrapper.
+ *
+ * Callers (both the VSCode extension and the MCP engine) always run the user
+ * script through esbuild first, so the input to this transform is canonical
+ * esbuild ESM output: top-level `var`/`function` declarations with a single
+ * trailing `export { main as default, ... }` block. That narrows the surface
+ * area to three rewrites:
+ *   - `import { x } from "replicad"`      → `const { x } = __replicad__;`
+ *   - `import { x as y } from "replicad"` → `const { x: y } = __replicad__;`
+ *   - `import * as r from "replicad"`     → `const r = __replicad__;`
+ *   - `import r from "replicad"`          → `const r = __replicad__.default || __replicad__;`
+ *   - same four forms for the `"shapeitup"` stdlib
+ *   - trailing `export { ... };` block    → stripped
+ */
+export function rewriteImports(js: string): string {
   let code = js;
 
   code = code.replace(
@@ -36,9 +89,6 @@ export function executeScript(
     (_, name) => `const ${name} = __replicad__.default || __replicad__;`
   );
 
-  // ShapeItUp stdlib: `import { holes, screws } from "shapeitup"` →
-  // destructure from the injected __shapeitup__ object. Same three forms as
-  // the replicad rewriter above (named, namespace, default).
   code = code.replace(
     /import\s*\{([^}]+)\}\s*from\s*["']shapeitup["']\s*;?/g,
     (_, imports) => {
@@ -57,32 +107,45 @@ export function executeScript(
     (_, name) => `const ${name} = __shapeitup__.default || __shapeitup__;`
   );
 
-  code = code.replace(
-    /export\s+default\s+function\s+(\w+)/g,
-    "function $1"
-  );
-
-  code = code.replace(
-    /export\s+default\s+function\s*\(/g,
-    "const __default__ = function("
-  );
-
-  let paramsCode = "";
-  code = code.replace(
-    /export\s+const\s+params\s*=\s*(\{[^}]+\})\s*;?/g,
-    (_, obj) => {
-      paramsCode = obj;
-      return `const params = ${obj};`;
-    }
-  );
-
-  code = code.replace(
-    /export\s+const\s+material\s*=\s*(\{[^}]+\})\s*;?/g,
-    (_, obj) => `const material = ${obj};`
-  );
-
   code = code.replace(/export\s*\{[^}]*\}\s*;?/g, "");
-  code = code.replace(/export\s+/g, "");
+
+  // Esbuild ESM output inserts a `__require` shim for any leftover `require(...)`
+  // calls (typically introduced when the user or a transitively-imported file
+  // uses CJS `const x = require("replicad")` instead of an ESM `import`). That
+  // shim throws "Dynamic require of X is not supported" at runtime because
+  // `require` isn't defined in our `new Function(...)` sandbox. Rewrite the two
+  // module names we DO provide through the sandbox globals, so CJS-shaped user
+  // code works without an extra build-time step.
+  code = code.replace(
+    /__require\s*\(\s*["']replicad["']\s*\)/g,
+    "__replicad__",
+  );
+  code = code.replace(
+    /__require\s*\(\s*["']shapeitup["']\s*\)/g,
+    "__shapeitup__",
+  );
+
+  return code;
+}
+
+/**
+ * Execute a user .shape.ts script (already transpiled/bundled to JS).
+ *
+ * Scripts can export a `params` object for slider support:
+ *   export const params = { width: 50, height: 30, radius: 5 };
+ *   export default function main({ width, height, radius }) { ... }
+ *
+ * By the time the JS reaches this function, esbuild has rewritten those
+ * forms to `var params = {...}` + a trailing `export { main as default, params }`
+ * block — the shape `rewriteImports` expects.
+ */
+export function executeScript(
+  js: string,
+  replicadExports: Record<string, any>,
+  shapeitupExports: Record<string, any>,
+  paramOverrides?: Record<string, number>
+): { result: any; params: ParamDef[]; material?: { density: number; name?: string } } {
+  const code = rewriteImports(js);
 
   const wrapped = `
     return (function(__replicad__, __shapeitup__, __paramOverrides__) {
@@ -143,12 +206,6 @@ export function executeScript(
         } else {
           __result__ = main();
         }
-      } else if (typeof __default__ === "function") {
-        if (__default__.length > 0) {
-          __result__ = __default__(__params__);
-        } else {
-          __result__ = __default__();
-        }
       } else {
         throw new Error("Script must export a default function named 'main'");
       }
@@ -172,10 +229,22 @@ export function executeScript(
   );
 
   // Validate: only surface a material object when density is strictly a
-  // finite positive number. Strings, 0, negatives, NaN all get dropped so
+  // finite positive number. Strings matching a MATERIAL_PRESETS key are
+  // expanded to the preset's density + name. Unknown strings emit a runtime
+  // warning so the user can see the typo instead of silently losing mass
+  // data. 0, negatives, NaN, and malformed objects all get dropped so
   // downstream code can treat `material` as "present ⇒ usable".
   let material: { density: number; name?: string } | undefined;
-  if (
+  if (typeof rawMaterial === "string") {
+    const preset = MATERIAL_PRESETS[rawMaterial];
+    if (preset !== undefined) {
+      material = { density: preset, name: rawMaterial };
+    } else {
+      pushRuntimeWarning(
+        `Unknown material preset '${rawMaterial}'. Known presets: ${Object.keys(MATERIAL_PRESETS).join(", ")}. Use { density: number } for custom densities.`
+      );
+    }
+  } else if (
     rawMaterial &&
     typeof rawMaterial === "object" &&
     typeof rawMaterial.density === "number" &&
