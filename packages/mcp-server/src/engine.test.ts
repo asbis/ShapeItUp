@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { inferErrorHint } from "./engine.js";
+import { inferErrorHint, appendScreenshotMetadata, type EngineStatus } from "./engine.js";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // ---------------------------------------------------------------------------
 // Fix E — error-hint specificity.
@@ -217,5 +220,137 @@ export default function main() {
     );
     expect(hint).toBeDefined();
     expect(hint).toMatch(/sketchCircle/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix #6 — `appendScreenshotMetadata` writes the monotonic `lastScreenshot`
+// field into shapeitup-status.json without clobbering other fields. Run with
+// a tempdir-scoped GLOBAL_STORAGE so the tests never touch the user's real
+// status file.
+// ---------------------------------------------------------------------------
+describe("appendScreenshotMetadata — monotonic lastScreenshot breadcrumb", () => {
+  const makeDir = () => mkdtempSync(join(tmpdir(), "siu-engine-test-"));
+
+  it("creates a new status file with just lastScreenshot when none exists", () => {
+    const dir = makeDir();
+    try {
+      appendScreenshotMetadata(
+        {
+          timestamp: 1234567890,
+          path: "/abs/path.png",
+          renderMode: "ai",
+          cameraAngle: "isometric",
+          fileName: "x.shape.ts",
+        },
+        dir,
+      );
+      const raw = readFileSync(join(dir, "shapeitup-status.json"), "utf-8");
+      const status = JSON.parse(raw) as EngineStatus;
+      expect(status.lastScreenshot?.path).toBe("/abs/path.png");
+      expect(status.lastScreenshot?.timestamp).toBe(1234567890);
+      expect(status.lastScreenshot?.renderMode).toBe("ai");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves all existing fields when appending", () => {
+    const dir = makeDir();
+    try {
+      const existing: EngineStatus = {
+        success: true,
+        fileName: "a.shape.ts",
+        stats: "foo",
+        partCount: 3,
+        partNames: ["x", "y", "z"],
+        boundingBox: { x: 10, y: 20, z: 30 },
+        timestamp: "2026-04-20T00:00:00.000Z",
+      };
+      writeFileSync(join(dir, "shapeitup-status.json"), JSON.stringify(existing));
+      appendScreenshotMetadata(
+        {
+          timestamp: 999,
+          path: "/abs/ss.png",
+        },
+        dir,
+      );
+      const after = JSON.parse(
+        readFileSync(join(dir, "shapeitup-status.json"), "utf-8"),
+      ) as EngineStatus;
+      expect(after.success).toBe(true);
+      expect(after.fileName).toBe("a.shape.ts");
+      expect(after.stats).toBe("foo");
+      expect(after.partCount).toBe(3);
+      expect(after.partNames).toEqual(["x", "y", "z"]);
+      expect(after.boundingBox).toEqual({ x: 10, y: 20, z: 30 });
+      expect(after.lastScreenshot?.path).toBe("/abs/ss.png");
+      expect(after.lastScreenshot?.timestamp).toBe(999);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("overwrites an earlier lastScreenshot with the latest one", () => {
+    const dir = makeDir();
+    try {
+      const base: EngineStatus = {
+        success: true,
+        timestamp: "2026-04-20T00:00:00.000Z",
+        lastScreenshot: {
+          timestamp: 1,
+          path: "/old.png",
+        },
+      };
+      writeFileSync(join(dir, "shapeitup-status.json"), JSON.stringify(base));
+      appendScreenshotMetadata(
+        { timestamp: 2, path: "/new.png" },
+        dir,
+      );
+      const after = JSON.parse(
+        readFileSync(join(dir, "shapeitup-status.json"), "utf-8"),
+      ) as EngineStatus;
+      expect(after.lastScreenshot?.path).toBe("/new.png");
+      expect(after.lastScreenshot?.timestamp).toBe(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("tolerates a corrupt existing status file by starting fresh", () => {
+    const dir = makeDir();
+    try {
+      writeFileSync(join(dir, "shapeitup-status.json"), "not-valid-json{");
+      appendScreenshotMetadata(
+        { timestamp: 42, path: "/fresh.png" },
+        dir,
+      );
+      const after = JSON.parse(
+        readFileSync(join(dir, "shapeitup-status.json"), "utf-8"),
+      ) as EngineStatus;
+      expect(after.lastScreenshot?.path).toBe("/fresh.png");
+      // Seeded-from-scratch status — success defaults to false so
+      // get_render_status can distinguish "screenshot without a render".
+      expect(after.success).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never throws on an unwritable directory (best-effort semantics)", () => {
+    // Nonexistent parent of a parent — mkdirSync recursive handles this fine
+    // on normal systems. Verify no throw and the file does exist after.
+    const dir = join(makeDir(), "a", "b", "c");
+    try {
+      expect(() =>
+        appendScreenshotMetadata({ timestamp: 1, path: "/p.png" }, dir),
+      ).not.toThrow();
+      expect(existsSync(join(dir, "shapeitup-status.json"))).toBe(true);
+    } finally {
+      // Cleanup — the top-level mkdtempSync dir persists under the tempdir.
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {}
+    }
   });
 });

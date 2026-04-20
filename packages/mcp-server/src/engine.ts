@@ -104,6 +104,29 @@ export interface EngineStatus {
    */
   engineReset?: boolean;
   timestamp: string;
+  /**
+   * Monotonic record of the most recent screenshot produced by `render_preview`,
+   * `preview_shape` (with `captureScreenshot: true`), or `tune_params` (with
+   * `captureScreenshot: true`). The extension host intentionally does NOT
+   * overwrite the engine's authoritative status record on render — it's the
+   * MCP server's job to append this metadata once the extension signals
+   * render-complete. Kept PRESERVED across subsequent failed renders so a
+   * later failure can't erase the "last known good screenshot" breadcrumb.
+   */
+  lastScreenshot?: {
+    /** Epoch ms when the screenshot was captured. */
+    timestamp: number;
+    /** Absolute path to the PNG. */
+    path: string;
+    /** "ai" or "standard" / "dark" — render mode used. */
+    renderMode?: string;
+    /** "isometric" / "top" / "front" / ... — camera preset. */
+    cameraAngle?: string;
+    /** Source .shape.ts basename (no extension) when known. */
+    fileName?: string;
+    /** Absolute path to the source .shape.ts when known. */
+    sourceFile?: string;
+  };
 }
 
 export interface ShapeProperties {
@@ -416,9 +439,67 @@ export async function exportLastToFile(
 function writeStatusFile(status: EngineStatus, dir: string) {
   try {
     mkdirSync(dir, { recursive: true });
+    // Preserve the monotonic `lastScreenshot` breadcrumb across writes. The
+    // engine owns everything ELSE in this file; screenshots are written out-
+    // of-band by `appendScreenshotMetadata` after the extension finishes
+    // capturing. Without this read-then-carry, a failed render (or any
+    // other engine write) would erase the last-good screenshot path and
+    // break `get_render_status`' ability to show "Last screenshot: ...".
+    if (status.lastScreenshot === undefined) {
+      try {
+        const existing = JSON.parse(
+          readFileSync(join(dir, "shapeitup-status.json"), "utf-8"),
+        ) as EngineStatus;
+        if (existing && existing.lastScreenshot) {
+          status.lastScreenshot = existing.lastScreenshot;
+        }
+      } catch {
+        // Missing / unreadable prior status — nothing to carry forward.
+      }
+    }
     writeFileSync(join(dir, "shapeitup-status.json"), JSON.stringify(status));
   } catch {
     // Best effort — status file is observability, not correctness.
+  }
+}
+
+/**
+ * Write screenshot metadata into `shapeitup-status.json` WITHOUT touching
+ * any other field. Called by render_preview / preview_shape / tune_params
+ * after the VSCode extension signals render-complete so that a subsequent
+ * `get_render_status` can report the last screenshot path + timestamp.
+ *
+ * The extension host itself deliberately avoids writing the status file
+ * (to preserve the engine's authoritative record); this helper closes the
+ * loop on the MCP side. If the status file doesn't exist yet — e.g. the
+ * user called render_preview before any engine-driven execute — we create
+ * a minimal success-looking record with just `lastScreenshot` + a
+ * timestamp so later readers don't see a naked file.
+ */
+export function appendScreenshotMetadata(
+  meta: NonNullable<EngineStatus["lastScreenshot"]>,
+  dir: string,
+): void {
+  try {
+    mkdirSync(dir, { recursive: true });
+    const statusPath = join(dir, "shapeitup-status.json");
+    let current: EngineStatus;
+    try {
+      current = JSON.parse(readFileSync(statusPath, "utf-8")) as EngineStatus;
+    } catch {
+      // No prior status — seed a minimal record. success=true here would be
+      // misleading (we haven't executed anything); leave it false so
+      // get_render_status flags the situation as an empty-engine "screenshot
+      // only" record.
+      current = {
+        success: false,
+        timestamp: new Date().toISOString(),
+      };
+    }
+    current.lastScreenshot = meta;
+    writeFileSync(statusPath, JSON.stringify(current));
+  } catch {
+    // Best effort — same rationale as writeStatusFile.
   }
 }
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { validateSyntaxPure, detectPathDoubling, extractSignatures, safeHandler, computePartsLine } from "./tools.js";
+import { validateSyntaxPure, detectPathDoubling, detectPathDoublingInfo, extractSignatures, safeHandler, computePartsLine } from "./tools.js";
 
 // ---------------------------------------------------------------------------
 // Bug #6 — validate_syntax must trust .method() calls whose receiver was
@@ -136,6 +136,31 @@ describe("detectPathDoubling", () => {
   it("ignores single-segment paths", () => {
     expect(detectPathDoubling("/")).toBe("");
     expect(detectPathDoubling("/root")).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// detectPathDoublingInfo — structured companion used by create_shape to
+// build a refusal message when the caller would otherwise accidentally
+// write into a doubled-segment directory.
+// ---------------------------------------------------------------------------
+
+describe("detectPathDoublingInfo", () => {
+  it("returns the duplicated segment and resolved path on doubling", () => {
+    const info = detectPathDoublingInfo("/home/u/code/ShapeItUp/examples/examples");
+    expect(info).not.toBeNull();
+    expect(info!.duplicatedSegment.toLowerCase()).toBe("examples");
+    expect(info!.absoluteDir).toMatch(/examples[\\/]examples$/i);
+  });
+
+  it("returns null when there is no doubling", () => {
+    expect(detectPathDoublingInfo("/a/b/c")).toBeNull();
+    expect(detectPathDoublingInfo("/home/u/code/ShapeItUp/examples")).toBeNull();
+  });
+
+  it("is case-insensitive", () => {
+    const info = detectPathDoublingInfo("/tmp/Examples/examples");
+    expect(info).not.toBeNull();
   });
 });
 
