@@ -179,7 +179,21 @@ export interface ShapeProperties {
     volume?: number;
     surfaceArea?: number;
     centerOfMass?: [number, number, number];
-    boundingBox?: { x: number; y: number; z: number };
+    /**
+     * Per-part bounding box. `x`/`y`/`z` remain the SIZE along each axis (back
+     * compat with every consumer that read these before). `min`/`max` carry the
+     * raw world-space corners so consumers that care about absolute position
+     * (e.g. the "part extends below z=0" warning in formatStatusText) don't
+     * have to re-derive them from the vertex array. Both corners are undefined
+     * together when the mesh was empty/degenerate.
+     */
+    boundingBox?: {
+      x: number;
+      y: number;
+      z: number;
+      min?: [number, number, number];
+      max?: [number, number, number];
+    };
     /** Mass in grams — present only when the script supplied a material density. */
     mass?: number;
   }>;
@@ -579,7 +593,13 @@ export function appendScreenshotMetadata(
  * array. Returns undefined for empty/degenerate meshes so callers can choose
  * whether to emit a zero-size box or skip the field entirely.
  */
-function boundingBoxFromVertices(v: Float32Array): { x: number; y: number; z: number } | undefined {
+function boundingBoxFromVertices(v: Float32Array): {
+  x: number;
+  y: number;
+  z: number;
+  min: [number, number, number];
+  max: [number, number, number];
+} | undefined {
   if (v.length < 3) return undefined;
   let minX = Infinity, minY = Infinity, minZ = Infinity;
   let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
@@ -595,6 +615,8 @@ function boundingBoxFromVertices(v: Float32Array): { x: number; y: number; z: nu
     x: parseFloat((maxX - minX).toFixed(1)),
     y: parseFloat((maxY - minY).toFixed(1)),
     z: parseFloat((maxZ - minZ).toFixed(1)),
+    min: [minX, minY, minZ],
+    max: [maxX, maxY, maxZ],
   };
 }
 
@@ -603,6 +625,8 @@ function boundingBoxFromParts(parts: ExecutedPart[]): { x: number; y: number; z:
   // helper. Because min/max over the union of point sets equals min/max over
   // the concatenated array, the WxHxD result is the correct assembly-wide
   // bounding box. The allocation is negligible next to tessellation itself.
+  // Note: the top-level `status.boundingBox` is intentionally the size-only
+  // {x,y,z}; min/max are surfaced per-part via aggregateProperties instead.
   let total = 0;
   for (const p of parts) total += p.vertices.length;
   if (total === 0) return { x: 0, y: 0, z: 0 };
@@ -612,7 +636,8 @@ function boundingBoxFromParts(parts: ExecutedPart[]): { x: number; y: number; z:
     combined.set(p.vertices, offset);
     offset += p.vertices.length;
   }
-  return boundingBoxFromVertices(combined) ?? { x: 0, y: 0, z: 0 };
+  const bb = boundingBoxFromVertices(combined);
+  return bb ? { x: bb.x, y: bb.y, z: bb.z } : { x: 0, y: 0, z: 0 };
 }
 
 function aggregateProperties(parts: ExecutedPart[]): ShapeProperties {
