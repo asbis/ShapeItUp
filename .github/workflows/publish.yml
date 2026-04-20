@@ -26,20 +26,27 @@ jobs:
       - name: Build
         run: pnpm build
 
-      - name: Dereference esbuild-wasm symlink for VSIX packaging
-        # pnpm's `install` at the repo root already places esbuild-wasm in
-        # packages/extension/node_modules/, but as a symlink into the pnpm
-        # store. vsce's VSIX packager does not follow symlinks cleanly on
-        # all runners, so replace the symlink with a real copy of the
-        # package. We can't use `npm install` here — npm trips on the
-        # workspace: protocol used by the extension's devDependencies
-        # even when filtering devDeps out.
+      - name: Dereference WASM symlinks for VSIX packaging
+        # pnpm's install places runtime deps in packages/extension/node_modules
+        # as symlinks into the pnpm store. vsce's VSIX packager does not
+        # follow symlinks cleanly on all runners, so replace each symlink
+        # with a real copy. Covers esbuild-wasm (runtime .shape.ts bundling)
+        # and @resvg/resvg-wasm (headless SVG→PNG for render_preview).
         run: |
           cd packages/extension/node_modules
-          if [ -L esbuild-wasm ]; then
-            target=$(readlink -f esbuild-wasm)
-            rm esbuild-wasm
-            cp -r "$target" esbuild-wasm
+          for pkg in esbuild-wasm; do
+            if [ -L "$pkg" ]; then
+              target=$(readlink -f "$pkg")
+              rm "$pkg"
+              cp -r "$target" "$pkg"
+            fi
+          done
+          # Scoped package: resolve the symlink at @resvg/resvg-wasm.
+          if [ -L "@resvg/resvg-wasm" ]; then
+            target=$(readlink -f "@resvg/resvg-wasm")
+            rm "@resvg/resvg-wasm"
+            mkdir -p "@resvg"
+            cp -r "$target" "@resvg/resvg-wasm"
           fi
 
       - name: Publish @shapeitup/mcp-server to npm

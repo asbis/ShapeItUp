@@ -15,6 +15,7 @@ import {
 } from "./engine.js";
 import { autoBootstrapIfNeeded, setupShapeProject } from "./project-setup.js";
 import { renderPartsToSvg } from "./svg-renderer.js";
+import { svgToPng } from "./svg-to-png.js";
 
 /**
  * Shared globalStorage dir with the VSCode extension. Both processes write and
@@ -2208,7 +2209,7 @@ export function registerTools(server: McpServer) {
         .enum(["preview", "final"])
         .optional()
         .describe("Tessellation-quality preset. `'final'` (default for <15-part assemblies) matches the pre-existing render quality. `'preview'` coarsens the mesh ~2.5× for faster first-render on large assemblies, at the cost of visibly chunkier facets — choose this for layout checks on 15+ part assemblies. If omitted, the extension auto-degrades to `'preview'` when the part count is >= 15 and uses `'final'` otherwise."),
-      inline: z.boolean().optional().describe("When true, also returns the rendered PNG inline as base64 image content on top of the usual text + file path — saves an extra `get_preview` round trip. The PNG is still written to disk. Skipped inline if the file exceeds 10 MB. Default false."),
+      inline: z.boolean().optional().describe("Return the rendered PNG inline as base64 image content on top of the usual text + file path. Default true — agents see the image directly without an extra `get_preview` round trip. Skipped inline if the file exceeds 10 MB. Pass false to skip the base64 payload (saves ~30% response size) when you only need the path."),
     },
     safeHandler("render_preview", async ({ filePath, cameraAngle, showDimensions, showAxes, renderMode, width, height, timeoutMs, focusPart, hideParts, finder, partName, partIndex, meshQuality, inline }) => {
       // Resolve which file to render: explicit > engine's last-executed > status file.
@@ -2246,9 +2247,12 @@ export function registerTools(server: McpServer) {
         }
 
         const svgOut = renderPartsToSvg(parts);
-        const svgPath = join(GLOBAL_STORAGE, "shapeitup-previews", `headless-${Date.now()}.svg`);
+        const ts = Date.now();
+        const previewsDir = join(GLOBAL_STORAGE, "shapeitup-previews");
+        const svgPath = join(previewsDir, `headless-${ts}.svg`);
+        const pngPath = join(previewsDir, `headless-${ts}.png`);
         try {
-          mkdirSync(dirname(svgPath), { recursive: true });
+          mkdirSync(previewsDir, { recursive: true });
           writeFileSync(svgPath, svgOut.svg, "utf-8");
         } catch (e: any) {
           return {
@@ -2262,15 +2266,42 @@ export function registerTools(server: McpServer) {
           ? `\nFor the richer Three.js preview, focus a VS Code window with one of these workspaces open: ${liveRoots.join(", ")}`
           : "\nFor the richer Three.js preview, open the .shape.ts file in VS Code with the ShapeItUp extension.";
 
-        return {
-          content: [{
-            type: "text" as const,
-            text:
-              `Headless wireframe preview (VS Code extension not running): ${svgPath}\n` +
-              `${svgOut.summary}${rootHint}`,
-          }],
-          isError: false,
+        // Rasterize the SVG → PNG so the agent gets a visible image in the
+        // response, not just a file path. Resvg-wasm pays a ~4 MB first-call
+        // init; after that each render is fast.
+        let pngBuf: Buffer | null = null;
+        let rasterError: string | null = null;
+        try {
+          pngBuf = await svgToPng(svgOut.svg, width ?? 800);
+          writeFileSync(pngPath, pngBuf);
+        } catch (e: any) {
+          rasterError = e?.message ?? String(e);
+        }
+
+        const textBlock = {
+          type: "text" as const,
+          text:
+            `Headless wireframe preview (VS Code extension not running).\n` +
+            `${svgOut.summary}\n` +
+            (pngBuf ? `PNG: ${pngPath}\nSVG: ${svgPath}` : `SVG: ${svgPath}\n(PNG rasterization failed: ${rasterError ?? "unknown"} — read the SVG directly.)`) +
+            rootHint,
         };
+
+        if (pngBuf && pngBuf.length < 10 * 1024 * 1024) {
+          return {
+            content: [
+              textBlock,
+              {
+                type: "image" as const,
+                data: pngBuf.toString("base64"),
+                mimeType: "image/png",
+              },
+            ],
+            isError: false,
+          };
+        }
+
+        return { content: [textBlock], isError: false };
       }
 
       // Bug #10: hard pre-flight check for cross-workspace renders. If the
@@ -2572,7 +2603,9 @@ export function registerTools(server: McpServer) {
         // it as an image content block so the caller gets bytes + path in a
         // single round trip. Mirrors get_preview's 10 MB size guard to avoid
         // blowing past MCP response limits.
-        if (inline === true) {
+        // Default to inlining the PNG so agents see the image without an
+        // extra get_preview round trip. Pass `inline: false` to opt out.
+        if (inline !== false) {
           try {
             const st = statSync(screenshotPath);
             if (st.size > 10 * 1024 * 1024) {
