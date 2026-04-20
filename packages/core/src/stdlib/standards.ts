@@ -16,7 +16,7 @@
  *   - Extrusions:    Bosch 20/30/40 series (Misumi HFS compatible)
  */
 
-export type MetricSize = "M2" | "M2.5" | "M3" | "M4" | "M5" | "M6" | "M8";
+export type MetricSize = "M2" | "M2.5" | "M3" | "M4" | "M5" | "M6" | "M8" | "M10" | "M12";
 
 /** Socket head cap screw — ISO 4762. Most common machine screw in 3D-printed parts. */
 export interface SocketHeadSpec {
@@ -35,13 +35,15 @@ export interface SocketHeadSpec {
 }
 
 export const SOCKET_HEAD: Record<MetricSize, SocketHeadSpec> = {
-  "M2":   { shaft: 2.0, headD: 3.8,  headH: 2.0, hex: 1.5, tapDrill: 1.6,  clearance: 2.4 },
-  "M2.5": { shaft: 2.5, headD: 4.5,  headH: 2.5, hex: 2.0, tapDrill: 2.05, clearance: 2.9 },
-  "M3":   { shaft: 3.0, headD: 5.5,  headH: 3.0, hex: 2.5, tapDrill: 2.5,  clearance: 3.4 },
-  "M4":   { shaft: 4.0, headD: 7.0,  headH: 4.0, hex: 3.0, tapDrill: 3.3,  clearance: 4.5 },
-  "M5":   { shaft: 5.0, headD: 8.5,  headH: 5.0, hex: 4.0, tapDrill: 4.2,  clearance: 5.5 },
-  "M6":   { shaft: 6.0, headD: 10.0, headH: 6.0, hex: 5.0, tapDrill: 5.0,  clearance: 6.6 },
-  "M8":   { shaft: 8.0, headD: 13.0, headH: 8.0, hex: 6.0, tapDrill: 6.8,  clearance: 9.0 },
+  "M2":   { shaft: 2.0,  headD: 3.8,  headH: 2.0,  hex: 1.5,  tapDrill: 1.6,  clearance: 2.4  },
+  "M2.5": { shaft: 2.5,  headD: 4.5,  headH: 2.5,  hex: 2.0,  tapDrill: 2.05, clearance: 2.9  },
+  "M3":   { shaft: 3.0,  headD: 5.5,  headH: 3.0,  hex: 2.5,  tapDrill: 2.5,  clearance: 3.4  },
+  "M4":   { shaft: 4.0,  headD: 7.0,  headH: 4.0,  hex: 3.0,  tapDrill: 3.3,  clearance: 4.5  },
+  "M5":   { shaft: 5.0,  headD: 8.5,  headH: 5.0,  hex: 4.0,  tapDrill: 4.2,  clearance: 5.5  },
+  "M6":   { shaft: 6.0,  headD: 10.0, headH: 6.0,  hex: 5.0,  tapDrill: 5.0,  clearance: 6.6  },
+  "M8":   { shaft: 8.0,  headD: 13.0, headH: 8.0,  hex: 6.0,  tapDrill: 6.8,  clearance: 9.0  },
+  "M10":  { shaft: 10.0, headD: 16.0, headH: 10.0, hex: 8.0,  tapDrill: 8.5,  clearance: 11.0 }, // TODO verify against ISO 4762 spec
+  "M12":  { shaft: 12.0, headD: 19.0, headH: 12.0, hex: 10.0, tapDrill: 10.2, clearance: 13.5 }, // TODO verify against ISO 4762 spec (headD: some sources say 18.0)
 };
 
 /** Button head cap screw — ISO 7380. Low-profile alternative to socket head. */
@@ -53,11 +55,32 @@ export interface ButtonHeadSpec {
 }
 
 export const BUTTON_HEAD: Partial<Record<MetricSize, ButtonHeadSpec>> = {
-  "M3": { shaft: 3.0, headD: 5.7,  headH: 1.65, hex: 2.0 },
-  "M4": { shaft: 4.0, headD: 7.6,  headH: 2.2,  hex: 2.5 },
-  "M5": { shaft: 5.0, headD: 9.5,  headH: 2.75, hex: 3.0 },
-  "M6": { shaft: 6.0, headD: 10.5, headH: 3.3,  hex: 4.0 },
-  "M8": { shaft: 8.0, headD: 14.0, headH: 4.4,  hex: 5.0 },
+  "M3":  { shaft: 3.0,  headD: 5.7,  headH: 1.65, hex: 2.0 },
+  "M4":  { shaft: 4.0,  headD: 7.6,  headH: 2.2,  hex: 2.5 },
+  "M5":  { shaft: 5.0,  headD: 9.5,  headH: 2.75, hex: 3.0 },
+  "M6":  { shaft: 6.0,  headD: 10.5, headH: 3.3,  hex: 4.0 },
+  "M8":  { shaft: 8.0,  headD: 14.0, headH: 4.4,  hex: 5.0 },
+  "M10": { shaft: 10.0, headD: 17.5, headH: 5.5,  hex: 6.0 }, // TODO verify against ISO 7380-1 spec
+  "M12": { shaft: 12.0, headD: 21.0, headH: 6.6,  hex: 8.0 }, // TODO verify against ISO 7380-1 spec
+};
+
+/** Hex head bolt — ISO 4017 (fully threaded). External hex, wrench-driven. */
+export interface HexHeadSpec {
+  shaft: number;
+  /** Across-flats wrench size. */
+  acrossFlats: number;
+  /** Head height. */
+  headH: number;
+}
+
+export const HEX_HEAD: Partial<Record<MetricSize, HexHeadSpec>> = {
+  "M3":  { shaft: 3.0,  acrossFlats: 5.5,  headH: 2.0 },
+  "M4":  { shaft: 4.0,  acrossFlats: 7.0,  headH: 2.8 },
+  "M5":  { shaft: 5.0,  acrossFlats: 8.0,  headH: 3.5 },
+  "M6":  { shaft: 6.0,  acrossFlats: 10.0, headH: 4.0 },
+  "M8":  { shaft: 8.0,  acrossFlats: 13.0, headH: 5.3 },
+  "M10": { shaft: 10.0, acrossFlats: 17.0, headH: 6.4 }, // TODO verify against ISO 4017 spec
+  "M12": { shaft: 12.0, acrossFlats: 19.0, headH: 7.5 }, // TODO verify against ISO 4017 spec
 };
 
 /** Flat head (countersunk) cap screw — ISO 10642. 90° head angle. */
@@ -73,11 +96,13 @@ export interface FlatHeadSpec {
 }
 
 export const FLAT_HEAD: Partial<Record<MetricSize, FlatHeadSpec>> = {
-  "M3": { shaft: 3.0, headD: 6.72,  headH: 1.86, hex: 2.0, csAngle: 90 },
-  "M4": { shaft: 4.0, headD: 8.96,  headH: 2.48, hex: 2.5, csAngle: 90 },
-  "M5": { shaft: 5.0, headD: 11.20, headH: 3.10, hex: 3.0, csAngle: 90 },
-  "M6": { shaft: 6.0, headD: 13.44, headH: 3.72, hex: 4.0, csAngle: 90 },
-  "M8": { shaft: 8.0, headD: 17.92, headH: 4.96, hex: 5.0, csAngle: 90 },
+  "M3":  { shaft: 3.0,  headD: 6.72,  headH: 1.86, hex: 2.0,  csAngle: 90 },
+  "M4":  { shaft: 4.0,  headD: 8.96,  headH: 2.48, hex: 2.5,  csAngle: 90 },
+  "M5":  { shaft: 5.0,  headD: 11.20, headH: 3.10, hex: 3.0,  csAngle: 90 },
+  "M6":  { shaft: 6.0,  headD: 13.44, headH: 3.72, hex: 4.0,  csAngle: 90 },
+  "M8":  { shaft: 8.0,  headD: 17.92, headH: 4.96, hex: 5.0,  csAngle: 90 },
+  "M10": { shaft: 10.0, headD: 19.68, headH: 5.84, hex: 8.0,  csAngle: 90 }, // TODO verify against ISO 10642 spec
+  "M12": { shaft: 12.0, headD: 23.52, headH: 7.00, hex: 10.0, csAngle: 90 }, // TODO verify against ISO 10642 spec
 };
 
 /** Hex nut — DIN 934. */
@@ -91,11 +116,13 @@ export interface HexNutSpec {
 }
 
 export const HEX_NUT: Partial<Record<MetricSize, HexNutSpec>> = {
-  "M3": { acrossFlats: 5.5,  height: 2.4, shaft: 3.0 },
-  "M4": { acrossFlats: 7.0,  height: 3.2, shaft: 4.0 },
-  "M5": { acrossFlats: 8.0,  height: 4.0, shaft: 5.0 },
-  "M6": { acrossFlats: 10.0, height: 5.0, shaft: 6.0 },
-  "M8": { acrossFlats: 13.0, height: 6.5, shaft: 8.0 },
+  "M3":  { acrossFlats: 5.5,  height: 2.4, shaft: 3.0  },
+  "M4":  { acrossFlats: 7.0,  height: 3.2, shaft: 4.0  },
+  "M5":  { acrossFlats: 8.0,  height: 4.0, shaft: 5.0  },
+  "M6":  { acrossFlats: 10.0, height: 5.0, shaft: 6.0  },
+  "M8":  { acrossFlats: 13.0, height: 6.5, shaft: 8.0  },
+  "M10": { acrossFlats: 17.0, height: 8.0, shaft: 10.0 }, // TODO verify against DIN 934 / ISO 4032 spec
+  "M12": { acrossFlats: 19.0, height: 10.0, shaft: 12.0 }, // TODO verify against DIN 934 / ISO 4032 spec
 };
 
 /** Flat washer — DIN 125. */
@@ -106,11 +133,13 @@ export interface FlatWasherSpec {
 }
 
 export const FLAT_WASHER: Partial<Record<MetricSize, FlatWasherSpec>> = {
-  "M3": { id: 3.2, od: 7.0,  thickness: 0.5 },
-  "M4": { id: 4.3, od: 9.0,  thickness: 0.8 },
-  "M5": { id: 5.3, od: 10.0, thickness: 1.0 },
-  "M6": { id: 6.4, od: 12.0, thickness: 1.6 },
-  "M8": { id: 8.4, od: 16.0, thickness: 1.6 },
+  "M3":  { id: 3.2,  od: 7.0,  thickness: 0.5 },
+  "M4":  { id: 4.3,  od: 9.0,  thickness: 0.8 },
+  "M5":  { id: 5.3,  od: 10.0, thickness: 1.0 },
+  "M6":  { id: 6.4,  od: 12.0, thickness: 1.6 },
+  "M8":  { id: 8.4,  od: 16.0, thickness: 1.6 },
+  "M10": { id: 10.5, od: 20.0, thickness: 2.0 }, // TODO verify against DIN 125 / ISO 7089 spec
+  "M12": { id: 13.0, od: 24.0, thickness: 2.5 }, // TODO verify against DIN 125 / ISO 7089 spec
 };
 
 /** Heat-set threaded insert (brass, press-fit) — common 3D-printing standard. */
@@ -292,6 +321,8 @@ export const METRIC_COARSE_PITCH: Record<MetricSize, number> = {
   "M5":   0.8,
   "M6":   1.0,
   "M8":   1.25,
+  "M10":  1.5,
+  "M12":  1.75,
 };
 
 /** ISO 261 metric thread pitch table (fine pitch, mm). */
@@ -303,6 +334,8 @@ export const METRIC_FINE_PITCH: Record<MetricSize, number> = {
   "M5":   0.5,
   "M6":   0.75,
   "M8":   1.0,
+  "M10":  1.25,
+  "M12":  1.5,
 };
 
 /** Trapezoidal leadscrew spec (ISO 2901). `majorDia` is nominal diameter. */
@@ -323,6 +356,120 @@ export const TRAPEZOIDAL_LEADSCREW: Record<string, TrapezoidalLeadscrewSpec> = {
   "TR12x2":  { majorDia: 12, pitch: 2, starts: 1, lead: 2 },
   "TR12x4":  { majorDia: 12, pitch: 2, starts: 2, lead: 4 },
 };
+
+/**
+ * Throw if `size` isn't a key in `table`. Use at every `TABLE[size]` lookup
+ * site before the lookup so an unknown metric size (e.g. "M10" when the table
+ * only went to M8, or a plain typo like "m3") produces a readable error
+ * listing the supported sizes instead of silently returning `undefined` and
+ * propagating as NaN into OCCT.
+ */
+export function assertSupportedSize(
+  size: unknown,
+  table: Record<string, unknown>,
+  tableName: string,
+): asserts size is MetricSize {
+  if (typeof size !== "string" || !(size in table)) {
+    const supported = Object.keys(table).join(", ");
+    throw new TypeError(
+      `Unknown metric size '${String(size)}' for ${tableName}. Supported: ${supported}.`,
+    );
+  }
+}
+
+/**
+ * Throw if `value` isn't a finite positive number. Use at stdlib boundaries
+ * where an opaque OCCT "pointer exception" is the alternative — e.g. the
+ * numeric path of `holes.through(d)` where a user typo propagates as NaN.
+ * The error always names the caller (`fnName`) and the offending value so
+ * the agent can self-correct without re-running.
+ */
+export function assertPositiveFinite(
+  fnName: string,
+  paramName: string,
+  value: unknown
+): asserts value is number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    throw new TypeError(
+      `${fnName}: ${paramName} must be a finite positive number, got ${String(value)} (${typeof value}).`
+    );
+  }
+}
+
+/**
+ * Simple did-you-mean suggestion: returns the single closest key by
+ * case-insensitive substring overlap + edit distance (bounded). Conservative
+ * — returns undefined when no candidate is clearly best. The goal isn't
+ * best-in-class fuzzy matching, it's catching typos like `pilotDiameter` →
+ * `pilotDia`.
+ */
+function didYouMean(target: string, candidates: readonly string[]): string | undefined {
+  if (candidates.length === 0) return undefined;
+  const t = target.toLowerCase();
+  let best: { key: string; score: number } | undefined;
+  for (const key of candidates) {
+    const k = key.toLowerCase();
+    let score = 0;
+    if (k === t) score = 1000;
+    else if (k.startsWith(t) || t.startsWith(k)) score = 100 - Math.abs(k.length - t.length);
+    else if (k.includes(t) || t.includes(k)) score = 50 - Math.abs(k.length - t.length);
+    else {
+      // Shared-prefix length
+      let shared = 0;
+      const min = Math.min(k.length, t.length);
+      for (let i = 0; i < min && k[i] === t[i]; i++) shared++;
+      score = shared * 2;
+    }
+    if (!best || score > best.score) best = { key, score };
+  }
+  return best && best.score >= 6 ? best.key : undefined;
+}
+
+/**
+ * Wrap an object with a Proxy that throws on unknown-key reads. Intended for
+ * user-facing spec/table lookups where a typo (`standards.NEMA17.pilotDiameter`
+ * vs `.pilotDia`) would otherwise silently return `undefined` and propagate
+ * as NaN into downstream OCCT calls. Internal stdlib code imports the raw
+ * tables directly from this module and bypasses the guard.
+ *
+ * The wrap is read-only on unknown keys — known keys, symbols, and common
+ * host operations (toJSON, iteration) pass through. Writing new keys is
+ * allowed so user code can decorate a spec if it really wants to.
+ */
+export function guardUnknownKeys<T extends object>(obj: T, label: string): T {
+  return new Proxy(obj, {
+    get(target, prop, receiver) {
+      if (typeof prop === "symbol") return Reflect.get(target, prop, receiver);
+      // Allow inherited Object prototype reads (toString, hasOwnProperty, etc.)
+      // so JSON.stringify and iteration still work without contortions.
+      if (!(prop in target)) {
+        if (prop in Object.prototype) return Reflect.get(target, prop, receiver);
+        const keys = Object.keys(target);
+        const suggestion = didYouMean(String(prop), keys);
+        throw new TypeError(
+          `Unknown key "${String(prop)}" on ${label}.` +
+            (suggestion
+              ? ` Did you mean "${suggestion}"?`
+              : keys.length > 0
+                ? ` Available: ${keys.join(", ")}.`
+                : "")
+        );
+      }
+      const value = Reflect.get(target, prop, receiver);
+      // Recursively wrap plain-object descendants so deeper typos also throw.
+      // Skip arrays, functions, and class instances (constructor !== Object).
+      if (
+        value !== null &&
+        typeof value === "object" &&
+        !Array.isArray(value) &&
+        (value.constructor === Object || value.constructor === undefined)
+      ) {
+        return guardUnknownKeys(value, `${label}.${String(prop)}`);
+      }
+      return value;
+    },
+  });
+}
 
 /**
  * Parse a screw designator like "M3x10" into size + length.

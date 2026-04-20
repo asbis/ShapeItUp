@@ -17,6 +17,37 @@
  * through `resolveWasmException` without worrying about double-handling.
  */
 
+/**
+ * Bug #8: track whether ANY execute() has already completed successfully in
+ * this process. When an "OCCT exception (pointer N)" surfaces AFTER a prior
+ * success with a small pointer value, the overwhelmingly likely cause is heap
+ * corruption from an earlier WASM-level failure — not a user-script mistake
+ * like a bad import path (the existing `inferErrorHint` fallback). The flag
+ * lets us steer the hint toward "retry after reset" instead of sending the
+ * agent down the wrong trail.
+ *
+ * Reset on every resetCore() (engine drops the core; we also drop the flag so
+ * the freshly-booted core starts clean — a first-render failure on the new
+ * instance is NOT the wedged-heap signature).
+ */
+let hasSucceededOnce = false;
+
+export function markExecutionSucceeded(): void {
+  hasSucceededOnce = true;
+}
+
+export function resetWedgeTracking(): void {
+  hasSucceededOnce = false;
+}
+
+/**
+ * Read-only accessor for callers that need to branch (e.g. inferErrorHint in
+ * mcp-server's engine.ts).
+ */
+export function hasSucceededBefore(): boolean {
+  return hasSucceededOnce;
+}
+
 function isPointerish(e: unknown): boolean {
   if (typeof e === "number" && Number.isFinite(e)) return true;
   if (typeof e === "bigint") return true;
@@ -114,8 +145,16 @@ function tryResolveViaOc(ptr: number, oc: any): string | undefined {
  *   - Normal Error          → e.message (unchanged)
  *   - Numeric/pointer-ish   → resolved via oc, or a descriptive fallback
  *   - Anything else         → String(e)
+ *
+ * When `operationName` is supplied (typically the `err.operation` tag set
+ * by instrumentation's `tagError()` — e.g. `"_3DShape.cut"`,
+ * `"_3DShape.fillet"`), the resolver can steer the fallback message toward
+ * the most likely cause. Boolean ops (cut/fuse/intersect) almost always fail
+ * due to coincident/tangent faces; fillet/chamfer almost always fail due to
+ * a radius that's too large or edges that vanished after a prior op. Giving
+ * a generic "simplify geometry" hint for these misdirects the user.
  */
-export function resolveWasmException(e: unknown, oc: any): string {
+export function resolveWasmException(e: unknown, oc: any, operationName?: string): string {
   // Pass normal Error objects through untouched.
   if (e instanceof Error) {
     return e.message || String(e);
@@ -129,7 +168,32 @@ export function resolveWasmException(e: unknown, oc: any): string {
     if (ptr !== undefined) {
       const resolved = tryResolveViaOc(ptr, oc);
       if (resolved) return resolved;
-      return `OCCT exception (pointer ${ptr}); try simplifying geometry or reducing complexity.`;
+      // Operation-specific fallbacks — the generic "simplify geometry" hint
+      // sends boolean/fillet failures down the wrong trail. Branch on the
+      // instrumentation-tagged operation name when present.
+      if (operationName) {
+        const lowerOp = operationName.toLowerCase();
+        const isBoolean = /\b(cut|fuse|intersect)\b/.test(lowerOp);
+        const isFillet = /\b(fillet|chamfer)\b/.test(lowerOp);
+        if (isBoolean) {
+          return (
+            `OCCT boolean operation (${operationName}) failed at a low level. ` +
+            `The most common cause is coincident or tangent faces between the operands. Try:\n` +
+            `  - nudging one operand by >= 0.01mm so faces overlap instead of kissing,\n` +
+            `  - inflating a cutter by a small epsilon (e.g. 0.01mm) so cuts pass clearly through instead of ending on a face,\n` +
+            `  - checking for self-intersecting or zero-thickness geometry in either operand.`
+          );
+        }
+        if (isFillet) {
+          return (
+            `OCCT ${operationName} failed at a low level. ` +
+            `Common causes: radius larger than the shortest adjacent edge, ` +
+            `fillet crossing a tangent face boundary, or the selected edges no longer exist after a prior operation.`
+          );
+        }
+      }
+      const opSuffix = operationName ? ` during ${operationName}` : "";
+      return `OCCT exception (pointer ${ptr})${opSuffix}; try simplifying geometry or reducing complexity.`;
     }
   }
 
