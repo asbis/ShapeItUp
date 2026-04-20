@@ -113,6 +113,10 @@ ZY       +Z               +Y               -X
 
 Concrete footgun: `draw().hLine(60).sketchOnPlane("ZX")` moves the pen 60 mm along **world Z**, not world X. If you expected `hLine` to walk along world X, you want plane `"XZ"` (where pen h → +X).
 
+> **`holes.*` axis is NOT pen direction.**
+> `axis: "+Y"` on `holes.slot({...})` means **the slot opens on the +Y face** and penetrates toward -Y. It's the same semantic as `holes.through(..., axis: "+Y")`.
+> Pen axis mapping above governs 2D sketch → plane; hole axis governs which face the cut opens on.
+
 ---
 
 ## Top Best Practices
@@ -465,6 +469,8 @@ export default function main() {
 
 `main()` is only invoked when a file is the top-level shape — it's NOT imported. Export named factory functions for reuse. If you see `No matching export in "x.shape.ts" for import "makeX"`, you're trying to import something that's only reachable via `main()`'s return value.
 
+Library `.shape.ts` modules should export **named factories** (`export function makeBolt(p) { ... }`) — never import `main` or `params` from another file. The executor treats those names as reserved entry-point symbols.
+
 ```typescript
 // bolt.shape.ts
 import { sketchCircle, drawPolysides } from "replicad";
@@ -710,6 +716,16 @@ wall.cut(holes.slot({ length: 20, width: 5, depth: 4, axis: "+X" }).translate(5,
 ```
 
 **Common mistake (pre-fix behavior)**: translating to the origin-side face (e.g. `translate(0, y, z)` with `axis: "+X"`) used to "work" because the body extended into +X. It now extends into -X and lands OUTSIDE the wall — you'll see the "cut produced no material removal" warning. Fix: translate to the wall's +X face coordinate, not X=0.
+
+**Non-default axis examples** — `holes.slot` and `holes.keyhole` follow the same axis convention as `holes.through`. The axis names the face the feature opens on; translate to that face's coordinate.
+
+```typescript
+// Adjustment slot on a vertical +Y flange (opens on +Y face, penetrates -Y)
+flange.cut(holes.slot({ length: 20, width: 5, depth: 4, axis: "+Y" }).translate(x, flangeThickness, z))
+
+// Keyhole on a vertical +X wall (mouth opens on +X, screw enters from outside)
+wall.cut(holes.keyhole({ largeD: 10, smallD: 4, slot: 6, depth: 4, axis: "+X" }).translate(wallThickness, y, z))
+```
 
 **Z-convention — every hole tool spans `Z ∈ [-depth, 0]`**: the hole's top (entry) face sits AT `Z=0` and the body extends DOWNWARD into `-Z`. To cut from the top of a plate whose upper face is at `Z = plateTop`, translate by `plateTop`:
 

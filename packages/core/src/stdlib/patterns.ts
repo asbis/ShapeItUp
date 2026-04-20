@@ -131,6 +131,17 @@ export function polar(
   } = {}
 ): Placement[] {
   if (n < 1) throw new Error(`polar: n must be >= 1, got ${n}`);
+  // Silent-no-op guard: a zero-radius polar pattern without orientOutward
+  // places every copy at the same angle (startAngle) at the origin — so all
+  // N copies coincide exactly. Users who reach for `radius: 0` almost always
+  // want `orientOutward: true` (rotational-only pattern, e.g. spokes of a
+  // hub). Warn — don't throw — because a handful of legitimate users want
+  // stacked identical copies for manual post-processing.
+  if (radius === 0 && opts.orientOutward !== true) {
+    pushRuntimeWarning(
+      `patterns.polar(n, 0, { orientOutward: false }) is a no-op — all ${n} copies land at the same angle. Did you mean { orientOutward: true }?`
+    );
+  }
   const start = opts.startAngle ?? 0;
   const axis = opts.axis ?? "Z";
   const placements: Placement[] = [];
