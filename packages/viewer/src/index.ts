@@ -13,6 +13,31 @@ import { initMessageHandler, onMessage, postToExtension } from "./message-handle
 import type { WorkerToWebview, TessellatedPart } from "@shapeitup/shared";
 import { PART_COLORS } from "./theme";
 
+// --- Locale-invariant numeric formatting ---------------------------------
+// Screenshots are an agent-facing output channel, so dimension labels must
+// render identically regardless of the user's OS locale. A European locale
+// (e.g. nb-NO) would otherwise render "80,0mm" via the implicit locale path
+// in template literals / `toLocaleString()` defaults. We pin every visible
+// numeric label to en-US and add the "mm" suffix here.
+function formatMm(n: number, digits = 1): string {
+  const s = n.toLocaleString("en-US", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+    useGrouping: false,
+  });
+  return `${s}mm`;
+}
+
+// Same as formatMm but without the "mm" suffix — for places like the
+// parameter-slider readout where the unit is implicit from the label.
+function formatNum(n: number, digits = 1): string {
+  return n.toLocaleString("en-US", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+    useGrouping: false,
+  });
+}
+
 // DOM elements
 const container = document.getElementById("canvas-container")!;
 const loadingEl = document.getElementById("loading")!;
@@ -40,6 +65,109 @@ const orthoCamera = createOrthoCamera();
 
 const modelGroup = new THREE.Group();
 scene.add(modelGroup);
+
+// --- Compass / gnomon overlay --------------------------------------------
+// A small RGB axis indicator pinned to the lower-right corner so agents can
+// read orientation directly from a screenshot. The overlay lives in its own
+// scene + orthographic camera; the main render loop disables autoClear and
+// draws this last with clearDepth() so it composites on top of the model.
+//
+// The overlay camera sits at a fixed offset from origin and always points
+// AT origin; each frame we copy the main camera's quaternion onto it so the
+// gnomon rotates in lockstep with the viewport. (Copying position instead
+// of quaternion would keep the axes fixed relative to the world rather than
+// the view — the opposite of what you want.)
+let showCompass = true;
+const gnomonScene = new THREE.Scene();
+const gnomonCamera = new THREE.OrthographicCamera(-1.2, 1.2, 1.2, -1.2, 0.1, 10);
+gnomonCamera.position.set(0, 0, 3);
+gnomonCamera.lookAt(0, 0, 0);
+const gnomonAxes = new THREE.AxesHelper(0.8);
+// Boost axis colors so they stay readable on both the dark and AI backgrounds.
+// AxesHelper.setColors wasn't added until r152; guard for older typings.
+if (typeof (gnomonAxes as any).setColors === "function") {
+  (gnomonAxes as any).setColors(
+    new THREE.Color(0xff3333),
+    new THREE.Color(0x33cc33),
+    new THREE.Color(0x3388ff),
+  );
+}
+gnomonScene.add(gnomonAxes);
+
+// Letter sprites at the tip of each axis. Canvas-based so we don't need an
+// external font asset. Same sizeAttenuation:false trick keeps the letters
+// screen-space-constant inside the gnomon viewport.
+function makeGnomonLabel(text: string, color: string): THREE.Sprite {
+  const c = document.createElement("canvas");
+  c.width = 64;
+  c.height = 64;
+  const ctx = c.getContext("2d")!;
+  ctx.clearRect(0, 0, 64, 64);
+  ctx.font = "bold 48px -apple-system, BlinkMacSystemFont, sans-serif";
+  ctx.fillStyle = color;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, 32, 32);
+  const tex = new THREE.CanvasTexture(c);
+  tex.needsUpdate = true;
+  const mat = new THREE.SpriteMaterial({ map: tex, sizeAttenuation: false, depthTest: false });
+  const s = new THREE.Sprite(mat);
+  s.scale.set(0.2, 0.2, 1);
+  return s;
+}
+const gnomonLabelX = makeGnomonLabel("X", "#ff3333");
+gnomonLabelX.position.set(0.95, 0, 0);
+const gnomonLabelY = makeGnomonLabel("Y", "#33cc33");
+gnomonLabelY.position.set(0, 0.95, 0);
+const gnomonLabelZ = makeGnomonLabel("Z", "#3388ff");
+gnomonLabelZ.position.set(0, 0, 0.95);
+gnomonScene.add(gnomonLabelX, gnomonLabelY, gnomonLabelZ);
+
+// Draw the gnomon on top of whatever was just rendered into `renderer`.
+// Caller must have already rendered the main scene; we only add the overlay.
+// Invariants on exit: viewport restored to full target size, autoClear left
+// enabled (we disable it only for the duration of the main animate() render).
+function renderGnomon(targetW: number, targetH: number) {
+  if (!showCompass) return;
+  // Mirror the main camera's orientation so the axes rotate with the view.
+  // Position stays fixed on the +Z axis so the camera always "looks back"
+  // toward origin; only the rotation is taken from the main camera.
+  gnomonCamera.quaternion.copy(camera.quaternion);
+  // The main camera is oriented such that its default forward is -Z. We
+  // want the gnomon camera to inherit that, placed out on the inherited
+  // -forward axis so (world origin) is centered in its view. Compute the
+  // gnomon position by pushing out along the camera's local +Z in world
+  // space (i.e. the direction away from where it's looking).
+  const backward = new THREE.Vector3(0, 0, 1).applyQuaternion(gnomonCamera.quaternion);
+  gnomonCamera.position.copy(backward.multiplyScalar(3));
+  gnomonCamera.updateMatrixWorld();
+
+  // 80x80 viewport in the lower-right with a 10px margin. In screenshot
+  // mode the caller resizes the renderer to targetW/H first, so using
+  // those values (not container.clientWidth) pins the gnomon to the
+  // correct corner of the captured frame rather than the live viewport.
+  const size = 80;
+  const margin = 10;
+  const prevViewport = new THREE.Vector4();
+  renderer.getViewport(prevViewport);
+  const prevScissorTest = renderer.getScissorTest();
+
+  renderer.setViewport(targetW - size - margin, margin, size, size);
+  renderer.setScissor(targetW - size - margin, margin, size, size);
+  renderer.setScissorTest(true);
+  renderer.clearDepth();
+  renderer.render(gnomonScene, gnomonCamera);
+
+  // Restore viewport/scissor so the next frame's main render isn't clipped
+  // to the gnomon rectangle.
+  renderer.setViewport(prevViewport.x, prevViewport.y, prevViewport.z, prevViewport.w);
+  renderer.setScissor(prevViewport.x, prevViewport.y, prevViewport.z, prevViewport.w);
+  renderer.setScissorTest(prevScissorTest);
+}
+
+// autoClear:false lets us composite the gnomon on top of the main scene
+// without it wiping the color buffer. We clear manually in animate().
+renderer.autoClear = false;
 
 // State
 let edgesVisible = true;
@@ -518,7 +646,7 @@ onMessage("request-screenshot", (msg: any) => {
   // request path, falling back to isometric for the default/uncustomized
   // case. Only the screenshot path consults ortho; live interaction stays
   // on the perspective camera regardless of preset.
-  let presetForCapture: [number, number, number] = [1, -1.2, 0.8];
+  let presetForCapture: [number, number, number] = [1, -1, 0.7];
   if (pendingScreenshotCameraPreset && modelGroup.children.length > 0) {
     presetForCapture = pendingScreenshotCameraPreset;
     setCameraAngle(pendingScreenshotCameraPreset);
@@ -527,7 +655,7 @@ onMessage("request-screenshot", (msg: any) => {
   }
   // Only set default isometric if no custom angle was explicitly set
   if (!customCameraAngleSet && modelGroup.children.length > 0) {
-    setCameraAngle([1, -1.2, 0.8]);
+    setCameraAngle([1, -1, 0.7]);
   }
   customCameraAngleSet = false; // reset for next screenshot
 
@@ -575,7 +703,15 @@ onMessage("request-screenshot", (msg: any) => {
 
   try {
     controls.update();
+    // autoClear is off (see setup), so clear before compositing main + gnomon.
+    renderer.clear();
     renderer.render(scene, captureCamera);
+    // Draw gnomon at the captured resolution, not the live container size —
+    // otherwise the compass lands in the wrong corner of the screenshot when
+    // the screenshot pipeline resizes the backbuffer (targetW/H != viewport).
+    const gW = needsResize ? targetW : container.clientWidth;
+    const gH = needsResize ? targetH : container.clientHeight;
+    renderGnomon(gW, gH);
     const dataUrl = renderer.domElement.toDataURL("image/png");
     postToExtension({ type: "screenshot-data", dataUrl });
   } finally {
@@ -598,7 +734,7 @@ onMessage("request-screenshot", (msg: any) => {
 // (e.g. `[0, -1, 0.3]`) was removed. `isometric` keeps its tilt because
 // isometric IS supposed to be a 3D oblique projection.
 const CAMERA_ANGLE_PRESETS: Record<string, [number, number, number]> = {
-  isometric: [1, -1.2, 0.8],
+  isometric: [1, -1, 0.7],
   top: [0, 0, 1],
   bottom: [0, 0, -1],
   front: [0, -1, 0],
@@ -707,6 +843,9 @@ onMessage("viewer-command", (msg) => {
       // showAxes is opt-in; when present, scale axes to the model so they're
       // legible without dominating the frame.
       setAxes(!!msg.showAxes, !!msg.showAxes);
+      // showCompass defaults to true; callers can explicitly pass false to
+      // suppress the corner gnomon for e.g. overhead PCB-style renders.
+      showCompass = msg.showCompass === undefined ? true : !!msg.showCompass;
       // focusPart wins over hideParts when both are supplied.
       if (msg.focusPart || (msg.hideParts && msg.hideParts.length > 0)) {
         applyPartVisibility(msg.focusPart, msg.hideParts);
@@ -728,7 +867,9 @@ onMessage("viewer-command", (msg) => {
       }
       // Force render two frames to ensure everything is updated
       controls.update();
+      renderer.clear();
       renderer.render(scene, camera);
+      renderGnomon(container.clientWidth, container.clientHeight);
       break;
     }
   }
@@ -850,7 +991,7 @@ onMessage("installed-apps", (msg) => {
 document.getElementById("vc-top")!.addEventListener("click", () => setCameraAngle([0, 0, 1]));
 document.getElementById("vc-front")!.addEventListener("click", () => setCameraAngle([0, -1, 0]));
 document.getElementById("vc-right")!.addEventListener("click", () => setCameraAngle([1, 0, 0]));
-document.getElementById("vc-iso")!.addEventListener("click", () => setCameraAngle([1, -1, 0.8]));
+document.getElementById("vc-iso")!.addEventListener("click", () => setCameraAngle([1, -1, 0.7]));
 
 // --- Parameter Sliders ---
 import type { ParamDef } from "@shapeitup/shared";
@@ -901,9 +1042,8 @@ function updateParamsUI(params: ParamDef[]) {
     slider.addEventListener("input", () => {
       const val = parseFloat(slider.value);
       currentParamValues[p.name] = val;
-      document.getElementById(`pv-${p.name}`)!.textContent = String(
-        Number.isInteger(val) ? val : val.toFixed(1)
-      );
+      document.getElementById(`pv-${p.name}`)!.textContent =
+        Number.isInteger(val) ? String(val) : formatNum(val, 1);
 
       // Debounce re-execution
       if (paramDebounceTimer) clearTimeout(paramDebounceTimer);
@@ -970,7 +1110,7 @@ function updateSectionPlane() {
   renderer.clippingPlanes = [clipPlane];
 
   const dimLabel = axis === "x" ? size.x : axis === "y" ? size.y : size.z;
-  sectionValueEl.textContent = `${(dimLabel * pct).toFixed(1)}mm`;
+  sectionValueEl.textContent = formatMm(dimLabel * pct, 1);
 }
 
 sectionAxisSelect.addEventListener("change", updateSectionPlane);
@@ -1024,7 +1164,7 @@ function addMeasurePoint(point: THREE.Vector3) {
     const dz = Math.abs(measurePoints[1].z - measurePoints[0].z);
 
     measureInfoEl.textContent =
-      `Distance: ${dist.toFixed(2)}mm  |  \u0394X: ${dx.toFixed(1)}  \u0394Y: ${dy.toFixed(1)}  \u0394Z: ${dz.toFixed(1)}`;
+      `Distance: ${formatMm(dist, 2)}  |  \u0394X: ${formatNum(dx, 1)}  \u0394Y: ${formatNum(dy, 1)}  \u0394Z: ${formatNum(dz, 1)}`;
     measureInfoEl.style.display = "block";
 
     // Reset for next measurement after a delay
@@ -1207,7 +1347,7 @@ function updateDimensions() {
   // origin indicator regardless of part scale; the proportional term still
   // keeps labels tight on 100mm+ parts.
   const maxDim = Math.max(size.x, size.y, size.z);
-  const offset = Math.max(0.12 * maxDim, 15);
+  const offset = Math.max(0.18 * maxDim, 20);
 
   // Each dim line is anchored to the midpoint of the matching bbox edge
   // (rather than a translated model-origin ray) and then shoved
@@ -1227,7 +1367,7 @@ function updateDimensions() {
   addDimensionLine(
     [min.x, min.y - offset, min.z],
     [max.x, min.y - offset, min.z],
-    `X: ${size.x.toFixed(1)}mm`,
+    `X: ${formatMm(size.x, 1)}`,
     dimColor, textColor,
     [midX, min.y - offset, min.z]
   );
@@ -1237,7 +1377,7 @@ function updateDimensions() {
   addDimensionLine(
     [max.x + offset, min.y, min.z],
     [max.x + offset, max.y, min.z],
-    `Y: ${size.y.toFixed(1)}mm`,
+    `Y: ${formatMm(size.y, 1)}`,
     dimColor, textColor,
     [max.x + offset, midY, min.z]
   );
@@ -1250,7 +1390,7 @@ function updateDimensions() {
   addDimensionLine(
     [max.x + offset, max.y + offset, min.z],
     [max.x + offset, max.y + offset, max.z],
-    `Z: ${size.z.toFixed(1)}mm`,
+    `Z: ${formatMm(size.z, 1)}`,
     dimColor, textColor,
     [max.x + offset, max.y + offset, midZ]
   );
@@ -1339,7 +1479,17 @@ function addDimensionLine(
     return Math.max(s.x, s.y, s.z, 1);
   })();
   const maxScale = modelSize * 0.4;
-  const scale = Math.min(maxScale, Math.max(lineLength * 0.3, 8));
+  let scale = Math.min(maxScale, Math.max(lineLength * 0.3, 8));
+  // Z-label parity: the Z dim label is anchored at the far corner of the
+  // bbox (max X + offset, max Y + offset, midZ). From the default iso
+  // camera that corner sits noticeably further away than the X/Y label
+  // anchors, so with sizeAttenuation:true on the sprite material the Z
+  // sprite rendered ~50% the size of X/Y in screenshots. Bumping by 1.5x
+  // for Z restores visual parity without breaking the proportional-scale
+  // logic above.
+  if (label.startsWith("Z:")) {
+    scale *= 1.5;
+  }
   sprite.scale.set(scale, scale * 0.25, 1);
   dimensionGroup.add(sprite);
 }
@@ -1348,7 +1498,13 @@ function addDimensionLine(
 function animate() {
   requestAnimationFrame(animate);
   controls.update();
+  // autoClear was flipped to false so the gnomon can composite on top. We
+  // now have to clear the color + depth manually before the main render.
+  renderer.clear();
   renderer.render(scene, camera);
+  const w = container.clientWidth;
+  const h = container.clientHeight;
+  renderGnomon(w, h);
 }
 
 // --- Handle resize ---
