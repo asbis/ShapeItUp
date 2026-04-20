@@ -4,6 +4,7 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSy
 import { join, resolve, basename, dirname, isAbsolute, sep } from "path";
 import { homedir } from "os";
 import {
+  appendScreenshotMetadata,
   executeShapeFile,
   exportLastToFile,
   getCore,
@@ -469,20 +470,60 @@ function notifyExtensionOfShape(filePath: string): void {
  * the full MCP harness (executeShapeFile needs OCCT).
  */
 export function detectPathDoubling(absoluteDir: string): string {
-  const segments = resolve(absoluteDir).split(/[\\/]+/).filter(Boolean);
+  const info = detectPathDoublingInfo(absoluteDir);
+  if (!info) return "";
+  return (
+    `\nWarning: directory resolved to ${info.absoluteDir}. Note the path segment ` +
+    `"${info.duplicatedSegment}" appears twice — you may have intended directory: "." ` +
+    `or a subdir. Passed through as-is.`
+  );
+}
+
+/**
+ * Structured companion to `detectPathDoubling`. Returns `null` when no
+ * duplication is detected; otherwise returns the resolved path and the
+ * offending segment so callers can build a hard-refusal error message
+ * (see `create_shape` / `allowPathDuplication`).
+ */
+export function detectPathDoublingInfo(
+  absoluteDir: string,
+): { absoluteDir: string; duplicatedSegment: string } | null {
+  const resolved = resolve(absoluteDir);
+  const segments = resolved.split(/[\\/]+/).filter(Boolean);
   const last = segments[segments.length - 1];
   const prev = segments[segments.length - 2];
   if (last && prev && last.toLowerCase() === prev.toLowerCase()) {
-    return (
-      `\nWarning: directory resolved to ${absoluteDir}. Note the path segment ` +
-      `"${last}" appears twice — you may have intended directory: "." ` +
-      `or a subdir. Passed through as-is.`
-    );
+    return { absoluteDir: resolved, duplicatedSegment: last };
   }
-  return "";
+  return null;
+}
+
+function formatRelativeTimestamp(epochMs: number): string {
+  const delta = Date.now() - epochMs;
+  if (!isFinite(delta) || delta < 0) return new Date(epochMs).toISOString();
+  const s = Math.round(delta / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h}h ago`;
+  const d = Math.round(h / 24);
+  return `${d}d ago`;
+}
+
+function formatLastScreenshotLine(status: EngineStatus): string {
+  const ls = status.lastScreenshot;
+  if (!ls || !ls.path) return "";
+  const when = typeof ls.timestamp === "number"
+    ? ` (${formatRelativeTimestamp(ls.timestamp)})`
+    : "";
+  const mode = ls.renderMode ? `, mode=${ls.renderMode}` : "";
+  const cam = ls.cameraAngle ? `, camera=${ls.cameraAngle}` : "";
+  return `\nLast screenshot: ${ls.path}${when}${mode}${cam}`;
 }
 
 function formatStatusText(status: EngineStatus): string {
+  const lastShot = formatLastScreenshotLine(status);
   if (!status.success) {
     const hint = status.hint ? `\nHint: ${status.hint}` : "";
     const operation = status.operation ? `\nFailed operation: ${status.operation}` : "";
@@ -512,7 +553,7 @@ function formatStatusText(status: EngineStatus): string {
     const resetNote = status.engineReset
       ? `\nEngine was re-initialized after a WASM exception. Next call will take ~500ms.`
       : "";
-    return `Render FAILED\nError: ${status.error}${hint}${operation}${stack}${resetNote}\nFile: ${status.fileName || "unknown"}\nTip: call get_preview to view the last successful render for visual comparison (the PNG is NOT overwritten on failure).\nTime: ${status.timestamp}${SHAPEITUP_VERSION_TAG}`;
+    return `Render FAILED\nError: ${status.error}${hint}${operation}${stack}${resetNote}\nFile: ${status.fileName || "unknown"}\nTip: call get_preview to view the last successful render for visual comparison (the PNG is NOT overwritten on failure).${lastShot}\nTime: ${status.timestamp}${SHAPEITUP_VERSION_TAG}`;
   }
   const parts = status.partNames?.length ? `\nParts: ${status.partNames.join(", ")}` : "";
   const paramEntries = status.currentParams ? Object.entries(status.currentParams) : [];
@@ -554,9 +595,9 @@ function formatStatusText(status: EngineStatus): string {
   if (geomInvalid) {
     // Hoist the warnings block above stats so the structural problem is the
     // first thing the reader sees, not an otherwise-normal-looking summary.
-    return `${headline}\nFile: ${status.fileName || "unknown"}${warnings}\nStats: ${status.stats}${parts}${bbox}${material}${properties}${currentParams}${timings}\nTime: ${status.timestamp}${SHAPEITUP_VERSION_TAG}`;
+    return `${headline}\nFile: ${status.fileName || "unknown"}${warnings}\nStats: ${status.stats}${parts}${bbox}${material}${properties}${currentParams}${timings}${lastShot}\nTime: ${status.timestamp}${SHAPEITUP_VERSION_TAG}`;
   }
-  return `${headline}\nFile: ${status.fileName || "unknown"}\nStats: ${status.stats}${parts}${bbox}${material}${properties}${currentParams}${timings}${warnings}\nTime: ${status.timestamp}${SHAPEITUP_VERSION_TAG}`;
+  return `${headline}\nFile: ${status.fileName || "unknown"}\nStats: ${status.stats}${parts}${bbox}${material}${properties}${currentParams}${timings}${warnings}${lastShot}\nTime: ${status.timestamp}${SHAPEITUP_VERSION_TAG}`;
 }
 
 /**
@@ -1326,14 +1367,15 @@ async function executeWithPersistedParams(
 export function registerTools(server: McpServer) {
   server.tool(
     "create_shape",
-    "Create a new .shape.ts CAD script file and execute it. Fails if file already exists — use modify_shape to update existing files. Path resolution precedence: absolute `directory` used as-is; relative `directory` probed against each heartbeat-reported VSCode workspace root (first match wins), else `process.cwd()`; omitted `directory` defaults to the first active VSCode workspace root (or cwd if no extension is running).",
+    "Create a new .shape.ts CAD script file and execute it. Fails if file already exists — use modify_shape to update existing files. Path resolution precedence: absolute `directory` used as-is; relative `directory` probed against each heartbeat-reported VSCode workspace root (first match wins), else `process.cwd()`; omitted `directory` defaults to the first active VSCode workspace root (or cwd if no extension is running). Refuses to create a file when the resolved path contains a duplicated segment (e.g. `examples/examples/...`) unless `allowPathDuplication: true` is passed.",
     {
       name: z.string().describe("File name without extension (e.g., 'bracket')"),
       code: z.string().describe("TypeScript source code using Replicad API"),
       directory: z.string().optional().describe("Directory to create the file in. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first match wins), falling back to process.cwd(). When omitted, defaults to the active VSCode workspace root."),
       overwrite: z.boolean().optional().describe("Set to true to overwrite an existing file (default: false)"),
+      allowPathDuplication: z.boolean().optional().describe("Set to true to proceed (with a warning) when the resolved directory has a duplicated last-two segments (e.g. `.../examples/examples`). Default: false — the call refuses in that case and lists the recovery options. Absolute `directory` paths bypass this refusal regardless."),
     },
-    safeHandler("create_shape", async ({ name, code, directory, overwrite }) => {
+    safeHandler("create_shape", async ({ name, code, directory, overwrite, allowPathDuplication }) => {
       // Resolve `directory` with the same unified precedence as resolveShapePath:
       // absolute → use as-is; relative → probe each workspace root for an
       // existing directory; else anchor to cwd. For `create_shape` the
@@ -1378,6 +1420,35 @@ export function registerTools(server: McpServer) {
             content: [{
               type: "text" as const,
               text: `create_shape: cannot auto-resolve directory because MCP shell cwd and VSCode workspace disagree.\n  shell cwd:         ${cwdAbs}\n  VSCode workspace:  ${defaultDir}\nPass 'directory' explicitly (either of the above, or any other path) to proceed.`,
+            }],
+            isError: true,
+          };
+        }
+      }
+
+      // Fix #4: hard refusal on duplicated-segment resolution. The previous
+      // behaviour emitted a "path doubled" warning and created the file anyway
+      // (e.g. cwd=examples + directory="examples" → `examples/examples/...`).
+      // That near-universally surprised the caller — the warning was read as
+      // advisory, not as a sign the path they wanted had slipped. Now we
+      // refuse unless (a) `directory` is absolute (the caller is fully
+      // explicit), or (b) `allowPathDuplication: true` is passed (opt-in).
+      if (directory && !allowPathDuplication) {
+        const dupInfo = detectPathDoublingInfo(dir);
+        const dirWasAbsolute = isAbsolute(directory);
+        if (dupInfo && !dirWasAbsolute) {
+          return {
+            content: [{
+              type: "text" as const,
+              text:
+                `create_shape: refusing to create file at ${join(dupInfo.absoluteDir, `${name}.shape.ts`)} — the path segment "${dupInfo.duplicatedSegment}" appears twice in the resolved directory.\n` +
+                `Resolved directory: ${dupInfo.absoluteDir}\n` +
+                `Duplicated segment: "${dupInfo.duplicatedSegment}"\n` +
+                `This usually means the MCP shell cwd is already inside "${dupInfo.duplicatedSegment}" and you passed directory: "${directory}" on top of it.\n` +
+                `Recovery options:\n` +
+                `  (a) Pass an absolute path, e.g. directory: "${dupInfo.absoluteDir}"\n` +
+                `  (b) Pass allowPathDuplication: true to confirm the intent and proceed with just a warning.\n` +
+                `  (c) Pass directory: "." if you meant to create the file at the current location.`,
             }],
             isError: true,
           };
@@ -1434,11 +1505,36 @@ export function registerTools(server: McpServer) {
       const cwdNote = shouldEmit
         ? `\n(Resolved to VSCode workspace ${dir}; shell cwd is ${cwd}. Pass 'directory' explicitly to override.)`
         : "";
+
+      // Fix #4 (companion): when a RELATIVE `directory` was passed and the
+      // resolver fell back to the first workspace root (because no workspace
+      // probe matched a real directory), emit an extra line calling out the
+      // mismatch between the chosen workspace and the shell cwd. This does
+      // NOT refuse — it's the broader "we chose a plausible path but you
+      // should double-check" case. The user's saved memory about silent
+      // workspace routing surprises (workspace_mismatch.md) is exactly what
+      // this warning targets.
+      let fallbackWarning = "";
+      if (directory && !isAbsolute(directory)) {
+        const wsRoots = getHeartbeatWorkspaceRoots();
+        const probedMatch = wsRoots.some(
+          (r) => existsSync(resolve(r, directory)),
+        );
+        if (!probedMatch && wsRoots.length > 0 && !dirMatchesCwd) {
+          fallbackWarning =
+            `\nNote: no VSCode workspace contained a pre-existing '${directory}' directory, so the resolver fell back to the first workspace root.\n` +
+            `  chosen workspace: ${wsRoots[0]}\n` +
+            `  shell cwd:        ${cwd}\n` +
+            `  final path:       ${filePath}\n` +
+            `If that wasn't your intent, pass an absolute 'directory' or set 'directory: "."' to anchor to shell cwd.`;
+        }
+      }
+
       const doubledWarning = directory ? detectPathDoubling(dir) : "";
       const actionWord = contentIdenticalNoOp
         ? "Unchanged (content-identical re-create)"
         : overwrite ? "Overwrote" : "Created";
-      const prefix = `${actionWord} ${filePath}${cwdNote}${doubledWarning}\n`;
+      const prefix = `${actionWord} ${filePath}${cwdNote}${fallbackWarning}${doubledWarning}\n`;
       return {
         content: [{ type: "text" as const, text: prefix + formatStatusText(status) }],
         isError: !status.success,
@@ -1981,6 +2077,25 @@ export function registerTools(server: McpServer) {
                   ? `\nPart warnings: ${result.partWarnings.join("; ")}`
                   : "";
                 screenshotLine = `\nScreenshot: ${result.screenshotPath}${partsLine}${partWarnLine}`;
+                // Fix #6: record the screenshot on the status file so
+                // `get_render_status` can surface it. Snippet renders use
+                // the tempPath as fileName — it's the only sensible label,
+                // even though the snippet won't survive the tool call.
+                try {
+                  appendScreenshotMetadata(
+                    {
+                      timestamp: Date.now(),
+                      path: result.screenshotPath,
+                      renderMode: "ai",
+                      cameraAngle: "isometric",
+                      fileName: basename(tempPath),
+                      sourceFile: tempPath,
+                    },
+                    GLOBAL_STORAGE,
+                  );
+                } catch {
+                  // Best effort.
+                }
               }
             }
           }
@@ -2147,6 +2262,24 @@ export function registerTools(server: McpServer) {
             } else if (result.screenshotPath) {
               responseText += `\nScreenshot: ${result.screenshotPath}`;
               capturedScreenshotPath = result.screenshotPath;
+              // Fix #6: record the tune_params screenshot. Matches
+              // render_preview / preview_shape so get_render_status always
+              // reflects the most recent PNG regardless of which tool made it.
+              try {
+                appendScreenshotMetadata(
+                  {
+                    timestamp: Date.now(),
+                    path: result.screenshotPath,
+                    renderMode: "ai",
+                    cameraAngle: "isometric",
+                    fileName: basename(absPath),
+                    sourceFile: absPath,
+                  },
+                  GLOBAL_STORAGE,
+                );
+              } catch {
+                // Best effort.
+              }
             }
           }
         }
@@ -2659,6 +2792,29 @@ export function registerTools(server: McpServer) {
           } catch {
             // keep raw screenshotPath
           }
+        }
+
+        // Fix #6: append screenshot metadata to shapeitup-status.json. The
+        // VSCode extension deliberately does NOT write the status file on
+        // render (it would clobber the engine's authoritative record), so
+        // without this hop, `get_render_status` can never surface the fact
+        // that a PNG was just produced. Additive only — other fields (stats,
+        // warnings, geometryValid, etc.) are untouched, and subsequent
+        // failed renders preserve this field (see engine.ts:writeStatusFile).
+        try {
+          appendScreenshotMetadata(
+            {
+              timestamp: Date.now(),
+              path: screenshotPath,
+              renderMode: renderMode || "ai",
+              cameraAngle: cameraAngle || "isometric",
+              fileName: basename(source),
+              sourceFile: source,
+            },
+            GLOBAL_STORAGE,
+          );
+        } catch {
+          // Best effort — never block the response on observability.
         }
 
         const finderLine = finder !== undefined && finder.trim().length > 0
