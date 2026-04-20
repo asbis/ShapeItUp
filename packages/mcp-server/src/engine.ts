@@ -103,6 +103,15 @@ export interface EngineStatus {
    * warn the agent that the NEXT call will pay ~500ms of OCCT re-init.
    */
   engineReset?: boolean;
+  /**
+   * Set when the entry `.shape.ts` declares no `export const params` but the
+   * execution still returned a populated `params` object — meaning those
+   * params were inlined from an imported module. Without this flag users
+   * would see "Current params: {...}" in the render status and assume the
+   * entry's sliders, when in fact no sliders apply. The formatter surfaces
+   * this as a warning line alongside `Current params`.
+   */
+  importedParamsWarning?: string;
   timestamp: string;
 }
 
@@ -281,6 +290,15 @@ export async function executeShapeFile(
       // `sourceURL` directive is present. No extra runtime deps — the
       // VM does the mapping.
       sourcemap: "inline",
+      // Multi-file .shape.ts disambiguation: see viewer-provider.ts for the
+      // full rationale. esbuild renames imported `main`/`params` bindings
+      // (e.g. `main2`) while the entry's stay bare; stamping the entry's
+      // names onto globalThis AFTER the rename pass lets the executor
+      // pick the correct entry `main` regardless of output ordering.
+      footer: {
+        js: ';try { if (typeof main !== "undefined") globalThis.__SHAPEITUP_ENTRY_MAIN__ = main; } catch(e){}\n'
+          + ';try { if (typeof params !== "undefined") globalThis.__SHAPEITUP_ENTRY_PARAMS__ = params; } catch(e){}',
+      },
       logLevel: "silent",
     });
     // Treat "Could not resolve" warnings as hard errors — a missing local
@@ -339,6 +357,18 @@ export async function executeShapeFile(
     const currentParams: Record<string, number> = {};
     for (const p of result.params) currentParams[p.name] = p.value;
 
+    // When the entry declared no `export const params` but the executor
+    // still harvested a non-empty params object, those entries came from an
+    // imported module's bundled-in declaration — not from the file the user
+    // is editing. Surface this explicitly so "Current params: {...}" in the
+    // formatted status isn't silently misleading.
+    const entryDeclaredNone =
+      !status.declaredParams || status.declaredParams.length === 0;
+    const importedParamsWarning =
+      entryDeclaredNone && Object.keys(currentParams).length > 0
+        ? "Entry file declares no 'export const params'. Current params shown are from an imported module."
+        : undefined;
+
     const geometryErrorParts = (result.geometryIssues ?? [])
       .filter((i) => i.severity === "error")
       .map((i) => i.part);
@@ -360,6 +390,7 @@ export async function executeShapeFile(
       geometryErrorParts: geometryErrorParts.length > 0 ? geometryErrorParts : undefined,
       properties,
       material: result.material,
+      importedParamsWarning,
       timestamp: new Date().toISOString(),
     };
     writeStatusFile(successStatus, globalStorageDir);

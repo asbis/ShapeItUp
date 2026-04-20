@@ -229,6 +229,36 @@ export function executeScript(
 
   const code = rewriteImports(jsForRewrite);
 
+  // Multi-file .shape.ts bundles collision detection.
+  //
+  // When a user's entry `.shape.ts` imports other `.shape.ts` modules that each
+  // define `export default function main(...)` and `export const params`,
+  // esbuild inlines them all. To avoid local-variable collisions it renames
+  // the non-entry bindings to `main2`, `params2`, etc. The entry file's
+  // bindings keep the bare names `main` and `params`.
+  //
+  // Before the footer-injection fix the ambient `typeof main !== "undefined"`
+  // lookup inside the wrapper could bind to the LAST declared `main` in the
+  // bundle (depending on esbuild's output shape) rather than the entry's.
+  // Two symptoms:
+  //   - the wrong shape rendered, but "Render SUCCESS" still reported,
+  //   - `result.params` came from an imported module's declaration.
+  //
+  // With the `__SHAPEITUP_ENTRY_MAIN__` / `__SHAPEITUP_ENTRY_PARAMS__` globals
+  // (set by the esbuild footer in both the extension host and the MCP engine
+  // at bundle time) we now prefer the canonical entry bindings. This regex
+  // scan surfaces an advisory warning when the bundle shows signs of having
+  // merged multiple `main`/`params` declarations so the user can switch the
+  // imported modules to named factories.
+  if (/\b(?:var|let|const|function)\s+(?:main\d+|params\d+)\b/.test(code)) {
+    pushRuntimeWarning(
+      "Multi-file bundle detected multiple `main` symbols — using entry " +
+        "file's `main`. For library `.shape.ts` modules, export named " +
+        "factories (e.g. `export function makePart(...)`) instead of " +
+        "`export default main`.",
+    );
+  }
+
   const wrapped = `
     return (function(__replicad__, __shapeitup__, __paramOverrides__) {
       function highlightFinder(__shape__, __finder__, __opts__) {
@@ -273,7 +303,33 @@ export function executeScript(
 
       ${code}
 
-      var __params__ = typeof params !== "undefined" ? params : {};
+      // Prefer the canonical entry markers when present. The esbuild footer
+      // in both bundling call sites (viewer-provider.ts + engine.ts) assigns
+      // \`main\` and \`params\` from the ENTRY file's scope after esbuild's
+      // internal rename pass, so when the entry imports another .shape.ts
+      // that also exports a default \`main\`, we still pick the entry's.
+      //
+      // We read the markers then delete them immediately so subsequent
+      // executions on the same process (MCP engine lives across tool
+      // invocations) don't leak a stale "last run's entry main" into a
+      // script that forgot to declare one of its own.
+      var __entryMain__ = (typeof globalThis !== "undefined" && globalThis.__SHAPEITUP_ENTRY_MAIN__) || undefined;
+      var __entryParams__ = (typeof globalThis !== "undefined" && globalThis.__SHAPEITUP_ENTRY_PARAMS__) || undefined;
+      try {
+        if (typeof globalThis !== "undefined") {
+          globalThis.__SHAPEITUP_ENTRY_MAIN__ = undefined;
+          globalThis.__SHAPEITUP_ENTRY_PARAMS__ = undefined;
+        }
+      } catch (e) {}
+
+      var __resolvedMain__ = (typeof __entryMain__ === "function")
+        ? __entryMain__
+        : (typeof main !== "undefined" ? main : undefined);
+      var __resolvedParams__ = (__entryParams__ && typeof __entryParams__ === "object")
+        ? __entryParams__
+        : (typeof params !== "undefined" ? params : {});
+
+      var __params__ = __resolvedParams__ || {};
 
       if (__paramOverrides__) {
         for (var k in __paramOverrides__) {
@@ -282,11 +338,11 @@ export function executeScript(
       }
 
       var __result__;
-      if (typeof main === "function") {
-        if (main.length > 0) {
-          __result__ = main(__params__);
+      if (typeof __resolvedMain__ === "function") {
+        if (__resolvedMain__.length > 0) {
+          __result__ = __resolvedMain__(__params__);
         } else {
-          __result__ = main();
+          __result__ = __resolvedMain__();
         }
       } else {
         throw new Error("Script must export a default function named 'main'");

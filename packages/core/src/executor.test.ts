@@ -922,3 +922,118 @@ describe("patchShapeFuseNoOpGuard — warns when fuse adds zero material", () =>
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Multi-file .shape.ts entry disambiguation
+//
+// When an assembly `.shape.ts` imports other `.shape.ts` modules that each
+// define `export default function main(...)`, esbuild inlines them all and
+// renames the imported bindings (`main2`, `params2`, etc.) to avoid local
+// collisions. The executor previously used `typeof main !== "undefined"`
+// which, depending on esbuild's output ordering, could bind to the WRONG
+// `main` and silently render a single part with "Render SUCCESS" text.
+//
+// The fix injects `globalThis.__SHAPEITUP_ENTRY_MAIN__` / `..._ENTRY_PARAMS__`
+// via an esbuild footer (see viewer-provider.ts + engine.ts), and the
+// executor prefers those canonical markers. A collision-detection regex in
+// the executor also pushes a runtime warning via the stdlib channel so the
+// user can switch their library modules to named factories.
+// ---------------------------------------------------------------------------
+
+describe("executeScript — multi-file entry disambiguation", () => {
+  beforeEach(() => {
+    resetRuntimeWarnings();
+    // Ensure no stray markers from a prior test leak into this one.
+    const g = globalThis as any;
+    g.__SHAPEITUP_ENTRY_MAIN__ = undefined;
+    g.__SHAPEITUP_ENTRY_PARAMS__ = undefined;
+  });
+
+  it("prefers the canonical __SHAPEITUP_ENTRY_MAIN__ marker over a bare bundled `main`", () => {
+    // Simulate what a bundled multi-file script looks like after esbuild has
+    // renamed the imported module's main to `main2`, and the footer has
+    // stamped the entry's `main` onto globalThis. The wrapped code still
+    // contains bare `main` and `params` declarations (for esbuild internal
+    // reasons), but the executor must pick the entry one.
+    const g = globalThis as any;
+    // The "wrong" bundled main — this is what would win under the old
+    // ambient-lookup path if it happened to be last. We make it fail the
+    // test if called by having it return a sentinel we don't expect.
+    const js = `
+      function main2() { return "WRONG_IMPORTED_MAIN"; }
+      var params2 = { importedOnly: 1 };
+      function main() { return "ENTRY_MAIN_FROM_BARE"; }
+      var params = { entryFromBare: 1 };
+      export { main as default, params };
+    `;
+    // Stamp the entry marker, mimicking the esbuild footer.
+    g.__SHAPEITUP_ENTRY_MAIN__ = () => "ENTRY_MAIN_FROM_MARKER";
+    g.__SHAPEITUP_ENTRY_PARAMS__ = { entryFromMarker: 42 };
+
+    const { result, params } = executeScript(js, {}, {});
+    expect(result).toBe("ENTRY_MAIN_FROM_MARKER");
+    expect(params.map((p) => p.name)).toEqual(["entryFromMarker"]);
+  });
+
+  it("clears the canonical markers after execution so the next run doesn't leak", () => {
+    const g = globalThis as any;
+    g.__SHAPEITUP_ENTRY_MAIN__ = () => 1;
+    g.__SHAPEITUP_ENTRY_PARAMS__ = { a: 1 };
+    const js = `
+      function main() { return 99; }
+      export { main as default };
+    `;
+    executeScript(js, {}, {});
+    expect(g.__SHAPEITUP_ENTRY_MAIN__).toBeUndefined();
+    expect(g.__SHAPEITUP_ENTRY_PARAMS__).toBeUndefined();
+  });
+
+  it("falls back to bare `main` / `params` when no canonical markers are set", () => {
+    // Single-file scripts have no footer because the bundler doesn't run for
+    // them (test path) — the ambient lookup still has to work.
+    const js = `
+      var params = { width: 10 };
+      function main({ width }) { return width * 2; }
+      export { main as default, params };
+    `;
+    const { result, params } = executeScript(js, {}, {});
+    expect(result).toBe(20);
+    expect(params.map((p) => p.name)).toEqual(["width"]);
+  });
+
+  it("emits a runtime warning when the bundle contains `main2` / `params2` symbols", () => {
+    // This is the collision smell — esbuild only renames to `nameN` when two
+    // modules declared the same name. The warning tells the user to switch
+    // library modules to named factories.
+    const g = globalThis as any;
+    g.__SHAPEITUP_ENTRY_MAIN__ = () => "ok";
+    const js = `
+      function main2() { return "imported"; }
+      var params2 = { importedOnly: 1 };
+      function main() { return "entry"; }
+      export { main as default };
+    `;
+    executeScript(js, {}, {});
+    const warnings = drainRuntimeWarnings();
+    expect(warnings.length).toBeGreaterThanOrEqual(1);
+    const multiFileWarn = warnings.find((w) =>
+      /Multi-file bundle detected multiple `main` symbols/.test(w),
+    );
+    expect(multiFileWarn).toBeDefined();
+    expect(multiFileWarn!).toMatch(/named factories/i);
+  });
+
+  it("does NOT emit the collision warning for single-file scripts", () => {
+    const js = `
+      var params = { a: 1 };
+      function main() { return 1; }
+      export { main as default, params };
+    `;
+    executeScript(js, {}, {});
+    const warnings = drainRuntimeWarnings();
+    const hit = warnings.find((w) =>
+      /Multi-file bundle detected multiple `main` symbols/.test(w),
+    );
+    expect(hit).toBeUndefined();
+  });
+});
