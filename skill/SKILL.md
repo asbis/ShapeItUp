@@ -12,6 +12,7 @@ This skill gives you breadth: what to call, when, how. For depth (full signature
 
 - [AI Workflow (decision tree)](#ai-workflow)
 - [Available MCP Tools](#available-mcp-tools)
+- [Plane orientation (read this first)](#plane-orientation-read-this-first)
 - [Top Best Practices](#top-best-practices)
 - [File Convention](#file-convention)
 - [Core Concepts](#core-concepts)
@@ -84,10 +85,24 @@ All 19 tools. Dense reference — use this table to find the right tool fast.
 
 ---
 
+## Plane orientation (read this first)
+
+The single most common first-time mistake in this library — wrong extrude direction. Memorize:
+
+```
+XY → extrudes +Z (up)
+XZ → extrudes -Y (toward camera)
+YZ → extrudes +X
+```
+
+No exceptions, no flags, no "it depends". To flip direction, use the reverse-named plane (`YX` → -Z, `ZX` → +Y, `ZY` → -X) or pass a negative extrude depth (`.extrude(-L)`). `sketchOnPlane("XZ", [0, 0, 20])`'s origin offset is in WORLD coordinates, so the `[0, 0, 20]` raises along world Z, NOT along the XZ plane's local axis.
+
+---
+
 ## Top Best Practices
 
 1. **Always `export const params = { ... }`** so the user gets live sliders and `tune_params` works.
-2. **Add `export const material = { density, name }`** (g/cm³) — `get_render_status` then returns mass per part. Common densities: steel 7.85, aluminum 2.70, brass 8.40, ABS 1.05, PLA 1.24, PETG 1.27, wood ~0.7, water 1.0.
+2. **Add `export const material = "PLA"`** (or any preset name) so `get_render_status` returns mass per part. Named presets: `"PLA"` (1.24), `"ABS"` (1.04), `"PETG"` (1.27), `"Nylon"` (1.15), `"Aluminum"` (2.70), `"Steel"` (7.85), `"Stainless"` (8.00), `"Brass"` (8.47), `"Titanium"` (4.50), `"Copper"` (8.96), `"Wood"` (0.60). Densities in g/cm³. For custom materials: `export const material = { density: 1.5, name: "custom" }`.
 3. **Use `tune_params` to scan values** before committing with `modify_shape` — binary-search fit tolerance, target volume, target mass without touching the file.
 4. **Trust the `Hint:` line** on render failures — it's operation-specific and usually correct.
 5. **Preview finders before applying them** — `preview_finder({ filePath, finder })` catches zero-match or over-match selections before a fillet/chamfer/shell crashes.
@@ -106,7 +121,7 @@ Every shape file uses `.shape.ts` and exports a default `main()` that returns a 
 import { drawRoundedRectangle } from "replicad";
 
 export const params = { width: 80, height: 50, depth: 30, wall: 2, cornerRadius: 5 };
-export const material = { density: 7.85, name: "steel" }; // g/cm³
+export const material = "Steel"; // or { density: 7.85, name: "custom" }
 
 export default function main({ width, height, depth, wall, cornerRadius }: typeof params) {
   const outer = drawRoundedRectangle(width, height, cornerRadius)
@@ -144,7 +159,7 @@ Each part gets its own color in the viewer and becomes a named component in STEP
 - **Flow**: Drawing (2D) → Sketch (placed on a plane) → Shape3D (extruded/revolved/lofted/swept).
 - **Units**: millimeters.
 - **Axes**: X right, Y forward, Z up.
-- **Planes**: `"XY"` (top), `"XZ"` (front), `"YZ"` (right). Prefix with `-` to flip normal.
+- **Planes**: see [Plane orientation](#plane-orientation-read-this-first) at the top of this doc — `"XY"` extrudes +Z, `"XZ"` extrudes **-Y** (toward camera), `"YZ"` extrudes +X. Reverse-named planes (`"YX"` / `"ZX"` / `"ZY"`) or a negative extrude depth flip the direction.
 - **`sketchOnPlane(plane, origin?)` origin semantics**: `origin` is an offset in WORLD coordinates, NOT plane-local. `sketchOnPlane("XY", [0, 0, 20])` raises the sketch to Z=20. `sketchOnPlane("XZ", [10, 0, 0])` shifts it along world X.
 
 ---
@@ -304,9 +319,12 @@ const shaped = rawShape.cut(mold);  // removes everything outside the ellipsoid
 shape.fillet(2)                                    // all edges
 shape.fillet(2, e => e.inDirection("Z"))           // filtered
 shape.chamfer(1, e => e.inPlane("XY", 0))          // similar API
-shape.shell({ thickness: 2, filter: f => f.inPlane("XY", height) })
+shape.shell(2, f => f.inPlane("XY", height))       // positional form — callback OK
+shape.shell({ thickness: 2, filter: new FaceFinder().inPlane("XY", height) })
 shape.draft(angleDeg, faceFinder, neutralPlane?)
 ```
+
+> `shell`'s callback form ONLY works positionally. The config-object form's `filter` must be a `FaceFinder` *instance* — passing a lambda there throws `filter.find is not a function`.
 
 ---
 
@@ -377,6 +395,8 @@ export default function main() {
 ```
 
 Options: `{ color?, shapeColor?, radius? }`. Works with both EdgeFinder and FaceFinder. Prefer the `preview_finder` MCP tool when you don't want to edit the file.
+
+**Debugging finder selectors on a failing script.** `preview_finder` needs a shape to match against, so it can't run on a script that crashes before the finder target exists. Workaround: pass a modified script via the `code` parameter with the failing operation commented out or replaced with a benign stub. The finder then runs against whatever shape exists at the point you choose — ideal for iterating on a selector before re-enabling the fillet/chamfer that was crashing.
 
 ---
 
@@ -526,7 +546,7 @@ export default function main({ baseR, midR, neckR, topR, height }: typeof params
   const neck  = drawCircle(neckR).sketchOnPlane("XY", [0, 0, height * 0.75]);
   const top   = drawCircle(topR).sketchOnPlane("XY", [0, 0, height]);
   return base.loftWith([belly, neck, top], { ruled: false })
-    .shell({ thickness: 2, filter: (f: any) => f.inPlane("XY", height) });
+    .shell(2, (f: any) => f.inPlane("XY", height));
 }
 ```
 
@@ -574,7 +594,7 @@ export default function main() {
 Mechanical / 3D-printing helpers layered on top of Replicad. **Use these instead of re-deriving standards dimensions by hand** — you'll get correct ISO/DIN sizes, consistent orientation, and FDM-tuned fits on the first try.
 
 ```typescript
-import { holes, screws, nuts, washers, inserts, bearings, extrusions, printHints } from "shapeitup";
+import { holes, screws, bolts, washers, inserts, bearings, extrusions, printHints } from "shapeitup";
 ```
 
 **Cut-tool orientation convention** — every hole/seat/pocket helper returns a Shape3D with axis +Z, top at Z=0, extending into -Z. Translate it to the target location, then `.cut()`:
@@ -584,7 +604,7 @@ plate.cut(holes.counterbore("M3", { plateThickness: 4 }).translate(10, 10, 4))
 // Note: Z = plate_thickness, so the pocket's top aligns with the plate's top face.
 ```
 
-**Positive-shape convention** (screws, nuts, bearings bodies) — top at Z=0, body/shaft extends into -Z.
+**Positive-shape convention** (screws, nuts, bearing bodies — where "nut" is `screws.nut`/`bolts.nut`, not a separate `nuts.*` namespace) — top at Z=0, body/shaft extends into -Z.
 
 **Back-face cuts** — wrap a cut tool in `fromBack()` to flip it so it opens upward from Z=0. Useful for heat-set insert pockets / through-features on the bottom face of a plate whose underside sits at Z=0:
 
@@ -604,30 +624,94 @@ plate.cut(hole);  // OK
 ### holes — cut tools
 
 ```typescript
-holes.through("M3", { depth?, fit? })                     // clearance hole; or raw number for plain cylinder
-holes.counterbore("M3", { plateThickness, fit? })         // socket-head pocket + shaft
-holes.countersink("M4", { plateThickness, fit? })         // 90° flat-head flare + shaft
-holes.tapped("M3", { depth })                             // tap-drill sized
-holes.teardrop("M3", { depth, axis?: "X" | "Y" })         // FDM-printable horizontal hole
-holes.keyhole({ largeD, smallD, slot, depth })            // hang-on-screw mount
-holes.slot({ length, width, depth })                      // elongated adjustment slot
+holes.through("M3", { depth?, fit?, axis? })              // clearance hole; or raw number for plain cylinder
+holes.clearance("M3", { depth?, fit?, axis? })            // alias of `through` — same signature, common engineering term
+holes.counterbore("M3", { plateThickness, fit?, axis? })  // socket-head pocket + shaft
+holes.countersink("M4", { plateThickness, fit?, axis? })  // 90° flat-head flare + shaft
+holes.tapped("M3", { depth, axis? })                      // tap-drill sized
+holes.teardrop("M3", { depth, axis?: "+X" | "+Y" })       // FDM-printable horizontal hole (own +X/+Y axis set)
+holes.keyhole({ largeD, smallD, slot, depth, axis? })     // hang-on-screw mount
+holes.slot({ length, width, depth, axis? })               // elongated adjustment slot
 ```
 
 `fit`: `"press" | "slip" | "clearance"` (default) `| "loose"`. For FDM, `clearance` is usually right.
 
-### screws / nuts / washers / inserts — positive shapes
+Supported metric sizes: `M2`, `M2.5`, `M3`, `M4`, `M5`, `M6`, `M8`, `M10`, `M12`. (Not every table covers every size — button/flat-head start at M3; heat-set inserts stop at M5. Unknown sizes throw a readable `Unknown metric size` error listing what the table supports.)
+
+**String vs. raw diameter are NOT equivalent.** `holes.through("M4", …)` applies an ISO 273 clearance fit (~4.5mm for the default `"clearance"` fit style); `holes.through(4, …)` cuts a literal 4mm hole. Common nominal sizes (3, 4, 5, 6, 8, 10, 12) are easily confused — prefer the string form unless you specifically need a raw dimension. The stdlib emits a runtime warning when a raw integer matches a nominal size; pass a non-integer (e.g. `4.0001`) to suppress the warning when the literal diameter is intentional.
+
+`axis` (default `"+Z"`): one of `"+Z"` | `"-Z"` | `"+X"` | `"-X"` | `"+Y"` | `"-Y"`. **Axis names the face the hole OPENS ON** — the body penetrates in the OPPOSITE direction (into the material). So `axis: "+X"` means the hole's mouth sits on the part's +X face, and the cutter body extends in -X. Teardrop uses its own `"+X"`/`"+Y"` axis set (legacy `"X"`/`"Y"` still accepted) — its convention is different (see teardrop docstring).
+
+Per-axis cutter geometry in the tool's local frame (before `.translate(...)`):
+
+| `axis` | opening at | body spans | drill points |
+|--------|------------|-----------|--------------|
+| `"+Z"` (default) | Z = 0 | Z ∈ [-depth, 0] | -Z |
+| `"-Z"`           | Z = 0 | Z ∈ [0, depth]  | +Z |
+| `"+X"`           | X = 0 | X ∈ [-depth, 0] | -X |
+| `"-X"`           | X = 0 | X ∈ [0, depth]  | +X |
+| `"+Y"`           | Y = 0 | Y ∈ [-depth, 0] | -Y |
+| `"-Y"`           | Y = 0 | Y ∈ [0, depth]  | +Y |
+
+**Drilling into walls**: translate to the face you want the hole to ENTER through, then pick the axis of that face.
 
 ```typescript
-screws.socketHead("M3x10")    // ISO 4762
-screws.buttonHead("M4x8")     // ISO 7380 (head is a plain cylinder in v1)
-screws.flatHead("M5x12")      // ISO 10642 — revolved cone head
-nuts.hex("M3")                // DIN 934
-washers.flat("M3")            // DIN 125
-inserts.heatSet("M3")         // brass body — for visualization
-inserts.pocket("M3")          // CUT-TOOL for the printed part's insert pocket
+// Vertical wall whose material occupies X ∈ [0, 5]. Drill a hole through it
+// from the +X side: translate to X=5 (the wall's +X face), pick axis "+X".
+wall.cut(holes.through("M5", { depth: 10, axis: "+X" }).translate(5, y, z))
+//                                          ^^^ opens on +X face, body penetrates -X into wall
+
+// Counterbore pocket on the +Y face of a flange at Y=thickness:
+flange.cut(holes.counterbore("M4", { plateThickness: t, axis: "+Y" }).translate(x, t, z))
+
+// Sideways adjustment slot: slot opens on the wall's +X face, pocket goes -X.
+wall.cut(holes.slot({ length: 20, width: 5, depth: 4, axis: "+X" }).translate(5, y, z))
 ```
 
-**For 3D printing**: print with `inserts.pocket`, melt in a brass heat-set insert, use `screws.socketHead` as the fastener. Don't model threaded holes — printed threads are unreliable.
+**Common mistake (pre-fix behavior)**: translating to the origin-side face (e.g. `translate(0, y, z)` with `axis: "+X"`) used to "work" because the body extended into +X. It now extends into -X and lands OUTSIDE the wall — you'll see the "cut produced no material removal" warning. Fix: translate to the wall's +X face coordinate, not X=0.
+
+**Z-convention — every hole tool spans `Z ∈ [-depth, 0]`**: the hole's top (entry) face sits AT `Z=0` and the body extends DOWNWARD into `-Z`. To cut from the top of a plate whose upper face is at `Z = plateTop`, translate by `plateTop`:
+
+```typescript
+plate.cut(holes.through("M3", { depth: 10 }).translate(x, y, plateTop))
+plate.cut(holes.counterbore("M3", { plateThickness: t }).translate(x, y, t))
+```
+
+Forgetting the Z translate leaves the cutter BELOW the plate and the boolean silently removes nothing. If you see a `patterns.cutAt` or `.cut()` "no material removal" warning, double-check the `.translate(0, 0, Z)` places the cutter INTO the plate, not above or below it. For cuts opening on the bottom face of a plate, wrap with `fromBack(...)` to flip the cutter into `+Z` — then translate to the bottom-face Z (usually 0).
+
+### screws / bolts / washers / inserts — positive shapes
+
+Two parallel namespaces for fasteners, same method names. Pick by intent:
+
+- `screws.*` — **cosmetic**: plain cylinder shafts, B-Rep, fast, composable with any Shape3D operation. Use for layouts and assemblies.
+- `bolts.*`  — **threaded**: real helical geometry. Use for STEP export and 3D-print previews. External fasteners return `Shape3D` (Compound, **not fuse-safe** — see note below); `bolts.nut` returns `MeshShape` (internal threads need the Manifold mesh kernel). Every external-bolt factory has a `*Mesh` twin that returns a fuse-safe `MeshShape`.
+
+```typescript
+screws.socket("M3x10")       // ISO 4762 cap screw, plain shaft
+screws.button("M4x8")        // ISO 7380 button-head
+screws.flat("M5x12")         // ISO 10642 countersunk
+screws.hex("M6x20")          // ISO 4017 hex bolt, plain shaft
+screws.nut("M3")             // DIN 934 hex nut, clean bore
+
+bolts.socket("M3x10")        // threaded Compound — STEP-friendly, NOT fuse-safe
+bolts.button("M4x8")
+bolts.flat("M5x12")
+bolts.hex("M6x20")
+bolts.nut("M3")              // MeshShape — see note below
+
+bolts.socketMesh("M3x10")    // threaded MeshShape — fuse-safe, use for bolt.fuse/cut
+bolts.buttonMesh("M4x8")
+bolts.flatMesh("M5x12")
+bolts.hexMesh("M6x20")
+
+washers.flat("M3")           // DIN 125 (no threads possible)
+inserts.heatSet("M3")        // brass body — for visualization
+inserts.pocket("M3")         // CUT-TOOL for the printed part's insert pocket
+```
+
+**Mixing mesh and B-Rep**: `bolts.nut(...)` is a MeshShape — you can't `plate.cut(nut)` directly if `plate` is Shape3D. Convert the plate first: `plate.meshShape({ tolerance: 0.01 }).cut(bolts.nut("M3"))`.
+
+**For 3D printing**: print with `inserts.pocket`, melt in a brass heat-set insert, use `screws.socket` as the fastener. Modeled threads work but print badly under M5 — prefer heat-set inserts for small sizes.
 
 ### bearings — seats + visualizations
 
@@ -659,6 +743,8 @@ patterns.linear(5, [10, 0, 0])                       // n, step vector
 
 patterns.spread(makeShape, placements)               // fuse N copies (positive shape)
 patterns.cutAt(target, makeTool, placements)         // subtract N copies (cut tool)
+patterns.cutTop(plate, makeTool, [x, y])             // single cut at the plate's top face
+patterns.cutBottom(plate, makeTool, [x, y])          // single cut at the plate's bottom face
 patterns.applyPlacement(shape, placement)            // low-level: apply a single placement
 ```
 
@@ -689,6 +775,19 @@ plate = patterns.cutAt(
   () => holes.through("M3"),
   patterns.grid(2, 2, width - 2*inset, depth - 2*inset),
 );
+```
+
+**`cutTop` / `cutBottom` — single-cut shorthand for plate-face features.** Infers the plate's top or bottom face Z from its bounding box, then translates the tool there. ONLY handles positioning — the tool's own depth (e.g. `counterbore`'s `plateThickness`) still lives in the factory:
+
+```typescript
+// Before (thickness t appears twice — easy to drift):
+plate.cut(holes.counterbore("M3", { plateThickness: t }).translate(x, y, t))
+
+// After:
+plate = patterns.cutTop(plate, () => holes.counterbore("M3", { plateThickness: t }), [x, y]);
+
+// Bottom-face heat-set pocket:
+plate = patterns.cutBottom(plate, () => inserts.pocket("M3"), [x, y]);
 ```
 
 ### printHints — FDM print-cleanliness
@@ -923,18 +1022,38 @@ See `examples/stdlib/linear-actuator-subassembled.shape.ts` for a side-by-side w
 
 Real helical threads via OCCT sweep. Mostly useful for STEP export to machine shops, large printable threads (M8+, jar lids, leadscrews), and visual fidelity in renders. Small threads (M2–M5) **don't survive FDM printing reliably** — use `inserts.pocket` + heat-set inserts instead.
 
+**Compound vs. Mesh form — pick one deliberately.** `threads.metric` and `threads.leadscrew` return a *Compound* (root cylinder + un-fused per-turn loops). That's fast and appropriate for **multi-part STEP export** where the thread renders as its own named part. It is **not fuse-safe**: OCCT's B-Rep boolean cannot merge the per-turn loops with another solid and produces non-manifold seams — `head.fuse(threads.metric(...))` will fail BRepCheck. Any time you want to combine a thread with another solid, use the `*Mesh` variants below — they route the boolean through the Manifold kernel (O(n log n), sub-second on WASM).
+
 ```typescript
 import { threads } from "shapeitup";
 
+// Compound form — STEP-export-friendly, NOT fuse-safe:
 threads.metric("M5", 20);                          // ISO coarse pitch (0.8mm)
 threads.metric("M5", 20, { pitch: "fine" });       // ISO fine pitch (0.5mm)
 threads.metric("M6", 30, { pitch: 1.5 });           // custom pitch
 
+// Mesh form — fuse-safe (MeshShape). Use this for "build a bolt" workflows:
+threads.metricMesh("M8", 30);                      // same signature as .metric
+threads.fuseThreaded(head, "M8", 30, [0, 0, -30]); // head can be Shape3D or MeshShape
+
 threads.tapHole("M5", 8);                           // CUT-TOOL for a tapped hole
 plate.cut(threads.tapHole("M5", 8).translate(x, y, plateTop));
 
-threads.leadscrew("TR8x8", 150);                    // 4-start trapezoidal leadscrew
-threads.leadscrew("TR8x2", 150);                    // single-start
+// Modeled internal threads — real helical ridges, returns fuse-safe MeshShape:
+threads.tapInto(plate, "M5", 8, [x, y, plateTop]);                 // metric
+threads.tapIntoTrap(plate, "TR8x8", 16, [x, y, plateTop]);         // trapezoidal (leadscrew nuts)
+
+// Chaining multiple taps on one plate — tapInto/tapIntoTrap both accept a
+// Shape3D OR an already-meshed MeshShape, so second-and-later calls work:
+let plate = drawRoundedRectangle(50, 25, 2).sketchOnPlane("XY").extrude(25);
+plate = threads.tapInto(plate, "M6", 15, [-12, 0, 25]);   // Shape3D → MeshShape
+plate = threads.tapInto(plate, "M6", 15, [ 12, 0, 25]);   // MeshShape → MeshShape
+return plate;
+// Note: the output is a MeshShape (Manifold mesh), not a B-Rep. Any
+// subsequent .fuse / .cut must be Manifold-compatible (MeshShape-to-MeshShape).
+
+threads.leadscrew("TR8x8", 150);                    // Compound (not fuse-safe)
+threads.leadscrewMesh("TR8x8", 150);                // MeshShape (fuse-safe)
 ```
 
 Low-level access for non-standard sizes:
@@ -944,4 +1063,4 @@ threads.external({ diameter: 10, pitch: 1.25, length: 30, profile: threads.metri
 threads.internal({ diameter: 8.5, pitch: 1.25, length: 10 });
 ```
 
-**Cost warning**: a 20mm M3 thread adds ~3000 triangles. For "looks threaded" needs, a plain `cylinder()` is 20× cheaper.
+**Cost warning**: a 20mm M3 thread adds ~3000 triangles. For "looks threaded" needs, a plain `cylinder()` is 20× cheaper. Mesh-form threads are sub-second to build but can't be re-combined with B-Rep booleans — once you pick `*Mesh`, downstream ops must be MeshShape-native.

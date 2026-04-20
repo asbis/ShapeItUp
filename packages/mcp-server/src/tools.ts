@@ -1,13 +1,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync, renameSync } from "fs";
-import { join, resolve, basename, dirname, isAbsolute } from "path";
+import { join, resolve, basename, dirname, isAbsolute, sep } from "path";
 import { homedir } from "os";
 import {
   executeShapeFile,
   exportLastToFile,
   getCore,
   getLastFileName,
+  resetCore,
   type EngineStatus,
   type ShapeProperties,
 } from "./engine.js";
@@ -48,6 +49,16 @@ const WAIT_GRACE_MS = 30_000;
 // preview_finder, render_preview).
 let lastWaitTimeoutReason: "dead" | "slow" | null = null;
 
+// Workspace-resolution note throttle. When `create_shape` (and any future
+// handler with similar logic) falls back to the VSCode workspace because the
+// shell cwd disagrees, we surface a one-liner telling the caller which dir
+// was chosen. Emitting that line on every call is noise — agents learn it
+// once and then every subsequent response carries a stale-feeling reminder.
+// Keep a per-process Set of workspace roots we've already announced and
+// suppress the note on repeat hits. Case-folded so Windows "C:\" vs "c:\"
+// collide correctly.
+const _emittedWorkspaceRoots = new Set<string>();
+
 function nextCommandId(): string {
   return ID_PREFIX + (++commandCounter);
 }
@@ -85,10 +96,205 @@ function readHeartbeat(): { timestamp?: number; workspaceRoots?: string[] } | nu
   }
 }
 
+interface WindowHeartbeat {
+  pid: number;
+  timestamp: number;
+  workspaceRoots: string[];
+}
+
+/**
+ * Read all per-pid heartbeat files (`shapeitup-heartbeat-<pid>.json`). Each
+ * VSCode window writes its own so the MCP server can enumerate live windows
+ * and compute which ONE owns a given file. Stale heartbeats (> 10s old) are
+ * filtered out so a crashed window doesn't get routed commands.
+ *
+ * Falls back to the legacy single-file heartbeat when no per-pid files exist,
+ * so older extension builds stay functional — in that case we only know about
+ * one window's worth of workspace roots.
+ */
+function readAllHeartbeats(): WindowHeartbeat[] {
+  const out: WindowHeartbeat[] = [];
+  try {
+    if (!existsSync(GLOBAL_STORAGE)) return out;
+    const now = Date.now();
+    for (const name of readdirSync(GLOBAL_STORAGE)) {
+      if (!name.startsWith("shapeitup-heartbeat-") || !name.endsWith(".json")) continue;
+      try {
+        const data = JSON.parse(readFileSync(join(GLOBAL_STORAGE, name), "utf-8"));
+        if (
+          typeof data?.timestamp === "number" &&
+          typeof data?.pid === "number" &&
+          Array.isArray(data?.workspaceRoots) &&
+          now - data.timestamp < 10_000
+        ) {
+          out.push({
+            pid: data.pid,
+            timestamp: data.timestamp,
+            workspaceRoots: data.workspaceRoots as string[],
+          });
+        }
+      } catch {}
+    }
+  } catch {}
+  if (out.length === 0) {
+    // Back-compat: older extensions only wrote the legacy single-file heartbeat.
+    const legacy = readHeartbeat();
+    if (legacy && typeof legacy.timestamp === "number" && Array.isArray(legacy.workspaceRoots)) {
+      out.push({
+        pid: -1,
+        timestamp: legacy.timestamp,
+        workspaceRoots: legacy.workspaceRoots,
+      });
+    }
+  }
+  return out;
+}
+
 function isExtensionAlive(): boolean {
   const hb = readHeartbeat();
   if (!hb) return false;
   return Date.now() - (hb.timestamp ?? 0) < 5000;
+}
+
+/**
+ * Returns the list of VSCode workspace roots reported by the most recent
+ * heartbeat, or an empty array when no extension is running / heartbeat is
+ * missing. Unlike `isExtensionAlive()`, this does NOT require the heartbeat to
+ * be fresh — multi-window VSCode setups can have stale heartbeats from a
+ * window that lost focus but still own files the agent is working on. We
+ * treat *any* heartbeat-reported workspace as a candidate for path resolution;
+ * liveness is a separate concern enforced elsewhere (render tools, etc.).
+ *
+ * When per-pid heartbeats exist, aggregate workspace roots across ALL live
+ * windows so path resolution can probe every workspace in the user's
+ * multi-window setup (not just whichever window happened to write the legacy
+ * single-file heartbeat last).
+ */
+function getHeartbeatWorkspaceRoots(): string[] {
+  const all = readAllHeartbeats();
+  if (all.length > 0) {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const hb of all) {
+      for (const root of hb.workspaceRoots) {
+        const key = resolve(root).toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          out.push(root);
+        }
+      }
+    }
+    return out;
+  }
+  const hb = readHeartbeat();
+  return Array.isArray(hb?.workspaceRoots) ? (hb!.workspaceRoots as string[]) : [];
+}
+
+/**
+ * Multi-window cross-talk fix: given an absolute file path, return the single
+ * workspace root (from any live window's heartbeat) that CONTAINS the file.
+ * Returns undefined when no live window owns the file — in that case callers
+ * should NOT add a targetWorkspaceRoot hint and will fall back to the legacy
+ * arbitration inside the extension.
+ *
+ * When multiple windows' workspaces contain the file (e.g. nested folders
+ * opened in two windows), the deepest (longest path) match is returned — the
+ * innermost workspace is the most specific owner.
+ */
+export function computeTargetWorkspaceRoot(filePath: string): string | undefined {
+  if (!isAbsolute(filePath)) return undefined;
+  const fp = resolve(filePath).toLowerCase();
+  const all = readAllHeartbeats();
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  for (const hb of all) {
+    for (const root of hb.workspaceRoots) {
+      const normalized = resolve(root).toLowerCase();
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      const withSep = normalized.endsWith(sep.toLowerCase()) || normalized.endsWith("/")
+        ? normalized
+        : normalized + sep.toLowerCase();
+      const withFwdSep = normalized.endsWith("/") ? normalized : normalized + "/";
+      if (fp === normalized || fp.startsWith(withSep) || fp.startsWith(withFwdSep)) {
+        candidates.push(root);
+      }
+    }
+  }
+  if (candidates.length === 0) return undefined;
+  // Pick the deepest (longest) match so nested workspaces resolve to the
+  // inner workspace, not an outer wrapper. A file in `drivhus/ShapeItUp/x.ts`
+  // should land at ShapeItUp, not drivhus.
+  candidates.sort((a, b) => b.length - a.length);
+  return candidates[0];
+}
+
+/**
+ * Verifies that a resolved shape path belongs to a workspace currently owned by
+ * some live extension host. Returns null if ownership is fine, or an MCP error
+ * response if the shape is in a workspace that no live host owns.
+ *
+ * This is the single source of truth — both render_preview and preview_finder
+ * must call it for EVERY invocation, not only the explicit-filePath branch.
+ * Uses readAllHeartbeats() so a multi-window setup is handled correctly: if
+ * *any* live window owns the file we're fine. When there are no live windows
+ * reporting workspace roots, we assume a single-window setup and defer to the
+ * extension's own arbitration.
+ */
+function assertWorkspaceOwned(source: string): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
+  const wsRoots = getHeartbeatWorkspaceRoots();
+  if (wsRoots.length === 0) return null; // No heartbeat — assume single-window setup, extension will arbitrate
+  const sourceAbs = resolve(source).toLowerCase();
+  const inAnyWs = wsRoots.some((r) => {
+    const rAbs = resolve(r).toLowerCase();
+    return sourceAbs === rAbs || sourceAbs.startsWith(rAbs + sep.toLowerCase());
+  });
+  if (inAnyWs) return null;
+  return {
+    content: [{
+      type: "text" as const,
+      text: `Shape is in a workspace not owned by any live ShapeItUp window. Open the correct workspace in VSCode, or close the other window.\n\nShape is at ${source}\nLive workspace roots: ${wsRoots.join(", ") || "(none)"}`,
+    }],
+    isError: true,
+  };
+}
+
+/**
+ * Runs `op` with a resolved file path. If `code` is provided, writes it to a
+ * temp .shape.ts in `workingDir` (or a private globalStorage path when
+ * unspecified), runs `op` with that path, and always cleans up the temp file.
+ * Otherwise uses `filePath` directly.
+ *
+ * Used by preview_shape, preview_finder, and check_collisions so they all
+ * accept either `filePath` OR `code` — no need to preview_shape first and hope
+ * the temp file survives long enough for the follow-up call.
+ */
+async function withShapeFile<T>(
+  args: { filePath?: string; code?: string; workingDir?: string },
+  op: (absPath: string) => Promise<T>,
+): Promise<T> {
+  if (args.code !== undefined) {
+    let dir: string;
+    if (args.workingDir !== undefined) {
+      // Same rule as every other path arg: relative paths probe workspace roots.
+      dir = resolveShapePath(args.workingDir);
+    } else {
+      // Default: isolated globalStorage snippets dir — matches preview_shape's
+      // behavior when `workingDir` is omitted.
+      dir = join(GLOBAL_STORAGE, "preview-snippets");
+      mkdirSync(dir, { recursive: true });
+    }
+    const stamp = Date.now() + "-" + Math.floor(Math.random() * 100000);
+    const tempPath = join(dir, `.shapeitup-snippet-${stamp}.shape.ts`);
+    writeFileSync(tempPath, args.code, "utf-8");
+    try {
+      return await op(tempPath);
+    } finally {
+      try { unlinkSync(tempPath); } catch {}
+    }
+  }
+  if (!args.filePath) throw new Error("Either `filePath` or `code` must be provided.");
+  return op(resolveShapePath(args.filePath));
 }
 
 /**
@@ -110,18 +316,39 @@ function getDefaultDirectory(): string {
 }
 
 /**
- * Resolve a user-supplied `filePath` argument to an absolute path. Absolute
- * inputs pass through `resolve` unchanged; relative inputs anchor against
- * `getDefaultDirectory()` (the active VSCode workspace root, or cwd when the
- * extension isn't running) instead of `process.cwd()`. Plain `resolve(filePath)`
- * is wrong here: when VSCode/Claude Code spawns the MCP stdio child, cwd is
- * the extension's install dir — so a relative "bracket.shape.ts" handed to
- * modify/read/delete/open would miss the file the agent just created in the
- * workspace.
+ * Resolve a user-supplied `filePath` argument to an absolute path. Unified
+ * precedence for EVERY tool (create/modify/open/read/delete/list + all
+ * render/preview variants):
+ *   1. Absolute path — pass through `resolve()` unchanged.
+ *   2. Relative path — probe each heartbeat-reported VSCode workspace root in
+ *      order; the first one where `resolve(wsRoot, filePath)` exists wins.
+ *      This means the agent doesn't need to know which VSCode window has
+ *      focus: whichever workspace actually contains the file services the
+ *      request. No-match falls through.
+ *   3. Fallback — resolve against `process.cwd()`.
+ *
+ * Motivation: plain `resolve(filePath)` is wrong for stdio MCP children
+ * because cwd is usually the extension's install dir / user's home, not the
+ * workspace. A heartbeat-first policy that only consulted the FIRST workspace
+ * (the previous implementation) broke multi-workspace setups where the file
+ * lives in the second window. The `existsSync` probe disambiguates safely —
+ * creating a NEW file in one workspace still works because only that workspace's
+ * resolution will match on subsequent calls.
  */
 function resolveShapePath(filePath: string): string {
   if (isAbsolute(filePath)) return resolve(filePath);
-  return resolve(getDefaultDirectory(), filePath);
+  const wsRoots = getHeartbeatWorkspaceRoots();
+  for (const root of wsRoots) {
+    const candidate = resolve(root, filePath);
+    if (existsSync(candidate)) return candidate;
+  }
+  // No workspace owns the file. Fall back to cwd — callers will hit a
+  // "File not found" check against the returned absolute path and can
+  // disambiguate from there. We used to anchor to the first workspace root
+  // here too, but that meant a typo like "test-feedback/foo.shape.ts"
+  // (missing the `examples/` prefix) would deterministically resolve to
+  // `<root>/test-feedback/foo.shape.ts` — wrong directory, confusing error.
+  return resolve(process.cwd(), filePath);
 }
 
 async function waitForResult(commandId: string, timeoutMs: number): Promise<any> {
@@ -176,11 +403,43 @@ function extensionOfflineError(tool: string) {
  * Best-effort: when an MCP operation changes the current shape, poke the
  * extension so its live viewer re-renders the same file. Fires and forgets —
  * if VSCode isn't running, nothing happens and MCP still succeeds.
+ *
+ * The targetWorkspaceRoot hint routes the command to the single window whose
+ * workspace owns the file — without it, multi-window setups silently process
+ * the open-shape in every window that happens to read the command file.
  */
 function notifyExtensionOfShape(filePath: string): void {
   if (isExtensionAlive()) {
-    sendExtensionCommand("open-shape", { filePath });
+    const targetWorkspaceRoot = computeTargetWorkspaceRoot(filePath);
+    sendExtensionCommand("open-shape", { filePath, targetWorkspaceRoot });
   }
+}
+
+/**
+ * Soft-warning detector for path-segment doubling in create_shape.
+ *
+ * When the MCP shell cwd's basename matches the user-supplied relative
+ * `directory` arg (e.g. cwd = `ShapeItUp/examples`, `directory: "examples"`),
+ * `resolveDirArg` probes each workspace root — none match, so the final path
+ * resolves to `ShapeItUp/examples/examples`. That's almost never intentional.
+ * Returns a leading-newline warning string ready to concatenate into the
+ * response body, or `""` when no doubling is detected.
+ *
+ * Exported so the unit tests can exercise the detector without spinning up
+ * the full MCP harness (executeShapeFile needs OCCT).
+ */
+export function detectPathDoubling(absoluteDir: string): string {
+  const segments = resolve(absoluteDir).split(/[\\/]+/).filter(Boolean);
+  const last = segments[segments.length - 1];
+  const prev = segments[segments.length - 2];
+  if (last && prev && last.toLowerCase() === prev.toLowerCase()) {
+    return (
+      `\nWarning: directory resolved to ${absoluteDir}. Note the path segment ` +
+      `"${last}" appears twice — you may have intended directory: "." ` +
+      `or a subdir. Passed through as-is.`
+    );
+  }
+  return "";
 }
 
 function formatStatusText(status: EngineStatus): string {
@@ -193,7 +452,14 @@ function formatStatusText(status: EngineStatus): string {
     const stack = status.stack
       ? `\nStack (top frames):\n${status.stack.split("\n").slice(0, 6).map((l) => `  ${l.trim()}`).filter((l) => l.trim().length > 2).join("\n")}`
       : "";
-    return `Render FAILED\nError: ${status.error}${hint}${operation}${stack}\nFile: ${status.fileName || "unknown"}\nTip: call get_preview to view the last successful render for visual comparison (the PNG is NOT overwritten on failure).\nTime: ${status.timestamp}`;
+    // Bug #1: when the engine detects a WASM-level failure it drops the cached
+    // OCCT core so the next tool call boots a fresh one. Warn the caller that
+    // their next render pays the re-init cost AND that this wasn't a "just
+    // retry" situation — the heap was poisoned and has now been cleaned.
+    const resetNote = status.engineReset
+      ? `\nEngine was re-initialized after a WASM exception. Next call will take ~500ms.`
+      : "";
+    return `Render FAILED\nError: ${status.error}${hint}${operation}${stack}${resetNote}\nFile: ${status.fileName || "unknown"}\nTip: call get_preview to view the last successful render for visual comparison (the PNG is NOT overwritten on failure).\nTime: ${status.timestamp}`;
   }
   const parts = status.partNames?.length ? `\nParts: ${status.partNames.join(", ")}` : "";
   const paramEntries = status.currentParams ? Object.entries(status.currentParams) : [];
@@ -206,8 +472,16 @@ function formatStatusText(status: EngineStatus): string {
   const timings = timingEntries.length
     ? `\nTop operations (ms): ${timingEntries.map(([k, v]) => `${k}=${Math.round(v)}`).join(", ")}`
     : "";
+  // Bug #4: when BRepCheck flagged a part as invalid, the render is NOT a
+  // plain success — OCCT's volume/area on broken solids is garbage (e.g.
+  // shell-on-revolve reported 1.4x the correct volume because duplicated
+  // faces were counted twice). Flip the headline and hoist the warning
+  // block above the stats so agents see the problem first.
+  const geomInvalid = status.geometryValid === false;
   const warnings = Array.isArray(status.warnings) && status.warnings.length
-    ? `\nGeometry warnings:\n - ${status.warnings.join("\n - ")}`
+    ? (geomInvalid
+        ? `\nGeometry errors (part validation failed):\n - ${status.warnings.join("\n - ")}\nNote: Volume/area/mass omitted for invalid parts.`
+        : `\nGeometry warnings:\n - ${status.warnings.join("\n - ")}`)
     : "";
   const properties = formatProperties(status.properties);
   const bbox = status.boundingBox
@@ -216,7 +490,13 @@ function formatStatusText(status: EngineStatus): string {
   const material = status.material
     ? `\nMaterial: ${status.material.name ? status.material.name + ", " : ""}density ${status.material.density} g/cm³`
     : "";
-  return `Render SUCCESS\nFile: ${status.fileName || "unknown"}\nStats: ${status.stats}${parts}${bbox}${material}${properties}${currentParams}${timings}${warnings}\nTime: ${status.timestamp}`;
+  const headline = geomInvalid ? "Render COMPLETED WITH GEOMETRY ERRORS" : "Render SUCCESS";
+  if (geomInvalid) {
+    // Hoist the warnings block above stats so the structural problem is the
+    // first thing the reader sees, not an otherwise-normal-looking summary.
+    return `${headline}\nFile: ${status.fileName || "unknown"}${warnings}\nStats: ${status.stats}${parts}${bbox}${material}${properties}${currentParams}${timings}\nTime: ${status.timestamp}`;
+  }
+  return `${headline}\nFile: ${status.fileName || "unknown"}\nStats: ${status.stats}${parts}${bbox}${material}${properties}${currentParams}${timings}${warnings}\nTime: ${status.timestamp}`;
 }
 
 /**
@@ -265,22 +545,405 @@ export default function main(p: Record<string, number>) {
 `;
 }
 
+/**
+ * Pure syntax + pitfall validator. Extracted from the `validate_syntax` /
+ * `validate_script` MCP tools so unit tests can call it directly without
+ * spinning up an MCP server. Returns the same text the tools emit, plus a
+ * boolean signalling "hard parse failure" (so the caller can set isError on
+ * the MCP envelope).
+ *
+ * Catches two classes of problem:
+ *   1. Real JS syntax errors — evaluated via `new Function(stripped)` after a
+ *      best-effort TypeScript-feature strip. Fatal; sets isError.
+ *   2. Unknown `.method()` calls — compared against a hand-curated Replicad
+ *      whitelist. Method calls whose receiver was imported from "shapeitup"
+ *      are trusted unconditionally (so stdlib additions don't need to be
+ *      mirrored here). Warnings only; isError stays false.
+ *   3. Six well-known CAD pitfalls (sketch mischain, missing sketchOnPlane,
+ *      unclosed pen, non-uniform scale, oversized fillet, booleans in loop).
+ *      Warnings only.
+ */
+export function validateSyntaxPure(code: string): { text: string; isError: boolean } {
+  try {
+    let stripped = code;
+    stripped = stripped.replace(/^import\s+[\s\S]*?from\s*["'][^"']*["']\s*;?\s*$/gm, "");
+    stripped = stripped.replace(/^import\s+["'][^"']*["']\s*;?\s*$/gm, "");
+    stripped = stripped.replace(/^export\s+(default\s+)?/gm, "");
+    stripped = stripped.replace(/:\s*typeof\s+\w+/g, "");
+    stripped = stripped.replace(/(\w)\s*:\s*(?:string|number|boolean|any|void|never|unknown|null|undefined)(?:\[\])?\s*(?=[,)])/g, "$1");
+    stripped = stripped.replace(/\bas\s+\w+/g, "");
+    stripped = stripped.replace(/^(interface|type)\s+\w+[^=].*$/gm, "");
+    stripped = stripped.replace(/(<\w[\w,\s]*>)\s*\(/g, "(");
+    new Function(stripped);
+
+    const knownMethods = new Set([
+      "drawRectangle", "drawRoundedRectangle", "drawCircle", "drawEllipse", "drawPolysides", "drawText", "draw",
+      "sketchCircle", "sketchRectangle", "makeCylinder", "makeSphere", "makeBox", "makeEllipsoid",
+      "extrude", "revolve", "loftWith", "sweepSketch",
+      "fuse", "cut", "intersect",
+      "fillet", "chamfer", "shell", "draft",
+      "translate", "translateX", "translateY", "translateZ", "rotate", "mirror", "scale",
+      "sketchOnPlane", "sketchOnFace",
+      "mesh", "meshEdges",
+      "close", "hLine", "vLine", "lineTo", "line", "sagittaArcTo", "tangentArcTo", "threePointsArcTo",
+      "cubicBezierCurveTo", "smoothSplineTo", "closeWithMirror", "done",
+      "localGC", "exportSTEP",
+    ]);
+
+    // Bug #6: trust .method() calls whose receiver was imported from the
+    // shapeitup stdlib. Otherwise every stdlib helper (bearings.body,
+    // holes.through, patterns.grid, etc.) shows up as "unknown method" —
+    // the whitelist above only covers Replicad surface methods, and growing
+    // it per-stdlib-addition is a losing maintenance battle.
+    //
+    // Two import forms cover the ecosystem:
+    //   import { bearings, holes as h } from "shapeitup"
+    //   import * as lib from "shapeitup"
+    // Parse both out of the ORIGINAL code (not `stripped` — the import
+    // stripping earlier nuked the lines we need to read).
+    const stdlibIdents = new Set<string>();
+    const namedImport = /import\s*\{([^}]+)\}\s*from\s*["']shapeitup["']/g;
+    for (const m of code.matchAll(namedImport)) {
+      for (const piece of m[1].split(",")) {
+        // `X as Y` — the LOCAL binding is Y; the original export name X
+        // never appears as a .method() receiver in this file. Fall back
+        // to the trimmed piece itself when there's no alias.
+        const trimmed = piece.trim();
+        if (!trimmed) continue;
+        const parts = trimmed.split(/\s+as\s+/);
+        const name = (parts[1] ?? parts[0]).trim();
+        if (name) stdlibIdents.add(name);
+      }
+    }
+    const starImport = /import\s*\*\s*as\s+(\w+)\s+from\s*["']shapeitup["']/g;
+    for (const m of code.matchAll(starImport)) {
+      stdlibIdents.add(m[1]);
+    }
+
+    // Capture a (possibly dotted) receiver chain so stdlib calls are
+    // trusted in full. For `lib.patterns.grid(`, the root identifier is
+    // `lib` — if that's a stdlib namespace import, the WHOLE chain is
+    // trusted (not just the outermost `.grid`). The receiver group allows
+    // dots for that reason; the first segment is inspected for the stdlib
+    // check.
+    //
+    // A second chain-continuation pass picks up method calls whose receiver
+    // is a call expression (e.g. `drawCircle(5).fuse(x)`) — those can't be
+    // stdlib roots, so they fall through to the whitelist check.
+    const unknownMethods = new Set<string>();
+    const skippedByReceiver = new Set<string>();
+    const receiverCallPattern = /([A-Za-z_]\w*(?:\s*\.\s*\w+)*)\s*\.\s*(\w+)\s*\(/g;
+    let match: RegExpExecArray | null;
+    while ((match = receiverCallPattern.exec(code)) !== null) {
+      const [, receiverChain, methodName] = match;
+      const rootIdent = receiverChain.split(/\s*\.\s*/)[0];
+      if (stdlibIdents.has(rootIdent)) {
+        // Remember that this method name was seen on a stdlib receiver
+        // somewhere — even if the SAME name later appears as a chain
+        // continuation elsewhere in the file (edge case), we'd rather
+        // under-warn than over-warn. Matches the conservative
+        // "hints, not failures" posture of the other semantic checks.
+        skippedByReceiver.add(methodName);
+        continue;
+      }
+      if (!knownMethods.has(methodName)) unknownMethods.add(methodName);
+    }
+    // Chain-continuation pass: picks up `foo().bar()` — where `bar`'s
+    // receiver is a call expression, not a plain identifier, so the
+    // receiver pass above missed it. The lookbehind ensures we only match
+    // `.bar(` right after `)` — not the `.bar` of an `x.bar(` we already
+    // handled.
+    const chainCallPattern = /(?<=\))\s*\.\s*(\w+)\s*\(/g;
+    while ((match = chainCallPattern.exec(code)) !== null) {
+      const methodName = match[1];
+      if (skippedByReceiver.has(methodName)) continue;
+      if (!knownMethods.has(methodName)) unknownMethods.add(methodName);
+    }
+
+    // --- Semantic checks (pitfall linter) -----------------------------
+    // Regex-only, conservative. These warnings are hints, not failures:
+    // the script may be intentional, and we prefer false-negatives to
+    // false-positives. isError stays false regardless.
+    const semanticWarnings: string[] = [];
+
+    // 1. sketchCircle/sketchRectangle already return a Sketch — chaining
+    //    .sketchOnPlane() on top throws at runtime. Easy to confuse with
+    //    the draw* family since the names rhyme.
+    const sketchMisChain = /\b(sketchCircle|sketchRectangle)\s*\([^)]*\)\s*\.\s*sketchOnPlane\s*\(/;
+    if (sketchMisChain.test(code)) {
+      semanticWarnings.push(
+        "`sketchCircle`/`sketchRectangle` already return a Sketch — remove the `.sketchOnPlane()` call (pass `{ plane: ... }` as config to the sketch* function instead)."
+      );
+    }
+
+    // 2. draw*(...).(...).extrude() without an intervening sketchOnPlane/
+    //    sketchOnFace. Tolerate 2D ops (fuse, cut, offset, translate,
+    //    rotate, mirror) in the chain — those are all legal on Drawings.
+    //    Match is deliberately non-greedy and bounded to a single chain
+    //    expression (method calls with balanced-ish parens).
+    const drawExtrudePattern = /\b(drawRectangle|drawRoundedRectangle|drawCircle|drawEllipse|drawPolysides|drawText)\s*\(([^()]|\([^()]*\))*\)((?:\s*\.\s*(?:fuse|cut|intersect|offset|translate|rotate|mirror)\s*\(([^()]|\([^()]*\))*\))*)\s*\.\s*extrude\s*\(/;
+    if (drawExtrudePattern.test(code)) {
+      semanticWarnings.push(
+        "Drawings must be placed on a plane before extruding — add `.sketchOnPlane(\"XY\")` between the draw call and `.extrude()`."
+      );
+    }
+
+    // 3. Non-uniform .scale(). Replicad's shape.scale is uniform-only.
+    //    Flag array arg OR multiple numeric args (comma-separated).
+    const scaleArrayPattern = /\.\s*scale\s*\(\s*\[/;
+    const scaleMultiArgPattern = /\.\s*scale\s*\(\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*[,)]/;
+    if (scaleArrayPattern.test(code) || scaleMultiArgPattern.test(code)) {
+      semanticWarnings.push(
+        "`shape.scale()` is uniform-only — pass a single number. For non-uniform scaling use `makeEllipsoid(rx, ry, rz)` or draw the target shape in 2D."
+      );
+    }
+
+    // 4. draw() pen-builder chain missing .close()/.done() before
+    //    .sketchOnPlane() or .extrude(). Match `draw(` (not drawXxx —
+    //    the (?![a-zA-Z]) guard ensures we don't catch drawRectangle),
+    //    followed by any chain of method calls up to the first
+    //    sketchOnPlane/extrude. Warn if that chain contains no
+    //    close/done/closeWithMirror call.
+    const penChainPattern = /\bdraw\s*\((?![a-zA-Z])([^()]|\([^()]*\))*\)((?:\s*\.\s*[a-zA-Z_]\w*\s*\(([^()]|\([^()]*\))*\))*?)\s*\.\s*(sketchOnPlane|extrude)\s*\(/g;
+    let penMatch: RegExpExecArray | null;
+    while ((penMatch = penChainPattern.exec(code)) !== null) {
+      const chainMiddle = penMatch[2] || "";
+      if (!/\.\s*(close|closeWithMirror|done)\s*\(/.test(chainMiddle)) {
+        semanticWarnings.push(
+          "A `draw()` pen chain needs `.close()` (for extrudable regions) or `.done()` (for open sweep paths) before sketching/extruding."
+        );
+        break; // one warning is enough
+      }
+    }
+
+    // 5. Fillet/chamfer radius sanity check against observed dimensions.
+    //    Collect numeric literals from shape-factory calls and extrude
+    //    distances. Take min > 0 as "smallest significant" dimension.
+    //    Warn if any fillet/chamfer radius literal exceeds half of that.
+    const dims: number[] = [];
+    const extractNums = (s: string) => {
+      const nums: number[] = [];
+      const re = /-?\d+(?:\.\d+)?/g;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(s)) !== null) {
+        const v = parseFloat(m[0]);
+        if (isFinite(v) && v > 0) nums.push(v);
+      }
+      return nums;
+    };
+    const dimFnPattern = /\b(drawRectangle|drawRoundedRectangle|drawCircle|drawEllipse|sketchCircle|sketchRectangle|makeBox|makeCylinder|makeSphere|makeEllipsoid)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)/g;
+    let dimMatch: RegExpExecArray | null;
+    while ((dimMatch = dimFnPattern.exec(code)) !== null) {
+      dims.push(...extractNums(dimMatch[2]));
+    }
+    const extrudePattern = /\.\s*extrude\s*\(\s*(-?\d+(?:\.\d+)?)/g;
+    let eMatch: RegExpExecArray | null;
+    while ((eMatch = extrudePattern.exec(code)) !== null) {
+      const v = parseFloat(eMatch[1]);
+      if (isFinite(v) && v > 0) dims.push(v);
+    }
+    if (dims.length > 0) {
+      const smallest = Math.min(...dims);
+      const filletChamferPattern = /\.\s*(fillet|chamfer)\s*\(\s*(-?\d+(?:\.\d+)?)/g;
+      let fcMatch: RegExpExecArray | null;
+      const flagged = new Set<string>();
+      while ((fcMatch = filletChamferPattern.exec(code)) !== null) {
+        const r = parseFloat(fcMatch[2]);
+        if (!isFinite(r) || r <= 0) continue;
+        if (r > smallest * 0.5) {
+          const key = `${fcMatch[1]}:${r}:${smallest}`;
+          if (flagged.has(key)) continue;
+          flagged.add(key);
+          semanticWarnings.push(
+            `Fillet/chamfer radius ${r} may be too large for the smallest feature dimension (${smallest}) — OpenCascade often fails on radii larger than half the edge length.`
+          );
+        }
+      }
+    }
+
+    // 6. .fuse(/.cut( inside a for-loop body — classic "slow pattern".
+    //    Walk the raw code, track brace depth from the `for (...)` header
+    //    to the matching `}`, and flag fuse/cut within.
+    const forPattern = /\bfor\s*\([^)]*\)\s*\{/g;
+    let forMatch: RegExpExecArray | null;
+    let loopBoolSuggested = false;
+    while ((forMatch = forPattern.exec(code)) !== null) {
+      let depth = 1;
+      let i = forMatch.index + forMatch[0].length;
+      const start = i;
+      while (i < code.length && depth > 0) {
+        const ch = code[i];
+        if (ch === "{") depth++;
+        else if (ch === "}") depth--;
+        i++;
+      }
+      const body = code.slice(start, i);
+      if (/\.\s*(fuse|cut)\s*\(/.test(body)) {
+        loopBoolSuggested = true;
+        break;
+      }
+    }
+    if (loopBoolSuggested) {
+      semanticWarnings.push(
+        "Multiple 3D `fuse`/`cut` inside a loop is slow — consider combining in 2D first (with `drawing.fuse()` / `drawing.cut()`) then a single `.extrude()` at the end. See the `booleans` category in get_api_reference."
+      );
+    }
+
+    // 7. `return positioned` without `.entries()`. In multi-part assemblies
+    //    the stdlib's `assemble(...)` / sub-assembly builder returns a
+    //    positioned-parts Map; the engine expects an iterable of
+    //    [name, Part] entries. Returning the Map directly produces empty
+    //    parts or a runtime type error, depending on the downstream call.
+    //    The rule is deliberately soft — `positioned` is a plausible local
+    //    variable name, so we phrase the warning as a "did you mean" hint.
+    //    We exempt .entries() (the correct call) but flag other chains like
+    //    .toArray() / .values() — those are either wrong or already a
+    //    mistake worth surfacing.
+    const returnPositionedPattern = /\breturn\s+positioned\s*(?!\s*\.\s*entries\b)/;
+    if (returnPositionedPattern.test(code)) {
+      semanticWarnings.push(
+        "In multi-part assemblies, `return positioned` without `.entries()` returns a Map rather than an array. Did you mean `return positioned.entries()`?"
+      );
+    }
+
+    // --- Assemble response --------------------------------------------
+    const baseText = unknownMethods.size > 0
+      ? `Syntax OK. Warning: unknown method(s) found: ${Array.from(unknownMethods).map(m => `.${m}()`).join(", ")}.`
+      : "Syntax OK";
+    const warningBlock = semanticWarnings.length > 0
+      ? `\nSemantic warnings:\n${semanticWarnings.map(w => ` - ${w}`).join("\n")}`
+      : "";
+    return { text: baseText + warningBlock, isError: false };
+  } catch (e: any) {
+    return { text: `Syntax error: ${e.message}`, isError: true };
+  }
+}
+
+/**
+ * MCP tool response shape. Kept permissive — individual handlers return richer
+ * shapes (image content, structured metadata) that all satisfy this base, and
+ * `safeHandler` only cares about routing thrown errors into `{ content, isError }`.
+ */
+type ToolResponse = {
+  content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>;
+  isError?: boolean;
+};
+
+/**
+ * Fix A (Bug #6): wrap every MCP tool handler so a plain JS exception
+ * (TypeError, ReferenceError, anything thrown from inside the handler body)
+ * becomes a structured tool-error response instead of propagating up and
+ * killing the stdio channel.
+ *
+ * Before this fix, an uncaught throw inside any handler broke the MCP
+ * connection — every subsequent call returned `MCP error -32000: Connection
+ * closed`. The `executeShapeFile` catch covered WASM-level errors but plain
+ * JS throws in the handler itself (a typo, a bad chained call, etc.) bypassed
+ * it. Wrapping here puts the last-mile safety net directly at the handler
+ * boundary, as close to the thrown exception as possible.
+ *
+ * The message preserves the tool name, error message, and a truncated stack
+ * so the agent can self-correct without a stderr dive. Stack trimmed to 5
+ * lines so we don't flood the tool response with framework internals.
+ */
+export function safeHandler<T>(
+  name: string,
+  fn: (args: T) => Promise<ToolResponse>,
+): (args: T) => Promise<ToolResponse> {
+  return async (args: T) => {
+    try {
+      return await fn(args);
+    } catch (e: any) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const stack = e instanceof Error && typeof e.stack === "string" ? e.stack : undefined;
+      const tail = stack ? `\n${stack.split("\n").slice(0, 5).join("\n")}` : "";
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Tool "${name}" failed: ${msg}${tail}`,
+        }],
+        isError: true,
+      };
+    }
+  };
+}
+
+/**
+ * Fix B (Bug #5) core: compute the "Parts: …" line for a screenshot response
+ * using the engine's just-rendered parts list as the sole source of truth.
+ *
+ * Before: the line said "Parts: lid (focused — other parts hidden)" whenever
+ * the caller passed `focusPart`, regardless of whether the focus actually
+ * happened. The viewer could emit a contradicting "focusPart ignored: not a
+ * multi-part assembly" warning in the same response — two different checks
+ * reading two different states.
+ *
+ * After: we check the actual rendered partNames array. If the focus/hide is
+ * a no-op (single-part script, or the requested names aren't among the
+ * rendered parts), we return "" and let whatever warning the viewer emitted
+ * carry the message alone. No contradiction possible.
+ *
+ * Exported for unit testing. `focusedLabel` is the text inside the parens
+ * after the focused part name — render_preview says "focused — other parts
+ * hidden in screenshot", preview_shape just says "focused".
+ */
+export function computePartsLine(
+  focusPart: string | undefined,
+  hideParts: string[] | undefined,
+  renderedPartNames: string[],
+  focusedLabel: string,
+): string {
+  const isAssembly = renderedPartNames.length > 1;
+  const focusHonored =
+    !!focusPart && isAssembly && renderedPartNames.includes(focusPart);
+  const hideHonored =
+    !!hideParts &&
+    hideParts.length > 0 &&
+    isAssembly &&
+    hideParts.some((n) => renderedPartNames.includes(n));
+
+  if (focusHonored) {
+    return `\nParts: ${focusPart} (${focusedLabel})`;
+  }
+  if (hideHonored) {
+    const matched = hideParts!.filter((n) => renderedPartNames.includes(n));
+    return `\nParts hidden: ${matched.join(", ")}`;
+  }
+  return "";
+}
+
 export function registerTools(server: McpServer) {
   server.tool(
     "create_shape",
-    "Create a new .shape.ts CAD script file and execute it. Fails if file already exists — use modify_shape to update existing files.",
+    "Create a new .shape.ts CAD script file and execute it. Fails if file already exists — use modify_shape to update existing files. Path resolution precedence: absolute `directory` used as-is; relative `directory` probed against each heartbeat-reported VSCode workspace root (first match wins), else `process.cwd()`; omitted `directory` defaults to the first active VSCode workspace root (or cwd if no extension is running).",
     {
       name: z.string().describe("File name without extension (e.g., 'bracket')"),
       code: z.string().describe("TypeScript source code using Replicad API"),
-      directory: z.string().optional().describe("Directory to create the file in (defaults to the active VSCode workspace root, or cwd if no extension is running)"),
+      directory: z.string().optional().describe("Directory to create the file in. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first match wins), falling back to process.cwd(). When omitted, defaults to the active VSCode workspace root."),
       overwrite: z.boolean().optional().describe("Set to true to overwrite an existing file (default: false)"),
     },
-    async ({ name, code, directory, overwrite }) => {
-      // If `directory` is relative, anchor it to the workspace root (not cwd)
-      // for the same reason resolveShapePath exists; absolute values pass through.
-      const dir = directory
-        ? (isAbsolute(directory) ? resolve(directory) : resolve(getDefaultDirectory(), directory))
-        : getDefaultDirectory();
+    safeHandler("create_shape", async ({ name, code, directory, overwrite }) => {
+      // Resolve `directory` with the same unified precedence as resolveShapePath:
+      // absolute → use as-is; relative → probe each workspace root for an
+      // existing directory; else anchor to cwd. For `create_shape` the
+      // directory may not exist yet (new subfolder), so we also accept the
+      // FIRST workspace root as a fallback when no probe matches — that
+      // preserves the ergonomic "directory: 'examples/test'" pattern even when
+      // `examples/test` is brand-new.
+      const resolveDirArg = (d: string): string => {
+        if (isAbsolute(d)) return resolve(d);
+        const wsRoots = getHeartbeatWorkspaceRoots();
+        for (const root of wsRoots) {
+          const cand = resolve(root, d);
+          if (existsSync(cand)) return cand;
+        }
+        // No existing match. If heartbeat reports at least one workspace,
+        // prefer anchoring to the first one (the active VSCode window) —
+        // otherwise cwd. This keeps create_shape usable for brand-new subdirs.
+        if (wsRoots.length > 0) return resolve(wsRoots[0], d);
+        return resolve(process.cwd(), d);
+      };
+      const dir = directory ? resolveDirArg(directory) : getDefaultDirectory();
       const filePath = join(dir, `${name}.shape.ts`);
 
       if (!code.trim() || !code.includes("function")) {
@@ -288,6 +951,26 @@ export function registerTools(server: McpServer) {
           content: [{ type: "text" as const, text: `Invalid code: must contain at least a function definition.` }],
           isError: true,
         };
+      }
+
+      // Bug A (strict mode): when `directory` is omitted, getDefaultDirectory()
+      // prefers the VSCode heartbeat workspace over process.cwd(). If the two
+      // disagree, we can't safely auto-resolve — the shell might be in
+      // ShapeItUp/examples while VSCode is focused on a different workspace,
+      // and silently writing to either is a footgun. Refuse with a hard error
+      // BEFORE the write so the caller can disambiguate.
+      if (!directory) {
+        const defaultDir = resolve(getDefaultDirectory());
+        const cwdAbs = resolve(process.cwd());
+        if (defaultDir.toLowerCase() !== cwdAbs.toLowerCase()) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `create_shape: cannot auto-resolve directory because MCP shell cwd and VSCode workspace disagree.\n  shell cwd:         ${cwdAbs}\n  VSCode workspace:  ${defaultDir}\nPass 'directory' explicitly (either of the above, or any other path) to proceed.`,
+            }],
+            isError: true,
+          };
+        }
       }
 
       if (existsSync(filePath) && !overwrite) {
@@ -303,21 +986,30 @@ export function registerTools(server: McpServer) {
       const { status } = await executeShapeFile(filePath, GLOBAL_STORAGE);
       notifyExtensionOfShape(filePath);
 
-      const prefix = `${overwrite ? "Overwrote" : "Created"} ${filePath}\n`;
+      const cwd = process.cwd();
+      const wsKey = resolve(dir).toLowerCase();
+      const dirMatchesCwd = wsKey === resolve(cwd).toLowerCase();
+      const shouldEmit = !dirMatchesCwd && !_emittedWorkspaceRoots.has(wsKey);
+      if (shouldEmit) _emittedWorkspaceRoots.add(wsKey);
+      const cwdNote = shouldEmit
+        ? `\n(Resolved to VSCode workspace ${dir}; shell cwd is ${cwd}. Pass 'directory' explicitly to override.)`
+        : "";
+      const doubledWarning = directory ? detectPathDoubling(dir) : "";
+      const prefix = `${overwrite ? "Overwrote" : "Created"} ${filePath}${cwdNote}${doubledWarning}\n`;
       return {
         content: [{ type: "text" as const, text: prefix + formatStatusText(status) }],
         isError: !status.success,
       };
-    }
+    })
   );
 
   server.tool(
     "open_shape",
-    "Execute an existing .shape.ts file and (if VSCode is open) also bring it up in the viewer.",
+    "Execute an existing .shape.ts file and (if VSCode is open) also bring it up in the viewer. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd().",
     {
-      filePath: z.string().describe("Path to the .shape.ts file to execute. Relative paths resolve against the active VSCode workspace root."),
+      filePath: z.string().describe("Path to the .shape.ts file to execute. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
     },
-    async ({ filePath }) => {
+    safeHandler("open_shape", async ({ filePath }) => {
       const absPath = resolveShapePath(filePath);
       if (!existsSync(absPath)) {
         return {
@@ -333,17 +1025,17 @@ export function registerTools(server: McpServer) {
         content: [{ type: "text" as const, text: formatStatusText(status) }],
         isError: !status.success,
       };
-    }
+    })
   );
 
   server.tool(
     "modify_shape",
-    "Overwrite an existing .shape.ts file with new code and execute it.",
+    "Overwrite an existing .shape.ts file with new code and execute it. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd().",
     {
-      filePath: z.string().describe("Path to the .shape.ts file. Relative paths resolve against the active VSCode workspace root."),
+      filePath: z.string().describe("Path to the .shape.ts file. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
       code: z.string().describe("New TypeScript source code"),
     },
-    async ({ filePath, code }) => {
+    safeHandler("modify_shape", async ({ filePath, code }) => {
       const absPath = resolveShapePath(filePath);
       if (!existsSync(absPath)) {
         return {
@@ -361,16 +1053,16 @@ export function registerTools(server: McpServer) {
         content: [{ type: "text" as const, text: prefix + formatStatusText(status) }],
         isError: !status.success,
       };
-    }
+    })
   );
 
   server.tool(
     "read_shape",
-    "Read the contents of a .shape.ts file",
+    "Read the contents of a .shape.ts file. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd().",
     {
-      filePath: z.string().describe("Path to the .shape.ts file. Relative paths resolve against the active VSCode workspace root."),
+      filePath: z.string().describe("Path to the .shape.ts file. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
     },
-    async ({ filePath }) => {
+    safeHandler("read_shape", async ({ filePath }) => {
       const absPath = resolveShapePath(filePath);
       if (!existsSync(absPath)) {
         return {
@@ -380,16 +1072,16 @@ export function registerTools(server: McpServer) {
       }
       const content = readFileSync(absPath, "utf-8");
       return { content: [{ type: "text" as const, text: content }] };
-    }
+    })
   );
 
   server.tool(
     "delete_shape",
-    "Delete a .shape.ts file",
+    "Delete a .shape.ts file. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd().",
     {
-      filePath: z.string().describe("Path to the .shape.ts file to delete. Relative paths resolve against the active VSCode workspace root."),
+      filePath: z.string().describe("Path to the .shape.ts file to delete. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
     },
-    async ({ filePath }) => {
+    safeHandler("delete_shape", async ({ filePath }) => {
       const absPath = resolveShapePath(filePath);
       if (!existsSync(absPath)) {
         return {
@@ -406,7 +1098,7 @@ export function registerTools(server: McpServer) {
       const { unlinkSync } = require("fs");
       unlinkSync(absPath);
       return { content: [{ type: "text" as const, text: `Deleted ${absPath}` }] };
-    }
+    })
   );
 
   server.tool(
@@ -422,7 +1114,7 @@ export function registerTools(server: McpServer) {
         .optional()
         .describe("If set, open the exported file in this app after saving. Requires VSCode + the extension."),
     },
-    async ({ format, outputPath, filePath, partName, openIn }) => {
+    safeHandler("export_shape", async ({ format, outputPath, filePath, partName, openIn }) => {
       // Figure out which file we're exporting. Precedence: explicit arg →
       // in-process last file → status file's fileName (set by VSCode/prior runs).
       let source: string | undefined = filePath ? resolveShapePath(filePath) : getLastFileName();
@@ -462,6 +1154,16 @@ export function registerTools(server: McpServer) {
         };
       }
 
+      // STL can't carry multi-part structure — all parts merge into a single
+      // mesh and lose their names/colors. We still honour the caller's
+      // request (the export itself succeeds), but append a one-time warning
+      // pointing at the STEP + per-part STL alternatives so the caller
+      // doesn't discover the loss of fidelity inside their slicer.
+      let multiPartWarning = "";
+      if (format === "stl" && !partName && availablePartNames.length > 1) {
+        multiPartWarning = `\n\nWarning: exporting multi-part assembly (${availablePartNames.length} parts: ${availablePartNames.join(", ")}) to STL merges all parts into a single mesh — part names and colors are lost. Consider STEP format, or pass partName to export an individual part.`;
+      }
+
       // Default output path: include the part name in the file name so
       // single-part exports don't collide with full-assembly exports.
       const defaultSuffix = partName ? `.${partName}.${format}` : `.${format}`;
@@ -469,8 +1171,24 @@ export function registerTools(server: McpServer) {
       try {
         await exportLastToFile(format, savePath, partName);
       } catch (e: any) {
+        const errMsg = e?.message ?? String(e);
+        // OOB = OCCT heap poisoned (see packages/core/src/index.ts's
+        // patchShapeMeshLeak for the root-cause leak we now patch on init,
+        // plus any user-script bug we haven't yet diagnosed). Reset so the
+        // next tool call re-initializes a clean WASM instance instead of
+        // crashing in the exact same spot.
+        if (/memory\s+access\s+out\s+of\s+bounds/i.test(errMsg)) {
+          resetCore();
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Export failed: ${errMsg}\n\nWASM state was reset due to a memory error; next call will re-initialize OCCT.`,
+            }],
+            isError: true,
+          };
+        }
         return {
-          content: [{ type: "text" as const, text: `Export failed: ${e?.message ?? e}` }],
+          content: [{ type: "text" as const, text: `Export failed: ${errMsg}` }],
           isError: true,
         };
       }
@@ -511,16 +1229,16 @@ export function registerTools(server: McpServer) {
       }
 
       return {
-        content: [{ type: "text" as const, text: `Exported to: ${savePath}\nFormat: ${format.toUpperCase()}\nSize: ${sizeStr}\nSource: ${source}${contentsLine}${openLine}` }],
+        content: [{ type: "text" as const, text: `Exported to: ${savePath}\nFormat: ${format.toUpperCase()}\nSize: ${sizeStr}\nSource: ${source}${contentsLine}${openLine}${multiPartWarning}` }],
       };
-    }
+    })
   );
 
   server.tool(
     "list_installed_apps",
     "List 3D apps detected on the user's machine (PrusaSlicer, Cura, Bambu Studio, OrcaSlicer, FreeCAD, Fusion 360). Requires VSCode extension — it owns the filesystem scanning logic.",
     {},
-    async () => {
+    safeHandler("list_installed_apps", async () => {
       if (!isExtensionAlive()) return extensionOfflineError("list_installed_apps");
       const cmdId = sendExtensionCommand("list-installed-apps", {});
       if (!cmdId) {
@@ -538,19 +1256,31 @@ export function registerTools(server: McpServer) {
       return {
         content: [{ type: "text" as const, text: `Detected apps (pass the id to export_shape's openIn parameter):\n${lines.join("\n")}` }],
       };
-    }
+    })
   );
 
   server.tool(
     "list_shapes",
-    "Find all .shape.ts files in a directory",
+    "Find all .shape.ts files in a directory. Relative `directory` probes each open VSCode workspace (first existing match wins), else falls back to process.cwd(). Omitted `directory` defaults to the first active VSCode workspace root.",
     {
-      directory: z.string().optional().describe("Directory to search (defaults to the active VSCode workspace root, or cwd if no extension is running)"),
+      directory: z.string().optional().describe("Directory to search. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd(). Omitted defaults to the active VSCode workspace root."),
       recursive: z.boolean().optional().describe("Search subdirectories recursively (default: true). Set to false for top-level only."),
     },
-    async ({ directory, recursive }) => {
+    safeHandler("list_shapes", async ({ directory, recursive }) => {
       const usedDefault = !directory;
-      const dir = resolve(directory || getDefaultDirectory());
+      // Unified precedence (same as resolveShapePath for filePath args): if
+      // the caller passed a relative directory, probe each heartbeat-reported
+      // workspace root for an existing match before falling back to cwd.
+      const resolveListDir = (d: string): string => {
+        if (isAbsolute(d)) return resolve(d);
+        const wsRoots = getHeartbeatWorkspaceRoots();
+        for (const root of wsRoots) {
+          const cand = resolve(root, d);
+          if (existsSync(cand)) return cand;
+        }
+        return resolve(process.cwd(), d);
+      };
+      const dir = directory ? resolveListDir(directory) : resolve(getDefaultDirectory());
       if (!existsSync(dir)) {
         return {
           content: [{ type: "text" as const, text: `Directory not found: ${dir}` }],
@@ -573,192 +1303,38 @@ export function registerTools(server: McpServer) {
           text: header + body,
         }],
       };
-    }
+    })
   );
 
+  // Shared implementation for validate_syntax (and backward-compat alias validate_script).
+  // Thin wrapper around the pure `validateSyntaxPure` — kept separate so the
+  // MCP `content: [...]` envelope lives here and the logic stays unit-testable.
+  const validateSyntaxImpl = async ({ code }: { code: string }) => {
+    const { text, isError } = validateSyntaxPure(code);
+    if (isError) {
+      return { content: [{ type: "text" as const, text }], isError: true };
+    }
+    return { content: [{ type: "text" as const, text }] };
+  };
+
+  const validateSyntaxSchema = {
+    code: z.string().describe("TypeScript source code to validate"),
+  };
+
+  server.tool(
+    "validate_syntax",
+    "Validate TypeScript syntax and detect 6 common CAD pitfalls (sketch mischain, missing sketchOnPlane, unclosed pen, non-uniform scale, oversized fillet, booleans in loop). Does NOT verify imports, types, or runtime behavior — for that, call create_shape or modify_shape.",
+    validateSyntaxSchema,
+    safeHandler("validate_syntax", validateSyntaxImpl)
+  );
+
+  // Backward-compat alias — kept so existing MCP clients calling validate_script continue to work.
+  // Deprecated: prefer validate_syntax.
   server.tool(
     "validate_script",
-    "Check syntax of a .shape.ts script (syntax only — does not verify imports or runtime behavior).",
-    {
-      code: z.string().describe("TypeScript source code to validate"),
-    },
-    async ({ code }) => {
-      try {
-        let stripped = code;
-        stripped = stripped.replace(/^import\s+[\s\S]*?from\s*["'][^"']*["']\s*;?\s*$/gm, "");
-        stripped = stripped.replace(/^import\s+["'][^"']*["']\s*;?\s*$/gm, "");
-        stripped = stripped.replace(/^export\s+(default\s+)?/gm, "");
-        stripped = stripped.replace(/:\s*typeof\s+\w+/g, "");
-        stripped = stripped.replace(/(\w)\s*:\s*(?:string|number|boolean|any|void|never|unknown|null|undefined)(?:\[\])?\s*(?=[,)])/g, "$1");
-        stripped = stripped.replace(/\bas\s+\w+/g, "");
-        stripped = stripped.replace(/^(interface|type)\s+\w+[^=].*$/gm, "");
-        stripped = stripped.replace(/(<\w[\w,\s]*>)\s*\(/g, "(");
-        new Function(stripped);
-
-        const knownMethods = new Set([
-          "drawRectangle", "drawRoundedRectangle", "drawCircle", "drawEllipse", "drawPolysides", "drawText", "draw",
-          "sketchCircle", "sketchRectangle", "makeCylinder", "makeSphere", "makeBox", "makeEllipsoid",
-          "extrude", "revolve", "loftWith", "sweepSketch",
-          "fuse", "cut", "intersect",
-          "fillet", "chamfer", "shell", "draft",
-          "translate", "translateX", "translateY", "translateZ", "rotate", "mirror", "scale",
-          "sketchOnPlane", "sketchOnFace",
-          "mesh", "meshEdges",
-          "close", "hLine", "vLine", "lineTo", "line", "sagittaArcTo", "tangentArcTo", "threePointsArcTo",
-          "cubicBezierCurveTo", "smoothSplineTo", "closeWithMirror", "done",
-          "localGC", "exportSTEP",
-        ]);
-        const methodCallPattern = /\.(\w+)\s*\(/g;
-        const unknownMethods = new Set<string>();
-        let match;
-        while ((match = methodCallPattern.exec(code)) !== null) {
-          if (!knownMethods.has(match[1])) unknownMethods.add(match[1]);
-        }
-
-        // --- Semantic checks (pitfall linter) -----------------------------
-        // Regex-only, conservative. These warnings are hints, not failures:
-        // the script may be intentional, and we prefer false-negatives to
-        // false-positives. isError stays false regardless.
-        const semanticWarnings: string[] = [];
-
-        // 1. sketchCircle/sketchRectangle already return a Sketch — chaining
-        //    .sketchOnPlane() on top throws at runtime. Easy to confuse with
-        //    the draw* family since the names rhyme.
-        const sketchMisChain = /\b(sketchCircle|sketchRectangle)\s*\([^)]*\)\s*\.\s*sketchOnPlane\s*\(/;
-        if (sketchMisChain.test(code)) {
-          semanticWarnings.push(
-            "`sketchCircle`/`sketchRectangle` already return a Sketch — remove the `.sketchOnPlane()` call (pass `{ plane: ... }` as config to the sketch* function instead)."
-          );
-        }
-
-        // 2. draw*(...).(...).extrude() without an intervening sketchOnPlane/
-        //    sketchOnFace. Tolerate 2D ops (fuse, cut, offset, translate,
-        //    rotate, mirror) in the chain — those are all legal on Drawings.
-        //    Match is deliberately non-greedy and bounded to a single chain
-        //    expression (method calls with balanced-ish parens).
-        const drawExtrudePattern = /\b(drawRectangle|drawRoundedRectangle|drawCircle|drawEllipse|drawPolysides|drawText)\s*\(([^()]|\([^()]*\))*\)((?:\s*\.\s*(?:fuse|cut|intersect|offset|translate|rotate|mirror)\s*\(([^()]|\([^()]*\))*\))*)\s*\.\s*extrude\s*\(/;
-        if (drawExtrudePattern.test(code)) {
-          semanticWarnings.push(
-            "Drawings must be placed on a plane before extruding — add `.sketchOnPlane(\"XY\")` between the draw call and `.extrude()`."
-          );
-        }
-
-        // 3. Non-uniform .scale(). Replicad's shape.scale is uniform-only.
-        //    Flag array arg OR multiple numeric args (comma-separated).
-        const scaleArrayPattern = /\.\s*scale\s*\(\s*\[/;
-        const scaleMultiArgPattern = /\.\s*scale\s*\(\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*[,)]/;
-        if (scaleArrayPattern.test(code) || scaleMultiArgPattern.test(code)) {
-          semanticWarnings.push(
-            "`shape.scale()` is uniform-only — pass a single number. For non-uniform scaling use `makeEllipsoid(rx, ry, rz)` or draw the target shape in 2D."
-          );
-        }
-
-        // 4. draw() pen-builder chain missing .close()/.done() before
-        //    .sketchOnPlane() or .extrude(). Match `draw(` (not drawXxx —
-        //    the (?![a-zA-Z]) guard ensures we don't catch drawRectangle),
-        //    followed by any chain of method calls up to the first
-        //    sketchOnPlane/extrude. Warn if that chain contains no
-        //    close/done/closeWithMirror call.
-        const penChainPattern = /\bdraw\s*\((?![a-zA-Z])([^()]|\([^()]*\))*\)((?:\s*\.\s*[a-zA-Z_]\w*\s*\(([^()]|\([^()]*\))*\))*?)\s*\.\s*(sketchOnPlane|extrude)\s*\(/g;
-        let penMatch: RegExpExecArray | null;
-        while ((penMatch = penChainPattern.exec(code)) !== null) {
-          const chainMiddle = penMatch[2] || "";
-          if (!/\.\s*(close|closeWithMirror|done)\s*\(/.test(chainMiddle)) {
-            semanticWarnings.push(
-              "A `draw()` pen chain needs `.close()` (for extrudable regions) or `.done()` (for open sweep paths) before sketching/extruding."
-            );
-            break; // one warning is enough
-          }
-        }
-
-        // 5. Fillet/chamfer radius sanity check against observed dimensions.
-        //    Collect numeric literals from shape-factory calls and extrude
-        //    distances. Take min > 0 as "smallest significant" dimension.
-        //    Warn if any fillet/chamfer radius literal exceeds half of that.
-        const dims: number[] = [];
-        const extractNums = (s: string) => {
-          const nums: number[] = [];
-          const re = /-?\d+(?:\.\d+)?/g;
-          let m: RegExpExecArray | null;
-          while ((m = re.exec(s)) !== null) {
-            const v = parseFloat(m[0]);
-            if (isFinite(v) && v > 0) nums.push(v);
-          }
-          return nums;
-        };
-        const dimFnPattern = /\b(drawRectangle|drawRoundedRectangle|drawCircle|drawEllipse|sketchCircle|sketchRectangle|makeBox|makeCylinder|makeSphere|makeEllipsoid)\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)/g;
-        let dimMatch: RegExpExecArray | null;
-        while ((dimMatch = dimFnPattern.exec(code)) !== null) {
-          dims.push(...extractNums(dimMatch[2]));
-        }
-        const extrudePattern = /\.\s*extrude\s*\(\s*(-?\d+(?:\.\d+)?)/g;
-        let eMatch: RegExpExecArray | null;
-        while ((eMatch = extrudePattern.exec(code)) !== null) {
-          const v = parseFloat(eMatch[1]);
-          if (isFinite(v) && v > 0) dims.push(v);
-        }
-        if (dims.length > 0) {
-          const smallest = Math.min(...dims);
-          const filletChamferPattern = /\.\s*(fillet|chamfer)\s*\(\s*(-?\d+(?:\.\d+)?)/g;
-          let fcMatch: RegExpExecArray | null;
-          const flagged = new Set<string>();
-          while ((fcMatch = filletChamferPattern.exec(code)) !== null) {
-            const r = parseFloat(fcMatch[2]);
-            if (!isFinite(r) || r <= 0) continue;
-            if (r > smallest * 0.5) {
-              const key = `${fcMatch[1]}:${r}:${smallest}`;
-              if (flagged.has(key)) continue;
-              flagged.add(key);
-              semanticWarnings.push(
-                `Fillet/chamfer radius ${r} may be too large for the smallest feature dimension (${smallest}) — OpenCascade often fails on radii larger than half the edge length.`
-              );
-            }
-          }
-        }
-
-        // 6. .fuse(/.cut( inside a for-loop body — classic "slow pattern".
-        //    Walk the raw code, track brace depth from the `for (...)` header
-        //    to the matching `}`, and flag fuse/cut within.
-        const forPattern = /\bfor\s*\([^)]*\)\s*\{/g;
-        let forMatch: RegExpExecArray | null;
-        let loopBoolSuggested = false;
-        while ((forMatch = forPattern.exec(code)) !== null) {
-          let depth = 1;
-          let i = forMatch.index + forMatch[0].length;
-          const start = i;
-          while (i < code.length && depth > 0) {
-            const ch = code[i];
-            if (ch === "{") depth++;
-            else if (ch === "}") depth--;
-            i++;
-          }
-          const body = code.slice(start, i);
-          if (/\.\s*(fuse|cut)\s*\(/.test(body)) {
-            loopBoolSuggested = true;
-            break;
-          }
-        }
-        if (loopBoolSuggested) {
-          semanticWarnings.push(
-            "Multiple 3D `fuse`/`cut` inside a loop is slow — consider combining in 2D first (with `drawing.fuse()` / `drawing.cut()`) then a single `.extrude()` at the end. See the `booleans` category in get_api_reference."
-          );
-        }
-
-        // --- Assemble response --------------------------------------------
-        const baseText = unknownMethods.size > 0
-          ? `Syntax OK. Warning: unknown method(s) found: ${Array.from(unknownMethods).map(m => `.${m}()`).join(", ")}.`
-          : "Syntax OK";
-        const warningBlock = semanticWarnings.length > 0
-          ? `\nSemantic warnings:\n${semanticWarnings.map(w => ` - ${w}`).join("\n")}`
-          : "";
-        return { content: [{ type: "text" as const, text: baseText + warningBlock }] };
-      } catch (e: any) {
-        return {
-          content: [{ type: "text" as const, text: `Syntax error: ${e.message}` }],
-          isError: true,
-        };
-      }
-    }
+    "[Deprecated — use validate_syntax] Validate TypeScript syntax and detect 6 common CAD pitfalls. Does NOT verify imports, types, or runtime behavior.",
+    validateSyntaxSchema,
+    safeHandler("validate_script", validateSyntaxImpl)
   );
 
   server.tool(
@@ -771,7 +1347,7 @@ export function registerTools(server: McpServer) {
       focusPart: z.string().optional().describe("For multi-part assemblies only: name of a single part to display exclusively in the screenshot — all other parts are hidden. No-op on single-part shapes. Takes precedence over hideParts when both are supplied. The interactive viewer's part visibility is restored after the screenshot."),
       hideParts: z.array(z.string()).optional().describe("For multi-part assemblies only: list of part names to hide in the screenshot. Other parts remain visible. Ignored if focusPart is also set. The interactive viewer's part visibility is restored after the screenshot."),
     },
-    async ({ code, workingDir, captureScreenshot, focusPart, hideParts }) => {
+    safeHandler("preview_shape", async ({ code, workingDir, captureScreenshot, focusPart, hideParts }) => {
       // Cheap pre-flight: reject obvious non-starters before touching the engine.
       // Matches the lightweight check create_shape does — full parse happens in esbuild.
       if (!code || !code.trim()) {
@@ -892,8 +1468,27 @@ export function registerTools(server: McpServer) {
           if (!isExtensionAlive()) {
             screenshotWarning = "\n(Screenshot skipped: VSCode extension is not running.)";
           } else {
+            // Bug #2: pin the previews dir to the tempfile's OWN dirname —
+            // same canonical rule as render_preview and tune_params. Previously
+            // this used readHeartbeat().workspaceRoots[0], which in
+            // multi-window VSCode setups could point at a workspace that
+            // doesn't own the snippet, landing the PNG in the wrong place.
+            // Anchoring to dirname(tempPath) makes output a pure function of
+            // the input: when `workingDir` was passed the PNG lands next to
+            // the user's workspace; when it wasn't, the PNG lands alongside
+            // the isolated globalStorage snippet (still readable via the
+            // returned absolute path).
+            const previewsDir = join(dirname(tempPath), "shapeitup-previews");
+            // Deterministic snippet-based filename derived from the tempfile
+            // basename (strip .shape.ts) so concurrent preview_shape calls
+            // don't collide and each PNG is traceable to its snippet.
+            const snippetBase = basename(tempPath).replace(/\.shape\.ts$/, "");
+            const expectedOutputPath = join(previewsDir, `shapeitup-preview-${snippetBase}.png`);
+
             const cmdId = sendExtensionCommand("render-preview", {
               filePath: tempPath,
+              outputPath: expectedOutputPath,
+              targetWorkspaceRoot: computeTargetWorkspaceRoot(tempPath),
               renderMode: "ai",
               showDimensions: true,
               cameraAngle: "isometric",
@@ -914,11 +1509,14 @@ export function registerTools(server: McpServer) {
               } else if (result.error) {
                 screenshotWarning = `\n(Screenshot skipped: ${result.error})`;
               } else if (result.screenshotPath) {
-                const partsLine = focusPart
-                  ? `\nParts: ${focusPart} (focused)`
-                  : hideParts && hideParts.length > 0
-                    ? `\nParts hidden: ${hideParts.join(", ")}`
-                    : "";
+                // Fix B (Bug #5): single-source-of-truth rule — derive from
+                // status.partNames. See computePartsLine for rationale.
+                const partsLine = computePartsLine(
+                  focusPart,
+                  hideParts,
+                  status.partNames ?? [],
+                  "focused",
+                );
                 const partWarnLine = Array.isArray(result.partWarnings) && result.partWarnings.length > 0
                   ? `\nPart warnings: ${result.partWarnings.join("; ")}`
                   : "";
@@ -943,18 +1541,18 @@ export function registerTools(server: McpServer) {
         // and thrown exceptions all funnel through here.
         try { unlinkSync(tempPath); } catch {}
       }
-    }
+    })
   );
 
   server.tool(
     "tune_params",
     "Re-execute an existing .shape.ts with ephemeral `params` overrides WITHOUT modifying the file — the file on disk is untouched. Returns the same stats as get_render_status (volume, surface area, bounding box, timings, warnings) so agents can binary-search a design constraint (target volume, bounding box, mass, fit tolerance) before committing the winning value with modify_shape. Pass `captureScreenshot: true` to also render a PNG of the tuned configuration via the VSCode extension.",
     {
-      filePath: z.string().describe("Path to the .shape.ts file. Relative paths resolve against the active VSCode workspace root."),
+      filePath: z.string().describe("Path to the .shape.ts file. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
       params: z.record(z.string(), z.number()).describe("Map of param name → override value. Only listed params are overridden; others fall back to the file's declared defaults. Values must be numbers."),
       captureScreenshot: z.boolean().optional().describe("If true, also capture a PNG screenshot of the tuned configuration via the VSCode extension. Default: false. Requires the extension to be running."),
     },
-    async ({ filePath, params, captureScreenshot }) => {
+    safeHandler("tune_params", async ({ filePath, params, captureScreenshot }) => {
       const absPath = resolveShapePath(filePath);
       if (!existsSync(absPath)) {
         return {
@@ -981,7 +1579,15 @@ export function registerTools(server: McpServer) {
       // Warn about keys that aren't declared in the script's `params` object.
       // The engine silently accepts unknown keys (they just don't do anything);
       // flagging them at the MCP layer is how the agent learns about a typo.
-      const declaredKeys = status.currentParams ? Object.keys(status.currentParams) : [];
+      //
+      // Bug #7 fix: on render failure, `currentParams` is absent (the executor
+      // never got far enough to populate it). Fall back to `declaredParams`,
+      // which engine.ts now extracts statically from the source code before
+      // esbuild runs — that way the "Declared: ..." line stays informative
+      // when the user's script crashes the WASM heap, has a typo, etc.
+      const declaredKeys = status.currentParams
+        ? Object.keys(status.currentParams)
+        : (status.declaredParams ?? []);
       const requestedKeys = Object.keys(params);
       const ignoredKeys = requestedKeys.filter((k) => !declaredKeys.includes(k));
       const warningLines: string[] = [];
@@ -1006,8 +1612,17 @@ export function registerTools(server: McpServer) {
         if (!isExtensionAlive()) {
           responseText += "\n(Screenshot skipped: VSCode extension is not running.)";
         } else {
+          // Pin output path to dirname(absPath)/shapeitup-previews — same
+          // canonical rule as render_preview, so tune_params and render_preview
+          // write to the same place for the same shape regardless of which
+          // VSCode window is active.
+          const previewsDir = join(dirname(absPath), "shapeitup-previews");
+          const tuneBase = basename(absPath).replace(/\.shape\.ts$/, "");
+          const tuneOutputPath = join(previewsDir, `shapeitup-preview-${tuneBase}-tuned-isometric.png`);
           const cmdId = sendExtensionCommand("render-preview", {
             filePath: absPath,
+            outputPath: tuneOutputPath,
+            targetWorkspaceRoot: computeTargetWorkspaceRoot(absPath),
             renderMode: "ai",
             showDimensions: true,
             cameraAngle: "isometric",
@@ -1040,7 +1655,7 @@ export function registerTools(server: McpServer) {
         content: [{ type: "text" as const, text: responseText }],
         isError: !status.success,
       };
-    }
+    })
   );
 
   server.tool(
@@ -1054,7 +1669,7 @@ export function registerTools(server: McpServer) {
       search: z.string().optional().describe("Keyword / phrase to search for across all categories. Returns the most relevant sections instead of one full category. Can be combined with `category` to search within a single category."),
       signaturesOnly: z.boolean().optional().describe("Return only method signatures (lines with `→` or top-level function/method declarations) from the requested category. Strips examples and prose for a compact lookup. Requires `category`."),
     },
-    async ({ category, search, signaturesOnly }) => {
+    safeHandler("get_api_reference", async ({ category, search, signaturesOnly }) => {
       if (search && search.trim().length > 0) {
         return { content: [{ type: "text" as const, text: searchApiReference(search, category) }] };
       }
@@ -1071,12 +1686,12 @@ export function registerTools(server: McpServer) {
         return { content: [{ type: "text" as const, text: extractSignatures(body, category) }] };
       }
       return { content: [{ type: "text" as const, text: body }] };
-    }
+    })
   );
 
   server.tool(
     "render_preview",
-    "Capture a PNG screenshot of the current shape. Requires VSCode + the ShapeItUp extension to be running (the extension renders via its webview, which works regardless of window size — the canvas is temporarily resized to the requested resolution). Preview PNGs are written to `{workspace}/shapeitup-previews/` — Read the returned absolute path to view the image. For headless verification without VSCode, use get_render_status which returns volume, surface area, center of mass, and bounding box. Pass `finder` to paint pink highlight spheres on the matched edges/faces in the screenshot (for just a text match count with no PNG, use `preview_finder`).",
+    "Capture a PNG screenshot of the current shape. Requires VSCode + the ShapeItUp extension to be running (the extension renders via its webview, which works regardless of window size — the canvas is temporarily resized to the requested resolution). Preview PNGs are written to `{workspace}/shapeitup-previews/` — Read the returned absolute path to view the image. For headless verification without VSCode, use get_render_status which returns volume, surface area, center of mass, and bounding box. Pass `finder` to paint pink highlight spheres on the matched edges/faces in the screenshot (for just a text match count with no PNG, use `preview_finder`). Pass `meshQuality: 'preview'` to speed up first-render on large assemblies at the cost of coarser facets; defaults to auto-degrade (preview for 15+ parts, final otherwise).",
     {
       filePath: z.string().optional().describe("Optional .shape.ts to execute first. Defaults to the last-executed shape."),
       cameraAngle: z
@@ -1099,9 +1714,14 @@ export function registerTools(server: McpServer) {
       finder: z.string().optional().describe("Optional EdgeFinder/FaceFinder expression, e.g. 'new EdgeFinder().inDirection(\"Z\")'. When provided, the rendered screenshot shows pink highlight spheres at each matched entity — same as preview_finder, but the PNG is saved alongside other render_previews (not ephemeral)."),
       partName: z.string().optional().describe("With `finder` on a multi-part assembly: apply the finder to the part whose name matches exactly. Wins over partIndex when both are given. Ignored when `finder` isn't set."),
       partIndex: z.number().int().nonnegative().optional().describe("With `finder` on a multi-part assembly: 0-based index of the part to apply the finder to (default: 0). Ignored when `finder` isn't set or `partName` is provided."),
+      meshQuality: z
+        .enum(["preview", "final"])
+        .optional()
+        .describe("Tessellation-quality preset. `'final'` (default for <15-part assemblies) matches the pre-existing render quality. `'preview'` coarsens the mesh ~2.5× for faster first-render on large assemblies, at the cost of visibly chunkier facets — choose this for layout checks on 15+ part assemblies. If omitted, the extension auto-degrades to `'preview'` when the part count is >= 15 and uses `'final'` otherwise."),
     },
-    async ({ filePath, cameraAngle, showDimensions, showAxes, renderMode, width, height, timeoutMs, focusPart, hideParts, finder, partName, partIndex }) => {
+    safeHandler("render_preview", async ({ filePath, cameraAngle, showDimensions, showAxes, renderMode, width, height, timeoutMs, focusPart, hideParts, finder, partName, partIndex, meshQuality }) => {
       // Resolve which file to render: explicit > engine's last-executed > status file.
+      const explicitFilePath = filePath !== undefined && filePath !== null;
       let source: string | undefined = filePath ? resolveShapePath(filePath) : getLastFileName();
       if (!source) {
         try {
@@ -1124,6 +1744,51 @@ export function registerTools(server: McpServer) {
           }],
           isError: true,
         };
+      }
+
+      // Bug #10: hard pre-flight check for cross-workspace renders. If the
+      // shape lives outside EVERY heartbeat-reported VSCode workspace, the
+      // bundler will later fail with the misleading "Could not resolve
+      // 'shapeitup'" — the real cause is that no open window owns this
+      // folder, so nothing can serve the render. Refuse up front with an
+      // actionable message instead of letting the bundler error bubble up.
+      // Note: preview_shape deliberately skips this check — its snippets live
+      // in an isolated globalStorage dir and have no user-visible workspace
+      // context, so a hard refusal would break every snippet render.
+      {
+        const wsErr = assertWorkspaceOwned(source);
+        if (wsErr) return wsErr;
+      }
+
+      // When no explicit filePath was passed, the default `source` came from
+      // engine.getLastFileName() — which is the process-wide "last executed
+      // shape", regardless of which window currently owns focus. In a
+      // multi-window VSCode setup, that file may belong to a workspace that is
+      // not the one the extension host will route this render to. Catching
+      // that silently would produce "success" responses pointing at a PNG
+      // captured by the wrong viewer. Refuse when the ambiguity is detectable
+      // and tell the caller to pass filePath.
+      if (!explicitFilePath) {
+        const hbs = readAllHeartbeats();
+        // Count live windows whose workspace roots actually contain `source`.
+        const resolvedSource = resolve(source).toLowerCase();
+        const ownedBy = hbs.filter((hb) =>
+          hb.workspaceRoots.some((r) => {
+            const rAbs = resolve(r).toLowerCase();
+            return resolvedSource === rAbs || resolvedSource.startsWith(rAbs + sep.toLowerCase());
+          }),
+        );
+        // Multi-window setup AND no window owns this file → the last-executed
+        // shape lives in a workspace that no current window can render.
+        if (hbs.length > 1 && ownedBy.length === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `No default shape for this workspace — last-executed shape (${source}) lives in a workspace no live ShapeItUp window owns. Pass an explicit \`filePath\` or open the correct workspace.\n\nLive windows: ${hbs.map((h) => h.workspaceRoots.join(",")).join(" | ")}`,
+            }],
+            isError: true,
+          };
+        }
       }
 
       // --- Optional finder branch ---------------------------------------------
@@ -1231,9 +1896,30 @@ export function registerTools(server: McpServer) {
         renderFileArg = wrapperPath;
       }
 
+      // Bug #1/#12 fix: MCP computes the exact PNG path here and hands it to
+      // the extension, instead of letting captureScreenshot() synthesize one
+      // from `this.lastExecutedFile` (which can be stale because executeScript
+      // is fired without await). The PNG is pinned to the USER-visible
+      // basename of `source`, placed in a shapeitup-previews/ sibling of the
+      // shape file itself. Anchoring to dirname(source) — rather than the
+      // heartbeat's workspace root — makes path resolution a pure function of
+      // the input, immune to the active-window/heartbeat drift that caused
+      // back-to-back calls to land in different directories.
+      const previewsDir = join(dirname(source), "shapeitup-previews");
+      const userBase = basename(source).replace(/\.shape\.ts$/, "");
+      const angleForName = cameraAngle || "isometric";
+      const expectedOutputPath = join(previewsDir, `shapeitup-preview-${userBase}-${angleForName}.png`);
+
       try {
         const cmdId = sendExtensionCommand("render-preview", {
           filePath: renderFileArg,
+          outputPath: expectedOutputPath,
+          // Target the window whose workspace owns the SOURCE file (not the
+          // possibly-synthetic wrapperPath). The wrapper is staged next to
+          // source, so its owning workspace is identical; resolving off the
+          // user-visible source path keeps the hint stable even when
+          // preview_finder rewrites renderFileArg to a sibling wrapper.
+          targetWorkspaceRoot: computeTargetWorkspaceRoot(source),
           renderMode: renderMode || "ai",
           showDimensions: showDimensions !== false,
           showAxes: showAxes === true,
@@ -1242,6 +1928,9 @@ export function registerTools(server: McpServer) {
           height: height || 960,
           focusPart,
           hideParts,
+          // P3-10: forward the user's quality preference (undefined → the
+          // core auto-degrades based on part count).
+          meshQuality,
         });
         if (!cmdId) {
           return { content: [{ type: "text" as const, text: "Failed to send command to extension" }], isError: true };
@@ -1274,20 +1963,48 @@ export function registerTools(server: McpServer) {
           };
         }
 
-        // Pull the latest render status so the response includes geometric props.
+        // Bug #1/#12 verification: the extension must report where it actually
+        // wrote the PNG, and that path must exist on disk. Previously the
+        // response echoed a synthesized path that could point at a stale
+        // cross-workspace file — now we require a real, existing path.
+        if (!result.screenshotPath || typeof result.screenshotPath !== "string") {
+          return {
+            content: [{ type: "text" as const, text: `render_preview: extension did not return a screenshotPath. Expected PNG at ${expectedOutputPath}.` }],
+            isError: true,
+          };
+        }
+        if (!existsSync(result.screenshotPath)) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `render_preview: extension reported screenshotPath=${result.screenshotPath}, but that file does not exist. Expected path was ${expectedOutputPath}. The extension may be running an older bundle that ignores the MCP-supplied outputPath — reload VSCode and retry.`,
+            }],
+            isError: true,
+          };
+        }
+
+        // Pull the latest render status so the response includes geometric props
+        // AND the authoritative partNames list from the just-completed render.
+        // Fix B (Bug #5): route the "Parts: …" line through computePartsLine
+        // so the "(focused)" claim only prints when the engine's rendered
+        // partNames actually contain the requested focus — otherwise the
+        // viewer's "focusPart ignored" warning would contradict it.
         let statusText = "";
+        let renderedPartNames: string[] = [];
         try {
           const status: EngineStatus = JSON.parse(readFileSync(join(GLOBAL_STORAGE, "shapeitup-status.json"), "utf-8"));
           if (status.success) {
             statusText = `\nStats: ${status.stats}${formatProperties(status.properties)}`;
           }
+          if (Array.isArray(status.partNames)) renderedPartNames = status.partNames;
         } catch {}
 
-        const partsLine = focusPart
-          ? `\nParts: ${focusPart} (focused — other parts hidden in screenshot)`
-          : hideParts && hideParts.length > 0
-            ? `\nParts hidden: ${hideParts.join(", ")}`
-            : "";
+        const partsLine = computePartsLine(
+          focusPart,
+          hideParts,
+          renderedPartNames,
+          "focused — other parts hidden in screenshot",
+        );
         const partWarnLine = Array.isArray(result.partWarnings) && result.partWarnings.length > 0
           ? `\nPart warnings: ${result.partWarnings.join("; ")}`
           : "";
@@ -1328,7 +2045,7 @@ export function registerTools(server: McpServer) {
           try { unlinkSync(wrapperPath); } catch {}
         }
       }
-    }
+    })
   );
 
   server.tool(
@@ -1341,25 +2058,42 @@ export function registerTools(server: McpServer) {
         .optional()
         .describe("Used only when filePath is omitted, to pick `shapeitup-preview-<shape>-<angle>.png` instead of the generic latest preview."),
     },
-    async ({ filePath, cameraAngle }) => {
+    safeHandler("get_preview", async ({ filePath, cameraAngle }) => {
       // 1) Resolve target PNG. Precedence: explicit filePath → per-shape+angle
-      // file in workspace previews dir → workspace "latest" → GLOBAL_STORAGE
-      // pre-workspace-move fallback.
+      // file in the shape's own shapeitup-previews/ → workspace "latest".
+      //
+      // The former GLOBAL_STORAGE fallback was removed — it routinely returned
+      // stale PNGs from earlier sessions (persisted across workspace switches)
+      // and silently broke the "render_preview → get_preview" loop. If no
+      // workspace-local PNG exists, fail cleanly so the caller knows to run
+      // render_preview first.
       let target: string | undefined;
       if (filePath) {
         target = resolveShapePath(filePath);
       } else {
-        const wsRoot = getDefaultDirectory();
-        const previewsDir = join(wsRoot, "shapeitup-previews");
         let shapeName: string | undefined;
+        let shapeDir: string | undefined;
         try {
           const status = JSON.parse(readFileSync(join(GLOBAL_STORAGE, "shapeitup-status.json"), "utf-8"));
-          if (status.fileName) shapeName = basename(status.fileName).replace(/\.shape\.ts$/, "");
+          if (status.fileName) {
+            shapeName = basename(status.fileName).replace(/\.shape\.ts$/, "");
+            shapeDir = dirname(status.fileName);
+          }
         } catch {}
         const candidates: string[] = [];
-        if (shapeName && cameraAngle) candidates.push(join(previewsDir, `shapeitup-preview-${shapeName}-${cameraAngle}.png`));
-        candidates.push(join(previewsDir, "shapeitup-preview.png"));
-        candidates.push(join(GLOBAL_STORAGE, "shapeitup-preview.png"));
+        // Prefer the shape's own sibling previews dir (matches render_preview's
+        // canonical output location). Fall back to the heartbeat workspace
+        // only so existing callers that never called render_preview still see
+        // something — but never globalStorage.
+        if (shapeDir) {
+          const localPreviewsDir = join(shapeDir, "shapeitup-previews");
+          if (shapeName && cameraAngle) candidates.push(join(localPreviewsDir, `shapeitup-preview-${shapeName}-${cameraAngle}.png`));
+          candidates.push(join(localPreviewsDir, "shapeitup-preview.png"));
+        }
+        const wsRoot = getDefaultDirectory();
+        const wsPreviewsDir = join(wsRoot, "shapeitup-previews");
+        if (shapeName && cameraAngle) candidates.push(join(wsPreviewsDir, `shapeitup-preview-${shapeName}-${cameraAngle}.png`));
+        candidates.push(join(wsPreviewsDir, "shapeitup-preview.png"));
         target = candidates.find((p) => existsSync(p));
       }
       if (!target || !existsSync(target)) {
@@ -1390,7 +2124,7 @@ export function registerTools(server: McpServer) {
           isError: true,
         };
       }
-    }
+    })
   );
 
   server.tool(
@@ -1399,14 +2133,14 @@ export function registerTools(server: McpServer) {
     {
       mode: z.enum(["ai", "dark"]).describe("'ai' for high-contrast light mode, 'dark' for normal dark mode"),
     },
-    async ({ mode }) => {
+    safeHandler("set_render_mode", async ({ mode }) => {
       if (!isExtensionAlive()) return extensionOfflineError("set_render_mode");
       const ok = !!sendExtensionCommand("set-render-mode", { mode });
       return {
         content: [{ type: "text" as const, text: ok ? `Render mode set to: ${mode}` : "Failed to send command" }],
         isError: !ok,
       };
-    }
+    })
   );
 
   server.tool(
@@ -1418,7 +2152,7 @@ export function registerTools(server: McpServer) {
         .optional()
         .describe("true to show dimensions, false to hide. Omit to toggle the current state. Also accepts 'true'/'false' strings for clients that stringify booleans."),
     },
-    async ({ show }) => {
+    safeHandler("toggle_dimensions", async ({ show }) => {
       if (!isExtensionAlive()) return extensionOfflineError("toggle_dimensions");
       const normalized: boolean | undefined =
         typeof show === "string" ? show === "true" : show;
@@ -1428,14 +2162,14 @@ export function registerTools(server: McpServer) {
         content: [{ type: "text" as const, text: ok ? `Dimensions: ${stateLabel}` : "Failed to send command" }],
         isError: !ok,
       };
-    }
+    })
   );
 
   server.tool(
     "get_render_status",
     "Get the result of the last shape render — whether it succeeded or failed, with stats, geometric properties (volume, area, center of mass, mass when material is exported), and bounding box. Reads the shared status file, which both MCP-driven and VSCode-driven renders write to. Includes currentParams — the resolved values of every exported param, so you don't need to re-read the file to inspect parameter state. For multi-part assemblies, returns per-part stats (name, volume, surface area, center of mass, bounding box, mass) — no separate list_parts tool needed.",
     {},
-    async () => {
+    safeHandler("get_render_status", async () => {
       const statusFile = join(GLOBAL_STORAGE, "shapeitup-status.json");
       if (!existsSync(statusFile)) {
         return {
@@ -1454,25 +2188,52 @@ export function registerTools(server: McpServer) {
           isError: true,
         };
       }
-    }
+    })
   );
 
   server.tool(
     "preview_finder",
-    "Preview which edges/faces a Replicad EdgeFinder or FaceFinder matches on a shape — WITHOUT editing the user's script. Runs the given .shape.ts file, applies the finder to the resulting shape, and reports how many entities matched plus their locations. `EdgeFinder` and `FaceFinder` are implicitly in scope — pass a plain TS finder expression (same DSL you'd use in a fillet/chamfer/shell call), e.g. `new EdgeFinder().inDirection(\"Z\")` or `new FaceFinder().inPlane(\"XY\", 10)`. Supports the full finder DSL: `.and`, `.or`, `.not`, `.inDirection`, `.inPlane`, `.ofLength`, `.containsPoint`, etc. If the VSCode extension is running, also renders the highlighted preview in the viewer (pink spheres at each match); otherwise just returns the text report.",
+    "Preview which edges/faces a Replicad EdgeFinder or FaceFinder matches on a shape — WITHOUT editing the user's script. Runs the given .shape.ts file (or an inline `code` snippet), applies the finder to the resulting shape, and reports how many entities matched plus their locations. `EdgeFinder` and `FaceFinder` are implicitly in scope — pass a plain TS finder expression (same DSL you'd use in a fillet/chamfer/shell call), e.g. `new EdgeFinder().inDirection(\"Z\")` or `new FaceFinder().inPlane(\"XY\", 10)`. Supports the full finder DSL: `.and`, `.or`, `.not`, `.inDirection`, `.inPlane`, `.ofLength`, `.containsPoint`, etc. If the VSCode extension is running, also renders the highlighted preview in the viewer (pink spheres at each match); otherwise just returns the text report. Pass either `filePath` (existing shape) or `code` (inline snippet) — they are mutually exclusive. Debugging a script that crashes BEFORE the finder target exists: pass a modified snippet via `code` with the failing op commented out or stubbed — the finder then runs against the shape at whatever earlier point you choose.",
     {
-      filePath: z.string().describe("Path to the .shape.ts file whose shape the finder should be applied to"),
+      filePath: z.string().optional().describe("Path to the .shape.ts file whose shape the finder should be applied to. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first existing match wins), else anchor to process.cwd(). Mutually exclusive with `code`."),
+      code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning a Shape3D or array of parts. Written to a throwaway temp file, executed, and deleted afterwards. Use `workingDir` to make local `./` imports resolve. Mutually exclusive with `filePath`."),
+      workingDir: z.string().optional().describe("Directory to write the temp snippet file in when `code` is provided. When set, relative imports (`./foo.shape`) resolve against this directory. Defaults to a private globalStorage path (isolated; relative imports won't work)."),
       finder: z.string().describe("TS expression producing an EdgeFinder or FaceFinder, e.g. 'new EdgeFinder().inDirection(\"Z\").ofLength(l => l > 10)'"),
       partIndex: z.number().int().nonnegative().optional().describe("If the script returns a multi-part assembly, which part's shape to apply the finder to (default: 0). Ignored when `partName` is also provided."),
       partName: z.string().optional().describe("For multi-part assemblies: apply the finder to the part whose name matches exactly (e.g., 'bolt'). Takes precedence over `partIndex` when both are provided."),
     },
-    async ({ filePath, finder, partIndex, partName }) => {
-      const absPath = resolveShapePath(filePath);
+    safeHandler("preview_finder", async ({ filePath, code, workingDir, finder, partIndex, partName }) => {
+      // Input validation: filePath and code are mutually exclusive, one required.
+      if (filePath !== undefined && code !== undefined) {
+        return {
+          content: [{ type: "text" as const, text: "preview_finder: pass either `filePath` OR `code`, not both." }],
+          isError: true,
+        };
+      }
+      if (filePath === undefined && code === undefined) {
+        return {
+          content: [{ type: "text" as const, text: "preview_finder: provide either `filePath` (existing shape) or `code` (inline snippet)." }],
+          isError: true,
+        };
+      }
+
+      return withShapeFile({ filePath, code, workingDir }, async (absPath) => {
       if (!existsSync(absPath)) {
         return {
           content: [{ type: "text" as const, text: `File not found: ${absPath}` }],
           isError: true,
         };
+      }
+
+      // Bug #10 / Issue #2: workspace-ownership check FIRST — before running the
+      // engine or building any text report. If this check fires on call #2
+      // after call #1 succeeded (because the heartbeat flipped to a different
+      // window in between), we want both calls to refuse identically instead
+      // of returning a match count + a stale PNG reference. Skip for inline
+      // `code` snippets since they live in the isolated globalStorage dir.
+      if (filePath !== undefined) {
+        const wsErr = assertWorkspaceOwned(absPath);
+        if (wsErr) return wsErr;
       }
 
       // Step 1: execute the user's script to get the live OCCT parts.
@@ -1574,6 +2335,33 @@ export function registerTools(server: McpServer) {
         try {
           if (!isFace && typeof m.length === "number") extra = `, length=${fmt(m.length)}mm`;
         } catch {}
+        // Face matches carry richer info — surface area (via the top-level
+        // `measureArea` helper) and the outward normal at the face center
+        // (via `.normalAt()` — optional argument, defaults to the face
+        // centroid). Both are wrapped in try/catch: measureArea throws on
+        // non-planar surfaces in some builds, and normalAt can return a
+        // Vector that throws on `.x` access after the underlying TopoDS was
+        // deleted. The per-field guards keep a single failure from nuking
+        // the entire report — we simply omit the field.
+        if (isFace) {
+          try {
+            if (typeof replicad.measureArea === "function") {
+              const a = replicad.measureArea(m);
+              if (typeof a === "number" && isFinite(a)) {
+                extra += `, area=${fmt(a)}mm²`;
+              }
+            }
+          } catch {}
+          try {
+            if (typeof m.normalAt === "function") {
+              const n = m.normalAt();
+              if (n && typeof n.x === "number" && typeof n.y === "number" && typeof n.z === "number") {
+                extra += `, normal=(${fmt(n.x)}, ${fmt(n.y)}, ${fmt(n.z)})`;
+              }
+              try { n?.delete?.(); } catch {}
+            }
+          } catch {}
+        }
         locationLines.push(`  [${i}] ${entityKind} ${loc}${extra}`);
         try { m.delete?.(); } catch {}
       }
@@ -1596,15 +2384,27 @@ export function registerTools(server: McpServer) {
       // Step 4: optional highlighted preview in the VSCode viewer. Write a
       // synthetic wrapper .shape.ts next to the user's file (so local imports
       // resolve through esbuild's bundler), render-preview it, then clean up.
+      // Note: the workspace-ownership check ran up-front (before we executed
+      // the script), so if we got here the workspace is owned — both first
+      // and second calls behave identically. Issue #2 fix.
       if (isExtensionAlive()) {
         const stamp = Date.now().toString(36);
         const dir = dirname(absPath);
         const previewPath = join(dir, `.shapeitup-finder-preview-${stamp}.shape.ts`);
         const wrapperSource = buildFinderWrapperScript(absPath, finder, { index: idx });
+        // Pin the output PNG to the USER's shape basename, not the wrapper —
+        // without an explicit outputPath the extension would synthesize a name
+        // from `this.lastExecutedFile` (which is the wrapper), producing
+        // `shapeitup-preview-.shapeitup-finder-preview-<stamp>-isometric.png`.
+        const previewsDir = join(dir, "shapeitup-previews");
+        const userBase = basename(absPath).replace(/\.shape\.ts$/, "");
+        const finderOutputPath = join(previewsDir, `shapeitup-preview-${userBase}-finder-isometric.png`);
         try {
           writeFileSync(previewPath, wrapperSource, "utf-8");
           const cmdId = sendExtensionCommand("render-preview", {
             filePath: previewPath,
+            outputPath: finderOutputPath,
+            targetWorkspaceRoot: computeTargetWorkspaceRoot(previewPath),
             renderMode: "ai",
             showDimensions: false,
             cameraAngle: "isometric",
@@ -1629,18 +2429,35 @@ export function registerTools(server: McpServer) {
       return {
         content: [{ type: "text" as const, text }],
       };
-    }
+      }); // close withShapeFile callback
+    })
   );
 
   server.tool(
     "check_collisions",
-    "Detects pairwise intersections between named parts in a multi-part assembly. AABB prefilter skips obviously-disjoint pairs; remaining pairs are tested with Replicad's 3D intersect (which can fail on complex curved solids — those pairs are reported as 'intersect failed' rather than silently ignored). Tolerance filters out numerical-noise contacts (default 0.001 mm³); very large assemblies (100+ parts) will be slow because work grows as N².",
+    "Detects pairwise intersections between named parts in a multi-part assembly. AABB prefilter skips obviously-disjoint pairs; remaining pairs are tested with Replicad's 3D intersect (which can fail on complex curved solids — those pairs are reported as 'intersect failed' rather than silently ignored). Tolerance filters out numerical-noise contacts (default 0.001 mm³); very large assemblies (100+ parts) will be slow because work grows as N². Pass either `filePath` (existing shape) or `code` (inline snippet) — they are mutually exclusive.",
     {
-      filePath: z.string().describe("Path to the .shape.ts file to check for part collisions."),
+      filePath: z.string().optional().describe("Path to the .shape.ts file to check for part collisions. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first existing match wins), else anchor to process.cwd(). Mutually exclusive with `code`."),
+      code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning an array of parts. Written to a throwaway temp file, executed, and deleted afterwards. Use `workingDir` to make local `./` imports resolve. Mutually exclusive with `filePath`."),
+      workingDir: z.string().optional().describe("Directory to write the temp snippet file in when `code` is provided. When set, relative imports (`./foo.shape`) resolve against this directory. Defaults to a private globalStorage path (isolated; relative imports won't work)."),
       tolerance: z.number().optional().describe("Minimum intersection volume in mm³ to count as a collision. Defaults to 0.001 — filters out numerical-noise overlaps on touching-but-not-overlapping parts. Negative values are clamped to 0."),
     },
-    async ({ filePath, tolerance }) => {
-      const absPath = resolveShapePath(filePath);
+    safeHandler("check_collisions", async ({ filePath, code, workingDir, tolerance }) => {
+      // Input validation: filePath and code are mutually exclusive, one required.
+      if (filePath !== undefined && code !== undefined) {
+        return {
+          content: [{ type: "text" as const, text: "check_collisions: pass either `filePath` OR `code`, not both." }],
+          isError: true,
+        };
+      }
+      if (filePath === undefined && code === undefined) {
+        return {
+          content: [{ type: "text" as const, text: "check_collisions: provide either `filePath` (existing shape) or `code` (inline snippet)." }],
+          isError: true,
+        };
+      }
+
+      return withShapeFile({ filePath, code, workingDir }, async (absPath) => {
       if (!existsSync(absPath)) {
         return {
           content: [{ type: "text" as const, text: `File not found: ${absPath}` }],
@@ -1811,7 +2628,8 @@ export function registerTools(server: McpServer) {
       return {
         content: [{ type: "text" as const, text: sections.join("\n") }],
       };
-    }
+      }); // close withShapeFile callback
+    })
   );
 }
 
@@ -1868,35 +2686,111 @@ function findShapeFiles(dir: string, depth = 3): string[] {
 }
 
 /**
- * Strip a category body down to signature-like lines: anything with a Replicad
- * arrow `→`, anything that looks like a function/method call (`name(args)`), and
- * inline-code signatures inside backticks. Drops prose, code fences, and blank
- * regions so agents doing quick API lookups don't pay for the full example text.
- * Headings are kept as section markers.
+ * Strip a category body down to honest-to-goodness signature lines — not
+ * recipe prose and not every line that happens to contain a `(`.
+ *
+ * A line qualifies as a signature if (stripped of leading bullets / backticks
+ * / whitespace) it matches ONE of:
+ *
+ *   - Heading (`#`..`####`) — kept as a section marker only.
+ *   - Arrow form `name(args) → ReturnType` anywhere on the line (the canonical
+ *     Replicad signature style in this file).
+ *   - Bare top-level call: `ident(args)` or `a.b.c(args)` possibly followed
+ *     only by an inline comment (`// ...` or `— ...`) — no lambda bodies,
+ *     no trailing English prose tails.
+ *   - Leading-dot method signature: `.method(args)` — chainable method style
+ *     used in the finders reference.
+ *   - Inside a code fence: `export function`, `function`, `const NAME = `,
+ *     `class`, `interface`, `type` declarations (TS/JS signature shapes).
+ *
+ * Recipe-style lines that embed a full call with a lambda (e.g.
+ * `` `shape.fillet(2, e => e.inDirection("Z"))` ``) are dropped — those are
+ * examples, not signatures. When a category has zero qualifying lines, the
+ * helper returns a short note saying so rather than a misleading "here are
+ * the signatures" wrapper around prose.
  */
-function extractSignatures(body: string, category: string): string {
+export function extractSignatures(body: string, category: string): string {
   const lines = body.split("\n");
   const kept: string[] = [];
   let inFence = false;
+
+  // Strip leading bullet markers and wrapping backticks so the signature
+  // pattern can match whether the author wrote ``- `foo(x)` `` or a bare
+  // `foo(x)` line. Keep a version without a leading `-`/`*` but preserve
+  // any inline code punctuation for kept output.
+  const normalize = (raw: string): string =>
+    raw.trim().replace(/^[-*]\s*/, "").replace(/^`|`$/g, "").trim();
+
+  // A "clean" signature line has no arrow-function lambda body and no
+  // prose tail after the closing paren (inline `//` or `— ...` comments
+  // are fine).
+  const isCleanSignature = (s: string): boolean => {
+    if (/=>/.test(s)) return false; // lambda body = recipe, not signature
+    // Pattern: optional leading dot, dotted identifier, parens (may nest
+    // one level), optional trailing comment/em-dash note.
+    const sigBody = /^\.?[A-Za-z_][\w.]*\s*\(([^()]|\([^()]*\))*\)\s*(?:→[^\n]*)?(?:\s*(?:\/\/.*|—\s*.*|-\s+.*))?$/;
+    return sigBody.test(s);
+  };
+
   for (const raw of lines) {
     const line = raw.replace(/\s+$/, "");
     if (/^```/.test(line)) { inFence = !inFence; continue; }
+
     if (inFence) {
-      // Keep signature-ish lines inside code fences (function decls, arrow types).
-      if (/→|^\s*(?:export\s+)?(?:function|const|class|interface|type)\s+\w/.test(line)) {
+      // Inside a code fence: keep TS/JS declaration forms + any arrow-style
+      // signature. Recipe code (call expressions with lambdas, chained
+      // boolean sequences) is dropped.
+      //
+      // Declarations must be `export`-prefixed, or be one of
+      // function/class/interface/type (which are always declarations — no
+      // assignment ambiguity). A bare `const sketch = drawCircle(5)` is a
+      // recipe assignment, not an API signature, so it falls through.
+      if (/^\s*export\s+(?:function|const|class|interface|type)\s+\w/.test(line)) {
         kept.push(line.trim());
+        continue;
       }
+      if (/^\s*(?:function|class|interface|type)\s+\w/.test(line)) {
+        kept.push(line.trim());
+        continue;
+      }
+      if (/→/.test(line)) { kept.push(line.trim()); continue; }
+      const n = normalize(line);
+      if (isCleanSignature(n)) kept.push(n);
       continue;
     }
+
+    // Outside fences.
     if (/^#{1,4}\s/.test(line)) { kept.push(line); continue; }
-    if (/→/.test(line)) { kept.push(line.trim()); continue; }
-    // Plain signature-ish prose lines: bulleted or bare method calls.
-    if (/^\s*[-*]?\s*`?\w[\w.]*\(/.test(line) && line.includes("(")) kept.push(line.trim());
+
+    const n = normalize(line);
+    if (!n) continue;
+    // Arrow form anywhere (e.g. prose that embeds `foo() → Bar`). Keep only
+    // the substring up through the arrow result to avoid dragging in prose.
+    if (/→/.test(n) && isCleanSignature(n)) { kept.push(n); continue; }
+    if (isCleanSignature(n)) kept.push(n);
   }
-  const body2 = kept.join("\n").replace(/\n{3,}/g, "\n\n").trim();
-  return body2.length > 0
+
+  // Collapse consecutive blank sections and strip headings that now have no
+  // body — a heading-only section is noise in signatures-only output.
+  const collapsed: string[] = [];
+  for (let i = 0; i < kept.length; i++) {
+    const line = kept[i];
+    const isHeading = /^#{1,4}\s/.test(line);
+    if (isHeading) {
+      const next = kept[i + 1];
+      const nextIsHeading = next && /^#{1,4}\s/.test(next);
+      if (nextIsHeading || next === undefined) continue;
+    }
+    collapsed.push(line);
+  }
+  // Require at least one non-heading signature line; otherwise we have
+  // nothing useful to show. Prose-heavy categories (finders recipes, the
+  // overview) fall into this branch cleanly.
+  const hasRealSignature = collapsed.some((l) => !/^#{1,4}\s/.test(l));
+  const body2 = collapsed.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return hasRealSignature
     ? `# ${category} — signatures only\n\n${body2}`
-    : `# ${category} — signatures only\n\n(No signature-style lines found in this category; call get_api_reference without signaturesOnly for the full content.)`;
+    : `# ${category} — signatures only\n\n(No signature-shaped lines found in this category — the content is prose / recipes. Call get_api_reference without signaturesOnly for the full text.)`;
 }
 
 function getApiReference(category: string): string {
@@ -1937,13 +2831,15 @@ Coordinate system (units: millimeters):
       /
      Y (forward, away from camera)
 \`\`\`
-Planes and their extrude directions:
+Planes and their extrude directions (verified from replicad source):
 - "XY" — horizontal plane (top-down view). .extrude(d) goes +Z (up).
-- "XZ" — vertical plane, faces the camera in "front" view. .extrude(d) goes +Y (away from camera).
+- "XZ" — vertical plane, faces the camera in "front" view. .extrude(d) goes -Y (TOWARD the camera). Normal = [0,-1,0].
 - "YZ" — vertical plane, faces the camera in "right" view. .extrude(d) goes +X.
-Prefix "-" flips the plane's normal, so extrude reverses: "-XY" extrudes in -Z (down),
-"-XZ" in -Y, "-YZ" in -X. Use this when cutting a hole downward through a base, or any
-time you want the solid to grow opposite the default direction.
+NOTE: replicad does NOT support "-XY"/"-XZ"/"-YZ" prefixes. Use the alternate plane names instead:
+- "YX" (normal [0,0,-1]) extrudes -Z — use instead of "-XY"
+- "ZX" (normal [0,1,0]) extrudes +Y — use instead of "-XZ" (or flip via negative extrude depth)
+- "ZY" (normal [-1,0,0]) extrudes -X — use instead of "-YZ"
+To cut a hole downward through a base, pass a negative extrude depth: .extrude(-depth), or use "YX" plane.
 
 draw* vs sketch* — they look alike but return different things:
 - drawCircle/drawRectangle/drawRoundedRectangle/drawEllipse/drawPolysides/drawText/draw()
@@ -2000,19 +2896,20 @@ sketchCircle(r).sketchOnPlane(...) throws at runtime.
 
 Methods:
 - drawing.sketchOnPlane(plane?, origin?) → Sketch
-    plane: "XY" | "XZ" | "YZ" (prefix "-" to flip normal, e.g. "-XY")
+    plane: "XY" | "XZ" | "YZ" | "ZX" | "YX" | "ZY" | "front" | "back" | "left" | "right" | "top" | "bottom"
+    (Note: "-XY"/"-XZ"/"-YZ" prefixes do NOT exist in replicad — use "YX"/"ZX"/"ZY" instead)
     origin: [x, y, z] — offsets the sketch along the plane normal, e.g. [0,0,20]
 - drawing.sketchOnFace(face, scaleMode?) → Sketch
 - sketchRectangle(w, h, config?) → Sketch
 - sketchCircle(r, config?) → Sketch
 
-Plane config for sketch*: { plane: "XY"|"XZ"|"YZ", origin: [x,y,z] }
+Plane config for sketch*: { plane: "XY"|"XZ"|"YZ"|..., origin: [x,y,z] }
 
 Plane orientation — what \`origin\` actually means:
 The \`origin\` arg is NOT a 2D offset within the sketch plane — it is a full 3D point
 that shifts the plane along its own normal. \`sketchOnPlane("XY", [0,0,20])\` places the
-sketch on XY raised 20 mm in +Z. For "XZ" the normal is +Y (so [0,20,0] shifts 20 mm
-forward); for "YZ" the normal is +X. To translate within the plane, use \`drawing.translate(dx, dy)\` before \`sketchOnPlane\`, not the origin arg.
+sketch on XY raised 20 mm in +Z. For "XZ" the normal is -Y (so [0,-20,0] shifts 20 mm
+toward camera); for "YZ" the normal is +X. To translate within the plane, use \`drawing.translate(dx, dy)\` before \`sketchOnPlane\`, not the origin arg.
 
 ## Composition Patterns
 
@@ -2089,10 +2986,13 @@ heights or offset planes). See the "Cooling Fins" example in the examples catego
 
 shape.fillet(radius, finder?) → Shape3D
 shape.chamfer(distance, finder?) → Shape3D
-shape.shell({ thickness, filter }) → Shape3D
+shape.shell(thickness, filter?) → Shape3D    — positional: filter is a callback
+shape.shell({ thickness, filter }) → Shape3D — config: filter must be a FaceFinder INSTANCE
 shape.draft(angle, faceFinder, neutralPlane?)
 
-Apply fillets BEFORE boolean cuts. Use small radii (0.3-0.5mm) on complex geometry.`,
+Apply fillets BEFORE boolean cuts. Use small radii (0.3-0.5mm) on complex geometry.
+
+IMPORTANT: the shell config-object form does NOT accept a callback for \`filter\`. Use the positional form for callbacks — \`shape.shell(2, f => f.inPlane("XY", h))\` — or pass a \`new FaceFinder().inPlane(...)\` instance to the config form.`,
     transforms: `# Transformations
 
 shape.translate(x, y, z), .translateX/Y/Z(d)
@@ -2111,8 +3011,8 @@ Pass a lambda \`e => e.method()\` (or \`f => f.method()\`) to the modification c
 Vertical (Z-aligned) edges — outer corners of a vertical extrude:
 \`shape.fillet(2, e => e.inDirection("Z"))\`
 
-Top face of a part of height h — for shell or draft:
-\`shape.shell({ thickness: 1, filter: f => f.inPlane("XY", h) })\`
+Top face of a part of height h — for shell, use the positional-callback form:
+\`shape.shell(1, f => f.inPlane("XY", h))\` — callback works here, NOT inside { filter }
 
 All circular edges (hole rims, cylinder caps):
 \`shape.fillet(0.5, e => e.ofCurveType("CIRCLE"))\`
@@ -2239,7 +3139,7 @@ returns a Replicad Shape3D (or Drawing, where noted), so results mix with any
 other Replicad code. Dimensions come from ISO/DIN tables — don't hardcode.
 
 \`\`\`typescript
-import { holes, screws, nuts, washers, inserts, bearings, extrusions, patterns, printHints, motors, couplers, threads, fromBack, shape3d, part, faceAt, shaftAt, boreAt, mate, assemble, subassembly, stackOnZ, entries, debugJoints, highlightJoints, cylinder, standards } from "shapeitup";
+import { holes, screws, bolts, washers, inserts, bearings, extrusions, patterns, printHints, motors, couplers, threads, fromBack, shape3d, part, faceAt, shaftAt, boreAt, mate, assemble, subassembly, stackOnZ, entries, debugJoints, highlightJoints, cylinder, standards } from "shapeitup";
 \`\`\`
 
 **Convention for cut-tool shapes** (holes, bearing seats, insert pockets):
@@ -2250,7 +3150,7 @@ tool to the target location and cut from their part:
 plate.cut(holes.counterbore("M3", { plateThickness: 4 }).translate(10, 10, 4))
 \`\`\`
 
-**Convention for positive shapes** (screws, nuts, washers, bearings bodies):
+**Convention for positive shapes** (screws, nuts, washers, bearing bodies — "nut" means \`screws.nut\`/\`bolts.nut\`, there's no separate \`nuts\` namespace):
 top face at Z = 0, shaft/body extends into -Z. Colors left to the caller.
 
 **Back-face cuts** — wrap a cut tool in \`fromBack(tool)\` to flip it so it
@@ -2275,35 +3175,63 @@ plate.cut(hole);  // OK
 ## holes — cut-tool shapes
 
 \`\`\`typescript
-holes.through(size, { depth?, fit? })                     // clearance hole ("M3" or raw mm)
-holes.counterbore(spec, { plateThickness, fit? })          // socket-head pocket + shaft
-holes.countersink(spec, { plateThickness, fit? })          // 90° flat-head flare + shaft
-holes.tapped(size, { depth })                              // tap-drill sized (metal taps or skip — use inserts.pocket for FDM)
-holes.teardrop(size, { depth, axis? })                     // horizontal hole, FDM-printable
-holes.keyhole({ largeD, smallD, slot, depth })             // hang-on-screw mount
-holes.slot({ length, width, depth })                       // elongated hole
+holes.through(size, { depth?, fit?, axis? })               // clearance hole ("M3" or raw mm)
+holes.clearance(size, { depth?, fit?, axis? })             // alias of through — same signature, common engineering term
+holes.counterbore(spec, { plateThickness, fit?, axis? })   // socket-head pocket + shaft
+holes.countersink(spec, { plateThickness, fit?, axis? })   // 90° flat-head flare + shaft
+holes.tapped(size, { depth, axis? })                       // tap-drill sized (metal taps or skip — use inserts.pocket for FDM)
+holes.teardrop(size, { depth, axis? })                     // horizontal hole, FDM-printable (axis: "+X"|"+Y")
+holes.keyhole({ largeD, smallD, slot, depth, axis? })      // hang-on-screw mount
+holes.slot({ length, width, depth, axis? })                // elongated hole
 \`\`\`
 
 \`fit\` is a FitStyle: "press" | "slip" | "clearance" (default) | "loose".
 \`size\` for through/teardrop accepts \`MetricSize\` strings ("M3") OR a raw diameter in mm.
 \`spec\` for counterbore/countersink is a screw designator ("M3" — length ignored).
+Supported metric sizes: M2, M2.5, M3, M4, M5, M6, M8, M10, M12. (Not every table covers every size — e.g. button/flat-head start at M3; heat-set inserts stop at M5. The helpers throw a readable "Unknown metric size" error with the supported list when the table misses a size.)
+\`axis\` (default "+Z", extends toward -Z): one of "+Z" | "-Z" | "+X" | "-X" | "+Y" | "-Y". Rotates the cutter so a single translate lands the hole on a vertical flange without manual \`.rotate(…)\`. Example: \`holes.through("M3", { depth: 8, axis: "+X" }).translate(0, 5, 10)\`. Teardrop uses its own "+X"/"+Y" axis set.
+
+**String vs. raw diameter are NOT equivalent.** \`holes.through("M4", …)\` applies an ISO 273 clearance fit (~4.5mm for the default "clearance" fit style); \`holes.through(4, …)\` cuts a literal 4mm hole. Common nominal sizes (3, 4, 5, 6, 8, 10, 12) are easily confused — prefer the string form unless you specifically want a raw dimension. The stdlib emits a runtime warning when a raw integer matches a nominal size; pass a non-integer (e.g. \`4.0001\`) to suppress the warning when the literal diameter is intentional.
+
+**Z-convention** — every hole tool spans \`Z ∈ [-depth, 0]\`: the entry face sits at Z=0 and the body extends into -Z. Translate by the plate's top-face Z so the mouth lands flush:
+
+\`\`\`typescript
+plate.cut(holes.through("M3", { depth: 10 }).translate(x, y, plateTop))
+plate.cut(holes.counterbore("M3", { plateThickness: t }).translate(x, y, t))
+\`\`\`
+
+Forgetting this translate leaves the cutter below the plate and the boolean silently removes nothing. A "no material removal" warning from \`patterns.cutAt\` / \`.cut()\` usually means a missing or wrong-signed Z translate. For features that open on the BOTTOM face of a plate (heat-set inserts), wrap with \`fromBack(...)\` to flip the cutter into +Z.
 
 ---
 
-## screws / nuts / washers / inserts — positive shapes
+## screws / bolts / washers / inserts — positive shapes
+
+Two parallel fastener namespaces with identical method names. Pick by intent:
+
+- \`screws.*\` = **cosmetic** (plain cylinder shafts, B-Rep Shape3D, fast, composable)
+- \`bolts.*\`  = **threaded** (real helical geometry; \`bolts.nut\` returns MeshShape)
 
 \`\`\`typescript
-screws.socketHead("M3x10")     // ISO 4762 cap screw, full shape with hex recess
-screws.buttonHead("M4x8")      // ISO 7380 — head is a simple cylinder in v1 (no dome)
-screws.flatHead("M5x12")       // ISO 10642 countersunk — head is a revolved cone
-nuts.hex("M3")                 // DIN 934 hex nut
-washers.flat("M3")             // DIN 125 flat washer
-inserts.heatSet("M3")          // brass heat-set insert BODY (for visualization)
-inserts.pocket("M3")           // CUT-TOOL for the pocket — interference-fit sized
+screws.socket("M3x10")     // ISO 4762 cap screw, plain shaft
+screws.button("M4x8")      // ISO 7380 button-head
+screws.flat("M5x12")       // ISO 10642 countersunk
+screws.hex("M6x20")        // ISO 4017 hex bolt, plain shaft
+screws.nut("M3")           // DIN 934 hex nut, clean bore
+
+bolts.socket("M3x10")      // same four shapes, threaded shafts
+bolts.button("M4x8")
+bolts.flat("M5x12")
+bolts.hex("M6x20")
+bolts.nut("M3")            // MeshShape — see mesh/B-Rep note below
+
+washers.flat("M3")         // DIN 125 flat washer
+inserts.heatSet("M3")      // brass heat-set insert BODY
+inserts.pocket("M3")       // CUT-TOOL for the pocket
 \`\`\`
 
-For 3D printing: use \`inserts.pocket\` in the printed part + \`screws.socketHead\` as the
-fastener. Don't try to print threaded holes — they're unreliable at small sizes.
+Mixing mesh and B-Rep: \`bolts.nut\` is a MeshShape — it can only fuse/cut with other MeshShapes. Convert the Shape3D side first: \`plate.meshShape({ tolerance: 0.01 }).cut(bolts.nut("M3"))\`.
+
+For 3D printing: use \`inserts.pocket\` + a real brass heat-set insert + \`screws.socket\` as the fastener. Printed threads under M5 are unreliable.
 
 ---
 
@@ -2554,16 +3482,45 @@ visual fidelity, and large printable threads (jar lids, leadscrews, M8+).
 **Small threads (M2–M5) don't survive FDM printing reliably** — use
 \`inserts.pocket\` + heat-set inserts instead.
 
+**Compound vs. Mesh form.** \`threads.metric\` and \`threads.leadscrew\`
+return a Compound (root cylinder + un-fused per-turn loops). That is fast
+and correct for multi-part STEP export where the thread is its own named
+part. It is **not fuse-safe**: OCCT's B-Rep boolean cannot merge the
+per-turn loops with another solid and produces non-manifold seams —
+\`head.fuse(threads.metric(...))\` will flunk BRepCheck. Whenever you want
+to combine a thread with another solid, use the \`*Mesh\` variants which
+route the union through the Manifold kernel (O(n log n), sub-second on
+WASM). Matching \`bolts.*Mesh\` factories (\`bolts.socketMesh\`,
+\`bolts.buttonMesh\`, \`bolts.hexMesh\`, \`bolts.flatMesh\`) return a
+pre-fused MeshShape bolt so you can drop a complete bolt into a MeshShape
+boolean directly.
+
 \`\`\`typescript
+// Compound form — STEP-friendly, NOT fuse-safe:
 threads.metric("M5", 20)                           // ISO coarse (0.8mm pitch)
 threads.metric("M5", 20, { pitch: "fine" })        // ISO fine (0.5mm)
 threads.metric("M6", 30, { pitch: 1.5 })           // custom pitch
 
+// Mesh form — fuse-safe (returns MeshShape):
+threads.metricMesh("M8", 30)                       // same signature as .metric
+threads.fuseThreaded(head, "M8", 30, [0, 0, -30])  // head: Shape3D or MeshShape
+
 threads.tapHole("M5", 8)                           // cut-tool for a tapped hole
 plate.cut(threads.tapHole("M5", 8).translate(x, y, plateTop))
 
-threads.leadscrew("TR8x8", 150)                    // 4-start trapezoidal (8mm lead)
-threads.leadscrew("TR8x2", 150)                    // single-start (2mm lead)
+// Modeled internal threads — real helical ridges, return fuse-safe MeshShape:
+threads.tapInto(plate, "M5", 8, [x, y, plateTop])               // metric
+threads.tapIntoTrap(plate, "TR8x8", 16, [x, y, plateTop])       // trapezoidal (leadscrew nuts)
+
+// Chaining multiple taps — both accept Shape3D OR MeshShape:
+let plate = shape
+plate = threads.tapInto(plate, "M6", 15, p1)   // Shape3D → MeshShape
+plate = threads.tapInto(plate, "M6", 15, p2)   // MeshShape → MeshShape (no crash)
+return plate
+// Output is always MeshShape; downstream .fuse/.cut must be Manifold-compatible.
+
+threads.leadscrew("TR8x8", 150)                    // Compound (not fuse-safe)
+threads.leadscrewMesh("TR8x8", 150)                // MeshShape (fuse-safe)
 
 // Low-level:
 threads.external({ diameter, pitch, length, profile?, starts? })

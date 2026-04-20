@@ -7,7 +7,9 @@
     "dev": "node esbuild.config.mjs --watch",
     "build": "node esbuild.config.mjs",
     "lint": "tsc -b packages/extension packages/mcp-server",
-    "package": "pnpm build && cd packages/extension && vsce package --no-dependencies"
+    "package": "pnpm build && cd packages/extension && vsce package --no-dependencies",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
@@ -18,9 +20,11 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "esbuild": "^0.24.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^2.0.0"
   },
   "dependencies": {
+    "manifold-3d": "^3.4.1",
     "replicad": "^0.23.0"
   }
 }

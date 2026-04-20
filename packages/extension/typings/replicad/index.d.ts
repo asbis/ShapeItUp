@@ -455,7 +455,7 @@ export declare class CompoundSketch implements SketchInterface {
         extrusionProfile?: ExtrusionProfile;
         twistAngle?: number;
         origin?: Point;
-    }): Shape3D;
+    }): Solid | Compound;
     /**
      * Revolves the drawing on an axis (defined by its direction and an origin
      * (defaults to the sketch origin)
@@ -2084,7 +2084,7 @@ export declare class Sketch implements SketchInterface {
         extrusionProfile?: ExtrusionProfile;
         twistAngle?: number;
         origin?: Point;
-    }): Shape3D;
+    }): Solid | Compound;
     /**
      * Sweep along this sketch another sketch defined in the function
      * `sketchOnPlane`.
@@ -2198,7 +2198,7 @@ export declare class Sketches {
         extrusionProfile?: ExtrusionProfile;
         twistAngle?: number;
         origin?: Point;
-    }): AnyShape;
+    }): Solid | Compound;
     /**
      * Revolves the drawing on an axis (defined by its direction and an origin
      * (defaults to the sketch origin)
@@ -2253,7 +2253,7 @@ export declare interface SketchInterface {
         extrusionProfile?: ExtrusionProfile;
         twistAngle?: number;
         origin?: Point;
-    }): Shape3D;
+    }): Solid | Compound;
     /**
      * Loft between this sketch and another sketch (or an array of them)
      *

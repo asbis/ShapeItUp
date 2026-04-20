@@ -20,7 +20,6 @@
     ]
   },
   "include": [
-    "*.shape.ts",
-    "stdlib/*.shape.ts"
+    "**/*.shape.ts"
   ]
 }

@@ -5,6 +5,11 @@ import { registerCommands } from "./commands";
 import { createFileWatcher } from "./file-watcher";
 import { getDetectedApps, getDetectedAppsAsync, warmAppCache, type AppId } from "./app-detector";
 import { exportAndOpen, findAppById, openFileInApp, resolveLaunchMode } from "./open-in-app";
+import {
+  installStub,
+  workspaceHasReplicadDependency,
+  ensureMinimalTsconfig,
+} from "./workspace-types";
 
 let viewerProvider: ViewerProvider;
 export const outputChannel = vscode.window.createOutputChannel("ShapeItUp");
@@ -33,6 +38,14 @@ export function activate(context: vscode.ExtensionContext) {
   // Register MCP server so Claude Code / Copilot can discover it automatically
   registerMcpServer(context, outputChannel);
 
+  // Install lightweight node_modules stubs so `import from "shapeitup"` and
+  // `import from "replicad"` resolve from ANY `.shape.ts` — including files
+  // nested in arbitrary subfolders, which the older paths-based tsconfig
+  // couldn't cover. Cheap no-op for workspaces with no .shape.ts files.
+  ensureWorkspaceTypes(context, outputChannel).catch((e) => {
+    outputChannel.appendLine(`[types] ensureWorkspaceTypes failed: ${e?.message ?? e}`);
+  });
+
   // Install the `/shapeitup` Claude Code skill (Replicad API reference)
   installClaudeSkill(context, outputChannel);
 
@@ -55,7 +68,6 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Auto-preview when switching to a .shape.ts file (debounced, deduplicated)
   let autoPreviewTimer: ReturnType<typeof setTimeout> | undefined;
-  let setupPromptShown = false;
   let lastPreviewedFile = "";
   context.subscriptions.push(
     vscode.window.onDidChangeActiveTextEditor((editor) => {
@@ -71,16 +83,6 @@ export function activate(context: vscode.ExtensionContext) {
           outputChannel.appendLine(`[auto] Switched to ${fileName}`);
           viewerProvider.executeScript(editor.document);
         }, 500);
-
-        // Provide replicad types for editor autocomplete (no npm install)
-        if (!setupPromptShown) {
-          const fs = require("fs");
-          const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-          if (folder) {
-            setupPromptShown = true;
-            provideReplicadTypes(folder, context.extensionPath, outputChannel);
-          }
-        }
       }
     })
   );
@@ -121,9 +123,17 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Heartbeat so the MCP server can detect if no extension is running and
   // fail fast instead of blocking for 10–30s. Written every 2s.
+  //
+  // Multi-window cross-talk fix: each window writes a per-pid heartbeat
+  // (`shapeitup-heartbeat-<pid>.json`) so the MCP server can enumerate every
+  // live window and pick the ONE whose workspace actually owns a given file.
+  // The legacy `shapeitup-heartbeat.json` is still written (last-write-wins
+  // across windows) for back-compat with older MCP binaries that only know
+  // about the single-file form.
   {
     const fs = require("fs");
-    const hbPath = path.join(context.globalStorageUri.fsPath, "shapeitup-heartbeat.json");
+    const legacyHbPath = path.join(context.globalStorageUri.fsPath, "shapeitup-heartbeat.json");
+    const pidHbPath = path.join(context.globalStorageUri.fsPath, `shapeitup-heartbeat-${process.pid}.json`);
     const writeHb = () => {
       try {
         fs.mkdirSync(context.globalStorageUri.fsPath, { recursive: true });
@@ -133,20 +143,30 @@ export function activate(context: vscode.ExtensionContext) {
         // getDefaultDirectory().
         const workspaceRoots =
           vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? [];
-        fs.writeFileSync(
-          hbPath,
-          JSON.stringify({ timestamp: Date.now(), pid: process.pid, workspaceRoots })
-        );
+        const payload = JSON.stringify({ timestamp: Date.now(), pid: process.pid, workspaceRoots });
+        fs.writeFileSync(pidHbPath, payload);
+        fs.writeFileSync(legacyHbPath, payload);
       } catch {}
     };
     writeHb();
     const hbInterval = setInterval(writeHb, 2000);
-    context.subscriptions.push({ dispose: () => clearInterval(hbInterval) });
+    context.subscriptions.push({
+      dispose: () => {
+        clearInterval(hbInterval);
+        // Clean up our own pid file on deactivation so stale heartbeats don't
+        // confuse the MCP server next time it starts.
+        try { fs.unlinkSync(pidHbPath); } catch {}
+      },
+    });
   }
 
   // Watch for MCP command files (allows MCP server to trigger extension actions)
   const commandFile = path.join(context.globalStorageUri.fsPath, "mcp-command.json");
   const resultFile = path.join(context.globalStorageUri.fsPath, "mcp-result.json");
+  const claimDir = path.join(context.globalStorageUri.fsPath, "mcp-claims");
+  try {
+    require("fs").mkdirSync(claimDir, { recursive: true });
+  } catch {}
   const seenCommandIds = new Set<string>();
   const writeResult = async (id: string | undefined, payload: Record<string, any>) => {
     try {
@@ -155,6 +175,101 @@ export function activate(context: vscode.ExtensionContext) {
         Buffer.from(JSON.stringify({ _id: id, ...payload }), "utf-8")
       );
     } catch {}
+  };
+
+  // Cross-window arbitration: every VSCode window with the extension watches
+  // the same globalStorage command file. Without a claim, both windows race
+  // and the wrong one's viewer can screenshot stale geometry under the right
+  // filename (the cross-workspace render_preview bug). Whichever window first
+  // creates `<id>.lock` services the command; losers return silently.
+  //
+  // Two layers of gating:
+  //
+  // 1. EXPLICIT targetWorkspaceRoot (preferred, new). The MCP server reads all
+  //    per-pid heartbeats, picks the single workspace that owns cmd.filePath,
+  //    and embeds `targetWorkspaceRoot`. Windows whose workspace folders don't
+  //    include that root drop out IMMEDIATELY — no lock race, no side effects.
+  //    This eliminates the multi-window cross-talk bug where a non-owning
+  //    window's viewer would still process the command's side effects because
+  //    it happened to be priority 1 in the legacy arbitration.
+  //
+  // 2. FALLBACK priority-based arbitration (legacy, for older MCP clients that
+  //    don't supply targetWorkspaceRoot):
+  //      priority 0 — file is in this window's workspace (claim immediately)
+  //      priority 1 — no filePath OR no workspace folders (neutral)
+  //      priority 2 — has workspaces but file is outside all of them (skip)
+  const isWorkspaceMatch = (root: string): boolean => {
+    const normalized = path.resolve(root).toLowerCase();
+    const wsFolders = vscode.workspace.workspaceFolders ?? [];
+    return wsFolders.some((ws) => {
+      const wsRoot = path.resolve(ws.uri.fsPath).toLowerCase();
+      return normalized === wsRoot;
+    });
+  };
+
+  const arbitrate = async (id: string, cmd: any): Promise<boolean> => {
+    const fs = require("fs");
+    const wsFolders = vscode.workspace.workspaceFolders ?? [];
+
+    // Layer 1: explicit targetWorkspaceRoot from MCP.
+    //
+    // When set, this window is ONLY allowed to handle the command if one of
+    // its workspace folders matches the target. We still pass through the
+    // lock race so two windows whose workspace folders both match the target
+    // (pathological: same workspace opened twice) don't double-execute.
+    // Windows whose folders don't match return false immediately — no race,
+    // no viewer side effects.
+    if (typeof cmd?.targetWorkspaceRoot === "string" && cmd.targetWorkspaceRoot.length > 0) {
+      if (!isWorkspaceMatch(cmd.targetWorkspaceRoot)) {
+        return false;
+      }
+      // Match — fall through to the lock race with priority 0 so we claim
+      // immediately (no delay, no fallback bidding from other windows).
+      const claimPath = path.join(claimDir, `${id}.lock`);
+      try {
+        fs.writeFileSync(claimPath, `${process.pid}\n0\n`, { flag: "wx" });
+        setTimeout(() => {
+          try { fs.unlinkSync(claimPath); } catch {}
+        }, 60_000);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    // Layer 2: legacy priority-based arbitration.
+    let priority = 1;
+    if (cmd?.filePath && typeof cmd.filePath === "string" && wsFolders.length > 0) {
+      const fp = path.resolve(cmd.filePath).toLowerCase();
+      const inWs = wsFolders.some((ws) => {
+        const root = path.resolve(ws.uri.fsPath).toLowerCase();
+        return fp === root || fp.startsWith(root + path.sep);
+      });
+      priority = inWs ? 0 : 2;
+    }
+    // Bug #1(c) fix: if this window has workspaces but none of them owns
+    // cmd.filePath, drop out of the race entirely instead of waiting and
+    // potentially winning the claim (which would silently render into the
+    // wrong workspace under a synthesized filename). A window that sees no
+    // cmd.filePath OR has no workspace folders still participates as a
+    // neutral bidder — that's the "lightweight MCP client" case.
+    if (priority === 2) {
+      return false;
+    }
+    if (priority > 0) {
+      await new Promise((r) => setTimeout(r, priority * 150));
+    }
+    const claimPath = path.join(claimDir, `${id}.lock`);
+    try {
+      fs.writeFileSync(claimPath, `${process.pid}\n${priority}\n`, { flag: "wx" });
+      // Best-effort GC so the claims dir doesn't grow without bound.
+      setTimeout(() => {
+        try { fs.unlinkSync(claimPath); } catch {}
+      }, 60_000);
+      return true;
+    } catch {
+      return false;
+    }
   };
 
   // Serialize command processing: concurrent render/screenshot/export calls
@@ -192,6 +307,14 @@ export function activate(context: vscode.ExtensionContext) {
 
     enqueue(async () => {
       try {
+        if (id) {
+          const won = await arbitrate(id, cmd);
+          if (!won) {
+            // Another window owns this command — don't write a result, don't
+            // log loudly (this is the normal case in multi-window setups).
+            return;
+          }
+        }
         await handleCommand(cmd, id);
       } catch (e: any) {
         outputChannel.appendLine(`[ai] command error: ${e?.message ?? e}`);
@@ -239,10 +362,31 @@ export function activate(context: vscode.ExtensionContext) {
         });
       }
     } else if (cmd.command === "render-preview") {
-      outputChannel.appendLine(`[ai] render-preview: file=${cmd.filePath || "<last>"} mode=${cmd.renderMode}, dims=${cmd.showDimensions}, axes=${!!cmd.showAxes}, camera=${cmd.cameraAngle || "isometric"}, size=${cmd.width || "auto"}x${cmd.height || "auto"}`);
+      outputChannel.appendLine(`[ai] render-preview: file=${cmd.filePath || "<last>"} mode=${cmd.renderMode}, dims=${cmd.showDimensions}, axes=${!!cmd.showAxes}, camera=${cmd.cameraAngle || "isometric"}, size=${cmd.width || "auto"}x${cmd.height || "auto"}${cmd.meshQuality ? `, meshQuality=${cmd.meshQuality}` : ""}`);
+
+      // P3-9 render-timeout diagnostic heartbeat. The MCP-side timeout fires
+      // at 60s by default; past 30s we start heartbeating into the output
+      // channel so a user chasing a pathological render sees *something* —
+      // empty progress is the worst failure mode because there's nothing to
+      // paste into a bug report. Cleared on every exit path (success, error,
+      // unhandled throw); one heartbeat per 10s.
+      const renderStartedAt = Date.now();
+      const renderFile = cmd.filePath || "<last>";
+      let heartbeatCount = 0;
+      const heartbeat = setInterval(() => {
+        const elapsedMs = Date.now() - renderStartedAt;
+        if (elapsedMs < 30_000) return; // wait until pathological
+        heartbeatCount++;
+        outputChannel.appendLine(
+          `[ai] render-preview heartbeat: file=${renderFile} executionMs=${elapsedMs} ` +
+            `beat=${heartbeatCount} — render has not completed yet. If this persists past 60s the MCP ` +
+            `render_preview will time out; paste this line into the bug report.`
+        );
+      }, 10_000);
 
       const ready = await viewerProvider.ensureWebview();
       if (!ready) {
+        clearInterval(heartbeat);
         await writeResult(id, { error: "Viewer webview could not be opened — the extension host may be unresponsive." });
         return;
       }
@@ -251,6 +395,14 @@ export function activate(context: vscode.ExtensionContext) {
       // the viewer before capturing. The engine in the MCP process already
       // renders in Node; we re-render here so the user's visible viewer shows
       // the same shape they're about to screenshot.
+      //
+      // Bug C: replace the status-file polling loop with an in-process
+      // handshake. The old loop waited for `shapeitup-status.json.timestamp >
+      // startTime`, but that file was already written by the MCP engine
+      // BEFORE this handler even ran — the loop always timed out, then fell
+      // through to a 500ms sleep and captured whatever was on screen (often
+      // the PREVIOUS shape). Armed BEFORE executeScript dispatch so fast
+      // renders can't beat us to the render-success message.
       if (cmd.filePath) {
         try {
           const doc = await vscode.workspace.openTextDocument(cmd.filePath);
@@ -258,19 +410,12 @@ export function activate(context: vscode.ExtensionContext) {
           // `cmd.params` (optional) is the ephemeral param override map set by
           // tune_params so the viewer re-renders the same configuration the
           // MCP engine just computed. Absent on normal render_preview calls.
-          viewerProvider.executeScript(doc, cmd.params);
-          // Wait briefly for the render to complete before capturing.
-          const startTime = Date.now();
-          const statusPath = path.join(context.globalStorageUri.fsPath, "shapeitup-status.json");
-          const fs = require("fs");
-          while (Date.now() - startTime < 8000) {
-            await new Promise((r) => setTimeout(r, 100));
-            if (fs.existsSync(statusPath)) {
-              try {
-                const s = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
-                if (s.timestamp && new Date(s.timestamp).getTime() > startTime) break;
-              } catch {}
-            }
+          viewerProvider.armPendingRender();
+          viewerProvider.executeScript(doc, cmd.params, cmd.meshQuality);
+          try {
+            await viewerProvider.awaitNextRender(8000);
+          } catch (e: any) {
+            outputChannel.appendLine(`[ai] render-preview: awaitNextRender failed — ${e?.message ?? e}`);
           }
         } catch (e: any) {
           outputChannel.appendLine(`[ai] render-preview: failed to load ${cmd.filePath}: ${e?.message ?? e}`);
@@ -298,9 +443,27 @@ export function activate(context: vscode.ExtensionContext) {
       // Note: avoid a dot-prefixed dir — AI agent tools (Claude Code / Gemini
       // CLI Read) hide dotfiles by default, which would break the
       // "render preview → read PNG → self-correct" loop.
+      //
+      // Bug #1/#12 fix: when MCP provides `cmd.outputPath`, honor it verbatim
+      // — the MCP side knows the exact shape being rendered and which
+      // workspace owns it, whereas this window's `workspaceFolders[0]` can
+      // disagree with the owning workspace in multi-window setups. The old
+      // synthesis path is preserved only as a fallback for legacy callers.
       const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
       let outputDir: string | undefined;
-      if (wsRoot) {
+      let explicitOutputPath: string | undefined;
+      if (typeof cmd.outputPath === "string" && cmd.outputPath.length > 0) {
+        explicitOutputPath = cmd.outputPath;
+        outputDir = path.dirname(cmd.outputPath);
+        try {
+          const fs = require("fs");
+          fs.mkdirSync(outputDir, { recursive: true });
+          const gitignorePath = path.join(outputDir, ".gitignore");
+          if (!fs.existsSync(gitignorePath)) {
+            fs.writeFileSync(gitignorePath, "*\n");
+          }
+        } catch {}
+      } else if (wsRoot) {
         outputDir = path.join(wsRoot, "shapeitup-previews");
         try {
           const fs = require("fs");
@@ -316,7 +479,8 @@ export function activate(context: vscode.ExtensionContext) {
         outputDir,
         cmd.cameraAngle,
         cmd.width,
-        cmd.height
+        cmd.height,
+        explicitOutputPath
       );
 
       // Always restore user's dark mode + hide dimensions, even on failure.
@@ -340,12 +504,22 @@ export function activate(context: vscode.ExtensionContext) {
             : screenshotPath;
         outputChannel.appendLine(`[ai] Screenshot saved: ${displayPath}`);
       } else {
+        // P3-9: final diagnostic line on screenshot failure. Paste-ready
+        // for a bug report: file path + elapsed ms + heartbeat count make
+        // it easy to distinguish "worker deadlocked" from "renderer crashed".
+        const elapsedMs = Date.now() - renderStartedAt;
+        outputChannel.appendLine(
+          `[ai] render-preview timeout-diagnostic: file=${renderFile} executionMs=${elapsedMs} ` +
+            `heartbeats=${heartbeatCount} — capture returned no path. ` +
+            `Viewer webview may be closed, worker may have crashed, or OCCT is wedged.`
+        );
         await writeResult(id, {
           error: "Screenshot capture timed out — the viewer webview may be closed or the worker may have crashed.",
           partWarnings,
         });
         outputChannel.appendLine("[ai] Screenshot failed (timeout)");
       }
+      clearInterval(heartbeat);
     } else if (cmd.command === "screenshot") {
       const screenshotPath = await viewerProvider.captureScreenshot(cmd.outputDir);
       if (screenshotPath) {
@@ -677,63 +851,79 @@ function installGeminiExtension(
 }
 
 /**
- * Ensure .shape.ts files get replicad type checking and autocomplete
- * by creating a tsconfig that points to our bundled type definitions.
- * No npm install, no node_modules, no package.json modifications.
+ * Ensure every workspace that contains `.shape.ts` files has local stubs for
+ * `shapeitup` and `replicad` under `<ws>/node_modules/`, plus a minimal
+ * tsconfig.json if none exists. TypeScript's default resolution will find
+ * these stubs from any depth of subfolder, so imports resolve without any
+ * `paths` or `typeRoots` configuration.
+ *
+ * This is the universal type-resolution strategy for marketplace installs:
+ * no npm install, no path mappings, zero config from the user's side. When
+ * the workspace has no `.shape.ts` files we skip entirely (cost: one
+ * findFiles call limited to 1 result).
+ *
+ * Idempotent: skips stub writes when the bundled source hasn't changed
+ * (size-matched). Never overwrites a user-authored tsconfig.json or
+ * package.json. Never stubs `replicad` when the workspace declares a real
+ * dependency on it.
  */
-function provideReplicadTypes(
-  folderPath: string,
-  extensionPath: string,
+async function ensureWorkspaceTypes(
+  context: vscode.ExtensionContext,
   output: vscode.OutputChannel
-) {
+): Promise<void> {
   const fs = require("fs");
 
-  // Path to our bundled replicad types inside the extension
-  const typingsPath = path.join(extensionPath, "typings");
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) return;
 
-  // Check if the project already has replicad installed (no need for our types)
-  if (fs.existsSync(path.join(folderPath, "node_modules", "replicad"))) return;
+  const extDistTypings = path.join(context.extensionUri.fsPath, "dist", "typings");
+  const shapeitupSrcDir = path.join(extDistTypings, "shapeitup");
+  const replicadSrcDir = path.join(extDistTypings, "replicad");
+  if (!fs.existsSync(shapeitupSrcDir) || !fs.existsSync(replicadSrcDir)) {
+    output.appendLine(`[types] bundled typings missing at ${extDistTypings} — skipping`);
+    return;
+  }
 
-  const tsconfigPath = path.join(folderPath, "tsconfig.json");
+  for (const folder of folders) {
+    const wsRoot = folder.uri.fsPath;
 
-  const replicadTypePath = path.join(typingsPath, "replicad");
-
-  if (!fs.existsSync(tsconfigPath)) {
-    // No tsconfig.json — create one for .shape.ts files
-    const tsconfig = {
-      compilerOptions: {
-        target: "ES2022",
-        module: "ESNext",
-        moduleResolution: "bundler",
-        strict: false,
-        esModuleInterop: true,
-        skipLibCheck: true,
-        noEmit: true,
-        typeRoots: [typingsPath],
-        paths: {
-          replicad: [replicadTypePath],
-        },
-      },
-      include: ["**/*.shape.ts"],
-    };
-    fs.writeFileSync(tsconfigPath, JSON.stringify(tsconfig, null, 2) + "\n");
-    output.appendLine("[setup] Created tsconfig.json with replicad types from extension");
-  } else {
-    // tsconfig.json exists — always update the replicad path to current extension version
+    // Cheap gate: only touch workspaces that actually have shape files.
+    // Limit 1 short-circuits at the first hit.
+    let hasShapeFile = false;
     try {
-      const existing = JSON.parse(fs.readFileSync(tsconfigPath, "utf-8"));
-      existing.compilerOptions = existing.compilerOptions || {};
-      existing.compilerOptions.paths = existing.compilerOptions.paths || {};
-      const currentPath = existing.compilerOptions.paths.replicad?.[0];
-
-      if (currentPath !== replicadTypePath) {
-        existing.compilerOptions.typeRoots = [typingsPath];
-        existing.compilerOptions.paths.replicad = [replicadTypePath];
-        fs.writeFileSync(tsconfigPath, JSON.stringify(existing, null, 2) + "\n");
-        output.appendLine("[setup] Updated replicad type paths in tsconfig.json to current extension version");
-      }
+      const hits = await vscode.workspace.findFiles(
+        new vscode.RelativePattern(folder, "**/*.shape.ts"),
+        "**/node_modules/**",
+        1
+      );
+      hasShapeFile = hits.length > 0;
     } catch {
-      // Can't parse existing tsconfig — leave it alone
+      hasShapeFile = false;
+    }
+    if (!hasShapeFile) continue;
+
+    const installed: string[] = [];
+    try {
+      // shapeitup: always safe to stub — not on npm.
+      if (installStub(wsRoot, "shapeitup", shapeitupSrcDir)) installed.push("shapeitup");
+
+      // replicad: skip if the user declares a real dependency in their
+      // package.json (either dependencies or devDependencies).
+      if (!workspaceHasReplicadDependency(wsRoot)) {
+        if (installStub(wsRoot, "replicad", replicadSrcDir)) installed.push("replicad");
+      }
+
+      // Minimal tsconfig only when none exists at the workspace root.
+      if (ensureMinimalTsconfig(wsRoot)) installed.push("tsconfig.json");
+    } catch (e: any) {
+      output.appendLine(`[types] failed at ${wsRoot}: ${e?.message ?? e}`);
+      continue;
+    }
+
+    if (installed.length > 0) {
+      output.appendLine(
+        `[types] installed ${installed.join(" + ")} at ${wsRoot}`
+      );
     }
   }
 }

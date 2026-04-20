@@ -1,6 +1,13 @@
 import * as THREE from "three";
 import { createScene, setAxesVisible } from "./scene";
-import { createCamera, createControls, fitCameraToObject } from "./camera";
+import {
+  createCamera,
+  createControls,
+  createOrthoCamera,
+  fitCameraToObject,
+  frameOrthographicToBounds,
+  isAxisAligned,
+} from "./camera";
 import { buildMesh, buildEdges } from "./mesh-builder";
 import { initMessageHandler, onMessage, postToExtension } from "./message-handler";
 import type { WorkerToWebview, TessellatedPart } from "@shapeitup/shared";
@@ -24,6 +31,12 @@ container.appendChild(renderer.domElement);
 const scene = createScene();
 const camera = createCamera(container);
 const controls = createControls(camera, renderer.domElement);
+
+// Secondary orthographic camera used only by the screenshot pipeline when a
+// true side-view preset is selected (top/bottom/front/back/left/right). The
+// interactive perspective `camera` above stays the live viewport camera so
+// OrbitControls and the render loop behave as before.
+const orthoCamera = createOrthoCamera();
 
 const modelGroup = new THREE.Group();
 scene.add(modelGroup);
@@ -71,53 +84,61 @@ function clearModelGroup() {
   currentParts = [];
 }
 
-function renderParts(parts: TessellatedPart[]) {
+// ── Streaming render state ────────────────────────────────────────────────
+// Parts arrive one at a time from the worker. We add each to the scene as
+// it arrives so the user sees progress rather than a frozen spinner.
+let streamingAccum: TessellatedPart[] = [];
+let streamingExpected = 0;
+
+function beginStreaming(totalParts: number) {
   clearModelGroup();
+  streamingAccum = [];
+  streamingExpected = totalParts;
+  statusEl.textContent = totalParts > 1 ? `0/${totalParts} parts…` : "rendering…";
+}
 
-  let totalVerts = 0;
-  let totalTris = 0;
+function addPart(part: TessellatedPart) {
+  const i = currentParts.length;
+  const partGroup = new THREE.Group();
+  partGroup.name = part.name;
 
-  parts.forEach((part, i) => {
-    const partGroup = new THREE.Group();
-    partGroup.name = part.name;
+  const colorValue = part.color || PART_COLORS[i % PART_COLORS.length];
+  const colorHex =
+    typeof colorValue === "string"
+      ? colorValue
+      : `#${colorValue.toString(16).padStart(6, "0")}`;
 
-    const colorValue = part.color || PART_COLORS[i % PART_COLORS.length];
-    const colorHex =
-      typeof colorValue === "string" ? colorValue : `#${colorValue.toString(16).padStart(6, "0")}`;
+  const mesh = buildMesh(part.vertices, part.normals, part.triangles, colorValue);
+  partGroup.add(mesh);
 
-    const mesh = buildMesh(part.vertices, part.normals, part.triangles, colorValue);
-    partGroup.add(mesh);
+  if (part.edgeVertices.length > 0) {
+    const edges = buildEdges(part.edgeVertices);
+    edges.visible = edgesVisible;
+    partGroup.add(edges);
+  }
 
-    if (part.edgeVertices.length > 0) {
-      const edges = buildEdges(part.edgeVertices);
-      edges.visible = edgesVisible;
-      partGroup.add(edges);
-    }
-
-    modelGroup.add(partGroup);
-
-    currentParts.push({
-      name: part.name,
-      color: colorHex,
-      visible: true,
-      group: partGroup,
-    });
-
-    totalVerts += part.vertices.length / 3;
-    totalTris += part.triangles.length / 3;
-  });
-
-  fitCameraToObject(camera, controls, modelGroup);
+  modelGroup.add(partGroup);
+  currentParts.push({ name: part.name, color: colorHex, visible: true, group: partGroup });
+  streamingAccum.push(part);
   updatePartsList();
-  if (dimensionsVisible) updateDimensions();
 
-  // Auto-open parts panel if there are multiple parts
-  if (parts.length > 1 && !partsPanelOpen) {
+  // Fit on the first part so the user immediately sees something instead
+  // of waiting for the full gallery to finish.
+  if (currentParts.length === 1) {
+    fitCameraToObject(camera, controls, modelGroup, dimensionsVisible ? dimensionGroup : undefined);
+  }
+  // Auto-open parts panel as soon as we know we're multi-part.
+  if (currentParts.length === 2 && streamingExpected > 1 && !partsPanelOpen) {
     togglePartsPanel();
   }
 
-  const partLabel = parts.length > 1 ? ` | ${parts.length} parts` : "";
-  statusEl.textContent = `${totalVerts} verts, ${totalTris} tris${partLabel}`;
+  const tVerts = streamingAccum.reduce((s, p) => s + p.vertices.length / 3, 0);
+  const tTris = streamingAccum.reduce((s, p) => s + p.triangles.length / 3, 0);
+  if (streamingExpected > 1) {
+    statusEl.textContent = `${tVerts} verts, ${tTris} tris | ${streamingAccum.length}/${streamingExpected} parts…`;
+  } else {
+    statusEl.textContent = `${tVerts} verts, ${tTris} tris`;
+  }
 }
 
 // --- Parts browser panel ---
@@ -129,17 +150,25 @@ function updatePartsList() {
     const item = document.createElement("div");
     item.className = `part-item${part.visible ? "" : " hidden"}`;
 
-    item.innerHTML = `
-      <div class="part-swatch" style="background:${part.color}"></div>
-      <span class="part-name">${part.name}</span>
-      <span class="part-eye">${part.visible ? "&#9673;" : "&#9675;"}</span>
-    `;
+    const swatch = document.createElement("div");
+    swatch.className = "part-swatch";
+    swatch.style.background = part.color;
+
+    const nameEl = document.createElement("span");
+    nameEl.className = "part-name";
+    nameEl.textContent = part.name;
+
+    const eyeEl = document.createElement("span");
+    eyeEl.className = "part-eye";
+    eyeEl.textContent = part.visible ? "\u25C9" : "\u25CB";
+
+    item.append(swatch, nameEl, eyeEl);
 
     item.addEventListener("click", () => {
       part.visible = !part.visible;
       part.group.visible = part.visible;
       item.className = `part-item${part.visible ? "" : " hidden"}`;
-      item.querySelector(".part-eye")!.innerHTML = part.visible ? "&#9673;" : "&#9675;";
+      eyeEl.textContent = part.visible ? "\u25C9" : "\u25CB";
     });
 
     partsList.appendChild(item);
@@ -164,7 +193,16 @@ function togglePartsPanel() {
 
 // --- ViewCube (preset camera angles) ---
 function setCameraAngle(position: [number, number, number]) {
+  // Include the dimension overlay in the bounds when it's visible — otherwise
+  // the camera fits tight around the model and the Y/Z dimension labels
+  // (anchored `0.2 * maxDim` outside the bbox on +X) fall off the right edge
+  // of narrow aspect ratios (e.g. the 800×600 top-view render that clipped
+  // the "Y: 20.0mm" label on the spacer). Sprites are world-positioned, so
+  // setFromObject picks up their extent correctly.
   const box = new THREE.Box3().setFromObject(modelGroup);
+  if (dimensionsVisible && dimensionGroup.children.length > 0) {
+    box.union(new THREE.Box3().setFromObject(dimensionGroup));
+  }
   const sphere = new THREE.Sphere();
   box.getBoundingSphere(sphere);
   const center = sphere.center;
@@ -227,6 +265,8 @@ function initWorker() {
         type: "init",
         wasmLoaderUrl: config.wasmLoaderUrl,
         wasmUrl: config.wasmUrl,
+        manifoldLoaderUrl: config.manifoldLoaderUrl,
+        manifoldWasmUrl: config.manifoldWasmUrl,
       });
     })
     .catch((err) => {
@@ -243,29 +283,45 @@ function handleWorkerMessage(msg: WorkerToWebview) {
       statusEl.textContent = "Ready";
       break;
 
-    case "mesh-result":
+    case "mesh-start":
       clearWorkerResponseTimer();
       try {
-        renderParts(msg.parts);
+        beginStreaming(msg.totalParts);
+      } catch (err: any) {
+        postToExtension({ type: "error", message: `Render error: ${err.message}` });
+      }
+      break;
+
+    case "mesh-part":
+      try {
+        addPart(msg.part);
+      } catch (err: any) {
+        postToExtension({ type: "error", message: `Render error: ${err.message}` });
+      }
+      break;
+
+    case "mesh-done":
+      try {
         updateParamsUI(msg.params || []);
         if (sectionActive) updateSectionPlane();
-        const totalVerts = msg.parts.reduce((s: number, p: TessellatedPart) => s + p.vertices.length / 3, 0);
-        const totalTris = msg.parts.reduce((s: number, p: TessellatedPart) => s + p.triangles.length / 3, 0);
-        const partLabel = msg.parts.length > 1 ? ` | ${msg.parts.length} parts` : "";
+        if (dimensionsVisible) updateDimensions();
+        // Re-fit with the final model (first-part fit may have been too tight).
+        fitCameraToObject(camera, controls, modelGroup, dimensionsVisible ? dimensionGroup : undefined);
+
+        const parts = streamingAccum;
+        const totalVerts = parts.reduce((s, p) => s + p.vertices.length / 3, 0);
+        const totalTris = parts.reduce((s, p) => s + p.triangles.length / 3, 0);
+        const partLabel = parts.length > 1 ? ` | ${parts.length} parts` : "";
         const statusText = `${totalVerts} verts, ${totalTris} tris${partLabel} — ${msg.execTimeMs}ms + ${msg.tessTimeMs}ms`;
         statusEl.textContent = statusText;
-        // Compute bounding box for AI dimension verification
+
         const bbox = new THREE.Box3().setFromObject(modelGroup);
         const bboxSize = bbox.getSize(new THREE.Vector3());
 
         const currentParams: Record<string, number> = {};
-        for (const p of msg.params || []) {
-          currentParams[p.name] = p.value;
-        }
+        for (const p of msg.params || []) currentParams[p.name] = p.value;
 
-        // Collect per-part geometric properties (volume, surface area, CoM)
-        // and a volume-weighted aggregate. OCCT volume is in mm³, area in mm².
-        const partProperties = msg.parts.map((p: TessellatedPart) => ({
+        const partProperties = parts.map((p) => ({
           name: p.name,
           volume: p.volume,
           surfaceArea: p.surfaceArea,
@@ -275,8 +331,17 @@ function handleWorkerMessage(msg: WorkerToWebview) {
         let totalSurfaceArea = 0;
         let hasAnyVolume = false;
         let hasAnySurface = false;
+        // Track the denominator for the CoM average SEPARATELY from totalVolume.
+        // If any part with volume is missing a centerOfMass (e.g. BRepCheck
+        // failed the part, or a MeshShape whose tet-integration produced
+        // zero signed volume), dividing weightedCoM by totalVolume would
+        // drag the result toward (0,0,0) in proportion to that part's
+        // volume share — a silently wrong answer. Bail out to undefined
+        // in that case instead.
         const weightedCoM: [number, number, number] = [0, 0, 0];
-        for (const p of msg.parts) {
+        let comDenominator = 0;
+        let anyVolumetricPartMissingCoM = false;
+        for (const p of parts) {
           if (typeof p.volume === "number") {
             totalVolume += p.volume;
             hasAnyVolume = true;
@@ -284,6 +349,9 @@ function handleWorkerMessage(msg: WorkerToWebview) {
               weightedCoM[0] += p.centerOfMass[0] * p.volume;
               weightedCoM[1] += p.centerOfMass[1] * p.volume;
               weightedCoM[2] += p.centerOfMass[2] * p.volume;
+              comDenominator += p.volume;
+            } else if (p.volume > 0) {
+              anyVolumetricPartMissingCoM = true;
             }
           }
           if (typeof p.surfaceArea === "number") {
@@ -292,23 +360,23 @@ function handleWorkerMessage(msg: WorkerToWebview) {
           }
         }
         const aggregateCoM: [number, number, number] | undefined =
-          hasAnyVolume && totalVolume > 0
-            ? [weightedCoM[0] / totalVolume, weightedCoM[1] / totalVolume, weightedCoM[2] / totalVolume]
+          !anyVolumetricPartMissingCoM && comDenominator > 0
+            ? [weightedCoM[0] / comDenominator, weightedCoM[1] / comDenominator, weightedCoM[2] / comDenominator]
             : undefined;
 
         postToExtension({
           type: "render-success",
           stats: statusText,
-          partCount: msg.parts.length,
-          partNames: msg.parts.map((p: TessellatedPart) => p.name),
+          partCount: parts.length,
+          partNames: parts.map((p) => p.name),
           boundingBox: {
             x: parseFloat(bboxSize.x.toFixed(1)),
             y: parseFloat(bboxSize.y.toFixed(1)),
             z: parseFloat(bboxSize.z.toFixed(1)),
           },
           currentParams,
-          timings: (msg as any).timings || undefined,
-          warnings: (msg as any).warnings || undefined,
+          timings: msg.timings,
+          warnings: msg.warnings,
           properties: {
             parts: partProperties,
             totalVolume: hasAnyVolume ? totalVolume : undefined,
@@ -354,6 +422,23 @@ function handleWorkerMessage(msg: WorkerToWebview) {
       });
       statusEl.textContent = `Error: ${msg.message}`;
       break;
+
+    case "needs-worker-restart":
+      // Explicit restart signal from the worker (sent after an OOB crash).
+      // The "error" case above already triggers respawnWorker() for the same
+      // condition via substring match — this branch is the clean,
+      // non-substring path and forwards the reason up to the extension host
+      // (viewer-provider) so it can log the restart visibly to the user.
+      clearWorkerResponseTimer();
+      postToExtension({
+        type: "status",
+        message: `Worker restart requested: ${msg.reason}`,
+      });
+      if (!workerCrashed) {
+        workerCrashed = true;
+        setTimeout(() => respawnWorker(), 2000);
+      }
+      break;
   }
 }
 
@@ -371,19 +456,35 @@ onMessage("execute-script", (msg) => {
     currentParamValues = msg.paramOverrides ? { ...msg.paramOverrides } : {};
     const name = msg.fileName.replace(/.*[\/\\]/, "");
     filenameEl.textContent = name;
-    const workerMsg: { type: "execute"; js: string; paramOverrides?: Record<string, number> } = {
+    const workerMsg: {
+      type: "execute";
+      js: string;
+      paramOverrides?: Record<string, number>;
+      meshQuality?: "preview" | "final";
+    } = {
       type: "execute",
       js: msg.js,
     };
     if (msg.paramOverrides && Object.keys(msg.paramOverrides).length > 0) {
       workerMsg.paramOverrides = msg.paramOverrides;
     }
+    // P3-10: forward MCP-supplied meshQuality verbatim. Historically the
+    // viewer filtered its worker-bound execute message to {js, paramOverrides}
+    // and silently dropped meshQuality — meaning an MCP caller asking for
+    // "preview" quality would get the auto-degrade default instead. Threaded
+    // through here so the contract survives the last hop.
+    if (msg.meshQuality) {
+      workerMsg.meshQuality = msg.meshQuality;
+    }
     worker.postMessage(workerMsg);
 
     // If the worker doesn't respond within 15s, assume it's dead and respawn
     clearWorkerResponseTimer();
     workerResponseTimer = setTimeout(() => {
-      postToExtension({ type: "error", message: "Worker unresponsive (15s timeout), restarting..." });
+      postToExtension({
+        type: "error",
+        message: "Script execution exceeded 15s — likely an infinite loop or runaway computation. Restarting renderer.",
+      });
       respawnWorker();
     }, 15_000);
   }
@@ -398,8 +499,32 @@ onMessage("request-export", (msg) => {
 
 // Track if a custom camera angle was set (by set-camera-angle command)
 let customCameraAngleSet = false;
+// Bug D: remember the preset requested by the most recent prepare-screenshot
+// so request-screenshot can re-apply it against the CURRENT modelGroup bounds.
+// Without this the camera was framed during prepare-screenshot (before the
+// worker had tessellated the new shape), so preview_finder's pink spheres —
+// added by the re-render after prepare-screenshot — could land outside the
+// frustum or too small to see.
+let pendingScreenshotCameraPreset: [number, number, number] | null = null;
 
 onMessage("request-screenshot", (msg: any) => {
+  // Bug D: if prepare-screenshot stashed a camera preset, re-apply it HERE
+  // using the current modelGroup (which by now includes any highlight spheres
+  // or multi-part output). This replaces the prior behavior where a stale
+  // bounding box was used during prepare-screenshot.
+  //
+  // `presetForCapture` tracks the active preset for the ortho-swap decision
+  // below. It mirrors whatever setCameraAngle was last called with in this
+  // request path, falling back to isometric for the default/uncustomized
+  // case. Only the screenshot path consults ortho; live interaction stays
+  // on the perspective camera regardless of preset.
+  let presetForCapture: [number, number, number] = [1, -1.2, 0.8];
+  if (pendingScreenshotCameraPreset && modelGroup.children.length > 0) {
+    presetForCapture = pendingScreenshotCameraPreset;
+    setCameraAngle(pendingScreenshotCameraPreset);
+    customCameraAngleSet = true;
+    pendingScreenshotCameraPreset = null;
+  }
   // Only set default isometric if no custom angle was explicitly set
   if (!customCameraAngleSet && modelGroup.children.length > 0) {
     setCameraAngle([1, -1.2, 0.8]);
@@ -428,9 +553,29 @@ onMessage("request-screenshot", (msg: any) => {
     camera.updateProjectionMatrix();
   }
 
+  // Axis-aligned presets (top/bottom/front/back/left/right) render through
+  // the orthographic camera so there's no vanishing-point skew — the
+  // expected default for engineering side views. Isometric and custom
+  // angles keep perspective, because iso is specifically an oblique
+  // projection and custom angles don't have a natural ortho framing.
+  const useOrtho = isAxisAligned(presetForCapture) && modelGroup.children.length > 0;
+  const captureCamera: THREE.Camera = useOrtho ? orthoCamera : camera;
+  if (useOrtho) {
+    const w = needsResize ? targetW : container.clientWidth;
+    const h = needsResize ? targetH : container.clientHeight;
+    const aspect = h > 0 ? w / h : 1;
+    frameOrthographicToBounds(
+      orthoCamera,
+      presetForCapture,
+      modelGroup,
+      aspect,
+      dimensionsVisible ? dimensionGroup : undefined,
+    );
+  }
+
   try {
     controls.update();
-    renderer.render(scene, camera);
+    renderer.render(scene, captureCamera);
     const dataUrl = renderer.domElement.toDataURL("image/png");
     postToExtension({ type: "screenshot-data", dataUrl });
   } finally {
@@ -443,15 +588,23 @@ onMessage("request-screenshot", (msg: any) => {
   }
 });
 
-// Camera angle presets: name → [x, y, z] direction vector
+// Camera angle presets: name → [x, y, z] direction vector.
+//
+// The six orthogonal names (top/bottom/front/back/left/right) are exactly
+// axis-aligned so `isAxisAligned()` recognizes them and the screenshot
+// pipeline renders them through `orthoCamera`. Engineers expect side views
+// to be "true ortho" — no vanishing-point skew along the projection axis —
+// so the 3/4-iso tilt that used to live on `front`/`right`/`back`/`left`
+// (e.g. `[0, -1, 0.3]`) was removed. `isometric` keeps its tilt because
+// isometric IS supposed to be a 3D oblique projection.
 const CAMERA_ANGLE_PRESETS: Record<string, [number, number, number]> = {
   isometric: [1, -1.2, 0.8],
   top: [0, 0, 1],
   bottom: [0, 0, -1],
-  front: [0, -1, 0.3],
-  right: [1, 0, 0.3],
-  back: [0, 1, 0.3],
-  left: [-1, 0, 0.3],
+  front: [0, -1, 0],
+  back: [0, 1, 0],
+  right: [1, 0, 0],
+  left: [-1, 0, 0],
 };
 
 // --- Per-part visibility control (used by render_preview focusPart/hideParts) ---
@@ -559,9 +712,19 @@ onMessage("viewer-command", (msg) => {
         applyPartVisibility(msg.focusPart, msg.hideParts);
       }
       const camPreset = CAMERA_ANGLE_PRESETS[msg.cameraAngle || "isometric"];
-      if (camPreset && modelGroup.children.length > 0) {
-        setCameraAngle(camPreset);
-        customCameraAngleSet = true;
+      // Bug D: stash the preset so request-screenshot can re-frame against
+      // the current modelGroup right before capture — prepare-screenshot's
+      // modelGroup may be stale (pre-tessellation of a render that was
+      // dispatched concurrently, especially for preview_finder where
+      // highlightFinder adds pink spheres). We still apply it once here for
+      // the visible-viewer feedback loop, but the authoritative framing
+      // happens in request-screenshot.
+      if (camPreset) {
+        pendingScreenshotCameraPreset = camPreset;
+        if (modelGroup.children.length > 0) {
+          setCameraAngle(camPreset);
+          customCameraAngleSet = true;
+        }
       }
       // Force render two frames to ensure everything is updated
       controls.update();
@@ -575,7 +738,7 @@ onMessage("viewer-command", (msg) => {
 document.getElementById("btn-parts")!.addEventListener("click", togglePartsPanel);
 
 document.getElementById("btn-fit")!.addEventListener("click", () => {
-  if (modelGroup.children.length > 0) fitCameraToObject(camera, controls, modelGroup);
+  if (modelGroup.children.length > 0) fitCameraToObject(camera, controls, modelGroup, dimensionsVisible ? dimensionGroup : undefined);
 });
 
 document.getElementById("btn-edges")!.addEventListener("click", () => {
@@ -680,9 +843,13 @@ onMessage("installed-apps", (msg) => {
 });
 
 // --- ViewCube ---
+// Side presets are axis-aligned (no tilt) so they match
+// CAMERA_ANGLE_PRESETS and trigger the orthographic capture path when used
+// by the screenshot pipeline. The interactive viewport still renders through
+// the perspective camera in both cases — live orbit/zoom remains unchanged.
 document.getElementById("vc-top")!.addEventListener("click", () => setCameraAngle([0, 0, 1]));
-document.getElementById("vc-front")!.addEventListener("click", () => setCameraAngle([0, -1, 0.3]));
-document.getElementById("vc-right")!.addEventListener("click", () => setCameraAngle([1, 0, 0.3]));
+document.getElementById("vc-front")!.addEventListener("click", () => setCameraAngle([0, -1, 0]));
+document.getElementById("vc-right")!.addEventListener("click", () => setCameraAngle([1, 0, 0]));
 document.getElementById("vc-iso")!.addEventListener("click", () => setCameraAngle([1, -1, 0.8]));
 
 // --- Parameter Sliders ---
@@ -715,7 +882,13 @@ function updateParamsUI(params: ParamDef[]) {
 
     const label = document.createElement("div");
     label.className = "param-label";
-    label.innerHTML = `<span>${p.name}</span><span class="param-value" id="pv-${p.name}">${p.value}</span>`;
+    const nameSpan = document.createElement("span");
+    nameSpan.textContent = p.name;
+    const valueSpan = document.createElement("span");
+    valueSpan.className = "param-value";
+    valueSpan.id = `pv-${p.name}`;
+    valueSpan.textContent = String(p.value);
+    label.append(nameSpan, valueSpan);
 
     const slider = document.createElement("input");
     slider.type = "range";
@@ -916,13 +1089,16 @@ function setRenderMode(mode: string) {
       }
     });
 
-    // Re-color parts: use custom colors if set (brightened), or AI palette
+    // Re-color parts: use custom colors if set (brightened), or AI palette.
+    // Any user-specified color is authoritative — do not second-guess even
+    // if it matches a common default value. If the user wants vivid AI
+    // palette colors, they should omit `color` from their parts.
     let i = 0;
     modelGroup.traverse((child) => {
       if (child instanceof THREE.Mesh) {
         const mat = child.material as THREE.MeshPhongMaterial;
         const partInfo = currentParts[i];
-        if (partInfo?.color && partInfo.color !== "#8899aa") {
+        if (partInfo?.color) {
           // User set a custom color — brighten significantly for white bg
           const c = new THREE.Color(partInfo.color);
           c.offsetHSL(0, 0.15, 0.25);
@@ -1024,31 +1200,59 @@ function updateDimensions() {
   (boxHelper.material as THREE.Material).opacity = 0.5;
   dimensionGroup.add(boxHelper);
 
-  // Dimension lines with labels using sprites
-  const offset = Math.max(size.x, size.y, size.z) * 0.2;
+  // Dimension-line offsets. Formerly a bare `0.2 * maxDim` — on tiny parts
+  // (e.g. a 4mm peg) that collapsed to ~0.8mm, which stuffed each dim label
+  // on top of the 5mm origin-axis arrowheads and made the overlay look like
+  // one blob. Clamp with a 15mm floor so labels always stand clear of the
+  // origin indicator regardless of part scale; the proportional term still
+  // keeps labels tight on 100mm+ parts.
+  const maxDim = Math.max(size.x, size.y, size.z);
+  const offset = Math.max(0.12 * maxDim, 15);
 
-  // X dimension (along bottom front)
+  // Each dim line is anchored to the midpoint of the matching bbox edge
+  // (rather than a translated model-origin ray) and then shoved
+  // perpendicularly outward by `offset`. This keeps the label glued to the
+  // feature it measures even for shapes whose min corner sits far from the
+  // origin — e.g. a part built at (100, 100, 0) used to render its X label
+  // down at the world X axis because `min.y - offset` happened to straddle
+  // the axes indicator; anchoring at the edge midpoint + outward offset
+  // makes placement translation-invariant.
+  const midX = (min.x + max.x) / 2;
+  const midY = (min.y + max.y) / 2;
+  const midZ = (min.z + max.z) / 2;
+
+  // X dim: midpoint of the bottom-front edge (min Y, min Z), offset
+  // outward in -Y. The endpoints run along X at that same offset position,
+  // so the label sits on top of the centerline of its own dim line.
   addDimensionLine(
     [min.x, min.y - offset, min.z],
     [max.x, min.y - offset, min.z],
     `X: ${size.x.toFixed(1)}mm`,
-    dimColor, textColor
+    dimColor, textColor,
+    [midX, min.y - offset, min.z]
   );
 
-  // Y dimension (along bottom right — visible from default camera angle)
+  // Y dim: midpoint of the right-bottom edge (max X, min Z), offset
+  // outward in +X.
   addDimensionLine(
     [max.x + offset, min.y, min.z],
     [max.x + offset, max.y, min.z],
     `Y: ${size.y.toFixed(1)}mm`,
-    dimColor, textColor
+    dimColor, textColor,
+    [max.x + offset, midY, min.z]
   );
 
-  // Z dimension (along right front — further out to not overlap with Y)
+  // Z dim: midpoint of the far-right vertical edge (max X, max Y), offset
+  // outward in +X AND +Y so the sprite doesn't share a column with the Y
+  // label (which also sits at max.x + offset). Pulling it to the far
+  // corner puts its anchor on a different face of the bbox — readable
+  // from the default iso camera angle.
   addDimensionLine(
-    [max.x + offset * 1.8, min.y, min.z],
-    [max.x + offset * 1.8, min.y, max.z],
+    [max.x + offset, max.y + offset, min.z],
+    [max.x + offset, max.y + offset, max.z],
     `Z: ${size.z.toFixed(1)}mm`,
-    dimColor, textColor
+    dimColor, textColor,
+    [max.x + offset, max.y + offset, midZ]
   );
 }
 
@@ -1057,7 +1261,8 @@ function addDimensionLine(
   to: [number, number, number],
   label: string,
   lineColor: number,
-  textColor: string
+  textColor: string,
+  labelAnchor?: [number, number, number]
 ) {
   // Line
   const geom = new THREE.BufferGeometry().setFromPoints([
@@ -1072,10 +1277,34 @@ function addDimensionLine(
   const capLen = dir.length() * 2 || 2;
   // (skip caps for simplicity — the label is the important part)
 
-  // Text label as a sprite
-  const midX = (from[0] + to[0]) / 2;
-  const midY = (from[1] + to[1]) / 2;
-  const midZ = (from[2] + to[2]) / 2;
+  // Text label as a sprite. Callers may supply an explicit anchor (the
+  // dimension-layout code anchors at bbox-edge midpoints so labels stay
+  // glued to their measurement); fall back to the line midpoint otherwise.
+  let midX = labelAnchor ? labelAnchor[0] : (from[0] + to[0]) / 2;
+  let midY = labelAnchor ? labelAnchor[1] : (from[1] + to[1]) / 2;
+  let midZ = labelAnchor ? labelAnchor[2] : (from[2] + to[2]) / 2;
+
+  // Near-origin nudge: on a part anchored at the world origin, a dim label
+  // whose anchor lands within a small neighborhood of (0,0,0) visually
+  // collides with the axes indicator. When that happens, shove the label
+  // along the unit vector from origin to the label position by another
+  // ~5% of maxDim so there's a clean gap. 0.05 * maxDim is conservative —
+  // enough to clear the axis cone (which is ~0.6 * maxDim long but
+  // tapered) without dislodging labels on large parts where the anchor
+  // is already far from origin.
+  if (modelGroup.children.length > 0) {
+    const box = new THREE.Box3().setFromObject(modelGroup);
+    const size = box.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z, 1);
+    const dist = Math.hypot(midX, midY, midZ);
+    const threshold = 0.05 * maxDim;
+    if (dist > 0 && dist < threshold) {
+      const scale = threshold / dist;
+      midX *= scale;
+      midY *= scale;
+      midZ *= scale;
+    }
+  }
 
   const canvas = document.createElement("canvas");
   canvas.width = 256;
@@ -1096,10 +1325,21 @@ function addDimensionLine(
   const spriteMat = new THREE.SpriteMaterial({ map: texture, sizeAttenuation: true });
   const sprite = new THREE.Sprite(spriteMat);
   sprite.position.set(midX, midY, midZ);
-  const scale = Math.max(
-    new THREE.Vector3(...from).distanceTo(new THREE.Vector3(...to)) * 0.3,
-    8
-  );
+  // Scale the label proportionally to its dimension line, but clamp on both
+  // ends. The floor (8) keeps labels legible for tiny models (1-2mm); the
+  // ceiling keeps them from growing large enough to overlap other labels or
+  // obscure the model itself on mid-sized parts. Using the largest model
+  // dimension as the ceiling anchor means a 20mm bbox caps labels at ~8mm
+  // long, preserving a visible gap between the X/Y/Z columns.
+  const lineLength = new THREE.Vector3(...from).distanceTo(new THREE.Vector3(...to));
+  const modelSize = (() => {
+    if (modelGroup.children.length === 0) return lineLength;
+    const box = new THREE.Box3().setFromObject(modelGroup);
+    const s = box.getSize(new THREE.Vector3());
+    return Math.max(s.x, s.y, s.z, 1);
+  })();
+  const maxScale = modelSize * 0.4;
+  const scale = Math.min(maxScale, Math.max(lineLength * 0.3, 8));
   sprite.scale.set(scale, scale * 0.25, 1);
   dimensionGroup.add(sprite);
 }

@@ -25,8 +25,33 @@ function muzzleStdout() {
   }) as typeof process.stdout.write;
 }
 
+/**
+ * Fix A (Bug #6) — process-level safety net. `safeHandler` in tools.ts
+ * catches every exception thrown synchronously or via awaited promises inside
+ * a tool handler, but background tasks (setImmediate, unhandled worker
+ * callbacks, stray promises) can still escape to the process level. If one
+ * does, the default Node behavior is to print and exit — which closes stdio
+ * and kills the MCP connection, exactly the symptom Bug #6 described.
+ *
+ * Log to stderr (never stdout, which is the JSON-RPC channel) and KEEP the
+ * process alive. The handler-local wrapping remains the authoritative fix;
+ * this is defensive-in-depth for anything that slipped past it.
+ */
+function installProcessSafetyNet() {
+  process.on("uncaughtException", (err) => {
+    process.stderr.write(
+      `[shapeitup-mcp] uncaughtException: ${err?.stack ?? err}\n`,
+    );
+  });
+  process.on("unhandledRejection", (reason) => {
+    const msg = reason instanceof Error ? (reason.stack ?? reason.message) : String(reason);
+    process.stderr.write(`[shapeitup-mcp] unhandledRejection: ${msg}\n`);
+  });
+}
+
 async function main() {
   muzzleStdout();
+  installProcessSafetyNet();
 
   const server = new McpServer({
     name: "shapeitup",

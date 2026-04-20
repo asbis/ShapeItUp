@@ -17,9 +17,18 @@
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { dirname, basename, resolve, join } from "node:path";
-import { initCore, type Core, type ExecutedPart } from "@shapeitup/core";
+import {
+  BUNDLE_EXTERNALS,
+  extractParamsStatic,
+  initCore,
+  hasSucceededBefore,
+  resetWedgeTracking,
+  type Core,
+  type ExecutedPart,
+} from "@shapeitup/core";
 import * as esbuild from "esbuild";
 import { loadOCCTNode } from "./node-loader.js";
+import { loadManifoldNode } from "./manifold-node-loader.js";
 
 export interface EngineStatus {
   success: boolean;
@@ -39,8 +48,33 @@ export interface EngineStatus {
   partNames?: string[];
   boundingBox?: { x: number; y: number; z: number };
   currentParams?: Record<string, number>;
+  /**
+   * Parameter names statically extracted from the script's
+   * `export const params = {...}` declaration. Populated from the raw source
+   * BEFORE esbuild/OCCT run, so it survives bundle failures and WASM crashes
+   * where `currentParams` would be missing. Empty array means "no params
+   * declaration found" (or unparseable form); the declaration itself may
+   * still be valid at runtime. Prefer `currentParams` when both are set —
+   * it includes the actual values, not just the names.
+   */
+  declaredParams?: string[];
   timings?: Record<string, number>;
   warnings?: string[];
+  /**
+   * False when BRepCheck flagged at least one rendered part as invalid
+   * (non-manifold shell, self-intersection, open topology). When false, the
+   * formatted status headline flips from "Render SUCCESS" to
+   * "Render COMPLETED WITH GEOMETRY ERRORS" and per-part volume/area/mass
+   * are omitted for the affected parts. Absent means "not checked" and is
+   * treated as valid by downstream code.
+   */
+  geometryValid?: boolean;
+  /**
+   * Part names that specifically failed BRepCheck. Used by consumers that
+   * want to render a per-part error list without re-parsing the `warnings`
+   * strings. Subset of `partNames`.
+   */
+  geometryErrorParts?: string[];
   properties?: ShapeProperties;
   /**
    * Material as declared by the script (`export const material`). Surfaces
@@ -48,6 +82,13 @@ export interface EngineStatus {
    * Undefined when the script didn't declare a (valid) material.
    */
   material?: { density: number; name?: string };
+  /**
+   * Bug #1: true when this execution triggered a `resetCore()` because the
+   * caught exception looked WASM-level (OCCT pointer throw, memory OOB, null
+   * object, etc.). Surfaced in the user-facing text so downstream tools can
+   * warn the agent that the NEXT call will pay ~500ms of OCCT re-init.
+   */
+  engineReset?: boolean;
   timestamp: string;
 }
 
@@ -104,9 +145,54 @@ function locateWasmDir(): string | undefined {
 export async function getCore(): Promise<Core> {
   if (!corePromise) {
     const wasmDir = locateWasmDir();
-    corePromise = initCore(() => loadOCCTNode(wasmDir));
+    // Pass a Manifold loader alongside OCCT — without it, `threads.tapInto()`
+    // and any other helper that calls `getManifold()` crashes with "manifold
+    // has not been loaded" the moment the MCP engine runs a script that
+    // touches internal/tapped threads. The worker path already does this
+    // (packages/worker/src/index.ts); before this change the MCP path
+    // silently omitted it, making internal threads unusable headless.
+    //
+    // Manifold load failures are non-fatal: we fall back to OCCT-only and log
+    // to stderr so the MCP protocol stream stays clean. Scripts that need
+    // Manifold will still see the original "manifold has not been loaded"
+    // error from getManifold() — better than crashing the whole engine on
+    // init when most scripts don't use threads at all.
+    corePromise = initCore(
+      () => loadOCCTNode(wasmDir),
+      () => loadManifoldNode(wasmDir).catch((e) => {
+        process.stderr.write(
+          `[mcp-engine] Manifold loader failed — threads.tapInto and other ` +
+          `mesh-native helpers will be unavailable in MCP context: ` +
+          `${e?.message ?? e}\n`,
+        );
+        return null;
+      }),
+    );
   }
   return corePromise;
+}
+
+/**
+ * Drop the cached core + any cached shape references so the next getCore()
+ * call reinitializes OCCT from scratch. Called from tool error paths when we
+ * detect a WASM "memory access out of bounds" — the OCCT heap is poisoned
+ * after that, so every subsequent call would crash until the process is
+ * restarted. Reloading the WASM module is the only reliable recovery.
+ *
+ * Note: lastParts references are stale handles into the old (poisoned) heap
+ * after a reset. Clearing them prevents getLastParts() consumers from feeding
+ * zombie pointers into the freshly-booted OCCT.
+ */
+export function resetCore(): void {
+  corePromise = null;
+  lastParts = [];
+  lastFileName = undefined;
+  // Bug #8: the wedge-detection heuristic treats a post-success pointer throw
+  // as "heap corruption — retry". After we reset the core, the freshly-booted
+  // OCCT instance hasn't succeeded yet, so a first-render failure on it
+  // should fall back to the user-oriented "check imports" hint (it's no longer
+  // the wedged-heap signature).
+  resetWedgeTracking();
 }
 
 export function getLastParts(): ExecutedPart[] {
@@ -140,9 +226,23 @@ export async function executeShapeFile(
     return { status };
   }
 
+  // Static param extraction happens BEFORE esbuild/OCCT so the declared names
+  // survive every downstream failure (bundle error, WASM crash, init failure).
+  // Consumers that only need "which params does this script claim to have?"
+  // (e.g. tune_params' Declared: ... warning line) read this field regardless
+  // of success/failure. On the happy path, currentParams supersedes it.
+  let code: string;
+  try {
+    code = readFileSync(absPath, "utf-8");
+    status.declaredParams = extractParamsStatic(code);
+  } catch (e: any) {
+    status.error = `Failed to read file: ${e.message}`;
+    writeStatusFile(status, globalStorageDir);
+    return { status };
+  }
+
   let js: string;
   try {
-    const code = readFileSync(absPath, "utf-8");
     const result = await esbuild.build({
       stdin: {
         contents: code,
@@ -154,10 +254,27 @@ export async function executeShapeFile(
       write: false,
       format: "esm",
       target: "es2022",
-      external: ["replicad", "shapeitup"],
+      external: [...BUNDLE_EXTERNALS],
       platform: "neutral",
       absWorkingDir: dirname(absPath),
+      logLevel: "silent",
     });
+    // Treat "Could not resolve" warnings as hard errors — a missing local
+    // import silently tree-shakes when the symbol is unused, which hides typos
+    // and missing files until runtime. Surface all resolution failures.
+    const resolutionErrors = result.warnings.filter((w) =>
+      w.text.includes("Could not resolve")
+    );
+    if (resolutionErrors.length > 0) {
+      const msg = resolutionErrors.map((w) => w.text).join("\n");
+      status.error = `Bundle failed (unresolved imports):\n${msg}`;
+      writeStatusFile(status, globalStorageDir);
+      return { status };
+    }
+    // Surface other warnings (non-fatal) in the status so the user sees them.
+    if (result.warnings.length > 0) {
+      status.warnings = result.warnings.map((w) => w.text);
+    }
     js = result.outputFiles[0].text;
   } catch (e: any) {
     status.error = `Bundle failed: ${e.message}`;
@@ -190,6 +307,9 @@ export async function executeShapeFile(
     const currentParams: Record<string, number> = {};
     for (const p of result.params) currentParams[p.name] = p.value;
 
+    const geometryErrorParts = (result.geometryIssues ?? [])
+      .filter((i) => i.severity === "error")
+      .map((i) => i.part);
     const successStatus: EngineStatus = {
       success: true,
       fileName: absPath,
@@ -198,8 +318,14 @@ export async function executeShapeFile(
       partNames: result.parts.map((p) => p.name),
       boundingBox: bbox,
       currentParams,
+      // Preserve the statically-extracted names even on success: consumers
+      // that read the status file shouldn't have to choose between the two
+      // sources depending on the success bit.
+      declaredParams: status.declaredParams,
       timings: result.timings,
       warnings: result.warnings,
+      geometryValid: result.geometryValid,
+      geometryErrorParts: geometryErrorParts.length > 0 ? geometryErrorParts : undefined,
       properties,
       material: result.material,
       timestamp: new Date().toISOString(),
@@ -213,7 +339,29 @@ export async function executeShapeFile(
     status.error = core.resolveError(e);
     status.operation = e?.operation;
     status.stack = e?.stack;
-    status.hint = inferErrorHint(status.error, status.operation, status.stack);
+    // Thread the user's `.shape.ts` source text (read into `code` above) into
+    // the hint generator so source-aware branches (e.g. the sketchOnPlane
+    // hint disambiguating draw()-without-close from sketchCircle() double-wrap)
+    // can specialize. Fall back to `undefined` when the source isn't
+    // available — hint generator just uses the generic multi-cause copy.
+    status.hint = inferErrorHint(status.error, status.operation, status.stack, code);
+
+    // Bug #1: OCCT exceptions (thread ops especially) poison the WASM heap —
+    // Emscripten's handle table is corrupted on the C++-exception path, and
+    // every subsequent call in this process dereferences garbage pointers.
+    // Detect a WASM-level failure and drop the cached core so the next call
+    // re-initializes OCCT from scratch. Pure user-error throws (e.g. "fillet
+    // radius too large" as a JS Error) don't qualify — we only reset when the
+    // signature matches something that could have corrupted the heap.
+    const isRawPointerThrow = typeof e === "number" || typeof e === "bigint";
+    const wasmSignaturePattern = /OCCT exception|memory access out of bounds|pointer|null object/i;
+    const looksWasmLevel = isRawPointerThrow ||
+      (typeof status.error === "string" && wasmSignaturePattern.test(status.error));
+    if (looksWasmLevel) {
+      resetCore();
+      status.engineReset = true;
+    }
+
     writeStatusFile(status, globalStorageDir);
     return { status };
   }
@@ -302,6 +450,17 @@ function aggregateProperties(parts: ExecutedPart[]): ShapeProperties {
   let hasVolume = false;
   let hasSurface = false;
   const weightedCoM: [number, number, number] = [0, 0, 0];
+  // CoM denominator is tracked separately from totalVolume: only parts that
+  // actually contributed a weighted centroid to the numerator may
+  // contribute to the denominator. Otherwise a part with volume but no
+  // CoM (e.g. a MeshShape whose tet-integration returned undefined, or
+  // a BRepCheck-invalidated part) would pull the aggregate toward
+  // (0,0,0) proportional to its volume share — silently misleading.
+  // When ANY volumetric part lacks a CoM, we refuse to report the
+  // aggregate at all; formatProperties (tools.ts) already omits the
+  // "center of mass" line when centerOfMass is undefined.
+  let comDenominator = 0;
+  let anyVolumetricPartMissingCoM = false;
   // Aggregate mass only when EVERY part has one — a partial total would
   // mislead (e.g. "assembly weighs 50 g" when one part's mass is unknown).
   let totalMass = 0;
@@ -314,6 +473,9 @@ function aggregateProperties(parts: ExecutedPart[]): ShapeProperties {
         weightedCoM[0] += p.centerOfMass[0] * p.volume;
         weightedCoM[1] += p.centerOfMass[1] * p.volume;
         weightedCoM[2] += p.centerOfMass[2] * p.volume;
+        comDenominator += p.volume;
+      } else if (p.volume > 0) {
+        anyVolumetricPartMissingCoM = true;
       }
     }
     if (typeof p.surfaceArea === "number") {
@@ -327,8 +489,8 @@ function aggregateProperties(parts: ExecutedPart[]): ShapeProperties {
     }
   }
   const centerOfMass: [number, number, number] | undefined =
-    hasVolume && totalVolume > 0
-      ? [weightedCoM[0] / totalVolume, weightedCoM[1] / totalVolume, weightedCoM[2] / totalVolume]
+    !anyVolumetricPartMissingCoM && comDenominator > 0
+      ? [weightedCoM[0] / comDenominator, weightedCoM[1] / comDenominator, weightedCoM[2] / comDenominator]
       : undefined;
   return {
     parts: perPart,
@@ -350,10 +512,11 @@ function aggregateProperties(parts: ExecutedPart[]): ShapeProperties {
  * signature purely so we can extract concrete numbers (e.g. the radius that
  * a fillet was called with) for more specific hints.
  */
-function inferErrorHint(
+export function inferErrorHint(
   errorMessage: string | undefined,
   operation: string | undefined,
-  stack: string | undefined
+  stack: string | undefined,
+  source?: string,
 ): string | undefined {
   if (!errorMessage) return undefined;
   const msg = errorMessage;
@@ -361,11 +524,24 @@ function inferErrorHint(
   const haystack = `${msg}\n${stack ?? ""}`;
 
   // why: the resolveWasmException fallback — emitted when OCCT threw a raw
-  // pointer we couldn't decode. In practice the real-world trigger is
-  // importing one .shape.ts into another (path rename / missing file) or
-  // reusing a sketch after a loft/fuse consumed it. Steer the agent toward
-  // those root causes instead of the generic "simplify geometry" advice.
-  if (/OCCT exception \(pointer/.test(msg)) {
+  // pointer we couldn't decode. Two meaningfully different root causes:
+  //
+  //   1. Fresh heap, small pointer, first render of the process: the user's
+  //      script has a real bug (bad import path, sketch reused after a
+  //      consuming op). The existing "check your imports" advice is right.
+  //
+  //   2. Bug #8 / wedge detection: a SMALL pointer value (< 10000 — these
+  //      look like tiny Emscripten offsets, not real heap addresses) AFTER a
+  //      prior successful render is the signature of a poisoned handle
+  //      table. Any script — even "return drawCircle(10).sketchOnPlane(...)"
+  //      — would hit it. Steer toward "retry" rather than "check imports"
+  //      which wastes the agent's effort editing files that aren't broken.
+  const ptrMatch = msg.match(/OCCT exception \(pointer\s+(\d+)/);
+  if (ptrMatch) {
+    const ptr = Number(ptrMatch[1]);
+    if (Number.isFinite(ptr) && ptr < 10000 && hasSucceededBefore()) {
+      return `Heap appears corrupted from a prior failure — engine has been re-initialized; retry.`;
+    }
     return `Low-level OCCT exception — most common cause is an invalid import path between .shape.ts files, or a shape being used after it was consumed (loft/fuse). Check your local imports exist and haven't been renamed; make sure you're not reusing a sketch after a loft.`;
   }
 
@@ -396,6 +572,18 @@ function inferErrorHint(
   // filter that matched zero/too many faces.
   if (notDone && /shell/.test(op)) {
     return `Shell failed — the wall thickness is likely too large relative to the feature size, or the open face has adjacent small faces. Try a smaller thickness and confirm the face filter matches exactly one face.`;
+  }
+
+  // why: Replicad's ObjectCache guard throws a plain `Error("This object has
+  // been deleted")` when a sketch/shape handle is reused after a consuming
+  // op (loft/fuse/cut destructively delete their inputs). This is a JS-side
+  // throw — it's already an Error instance, so `resolveWasmException`
+  // doesn't touch it and the bare message makes it past the generic loft
+  // hint below. Catch it specifically when the operation name mentions loft
+  // so the agent gets the reuse-is-the-bug answer instead of the generic
+  // topology-mismatch advice.
+  if (/loft/i.test(op) && /(?:object|shape|sketch)\s+(?:has\s+been|was|been)\s+deleted|deleted\s+(?:object|shape|sketch)/i.test(msg)) {
+    return `The sketch was consumed by a previous loft operation and its handle is no longer valid. Recreate the sketch (draw... sketchOnPlane...) before lofting again. Replicad's loft/fuse/cut methods destructively delete their inputs — reassigning the result to the same variable helps avoid this class of bug.`;
   }
 
   // Loft pattern-matches on the operation name; the error text rarely
@@ -473,6 +661,79 @@ function inferErrorHint(
   // Sketch that forgot .sketchOnPlane().extrude().
   if (/Shape3D.*required|\.mesh is not a function/i.test(msg)) {
     return `The script returned something that isn't a 3D shape. Confirm \`main()\` returns the Shape3D (or an array of { shape, name, color }) rather than a Drawing or Sketch.`;
+  }
+
+  // ---------------------------------------------------------------------
+  // TypeError post-analyzer. These mirror the static checks in
+  // validate_script, so callers who run the script without validating
+  // first still get the same actionable hint at runtime instead of a
+  // bare "X is not a function" or the generic OCCT pointer catch-all.
+  // Matched against msg only (stack can contain unrelated property names).
+  // ---------------------------------------------------------------------
+
+  // `filter.find is not a function` — shell({ filter: callback }) receives a
+  // FaceFinder *instance* in the config-object form. Callbacks only work
+  // with the positional form. Frequently hit because older skill docs
+  // showed the wrong form.
+  if (/filter\.find is not a function/i.test(msg)) {
+    return `shell's config-object form expects \`filter\` to be a FaceFinder instance, not a callback. Use the positional form with a callback: \`shape.shell(thickness, f => f.inPlane("XY", height))\`, or build a FaceFinder first: \`shape.shell({ thickness, filter: new FaceFinder().inPlane("XY", height) })\`.`;
+  }
+
+  // `.extrude is not a function` — user called .extrude() on a raw Drawing.
+  // Drawings need .sketchOnPlane() first; only Sketches extrude.
+  if (/\.extrude is not a function/i.test(msg)) {
+    return `Drawings must be placed on a plane before extruding. Add \`.sketchOnPlane("XY")\` between the draw* call and \`.extrude()\` — e.g. \`drawRectangle(10, 10).sketchOnPlane("XY").extrude(5)\`.`;
+  }
+
+  // `.sketchOnPlane is not a function` — two distinct root causes:
+  //   (a) user chained `.sketchOnPlane()` onto a DrawingPen that never got
+  //       `.close()` / `.done()` — e.g. `draw().hLine(20).vLine(10).sketchOnPlane("XY")`.
+  //       A DrawingPen has no `.sketchOnPlane` method until it's converted to
+  //       a Drawing via `.close()` / `.done()`.
+  //   (b) user chained `.sketchOnPlane()` onto a `sketchCircle` / `sketchRectangle`
+  //       — those functions already return a Sketch, which also lacks
+  //       `.sketchOnPlane()`.
+  // When we have access to the source code, grep for `draw(` / `.hLine(` /
+  // `.vLine(` to disambiguate and emit only the relevant fix; otherwise list
+  // both and let the user pick.
+  if (/\.sketchOnPlane is not a function/i.test(msg)) {
+    if (source && /\bdraw\s*\(|\.hLine\s*\(|\.vLine\s*\(|\.line\s*\(|\.polarLine\s*\(|\.bulgeArc\s*\(|\.smoothSpline\s*\(/.test(source)) {
+      return `\`.sketchOnPlane\` is not a method on a DrawingPen — you need to close the pen chain first. Add \`.close()\` (for a closed profile) or \`.done()\` (for an open path) before \`.sketchOnPlane()\`: e.g. \`draw().hLine(20).vLine(10).hLine(-20).close().sketchOnPlane("XY")\`.`;
+    }
+    return `\`.sketchOnPlane\` is not a method on this receiver. Likely causes: (1) you wrote \`draw().hLine(...).vLine(...).sketchOnPlane(...)\` without closing — add \`.close()\` or \`.done()\` before \`.sketchOnPlane()\`; (2) you wrote \`sketchCircle(r).sketchOnPlane(...)\` — sketch* functions already return a Sketch, so drop the redundant \`.sketchOnPlane()\` call or pass the plane as a config arg (e.g. \`sketchCircle(r, { plane: "XY" })\`). Check which applies.`;
+  }
+
+  // Bug #4 fallout (standards typo). The Proxy guard in standards.ts now
+  // throws a clean "Unknown key ... Did you mean ...?" TypeError, which
+  // carries the identifier info we need for a useful hint. Older / deeper
+  // paths can still surface as "Cannot read properties of undefined (reading
+  // 'X')" — which is ALSO useful IFF the reading target (`X`) is a plausible
+  // stdlib/standards identifier (alphabetic, camelCase). It is NOT useful
+  // when X is a tuple index ('0', '1') or a bare method name like
+  // 'translate' — that's the motor-bracket engineer's misread: passing
+  // `[[x,y],...]` where `Placement[]` was required fires
+  // "Cannot read properties of undefined (reading '0')", which has no typo
+  // content at all and shouldn't mention standards.NEMA17.pilotDiameter.
+  if (/Unknown key/i.test(msg) || /NaN.*not a number/i.test(msg)) {
+    return `A numeric value came through as \`undefined\` or NaN. Common causes: a typo in a standards lookup (e.g. \`standards.NEMA17.pilotDiameter\` — the correct key is \`pilotDia\`), or an arithmetic expression that divided by zero. Log the value just before the failing call to pinpoint which.`;
+  }
+  // Only fire the typo hint for `cannot read properties of undefined (reading '…')`
+  // when the property name looks like a named stdlib identifier — alphabetic,
+  // at least 4 chars, not a common generic method like translate/rotate/etc.
+  // that appears on every shape. This avoids hijacking tuple-index errors and
+  // wrong-type-arg errors with a misleading "standards typo" suggestion.
+  const readingMatch = msg.match(/cannot read propert.*of undefined \(reading '([^']+)'\)/i);
+  if (readingMatch) {
+    const prop = readingMatch[1];
+    const looksLikeLookup =
+      /^[A-Za-z][A-Za-z0-9_]{3,}$/.test(prop) &&
+      !/^(translate|rotate|mirror|scale|fuse|cut|intersect|extrude|sketchOnPlane|length|size|name|push|map|filter|forEach|slice|splice|concat|indexOf|includes|then|catch|finally)$/i.test(prop);
+    if (looksLikeLookup) {
+      return `A numeric value came through as \`undefined\` or NaN. Common causes: a typo in a standards lookup (e.g. \`standards.NEMA17.pilotDiameter\` — the correct key is \`pilotDia\`), or an arithmetic expression that divided by zero. Log the value just before the failing call to pinpoint which.`;
+    }
+    // Otherwise: fall through. A "reading '0'" or "reading 'translate'" error
+    // almost always means a type mismatch (wrong shape of argument) — the
+    // stdlib-typo hint would be actively misleading.
   }
 
   return undefined;

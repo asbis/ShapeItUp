@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 import * as esbuild from "esbuild-wasm";
 import * as path from "path";
-import type { ExportFormat } from "@shapeitup/shared";
+import * as fs from "fs";
+import { BUNDLE_EXTERNALS, type ExportFormat } from "@shapeitup/shared";
 import type { DetectedApp } from "./app-detector";
 import { getDetectedApps } from "./app-detector";
 
@@ -14,6 +15,17 @@ async function ensureEsbuild() {
   await esbuildInitPromise;
 }
 
+interface BundleCacheEntry {
+  /** Bundled JS output text. */
+  js: string;
+  /** Text of the entry file at the time of caching (matches document.getText()). */
+  entryContent: string;
+  /** Normalized absolute path of the entry file (the map key). */
+  entryPath: string;
+  /** Absolute input path -> mtimeMs for every file esbuild pulled in. */
+  inputMtimes: Record<string, number>;
+}
+
 export class ViewerProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private panel?: vscode.WebviewPanel;
@@ -22,13 +34,23 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
   private pendingExportResolve?: (data: ArrayBuffer) => void;
   private pendingScreenshotResolve?: (dataUrl: string) => void;
   private isReady = false;
-  private pendingScript?: { js: string; fileName: string; paramOverrides?: Record<string, number> };
+  private pendingScript?: { js: string; fileName: string; paramOverrides?: Record<string, number>; meshQuality?: "preview" | "final" };
   private lastScreenshotPath?: string;
   private lastExecutedFile?: string;
   // Buffer for per-part visibility warnings surfaced by the viewer while a
   // screenshot is being prepared. The render-preview handler clears this
   // before dispatching and drains it into the MCP result afterwards.
   private partWarnings: string[] = [];
+
+  // Bug C: handshake so the render-preview command can wait for the actual
+  // webview-side render to complete (render-success message from the worker)
+  // instead of polling a status file that was written by the MCP engine BEFORE
+  // executeScript was even dispatched. `armPendingRender()` is called right
+  // before executeScript; `awaitNextRender(timeoutMs)` is called AFTER to
+  // block until the worker finishes tessellating and the viewer reports back.
+  private pendingRenderResolve?: () => void;
+  private pendingRenderReject?: (err: Error) => void;
+  private pendingRenderPromise?: Promise<void>;
 
   constructor(context: vscode.ExtensionContext, output: vscode.OutputChannel) {
     this.context = context;
@@ -141,6 +163,12 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     );
     const wasmFile = webview.asWebviewUri(
       vscode.Uri.joinPath(distUri, "replicad_single.wasm")
+    );
+    const manifoldLoaderJs = webview.asWebviewUri(
+      vscode.Uri.joinPath(distUri, "manifold.js")
+    );
+    const manifoldWasmFile = webview.asWebviewUri(
+      vscode.Uri.joinPath(distUri, "manifold.wasm")
     );
 
     const nonce = getNonce();
@@ -419,7 +447,9 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     window.__SHAPEITUP_CONFIG__ = {
       workerUrl: "${workerJs}",
       wasmLoaderUrl: "${wasmLoaderJs}",
-      wasmUrl: "${wasmFile}"
+      wasmUrl: "${wasmFile}",
+      manifoldLoaderUrl: "${manifoldLoaderJs}",
+      manifoldWasmUrl: "${manifoldWasmFile}"
     };
   </script>
   <script nonce="${nonce}" src="${viewerJs}"></script>
@@ -454,28 +484,26 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         this.output.appendLine(`[error] ${msg.message}`);
         this.output.show(true);
         vscode.window.showErrorMessage(`ShapeItUp: ${msg.message}`);
-        this.writeStatusFile({
-          success: false,
-          error: msg.message,
-          fileName: this.lastExecutedFile || msg.fileName,
-          operation: msg.operation,
-          stack: msg.stack,
-        });
+        // Intentionally do NOT write shapeitup-status.json here. The MCP
+        // engine is authoritative for status — the extension's webview is a
+        // second instance of the same compile, and a failure here (often a
+        // divergent esbuild bundler) would clobber the engine's success
+        // status (see Bug #2).
+        // Bug C: unblock any awaitNextRender() caller so the render-preview
+        // command doesn't just hang on its 8s timeout after a viewer error.
+        this.rejectPendingRender(`viewer error: ${msg.message}`);
         break;
       case "render-success":
         this.output.appendLine(`[render] ${msg.stats}`);
-        this.writeStatusFile({
-          success: true,
-          fileName: this.lastExecutedFile,
-          stats: msg.stats,
-          boundingBox: msg.boundingBox,
-          partCount: msg.partCount,
-          partNames: msg.partNames,
-          currentParams: msg.currentParams,
-          timings: msg.timings,
-          warnings: msg.warnings,
-          properties: msg.properties,
-        });
+        // Intentionally do NOT write shapeitup-status.json here. The MCP
+        // engine is authoritative for status; writing from the webview
+        // path risks overwriting the engine's record with fields derived
+        // from a different bundler/worker instance.
+        // Bug C: signal any awaitNextRender() caller that the webview-side
+        // render (tessellation + scene update) actually finished — this is
+        // the handshake the render-preview handler needs before it can safely
+        // frame the camera and capture the screenshot.
+        this.resolvePendingRender();
         break;
       case "status":
         this.output.appendLine(`[status] ${msg.message}`);
@@ -520,6 +548,70 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     this.partWarnings = [];
   }
 
+  /**
+   * Bug C: arm a pending-render promise BEFORE dispatching executeScript so
+   * awaitNextRender() can reliably catch render-success even for fast renders
+   * that complete before the caller gets a chance to await. Replaces any
+   * previously-armed promise (which is rejected — its caller was waiting on
+   * a render that's been superseded).
+   */
+  armPendingRender(): void {
+    if (this.pendingRenderReject) {
+      this.pendingRenderReject(new Error("render superseded by new executeScript"));
+    }
+    this.pendingRenderPromise = new Promise<void>((resolve, reject) => {
+      this.pendingRenderResolve = resolve;
+      this.pendingRenderReject = reject;
+    });
+    // Swallow unhandled rejections on superseded promises — callers who care
+    // attach their own .catch via awaitNextRender.
+    this.pendingRenderPromise.catch(() => {});
+  }
+
+  /**
+   * Wait for the next `render-success` (or `error`) message from the webview.
+   * Rejects on timeout. Returns immediately if no render is armed (caller
+   * forgot to call armPendingRender first — treat as no-op).
+   */
+  async awaitNextRender(timeoutMs: number): Promise<void> {
+    if (!this.pendingRenderPromise) return;
+    const p = this.pendingRenderPromise;
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pendingRenderReject) {
+          this.pendingRenderReject(
+            new Error(`awaitNextRender: timed out after ${timeoutMs}ms`)
+          );
+        }
+        reject(new Error(`awaitNextRender: timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      p.then(
+        () => { clearTimeout(timer); resolve(); },
+        (err) => { clearTimeout(timer); reject(err); }
+      );
+    });
+  }
+
+  /** Resolve a pending render promise (called by render-success handler). */
+  private resolvePendingRender(): void {
+    if (this.pendingRenderResolve) {
+      this.pendingRenderResolve();
+    }
+    this.pendingRenderResolve = undefined;
+    this.pendingRenderReject = undefined;
+    this.pendingRenderPromise = undefined;
+  }
+
+  /** Reject a pending render promise (called by error handler). */
+  private rejectPendingRender(reason: string): void {
+    if (this.pendingRenderReject) {
+      this.pendingRenderReject(new Error(reason));
+    }
+    this.pendingRenderResolve = undefined;
+    this.pendingRenderReject = undefined;
+    this.pendingRenderPromise = undefined;
+  }
+
   /** Drain the buffered per-part visibility warnings. */
   drainPartWarnings(): string[] {
     const out = this.partWarnings;
@@ -533,7 +625,52 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
 
   private executing = false;
 
-  async executeScript(document: vscode.TextDocument, paramOverrides?: Record<string, number>) {
+  /**
+   * In-memory cache of bundled `.shape.ts` outputs, keyed by the normalized
+   * absolute path of the entry file. Avoids re-running esbuild.build() when
+   * neither the entry file nor any of its transitive imports have changed.
+   * Lives for the extension session; never persisted to disk.
+   */
+  private bundleCache = new Map<string, BundleCacheEntry>();
+
+  /**
+   * Last bundle actually handed to the viewer. Single entry, not a per-file
+   * map — we only dedup when the incoming bundle matches what's CURRENTLY
+   * on screen. If the user navigates A → B → A, the third event must
+   * re-render A even though its bundle is byte-identical to step 1's, because
+   * the viewer is now showing B.
+   */
+  private lastDispatched: { path: string; code: string; overrides: string } | null = null;
+
+  /**
+   * Decide whether `entry` is still fresh for `liveCode` (the entry file's
+   * current in-memory text). Returns `null` if the cache is reusable, or a
+   * short human-readable reason string if it must be invalidated. Any fs
+   * error is treated as an invalidation (safer to rebundle than to serve a
+   * stale bundle because a stat failed).
+   */
+  private checkBundleCache(entry: BundleCacheEntry, liveCode: string): string | null {
+    if (entry.entryContent !== liveCode) {
+      return "entry file content changed in-memory";
+    }
+    try {
+      for (const [inputPath, recordedMtime] of Object.entries(entry.inputMtimes)) {
+        const stat = fs.statSync(inputPath);
+        if (Math.abs(stat.mtimeMs - recordedMtime) > 1) {
+          return `input mtime changed: ${inputPath}`;
+        }
+      }
+    } catch (e: any) {
+      return `stat failed: ${e?.message ?? String(e)}`;
+    }
+    return null;
+  }
+
+  async executeScript(
+    document: vscode.TextDocument,
+    paramOverrides?: Record<string, number>,
+    meshQuality?: "preview" | "final",
+  ) {
     const webview = this.getActiveWebview();
     if (!webview) {
       this.output.appendLine("[warn] No active webview to send script to");
@@ -545,7 +682,6 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     this.executing = true;
 
     const code = document.getText();
-    this.output.appendLine(`[exec] Bundling ${document.fileName}`);
 
     try {
       await ensureEsbuild();
@@ -556,32 +692,130 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         .replace(/^([a-z]):/, (_, l) => l.toUpperCase() + ":");
 
       const resolveDir = path.dirname(normalizedPath);
-      const result = await esbuild.build({
-        stdin: {
-          contents: code,
-          resolveDir,
-          sourcefile: path.basename(document.fileName),
-          loader: "ts",
-        },
-        bundle: true,
-        write: false,
-        format: "esm",
-        target: "es2022",
-        external: ["replicad", "shapeitup"],
-        platform: "browser",
-        absWorkingDir: resolveDir,
-      });
 
-      const js = result.outputFiles[0].text;
-      const msg: { js: string; fileName: string; paramOverrides?: Record<string, number> } = { js, fileName: document.fileName };
+      let js: string;
+      const cached = this.bundleCache.get(normalizedPath);
+      const invalidReason = cached ? this.checkBundleCache(cached, code) : "no cache entry";
+
+      if (cached && invalidReason === null) {
+        js = cached.js;
+        this.output.appendLine(`[exec] Cache hit for ${document.fileName}`);
+      } else {
+        this.output.appendLine(`[exec] Cache miss (${invalidReason}), rebundling ${document.fileName}`);
+        const result = await esbuild.build({
+          stdin: {
+            contents: code,
+            resolveDir,
+            sourcefile: path.basename(document.fileName),
+            loader: "ts",
+          },
+          bundle: true,
+          write: false,
+          format: "esm",
+          target: "es2022",
+          external: [...BUNDLE_EXTERNALS],
+          platform: "browser",
+          absWorkingDir: resolveDir,
+          metafile: true,
+          logLevel: "silent",
+        });
+
+        // Treat "Could not resolve" warnings as hard errors — a missing local
+        // import silently tree-shakes when the symbol is unused, masking typos.
+        const resolutionErrors = result.warnings.filter((w) =>
+          w.text.includes("Could not resolve")
+        );
+        if (resolutionErrors.length > 0) {
+          const msg = resolutionErrors.map((w) => w.text).join("\n");
+          throw new Error(`Unresolved imports:\n${msg}`);
+        }
+        // Surface other (non-fatal) warnings in the output channel.
+        for (const w of result.warnings) {
+          this.output.appendLine(`[warn] ${w.text}`);
+        }
+
+        js = result.outputFiles[0].text;
+
+        // Record mtime for every LOCAL import esbuild discovered so we can
+        // invalidate next time if any of them changes on disk. We explicitly
+        // skip the entry file: its freshness is already handled by the
+        // entryContent equality check, and mtime can flicker on Windows
+        // (editor touches, indexers) without content changing — double-checking
+        // here causes spurious cache misses.
+        const inputMtimes: Record<string, number> = {};
+        try {
+          for (const inputPath of Object.keys(result.metafile?.inputs ?? {})) {
+            if (inputPath.startsWith("<stdin>")) continue;
+            const abs = path.isAbsolute(inputPath)
+              ? inputPath
+              : path.resolve(resolveDir, inputPath);
+            // Skip the entry file — covered by entryContent.
+            if (abs.toLowerCase() === document.fileName.toLowerCase()) continue;
+            try {
+              inputMtimes[abs] = fs.statSync(abs).mtimeMs;
+            } catch {
+              // If we can't stat an input at bundle time, omit it — the next
+              // run will see a mismatch (entry in cache but file missing) and
+              // fall through to rebundle.
+            }
+          }
+        } catch {
+          // Metafile walk failed entirely — leave inputMtimes empty so any
+          // future call falls back to checking only the entry content.
+        }
+
+        this.bundleCache.set(normalizedPath, {
+          js,
+          entryContent: code,
+          entryPath: normalizedPath,
+          inputMtimes,
+        });
+      }
+
+      const msg: {
+        js: string;
+        fileName: string;
+        paramOverrides?: Record<string, number>;
+        meshQuality?: "preview" | "final";
+      } = { js, fileName: document.fileName };
       // Ephemeral param overrides used by MCP's tune_params + any caller that
       // wants the viewer to render with non-default values without touching
       // the file on disk. Undefined means "use the script's declared defaults".
       if (paramOverrides && Object.keys(paramOverrides).length > 0) {
         msg.paramOverrides = paramOverrides;
       }
+      // P3-10: forward MCP-supplied meshQuality verbatim. Undefined leaves
+      // core.execute's auto-degrade heuristic in charge (≥15 parts → preview).
+      if (meshQuality) {
+        msg.meshQuality = meshQuality;
+      }
 
       this.lastExecutedFile = document.fileName;
+
+      // Dedupe: tab-switch + file-watcher + save often fire in quick succession
+      // for the SAME file with identical content — the worker would just
+      // re-tessellate the same input. But only dedup against what's actually
+      // on-screen; navigating away and back must re-render even if the bundle
+      // matches a previous dispatch of that file.
+      //
+      // Exception: if a pendingRenderPromise is armed (render-preview flow),
+      // dedup would silence the only signal the caller is waiting for — the
+      // webview wouldn't post render-success because no re-render happened,
+      // awaitNextRender times out at 8s, and the screenshot captures stale
+      // geometry. Always re-dispatch when something is awaiting a render.
+      const overridesKey = paramOverrides ? JSON.stringify(paramOverrides) : "";
+      if (
+        this.isReady &&
+        this.lastDispatched &&
+        this.lastDispatched.path === normalizedPath &&
+        this.lastDispatched.code === js &&
+        this.lastDispatched.overrides === overridesKey &&
+        !this.pendingRenderPromise
+      ) {
+        this.output.appendLine(`[exec] Dedup: identical bundle already dispatched for ${document.fileName}`);
+        return;
+      }
+      this.lastDispatched = { path: normalizedPath, code: js, overrides: overridesKey };
 
       if (this.isReady) {
         this.output.appendLine(`[exec] Sending to viewer (${js.length} chars)`);
@@ -594,7 +828,11 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     } catch (e: any) {
       this.output.appendLine(`[error] Bundle failed: ${e.message}`);
       vscode.window.showErrorMessage(`ShapeItUp bundle error: ${e.message}`);
-      this.writeStatusFile({ success: false, error: e.message, fileName: document.fileName });
+      // Intentionally do NOT write shapeitup-status.json here. The MCP
+      // engine's bundler is authoritative; the extension's esbuild-wasm
+      // bundle is just to drive the visible webview, and divergence from
+      // the MCP-side bundle (e.g. missing `external`) would otherwise
+      // clobber a valid engine success status (see Bug #2).
     } finally {
       this.executing = false;
     }
@@ -644,12 +882,19 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
    * `width`/`height` temporarily resize the WebGL canvas so the output is
    * decoupled from the user's window size — important for AI consumers that
    * need a predictable resolution.
+   *
+   * When `outputPath` is provided, the PNG is written to that exact path and
+   * the same path is returned verbatim. This is the trusted path used by the
+   * MCP render-preview flow (fix for Bug #1/#12 — the old synthesis from
+   * `this.lastExecutedFile` could be stale because executeScript is fired
+   * without await). When absent, the legacy filename synthesis is preserved.
    */
   async captureScreenshot(
     outputDir?: string,
     cameraAngle?: string,
     width?: number,
-    height?: number
+    height?: number,
+    outputPath?: string
   ): Promise<string | undefined> {
     const webview = await this.ensureWebview();
     if (!webview) {
@@ -679,13 +924,35 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     const base64 = dataUrl.replace(/^data:image\/png;base64,/, "");
     const buffer = Buffer.from(base64, "base64");
 
-    const dir = outputDir || this.context.globalStorageUri.fsPath;
-    const shapeName = this.lastExecutedFile
-      ? path.basename(this.lastExecutedFile, '.shape.ts')
-      : 'unknown';
-    // Include camera angle in filename to avoid parallel call collisions
-    const angleSuffix = cameraAngle ? `-${cameraAngle}` : "";
-    const filePath = path.join(dir, `shapeitup-preview-${shapeName}${angleSuffix}.png`);
+    let filePath: string;
+    let dir: string;
+    if (outputPath) {
+      // Trusted caller (MCP render-preview) — pin the path exactly.
+      filePath = outputPath;
+      dir = path.dirname(outputPath);
+      // Drift check: if the webview's last-executed shape doesn't match what
+      // MCP told us to write, log a warning so it's detectable in the output
+      // channel. This is the exact signature of the Bug #1 race — when it
+      // fires, we now still write the right PNG (because MCP pinned it),
+      // but the user gets a breadcrumb.
+      const mcpBase = path.basename(outputPath);
+      const lastBase = this.lastExecutedFile
+        ? path.basename(this.lastExecutedFile, ".shape.ts")
+        : "";
+      if (lastBase && !mcpBase.includes(lastBase)) {
+        this.output.appendLine(
+          `[screenshot] drift: MCP requested ${mcpBase} but lastExecutedFile is ${this.lastExecutedFile} — honoring MCP path`
+        );
+      }
+    } else {
+      dir = outputDir || this.context.globalStorageUri.fsPath;
+      const shapeName = this.lastExecutedFile
+        ? path.basename(this.lastExecutedFile, '.shape.ts')
+        : 'unknown';
+      // Include camera angle in filename to avoid parallel call collisions
+      const angleSuffix = cameraAngle ? `-${cameraAngle}` : "";
+      filePath = path.join(dir, `shapeitup-preview-${shapeName}${angleSuffix}.png`);
+    }
     const latestPath = path.join(dir, "shapeitup-preview.png");
 
     await vscode.workspace.fs.createDirectory(vscode.Uri.file(dir));

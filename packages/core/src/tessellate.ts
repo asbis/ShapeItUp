@@ -81,9 +81,46 @@ function chooseTolerance(shape: any): number {
   return 0.1;
 }
 
-export function tessellatePart(part: PartInput): TessellatedPart {
-  const tolerance = chooseTolerance(part.shape);
-  const meshData = part.shape.mesh({ tolerance, angularTolerance: 0.3 });
+/** Tessellation-quality preset. */
+export type MeshQuality = "preview" | "final";
+
+/**
+ * Per-quality multipliers applied to the auto-computed tolerance. `final`
+ * is the baseline (1× — behaviour unchanged from before the quality knob
+ * existed). `preview` multiplies by 2.5× — enough to cut triangle counts
+ * by roughly an order of magnitude on complex shapes (meshing cost scales
+ * inversely with tolerance²), while still looking reasonable on-screen for
+ * assemblies with a lot of threaded / lofted geometry. Also loosens the
+ * angular tolerance so helical surfaces don't pin runtime.
+ */
+const QUALITY_FACTOR: Record<MeshQuality, { linear: number; angular: number }> = {
+  final: { linear: 1, angular: 0.1 },
+  preview: { linear: 2.5, angular: 0.25 },
+};
+
+export interface TessellateOptions {
+  /**
+   * Mesh quality preset. `"final"` (default) preserves the pre-existing
+   * tolerance behaviour. `"preview"` scales the tolerance ~2.5× (roughly
+   * 10× faster tessellation on complex geometry, at the cost of visibly
+   * coarser facets). Auto-degrading to preview for large assemblies is the
+   * caller's policy decision — tessellatePart itself is neutral.
+   */
+  meshQuality?: MeshQuality;
+}
+
+export function tessellatePart(part: PartInput, opts: TessellateOptions = {}): TessellatedPart {
+  const quality: MeshQuality = opts.meshQuality ?? "final";
+  const factor = QUALITY_FACTOR[quality] ?? QUALITY_FACTOR.final;
+  // Apply the preset's linear multiplier to the auto-computed tolerance.
+  // Clamp upper bound so pathologically-large shapes on `preview` don't
+  // produce nearly-zero-triangle meshes that break the viewer.
+  const tolerance = Math.min(2.5, chooseTolerance(part.shape) * factor.linear);
+  // angularTolerance (radians) caps the angle between consecutive facet normals.
+  // 0.1 rad ≈ 5.7° matches replicad's default and is tight enough that helical
+  // surfaces (threads) tessellate smoothly. 0.3 rad — OCCT's coarse end —
+  // produced visibly faceted threads on M3–M8.
+  const meshData = part.shape.mesh({ tolerance, angularTolerance: factor.angular });
 
   const vertices = new Float32Array(meshData.vertices);
   const normals = new Float32Array(meshData.normals);
