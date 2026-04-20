@@ -11,7 +11,7 @@ import * as printHints from "./printHints";
 import * as bearings from "./bearings";
 import * as extrusions from "./extrusions";
 import * as patterns from "./patterns";
-import { screws, nuts, washers, inserts } from "./fasteners";
+import { screws, bolts, washers, inserts } from "./fasteners";
 import { fromBack, shape3d } from "./placement";
 import { Part, joint, part, faceAt, shaftAt, boreAt } from "./parts";
 import { mate, assemble, subassembly, stackOnZ, entries, debugJoints, highlightJoints } from "./assembly";
@@ -19,7 +19,33 @@ import { cylinder } from "./cylinder";
 import * as motors from "./motors";
 import * as couplers from "./couplers";
 import * as threads from "./threads";
-import * as standards from "./standards";
+import * as standardsRaw from "./standards";
+import { guardUnknownKeys } from "./standards";
+import { ensureFinderAndPatched } from "./finder-patch";
+
+// Patch Replicad's EdgeFinder/FaceFinder `.and()` to accept a single callback
+// in addition to the documented array form. Idempotent, safe to call before
+// OCCT is loaded (the patch only mutates class prototypes on the replicad
+// module). See finder-patch.ts for the full rationale.
+ensureFinderAndPatched();
+
+// Re-export the MetricSize union so user scripts can write
+// `import type { MetricSize } from "shapeitup"` instead of digging into the
+// standards namespace. Supported sizes: "M2" | "M2.5" | "M3" | "M4" | "M5" |
+// "M6" | "M8" | "M10" | "M12" — see standards.ts for the source tables.
+export type { MetricSize, FitStyle } from "./standards";
+
+// User-facing view of the standards namespace. Unknown-key reads throw with
+// a did-you-mean suggestion so `standards.NEMA17.pilotDiameter` (typo for
+// `pilotDia`) fails fast instead of returning undefined and propagating as
+// NaN into the next OCCT call. Internal stdlib code imports directly from
+// `./standards` and bypasses this guard.
+//
+// Note: we copy the module-namespace object into a plain object before
+// wrapping. Proxy over a Module Namespace Object fails the [[Get]]
+// invariant (the spec requires returning the exact property value for
+// frozen exports), so the wrap has to operate on a mutable copy.
+const standards = guardUnknownKeys({ ...standardsRaw }, "standards");
 
 export { standards };
 
@@ -34,7 +60,7 @@ export {
   extrusions,
   patterns,
   screws,
-  nuts,
+  bolts,
   washers,
   inserts,
   fromBack,
@@ -65,7 +91,7 @@ export {
 export const shapeitupStdlib = {
   holes,
   screws,
-  nuts,
+  bolts,
   washers,
   inserts,
   printHints,

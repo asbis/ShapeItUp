@@ -12,6 +12,7 @@
 
 import { makeCylinder, type Shape3D } from "replicad";
 import { BALL_BEARING, FIT, LINEAR_BEARING } from "./standards";
+import { applyAxis, type HoleAxis } from "./holes";
 
 /** Clearance behind the bearing back so the cut-tool doesn't coplanar-fail. */
 const POCKET_BACK_CLEARANCE = 0.2;
@@ -63,11 +64,18 @@ function linearBearing(designation: string) {
  * @param opts.depth Override the straight-through depth (mm). Used as the
  *   through-hole height when `throughHole: true`, and as the relief-bore
  *   length when `throughHole: false`. Default 50mm.
- * @returns Shape3D cut-tool positioned at the origin with axis +Z.
+ * @param opts.axis Pocket direction (default `"+Z"` — cavity opens upward,
+ *   tool extends into -Z). Pass `"+X"`/`"-X"`/`"+Y"`/`"-Y"`/`"-Z"` for a
+ *   sideways or upward-facing pocket. The axis rotation happens around the
+ *   origin — callers typically `.translate()` the returned tool to the
+ *   bearing center AFTER the axis has been applied (same contract as
+ *   `holes.*`).
+ * @returns Shape3D cut-tool positioned at the origin, oriented by `axis`
+ *   (default +Z).
  */
 export function seat(
   designation: string,
-  opts?: { throughHole?: boolean; depth?: number }
+  opts?: { throughHole?: boolean; depth?: number; axis?: HoleAxis }
 ): Shape3D {
   const spec = ballBearing(designation);
   const pocketRadius = (spec.od + FIT.press * 2) / 2;
@@ -75,7 +83,8 @@ export function seat(
   if (opts?.throughHole) {
     const depth = opts.depth ?? DEFAULT_THROUGH_DEPTH;
     // Cylinder axis +Z; translate so top face sits at Z=0 → cavity into -Z.
-    return makeCylinder(pocketRadius, depth, [0, 0, -depth], [0, 0, 1]);
+    const tool = makeCylinder(pocketRadius, depth, [0, 0, -depth], [0, 0, 1]);
+    return applyAxis(tool, opts.axis);
   }
 
   // Stepped pocket: full-width pocket at the seat, fused with a narrower
@@ -97,7 +106,8 @@ export function seat(
     [0, 0, 1]
   );
 
-  return pocket.fuse(relief);
+  const tool = pocket.fuse(relief);
+  return applyAxis(tool, opts?.axis);
 }
 
 /**
@@ -118,25 +128,32 @@ export function body(designation: string): Shape3D {
 }
 
 /**
- * Cut-tool for a linear bearing (LMxUU) pocket. Axis Z; pocket top at Z=0,
- * cavity extends into -Z for `length` mm (from LINEAR_BEARING).
+ * Cut-tool for a linear bearing (LMxUU) pocket. Axis Z by default; pocket top
+ * at Z=0, cavity extends into -Z for `length` mm (from LINEAR_BEARING).
  *
  * No shoulder — linear bearings are typically held by retaining rings or
  * press-fit at both ends, so the pocket is a straight bore of
  * `od + 2 · FIT.press` (press fit).
  *
  * @param designation Bearing code from LINEAR_BEARING (e.g. `"LM8UU"`).
+ * @param opts.axis Pocket direction (default `"+Z"`). Pass "+X"/"-X"/"+Y"/
+ *   "-Y"/"-Z" for a horizontal or upward-facing bore. Rotation happens
+ *   around the origin — translate to the bearing center AFTER axis.
  * @returns Shape3D cut-tool for the bearing pocket.
  */
-export function linearSeat(designation: string): Shape3D {
+export function linearSeat(
+  designation: string,
+  opts?: { axis?: HoleAxis }
+): Shape3D {
   const spec = linearBearing(designation);
   const pocketRadius = (spec.od + FIT.press * 2) / 2;
-  return makeCylinder(
+  const tool = makeCylinder(
     pocketRadius,
     spec.length,
     [0, 0, -spec.length],
     [0, 0, 1]
   );
+  return applyAxis(tool, opts?.axis);
 }
 
 /**

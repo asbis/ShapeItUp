@@ -258,9 +258,23 @@ export class Part {
     return this._xform;
   }
 
-  /** Produce the positioned Shape3D with the accumulated transform applied. */
+  /**
+   * Produce the positioned Shape3D with the accumulated transform applied.
+   *
+   * Returns a NEW shape handle each call — `this.shape` is never consumed.
+   * This is load-bearing: Replicad's `translate`/`rotate` delete their input
+   * (see replicad.js Solid.translate — `this.delete()` after cast), so
+   * without the clone, the Transform's `shape(s) => s.translate(...)` would
+   * invalidate `this.shape`. Callers like `subassembly()` and `toEntries()`
+   * iterate children and call `worldShape()` multiple times on the same
+   * Part; they would observe "This object has been deleted" on the second
+   * access if this method consumed its input.
+   *
+   * The IDENTITY case also clones — callers may mutate the result, and we
+   * don't want those mutations aliased back onto `this.shape`.
+   */
   worldShape(): Shape3D {
-    return this._xform.shape(this.shape);
+    return this._xform.shape(this.shape.clone());
   }
 
   /**

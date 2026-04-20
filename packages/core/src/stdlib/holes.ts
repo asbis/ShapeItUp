@@ -5,7 +5,23 @@
  * tool is oriented so its axis is Z, the top (entry) of the hole sits at Z=0,
  * and the tool extends into -Z. Users translate directly to the hole location:
  *
- *   plate.cut(holes.through("M3").translate(10, 10, 0))
+ *   plate.cut(holes.through("M3").translate(10, 10, plateTopZ))
+ *
+ * All directional functions accept an optional `axis` parameter specifying
+ * which face the hole OPENS ON — the body always penetrates in the OPPOSITE
+ * direction (into the material):
+ *   "+Z" (default) opens on top, drills down     — body Z ∈ [-depth, 0]
+ *   "-Z"           opens on bottom, drills up    — body Z ∈ [0, depth]
+ *   "+X"           opens on +X face, drills -X   — body X ∈ [-depth, 0]
+ *   "-X"           opens on -X face, drills +X   — body X ∈ [0, depth]
+ *   "+Y"           opens on +Y face, drills -Y   — body Y ∈ [-depth, 0]
+ *   "-Y"           opens on -Y face, drills +Y   — body Y ∈ [0, depth]
+ *
+ * Example — drilling through a wall whose +X face is at X=5:
+ *   plate.cut(holes.through("M4", { depth: 10, axis: "+X" }).translate(5, y, z))
+ *                                                                     ^ wall's +X face
+ * The cutter's opening lands at X=5 and the body extends to X=-5, so the
+ * whole wall thickness (X ∈ [0, 5]) is drilled out.
  *
  * Dimensions (clearance, tap-drill, head sizes) come from `./standards.ts` so
  * every hole stays consistent with its matching fastener.
@@ -25,7 +41,105 @@ import {
   type FitStyle,
   type MetricSize,
   parseScrewDesignator,
+  assertPositiveFinite,
+  assertSupportedSize,
 } from "./standards";
+import { pushRuntimeWarning } from "./warnings";
+
+/**
+ * Raw diameters that equal a nominal metric size (M3, M4, M5, M6, M8, M10, M12).
+ * When a user passes `holes.through(4, ...)` they usually want the ISO-273
+ * clearance hole (~4.5mm for M4), not a literal 4mm cylinder. Because the
+ * string and numeric paths produce different diameters by design, silently
+ * accepting an integer is a footgun. Emit a one-shot advisory warning so the
+ * user can either switch to the string form or pass a non-integer (e.g. 4.0001)
+ * to document the intent. See Issue #7.
+ */
+const AMBIGUOUS_RAW_DIAMETERS = new Set([3, 4, 5, 6, 8, 10, 12]);
+
+function warnAmbiguousRawDiameter(
+  fnName: string,
+  size: number,
+  fit: FitStyle | undefined,
+  effectiveFit: FitStyle,
+): void {
+  if (!AMBIGUOUS_RAW_DIAMETERS.has(size)) return;
+  const key = `M${size}` as MetricSize;
+  const spec = SOCKET_HEAD[key];
+  if (!spec) return;
+  const allowance = FIT[fit ?? effectiveFit];
+  const specDiameter = spec.shaft + allowance * 2;
+  pushRuntimeWarning(
+    `${fnName}: received raw diameter ${size}mm — did you mean ${fnName}('${key}')? ` +
+      `String form applies ISO clearance fit (~${specDiameter.toFixed(2)}mm for '${fit ?? effectiveFit}' fit). ` +
+      `Pass a non-integer raw diameter to suppress this warning.`,
+  );
+}
+
+/**
+ * Axis specifier for hole orientation.
+ *
+ * **Semantic: axis names the face the hole opens ON, not the direction the
+ * drill bit points.** `"+X"` means the hole enters through the +X face of
+ * your part — i.e. after `.translate(x,y,z)` the cutter's opening sits at
+ * that point and the body extends in the OPPOSITE direction (into -X),
+ * penetrating into the material.
+ *
+ * Per-axis geometry (tool in its pre-translate local frame):
+ *   "+Z"  opening at Z=0,  body Z ∈ [-depth, 0]   (drill points down)
+ *   "-Z"  opening at Z=0,  body Z ∈ [0, depth]    (drill points up)
+ *   "+X"  opening at X=0,  body X ∈ [-depth, 0]   (drill points -X)
+ *   "-X"  opening at X=0,  body X ∈ [0, depth]    (drill points +X)
+ *   "+Y"  opening at Y=0,  body Y ∈ [-depth, 0]   (drill points -Y)
+ *   "-Y"  opening at Y=0,  body Y ∈ [0, depth]    (drill points +Y)
+ *
+ * So for a wall with its +X face at X=`thickness`, `axis: "+X"` plus
+ * `.translate(thickness, y, z)` drills a hole INTO the wall from the +X
+ * side — exactly matching engineering intuition.
+ */
+export type HoleAxis = "+Z" | "-Z" | "+X" | "-X" | "+Y" | "-Y";
+
+/**
+ * Rotate a Shape3D from the default +Z orientation to the given axis.
+ * Returns the shape unchanged for "+Z".
+ *
+ * The source tool (before rotation) has its opening at Z=0 with the body
+ * spanning Z ∈ [-depth, 0]. After rotation, the opening stays at the local
+ * origin on the named face, and the body extends in the direction OPPOSITE
+ * to the axis name:
+ *   "+X" → rotate +90° about Y  → body at X ∈ [-depth, 0]   (drill -X)
+ *   "-X" → rotate -90° about Y  → body at X ∈ [0,  depth]   (drill +X)
+ *   "+Y" → rotate -90° about X  → body at Y ∈ [-depth, 0]   (drill -Y)
+ *   "-Y" → rotate +90° about X  → body at Y ∈ [0,  depth]   (drill +Y)
+ *   "-Z" → rotate 180° about X  → body at Z ∈ [0,  depth]   (drill +Z)
+ *
+ * Exported for unit testing — the hole helpers themselves need OCCT to run,
+ * but the rotation-routing logic is pure (just `.rotate()` dispatch) and
+ * can be tested against a mock Shape3D that records rotate calls.
+ */
+export function applyAxis(shape: Shape3D, axis: HoleAxis | undefined): Shape3D {
+  switch (axis) {
+    case "+Z":
+    case undefined:
+      return shape;
+    case "-Z":
+      return shape.rotate(180, [0, 0, 0], [1, 0, 0]);
+    case "+X":
+      // +90° about Y flips the +Z-pointing tool to -X, so opening at X=0
+      // and body extends into -X (penetrates through the +X face).
+      return shape.rotate(90, [0, 0, 0], [0, 1, 0]);
+    case "-X":
+      return shape.rotate(-90, [0, 0, 0], [0, 1, 0]);
+    case "+Y":
+      // -90° about X flips the +Z-pointing tool to -Y: opening at Y=0,
+      // body extends into -Y (penetrates through the +Y face).
+      return shape.rotate(-90, [0, 0, 0], [1, 0, 0]);
+    case "-Y":
+      return shape.rotate(90, [0, 0, 0], [1, 0, 0]);
+    default:
+      return shape;
+  }
+}
 
 /**
  * Resolve a fit allowance (radial, mm) from a FitStyle name. Defaults to
@@ -40,27 +154,73 @@ function fitAllowance(style: FitStyle | undefined, fallback: FitStyle): number {
  * clearance-sized hole, or a raw number (mm) for a plain cylindrical hole of
  * that diameter. Default depth: 50 mm (use `opts.depth` to match your plate).
  *
+ * @remarks Z CONVENTION: the returned cylinder spans `Z ∈ [-depth, 0]` — its
+ * top face sits AT Z=0 and it extends DOWNWARD into -Z. This anchors the cut
+ * tool so `.translate(x, y, plateTop)` puts the hole's mouth flush with the
+ * plate's upper face. Translating by a smaller Z (or none) leaves the cutter
+ * BELOW the plate, and the cut silently removes nothing. If you see a
+ * `patterns.cutAt` or `.cut()` "no material removal" warning, first confirm
+ * the `.translate(0, 0, Z)` places the cutter INTO the plate, not above or
+ * below it.
+ *
+ * @example
+ * // Horizontal hole through a vertical wall at X ∈ [0, 5]: translate to the
+ * // wall's +X face (X=5); axis: "+X" drills into -X, penetrating the wall.
+ * wall.cut(holes.through("M5", { depth: 10, axis: "+X" }).translate(5, y, z))
+ *
  * @param size Metric designator (`"M3"`) or explicit diameter in mm.
  * @param opts.depth Overall tool length in mm (default 50).
  * @param opts.fit Fit style for metric sizes (default `"clearance"`).
+ * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the hole OPENS ON; the body penetrates in the OPPOSITE direction. `"+X"` = opens on +X face, drills -X. See `HoleAxis` docstring for full semantics.
  * @returns Cut-tool Shape3D, axis=Z, top at Z=0, extends into -Z.
  */
 export function through(
   size: MetricSize | number,
-  opts: { depth?: number; fit?: FitStyle } = {}
+  opts: { depth?: number; fit?: FitStyle; axis?: HoleAxis } = {}
 ): Shape3D {
   const depth = opts.depth ?? 50;
+  assertPositiveFinite("holes.through", "opts.depth", depth);
   let diameter: number;
   if (typeof size === "number") {
+    assertPositiveFinite("holes.through", "size", size);
+    warnAmbiguousRawDiameter("holes.through", size, opts.fit, "clearance");
     diameter = size;
   } else {
+    assertSupportedSize(size, SOCKET_HEAD, "socket-head");
     const spec = SOCKET_HEAD[size];
     const allowance = fitAllowance(opts.fit, "clearance");
     diameter = spec.shaft + allowance * 2;
   }
   // makeCylinder(radius, height, location, direction) — location is the base
   // of the cylinder. Put base at -depth so the top sits at Z=0.
-  return makeCylinder(diameter / 2, depth, [0, 0, -depth], [0, 0, 1]);
+  const tool = makeCylinder(diameter / 2, depth, [0, 0, -depth], [0, 0, 1]);
+  return applyAxis(tool, opts.axis);
+}
+
+/**
+ * Alias for `holes.through(size, { fit: "clearance" })` — matches the common
+ * engineering term "clearance hole". Identical behaviour to `through`, but
+ * the `fit` option defaults to `"clearance"` when unspecified (which is
+ * already the default for `through`, so calls are fully interchangeable).
+ *
+ * @remarks Z CONVENTION: same as `through` — the cylinder spans `Z ∈ [-depth, 0]`
+ * with its top face anchored at Z=0. Translate by `plateTop` to place the
+ * hole's mouth flush with the plate's upper surface.
+ *
+ * @example
+ * // Sideways clearance hole through a flange whose +Y face is at Y=5:
+ * // translate to Y=5, axis "+Y" makes the hole drill into -Y.
+ * flange.cut(holes.clearance("M4", { depth: 8, axis: "+Y" }).translate(x, 5, z))
+ *
+ * @param size Metric designator (`"M3"`) or explicit diameter in mm.
+ * @param opts Same options as `holes.through`, including `axis` for non-vertical holes.
+ * @returns Cut-tool Shape3D, axis=Z, top at Z=0, extends into -Z.
+ */
+export function clearance(
+  size: MetricSize | number,
+  opts: { depth?: number; fit?: FitStyle; axis?: HoleAxis } = {}
+): Shape3D {
+  return through(size, { ...opts, fit: opts.fit ?? "clearance" });
 }
 
 /**
@@ -68,16 +228,31 @@ export function through(
  * pocket sized for a socket-head cap screw head. Total cut depth = the
  * plate thickness; the pocket depth = `SOCKET_HEAD[size].headH + 0.2 mm`.
  *
+ * @remarks Z CONVENTION: the pocket's top face is at Z=0 and the tool extends
+ * downward into -Z (shaft spans `Z ∈ [-plateThickness, 0]`, pocket sits just
+ * below Z=0). To cut a pocket from the TOP of a plate, translate by
+ * `plateTop`: `plate.cut(holes.counterbore("M3", {plateThickness: t}).translate(x, y, t))`.
+ * If you see "no material removal" warnings, check the translate places the
+ * cutter INTO the plate, not above it.
+ *
+ * @example
+ * // Counterbore in a vertical Y-flange (pocket opens on the +Y face at Y=5,
+ * // shaft penetrates into -Y).
+ * flange.cut(holes.counterbore("M4", { plateThickness: 5, axis: "+Y" }).translate(x, 5, z))
+ *
  * @param spec Metric screw designator, e.g. `"M3"` (length component ignored).
  * @param opts.plateThickness Plate thickness in mm — the clearance shaft spans this.
  * @param opts.fit Fit style for the shaft (default `"clearance"`).
+ * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the pocket OPENS ON; the shaft penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
  * @returns Cut-tool Shape3D, top of pocket at Z=0.
  */
 export function counterbore(
   spec: string,
-  opts: { plateThickness: number; fit?: FitStyle }
+  opts: { plateThickness: number; fit?: FitStyle; axis?: HoleAxis }
 ): Shape3D {
+  assertPositiveFinite("holes.counterbore", "opts.plateThickness", opts.plateThickness);
   const { size } = parseScrewDesignator(spec);
+  assertSupportedSize(size, SOCKET_HEAD, "socket-head");
   const head = SOCKET_HEAD[size];
   const allowance = fitAllowance(opts.fit, "clearance");
   const shaftD = head.shaft + allowance * 2;
@@ -100,22 +275,35 @@ export function counterbore(
     [0, 0, -plateThickness],
     [0, 0, 1]
   );
-  return pocket.fuse(shaft);
+  const tool = pocket.fuse(shaft);
+  return applyAxis(tool, opts.axis);
 }
 
 /**
  * Countersunk hole — clearance shaft through the plate plus a 90° cone flare
  * sized to the ISO 10642 head OD. Cone depth = headD/2 (90° included angle).
  *
+ * @remarks Z CONVENTION: the countersink's top (widest) face is at Z=0 and the
+ * tool extends downward into -Z (bottom of the shaft at `Z = -plateThickness`).
+ * Translate by `plateTop` so the flare sits flush with the plate's upper face:
+ * `plate.cut(holes.countersink("M4", {plateThickness: t}).translate(x, y, t))`.
+ *
+ * @example
+ * // Countersink into a vertical X-flange (flare opens on the +X face at X=5,
+ * // shaft penetrates into -X).
+ * flange.cut(holes.countersink("M4", { plateThickness: 5, axis: "+X" }).translate(5, y, z))
+ *
  * @param spec Metric screw designator, e.g. `"M4"`.
  * @param opts.plateThickness Plate thickness in mm.
  * @param opts.fit Fit style for the shaft (default `"clearance"`).
+ * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the flare OPENS ON; the shaft penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
  * @returns Cut-tool Shape3D, top of countersink at Z=0.
  */
 export function countersink(
   spec: string,
-  opts: { plateThickness: number; fit?: FitStyle }
+  opts: { plateThickness: number; fit?: FitStyle; axis?: HoleAxis }
 ): Shape3D {
+  assertPositiveFinite("holes.countersink", "opts.plateThickness", opts.plateThickness);
   const { size } = parseScrewDesignator(spec);
   const flat = FLAT_HEAD[size];
   if (!flat) {
@@ -147,10 +335,11 @@ export function countersink(
     .hLine(-shaftD / 2)
     .close();
 
-  return profile
+  const tool = profile
     .sketchOnPlane("XZ")
     .revolve([0, 0, 1], { origin: [0, 0, 0] })
     .asShape3D();
+  return applyAxis(tool, opts.axis);
 }
 
 /**
@@ -158,14 +347,27 @@ export function countersink(
  * are implicit (user taps them in metal) or irrelevant (printed threads are
  * unreliable — prefer `inserts.pocket` for FDM).
  *
+ * @remarks Z CONVENTION: the cylinder spans `Z ∈ [-depth, 0]` — top face at
+ * Z=0, extends downward into -Z. Translate by `plateTop` so the hole mouth
+ * lands flush with the plate's upper surface.
+ *
+ * @example
+ * // Tap into a flange whose +Y face is at Y=5: axis "+Y" opens the tap on
+ * // the +Y face, drilling 6 mm into -Y (Y ∈ [-1, 5]).
+ * flange.cut(holes.tapped("M3", { depth: 6, axis: "+Y" }).translate(x, 5, z))
+ *
  * @param size Metric designator, e.g. `"M3"`.
  * @param opts.depth Tap depth in mm (measured from Z=0 into -Z).
+ * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the tap OPENS ON; the body penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
  * @returns Cut-tool Shape3D, top at Z=0.
  */
-export function tapped(size: MetricSize, opts: { depth: number }): Shape3D {
+export function tapped(size: MetricSize, opts: { depth: number; axis?: HoleAxis }): Shape3D {
   const { depth } = opts;
+  assertPositiveFinite("holes.tapped", "opts.depth", depth);
+  assertSupportedSize(size, SOCKET_HEAD, "socket-head");
   const diameter = SOCKET_HEAD[size].tapDrill;
-  return makeCylinder(diameter / 2, depth, [0, 0, -depth], [0, 0, 1]);
+  const tool = makeCylinder(diameter / 2, depth, [0, 0, -depth], [0, 0, 1]);
+  return applyAxis(tool, opts.axis);
 }
 
 /**
@@ -173,25 +375,39 @@ export function tapped(size: MetricSize, opts: { depth: number }): Shape3D {
  * supports. Cross-section is a circle fused with a triangular tip pointing in
  * the +Z direction, giving a 45° roof that FDM handles without drooping.
  *
- * The hole is extruded along the chosen `axis`. Default axis = `"Y"` (so the
+ * The hole is extruded along the chosen `axis`. Default axis = `"+Y"` (so the
  * hole runs parallel to Y, usable as a cross-hole through a vertical face in
- * the XZ plane). Pass `axis: "X"` to run the hole along X instead.
+ * the XZ plane). Pass `axis: "+X"` to run the hole along X instead.
+ *
+ * Legacy values `"X"` and `"Y"` are accepted for backward compatibility and
+ * map to `"+X"` and `"+Y"` respectively.
+ *
+ * @remarks Z CONVENTION: entry face at the origin. For `axis: "+Y"` the tool
+ * extends along -Y (sketch on XZ, extrude +depth picks the XZ-normal
+ * direction); for `axis: "+X"` it extends along +X. The "teardrop tip" points
+ * in +Z so FDM can print the hole without support. Translate to the face
+ * you're cutting through — the entry face sits at the supplied coordinates.
  *
  * @param size Metric designator (applies clearance fit) or raw diameter in mm.
  * @param opts.depth Length of the hole along its axis in mm.
- * @param opts.axis `"X"` or `"Y"` (default `"Y"`).
+ * @param opts.axis `"+X"` or `"+Y"` (default `"+Y"`). Legacy: `"X"` → `"+X"`, `"Y"` → `"+Y"`.
  * @returns Cut-tool Shape3D positioned with its entry face at the origin.
  */
 export function teardrop(
   size: MetricSize | number,
-  opts: { depth: number; axis?: "X" | "Y" }
+  opts: { depth: number; axis?: "+X" | "+Y" | "X" | "Y" }
 ): Shape3D {
-  const axis = opts.axis ?? "Y";
+  const rawAxis = opts.axis ?? "+Y";
+  const axis: "+X" | "+Y" = rawAxis === "X" ? "+X" : rawAxis === "Y" ? "+Y" : rawAxis;
   const { depth } = opts;
+  assertPositiveFinite("holes.teardrop", "opts.depth", depth);
   let diameter: number;
   if (typeof size === "number") {
+    assertPositiveFinite("holes.teardrop", "size", size);
+    warnAmbiguousRawDiameter("holes.teardrop", size, undefined, "clearance");
     diameter = size;
   } else {
+    assertSupportedSize(size, SOCKET_HEAD, "socket-head");
     const spec = SOCKET_HEAD[size];
     diameter = spec.shaft + FIT.clearance * 2;
   }
@@ -205,9 +421,9 @@ export function teardrop(
   // robust — OCCT handles coplanar-face union of the circle's upper half and
   // the triangle's base without issue.
   //
-  //   axis = "Y" → sketch on XZ, extrude along +Y. Local X → world X, local Y → world Z.
-  //   axis = "X" → sketch on YZ, extrude along +X. Local X → world Y, local Y → world Z.
-  const plane = axis === "Y" ? "XZ" : "YZ";
+  //   axis = "+Y" → sketch on XZ, extrude along -Y (XZ normal). Local X → world X, local Y → world Z.
+  //   axis = "+X" → sketch on YZ, extrude along +X. Local X → world Y, local Y → world Z.
+  const plane = axis === "+Y" ? "XZ" : "YZ";
 
   const circleSolid = drawCircle(r)
     .sketchOnPlane(plane)
@@ -240,10 +456,23 @@ export function teardrop(
  * Layout: large circle at (0, 0), small circle at (0, -(largeD/2 + smallD/2 + slot)),
  * connected by a slot of width `smallD`.
  *
+ * @remarks Z CONVENTION: the profile is sketched on XY at Z=0 then extruded
+ * by `-depth`, so the cut tool spans `Z ∈ [-depth, 0]` — top face at Z=0,
+ * extending downward into -Z. Translate by `plateTop` to anchor the mouth
+ * to the plate's upper surface. For vertical-flange mounts, pass `axis:
+ * "+X"` (or "-X"/"+Y"/"-Y") to cut sideways instead of downward.
+ *
+ * @example
+ * // Keyhole on a vertical wall whose +X face sits at X=thickness: the mouth
+ * // opens on +X, pocket penetrates into -X so the screw enters from the wall's
+ * // outside.
+ * wall.cut(holes.keyhole({ largeD: 10, smallD: 4, slot: 6, depth: 4, axis: "+X" }).translate(thickness, y, z))
+ *
  * @param opts.largeD Entry-hole diameter (big enough for the screw head).
  * @param opts.smallD Capture-hole diameter (matches the screw shaft clearance).
  * @param opts.slot Centre-to-centre offset between the two circles in mm.
  * @param opts.depth Hole depth in mm.
+ * @param opts.axis Entry-face spec (default "+Z"). Names the face the mouth OPENS ON; the pocket penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
  * @returns Cut-tool Shape3D, top at Z=0.
  */
 export function keyhole(opts: {
@@ -251,8 +480,13 @@ export function keyhole(opts: {
   smallD: number;
   slot: number;
   depth: number;
+  axis?: HoleAxis;
 }): Shape3D {
   const { largeD, smallD, slot, depth } = opts;
+  assertPositiveFinite("holes.keyhole", "opts.largeD", largeD);
+  assertPositiveFinite("holes.keyhole", "opts.smallD", smallD);
+  assertPositiveFinite("holes.keyhole", "opts.slot", slot);
+  assertPositiveFinite("holes.keyhole", "opts.depth", depth);
   const largeR = largeD / 2;
   const smallR = smallD / 2;
 
@@ -263,7 +497,8 @@ export function keyhole(opts: {
   const neck = drawRectangle(smallD, slot).translate(0, -slot / 2);
 
   const profile = large.fuse(neck).fuse(small);
-  return profile.sketchOnPlane("XY").extrude(-depth).asShape3D();
+  const tool = profile.sketchOnPlane("XY").extrude(-depth).asShape3D();
+  return applyAxis(tool, opts.axis);
 }
 
 /**
@@ -271,17 +506,33 @@ export function keyhole(opts: {
  * overall length (tip-to-tip) is `length`; the width (hole diameter / radius
  * of the end-caps × 2) is `width`. The slot runs along the X axis.
  *
+ * @remarks Z CONVENTION: the profile is sketched on XY at Z=0 then extruded
+ * by `-depth`, so the cut tool spans `Z ∈ [-depth, 0]` — top face at Z=0,
+ * extending downward into -Z. Translate by `plateTop` so the slot mouth
+ * lands flush with the plate's upper surface; forgetting the translate
+ * leaves the cutter below the plate and the cut removes nothing.
+ *
+ * @example
+ * // Adjustment slot on a vertical Y-flange (opens on the +Y face at Y=t,
+ * // pocket penetrates into -Y).
+ * flange.cut(holes.slot({ length: 20, width: 5, depth: 4, axis: "+Y" }).translate(x, thickness, z))
+ *
  * @param opts.length Overall length (tip to tip) in mm — must be >= `width`.
  * @param opts.width Slot width in mm (diameter of the rounded ends).
  * @param opts.depth Hole depth in mm.
+ * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the slot OPENS ON; the pocket penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
  * @returns Cut-tool Shape3D, top at Z=0.
  */
 export function slot(opts: {
   length: number;
   width: number;
   depth: number;
+  axis?: HoleAxis;
 }): Shape3D {
   const { length, width, depth } = opts;
+  assertPositiveFinite("holes.slot", "opts.length", length);
+  assertPositiveFinite("holes.slot", "opts.width", width);
+  assertPositiveFinite("holes.slot", "opts.depth", depth);
   if (length < width) {
     throw new Error(
       `holes.slot: length (${length}) must be >= width (${width}).`
@@ -298,5 +549,6 @@ export function slot(opts: {
           .translate(-centres / 2, 0)
           .fuse(drawRectangle(centres, width))
           .fuse(drawCircle(r).translate(centres / 2, 0));
-  return profile.sketchOnPlane("XY").extrude(-depth).asShape3D();
+  const tool = profile.sketchOnPlane("XY").extrude(-depth).asShape3D();
+  return applyAxis(tool, opts.axis);
 }

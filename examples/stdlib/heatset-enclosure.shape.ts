@@ -39,7 +39,7 @@ export default function main({ width, depth, thickness, inset }: typeof params) 
 
   // Matching M3x12 socket-head screws, floating 8 mm above the inserts.
   const screwShapes = corners.map(([x, y]) =>
-    screws.socketHead("M3x12").translate(x, y, thickness + 20)
+    screws.socket("M3x12").translate(x, y, thickness + 20)
   );
 
   return [
