@@ -19,6 +19,7 @@ import { cylinder } from "./cylinder";
 import * as motors from "./motors";
 import * as couplers from "./couplers";
 import * as threads from "./threads";
+import * as gears from "./gears";
 import * as standardsRaw from "./standards";
 import { guardUnknownKeys } from "./standards";
 import { ensureFinderAndPatched } from "./finder-patch";
@@ -82,6 +83,7 @@ export {
   motors,
   couplers,
   threads,
+  gears,
 };
 
 /**
@@ -117,6 +119,7 @@ export const shapeitupStdlib = {
   motors,
   couplers,
   threads,
+  gears,
   standards,
 };
 
