@@ -52,8 +52,8 @@ import { pushRuntimeWarning } from "./warnings";
  * clearance hole (~4.5mm for M4), not a literal 4mm cylinder. Because the
  * string and numeric paths produce different diameters by design, silently
  * accepting an integer is a footgun. Emit a one-shot advisory warning so the
- * user can either switch to the string form or pass a non-integer (e.g. 4.0001)
- * to document the intent. See Issue #7.
+ * user can either switch to the string form or pass `{ raw: true }` (or a
+ * non-integer) to document the intent. See Issue #7.
  */
 const AMBIGUOUS_RAW_DIAMETERS = new Set([3, 4, 5, 6, 8, 10, 12]);
 
@@ -62,7 +62,11 @@ function warnAmbiguousRawDiameter(
   size: number,
   fit: FitStyle | undefined,
   effectiveFit: FitStyle,
+  raw?: boolean,
 ): void {
+  // Explicit `{ raw: true }` is the intent-declaring escape hatch — the user
+  // has asserted they want the literal diameter, so silently skip the advisory.
+  if (raw === true) return;
   if (!AMBIGUOUS_RAW_DIAMETERS.has(size)) return;
   const key = `M${size}` as MetricSize;
   const spec = SOCKET_HEAD[key];
@@ -72,7 +76,7 @@ function warnAmbiguousRawDiameter(
   pushRuntimeWarning(
     `${fnName}: received raw diameter ${size}mm — did you mean ${fnName}('${key}')? ` +
       `String form applies ISO clearance fit (~${specDiameter.toFixed(2)}mm for '${fit ?? effectiveFit}' fit). ` +
-      `Pass a non-integer raw diameter to suppress this warning.`,
+      `Pass \`{ raw: true }\` to treat the numeric diameter as intentional and suppress this advisory.`,
   );
 }
 
@@ -217,6 +221,7 @@ function fitAllowance(style: FitStyle | undefined, fallback: FitStyle): number {
  * @param opts.fit Fit style for metric sizes (default `"clearance"`).
  * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the hole OPENS ON; the body penetrates in the OPPOSITE direction. `"+X"` = opens on +X face, drills -X. See `HoleAxis` docstring for full semantics.
  * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
+ * @param opts.raw Pass `{ raw: true }` to treat the numeric diameter as intentional and suppress the "did you mean Mxx?" advisory that fires when a bare integer matches a standard metric size (3, 4, 5, 6, 8, 10, 12). No effect when `size` is a string designator.
  * @returns Cut-tool Shape3D, axis=Z, top at Z=0, extends into -Z.
  */
 export function through(
@@ -227,6 +232,7 @@ export function through(
     axis?: HoleAxis;
     // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
     drillDirection?: HoleAxis;
+    raw?: boolean;
   } = {}
 ): Shape3D {
   const axis = resolveHoleAxis("holes.through", opts.axis, opts.drillDirection);
@@ -235,7 +241,7 @@ export function through(
   let diameter: number;
   if (typeof size === "number") {
     assertPositiveFinite("holes.through", "size", size);
-    warnAmbiguousRawDiameter("holes.through", size, opts.fit, "clearance");
+    warnAmbiguousRawDiameter("holes.through", size, opts.fit, "clearance", opts.raw);
     diameter = size;
   } else {
     assertSupportedSize(size, SOCKET_HEAD, "socket-head");
@@ -272,6 +278,7 @@ export function through(
  *
  * @param size Metric designator (`"M3"`) or explicit diameter in mm.
  * @param opts Same options as `holes.through`, including `axis` for non-vertical holes.
+ * @param opts.raw Pass `{ raw: true }` to treat the numeric diameter as intentional and suppress the "did you mean Mxx?" advisory that fires when a bare integer matches a standard metric size.
  * @returns Cut-tool Shape3D, axis=Z, top at Z=0, extends into -Z.
  */
 export function clearance(
@@ -282,6 +289,7 @@ export function clearance(
     axis?: HoleAxis;
     // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
     drillDirection?: HoleAxis;
+    raw?: boolean;
   } = {}
 ): Shape3D {
   return through(size, { ...opts, fit: opts.fit ?? "clearance" });
@@ -499,11 +507,12 @@ export function tapped(
  * @param size Metric designator (applies clearance fit) or raw diameter in mm.
  * @param opts.depth Length of the hole along its axis in mm.
  * @param opts.axis `"+X"` or `"+Y"` (default `"+Y"`). Legacy: `"X"` → `"+X"`, `"Y"` → `"+Y"`.
+ * @param opts.raw Pass `{ raw: true }` to treat the numeric diameter as intentional and suppress the "did you mean Mxx?" advisory that fires when a bare integer matches a standard metric size.
  * @returns Cut-tool Shape3D positioned with its entry face at the origin.
  */
 export function teardrop(
   size: MetricSize | number,
-  opts: { depth: number; axis?: "+X" | "+Y" | "X" | "Y" }
+  opts: { depth: number; axis?: "+X" | "+Y" | "X" | "Y"; raw?: boolean }
 ): Shape3D {
   const rawAxis = opts.axis ?? "+Y";
   const axis: "+X" | "+Y" = rawAxis === "X" ? "+X" : rawAxis === "Y" ? "+Y" : rawAxis;
@@ -512,7 +521,7 @@ export function teardrop(
   let diameter: number;
   if (typeof size === "number") {
     assertPositiveFinite("holes.teardrop", "size", size);
-    warnAmbiguousRawDiameter("holes.teardrop", size, undefined, "clearance");
+    warnAmbiguousRawDiameter("holes.teardrop", size, undefined, "clearance", opts.raw);
     diameter = size;
   } else {
     assertSupportedSize(size, SOCKET_HEAD, "socket-head");
@@ -591,6 +600,7 @@ export function teardrop(
  * @param opts.depth Hole depth in mm.
  * @param opts.axis Entry-face spec (default "+Z"). Names the face the mouth OPENS ON; the pocket penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
  * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
+ * @param opts.raw Pass `{ raw: true }` to treat the numeric diameters as intentional and suppress any "did you mean Mxx?" advisory (reserved for parity with other raw-diameter factories — keyhole currently consumes `largeD`/`smallD` as literal dimensions, but the flag is accepted so calls stay consistent with `through`/`clearance`).
  * @returns Cut-tool Shape3D, top at Z=0.
  */
 export function keyhole(opts: {
@@ -601,6 +611,7 @@ export function keyhole(opts: {
   axis?: HoleAxis;
   // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
   drillDirection?: HoleAxis;
+  raw?: boolean;
 }): Shape3D {
   const axis = resolveHoleAxis("holes.keyhole", opts.axis, opts.drillDirection);
   const { largeD, smallD, slot, depth } = opts;

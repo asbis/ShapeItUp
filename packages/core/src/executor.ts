@@ -8,6 +8,12 @@ import { pushRuntimeWarning } from "./stdlib/warnings";
  * densities manually. Case-sensitive — "PLA", "ABS", etc. must match exactly;
  * unknown strings emit a runtime warning listing the known keys so the user
  * can correct the typo without silently losing mass data.
+ *
+ * For engineering work, specific alloys: "Aluminum 6061" (2.70), "Aluminum 7075"
+ * (2.81), "Steel 304" (7.93), "Steel 4140" (7.85), "Brass 360" (8.50),
+ * "Titanium Grade 5" (4.43). The generic "Aluminum"/"Steel"/"Brass"/"Titanium"
+ * entries stay as back-compat defaults for scripts that don't need alloy-grade
+ * precision.
  */
 const MATERIAL_PRESETS: Record<string, number> = {
   PLA: 1.24,
@@ -21,6 +27,14 @@ const MATERIAL_PRESETS: Record<string, number> = {
   Titanium: 4.50,
   Copper: 8.96,
   Wood: 0.60,
+  // Engineering-grade alloy variants — generic names above stay as back-compat
+  // defaults; prefer these when alloy-grade precision matters for mass budgets.
+  "Aluminum 6061": 2.70,
+  "Aluminum 7075": 2.81,
+  "Steel 304": 7.93,
+  "Steel 4140": 7.85,
+  "Brass 360": 8.50,
+  "Titanium Grade 5": 4.43,
 };
 
 /**

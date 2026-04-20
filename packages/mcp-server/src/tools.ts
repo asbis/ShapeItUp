@@ -489,8 +489,21 @@ function formatStatusText(status: EngineStatus): string {
     // Include the first few lines of the stack — enough to show which Replicad
     // / OCCT call blew up without dumping an unreadable wall of text. Agents
     // need this to know whether to back off the fillet, simplify geometry, etc.
+    //
+    // Filter out framework/bundler frames (mcp-server.mjs:NNN:NN, extension.mjs,
+    // viewer.mjs, and anything under dist/ or node_modules/) — they're noise
+    // the agent can't act on. Keep frames pointing to .shape.ts files
+    // (attributed via sourceURL from commit 99bc307) plus Replicad/OCCT
+    // internal calls, which name the actual geometry operation that failed.
+    const FRAMEWORK_FRAME_RE = /(?:mcp-server|extension|viewer)\.mjs|[/\\]dist[/\\]|[/\\]node_modules[/\\]/i;
     const stack = status.stack
-      ? `\nStack (top frames):\n${status.stack.split("\n").slice(0, 6).map((l) => `  ${l.trim()}`).filter((l) => l.trim().length > 2).join("\n")}`
+      ? `\nStack (top frames):\n${status.stack
+          .split("\n")
+          .slice(0, 6)
+          .filter((l) => !FRAMEWORK_FRAME_RE.test(l))
+          .map((l) => `  ${l.trim()}`)
+          .filter((l) => l.trim().length > 2)
+          .join("\n")}`
       : "";
     // Bug #1: when the engine detects a WASM-level failure it drops the cached
     // OCCT core so the next tool call boots a fresh one. Warn the caller that
@@ -1882,9 +1895,10 @@ export function registerTools(server: McpServer) {
       filePath: z.string().describe("Path to the .shape.ts file. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
       params: z.record(z.string(), z.number()).describe("Map of param name → override value. Only listed params are overridden; others fall back to the file's declared defaults. Values must be numbers."),
       captureScreenshot: z.boolean().optional().describe("If true, also capture a PNG screenshot of the tuned configuration via the VSCode extension. Default: false. Requires the extension to be running."),
+      inline: z.boolean().optional().describe("When used with captureScreenshot, also return the PNG as an inline image content block (base64) so the agent can see it without a second get_preview call. Skipped silently if the PNG exceeds 10 MB. Default: false."),
       persist: z.boolean().optional().describe("If true AND the render succeeds, write the override map to `.shapeitup-params.json` next to the file so subsequent render_preview/open_shape/export_shape/etc. calls pick them up automatically. Default: false (stateless, legacy behavior). Precedence: script defaults < sidecar < call-time params. Clear with `clear_params`."),
     },
-    safeHandler("tune_params", async ({ filePath, params, captureScreenshot, persist }) => {
+    safeHandler("tune_params", async ({ filePath, params, captureScreenshot, inline, persist }) => {
       const absPath = resolveShapePath(filePath);
       if (!existsSync(absPath)) {
         return {
@@ -1977,6 +1991,7 @@ export function registerTools(server: McpServer) {
       // Optional screenshot branch — only meaningful on a successful render
       // AND when the extension is running. Mirrors the preview_shape pattern
       // (warning, not isError, when the screenshot can't be produced).
+      let capturedScreenshotPath: string | undefined;
       if (captureScreenshot === true && status.success) {
         if (!isExtensionAlive()) {
           responseText += "\n(Screenshot skipped: VSCode extension is not running.)";
@@ -2015,13 +2030,59 @@ export function registerTools(server: McpServer) {
               responseText += `\n(Screenshot skipped: ${result.error})`;
             } else if (result.screenshotPath) {
               responseText += `\nScreenshot: ${result.screenshotPath}`;
+              capturedScreenshotPath = result.screenshotPath;
             }
           }
         }
       }
 
+      const textBlock = { type: "text" as const, text: responseText };
+
+      // Inline-image branch mirrors the render_preview pattern (~L2500–2531):
+      // on success, read the PNG from disk and append a base64 image content
+      // block so the caller gets bytes + path in a single round trip. 10 MB
+      // ceiling matches get_preview / render_preview's inline guard. The
+      // text block with the path is preserved either way so agents that
+      // skip inline still have the filesystem reference.
+      if (inline === true && capturedScreenshotPath) {
+        try {
+          const st = statSync(capturedScreenshotPath);
+          if (st.size > 10 * 1024 * 1024) {
+            return {
+              content: [
+                textBlock,
+                {
+                  type: "text" as const,
+                  text: `\n(inline=true requested but PNG is ${(st.size / 1024 / 1024).toFixed(1)} MB, exceeding the 10 MB inline limit. Reduce width/height or use the Read tool on the saved path.)`,
+                },
+              ],
+              isError: !status.success,
+            };
+          }
+          const data = readFileSync(capturedScreenshotPath).toString("base64");
+          return {
+            content: [
+              textBlock,
+              { type: "image" as const, data, mimeType: "image/png" },
+            ],
+            isError: !status.success,
+          };
+        } catch (e: any) {
+          return {
+            content: [
+              textBlock,
+              {
+                type: "text" as const,
+                text: `\n(inline=true requested but failed to read PNG at ${capturedScreenshotPath}: ${e?.message ?? e}. Use the Read tool on the saved path instead.)`,
+              },
+            ],
+            isError: !status.success,
+          };
+        }
+      }
+
       return {
-        content: [{ type: "text" as const, text: responseText }],
+        content: [textBlock],
         isError: !status.success,
       };
     })
@@ -2833,14 +2894,14 @@ export function registerTools(server: McpServer) {
         // not expose face adjacency (no `.adjacentFaces()` / `.faces`
         // accessor on `_1DShape<TopoDS_Edge>`), so we can't reliably
         // tell an outer-boundary edge from a seam left behind by a fuse.
-        // Rather than guess (a wrong tag here would actively mislead the
-        // agent), we mark every edge as `unknown` and document the
-        // limitation. If a future Replicad version surfaces adjacency,
-        // replace the literal below with the real lookup. Field is
-        // intentionally optional — face matches don't need it.
-        let matchType: "outer" | "seam" | "unknown" | undefined;
-        if (!isFace) {
-          matchType = "unknown";
+        // Field is intentionally optional and stays unset for edges —
+        // emitting `matchType=unknown` just adds noise to the report
+        // without helping the agent. Keep the type union ready so the
+        // day Replicad gains face-adjacency we can flip a literal here
+        // to "outer"/"seam" without re-plumbing the emit path.
+        let matchType: "outer" | "seam" | undefined;
+        // intentionally not assigned for edges — Replicad doesn't expose face-adjacency yet.
+        if (matchType !== undefined) {
           extra += `, matchType=${matchType}`;
         }
         // Face matches carry richer info — surface area (via the top-level
