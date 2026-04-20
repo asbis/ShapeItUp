@@ -706,7 +706,11 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           stdin: {
             contents: code,
             resolveDir,
-            sourcefile: path.basename(document.fileName),
+            // Pass the full normalized path so the inline sourcemap's
+            // `sources[0]` points at the real .shape.ts instead of a bare
+            // basename — V8 needs an unambiguous URL to resolve frames
+            // back when `//# sourceURL` is set.
+            sourcefile: normalizedPath,
             loader: "ts",
           },
           bundle: true,
@@ -717,6 +721,13 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           platform: "browser",
           absWorkingDir: resolveDir,
           metafile: true,
+          // `sourcemap: "inline"` appends `//# sourceMappingURL=data:...` to
+          // the bundle. V8 uses that (together with the `//# sourceURL=`
+          // directive the core executor emits) to resolve user-script stack
+          // frames to `bracket.shape.ts:12:14` instead of
+          // `Object.<anonymous>:48:52`. Zero extra runtime deps — V8 does
+          // all the mapping.
+          sourcemap: "inline",
           logLevel: "silent",
         });
 
@@ -772,12 +783,21 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         });
       }
 
+      // Prepend a `//# sourceURL=file:///...` pragma so V8 attributes user-
+      // script stack frames to the real .shape.ts. The core executor picks
+      // this up at `new Function()` time and lifts it to the top of the
+      // wrapper source — couldn't thread a filename through `core.execute()`
+      // directly (owned by another agent). Paired with the inline sourcemap
+      // esbuild now embeds, stacks read like `bracket.shape.ts:12:14`
+      // instead of `Object.<anonymous>:48:52`.
+      const jsWithSourceURL = `//# sourceURL=file:///${normalizedPath.replace(/^\/+/, "")}\n${js}`;
+
       const msg: {
         js: string;
         fileName: string;
         paramOverrides?: Record<string, number>;
         meshQuality?: "preview" | "final";
-      } = { js, fileName: document.fileName };
+      } = { js: jsWithSourceURL, fileName: document.fileName };
       // Ephemeral param overrides used by MCP's tune_params + any caller that
       // wants the viewer to render with non-default values without touching
       // the file on disk. Undefined means "use the script's declared defaults".

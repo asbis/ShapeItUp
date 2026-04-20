@@ -262,7 +262,11 @@ export async function executeShapeFile(
       stdin: {
         contents: code,
         resolveDir: dirname(absPath),
-        sourcefile: basename(absPath),
+        // Absolute path so the inline sourcemap's `sources[0]` points at the
+        // real .shape.ts. Paired with the `//# sourceURL=` pragma we
+        // prepend below, V8 resolves user-script stack frames to
+        // `bracket.shape.ts:12:14` instead of `Object.<anonymous>:48:52`.
+        sourcefile: absPath,
         loader: "ts",
       },
       bundle: true,
@@ -272,6 +276,11 @@ export async function executeShapeFile(
       external: [...BUNDLE_EXTERNALS],
       platform: "neutral",
       absWorkingDir: dirname(absPath),
+      // Inline sourcemap (base64 data URL appended as
+      // `//# sourceMappingURL=data:...`). V8 reads it automatically when the
+      // `sourceURL` directive is present. No extra runtime deps — the
+      // VM does the mapping.
+      sourcemap: "inline",
       logLevel: "silent",
     });
     // Treat "Could not resolve" warnings as hard errors — a missing local
@@ -291,6 +300,14 @@ export async function executeShapeFile(
       status.warnings = result.warnings.map((w) => w.text);
     }
     js = result.outputFiles[0].text;
+    // Prepend `//# sourceURL=file:///...` so the core executor can lift it
+    // to the top of the `new Function()` wrapper. Couldn't add a parameter
+    // to `core.execute()` (signature owned by another agent), so we ride it
+    // through the JS text itself — executor.ts strips the leading comment
+    // and re-emits it above the wrapper IIFE. Windows path separators are
+    // normalised to forward slashes for the URL form.
+    const fileURL = `file:///${absPath.replace(/\\/g, "/").replace(/^\/+/, "")}`;
+    js = `//# sourceURL=${fileURL}\n${js}`;
   } catch (e: any) {
     status.error = `Bundle failed: ${e.message}`;
     writeStatusFile(status, globalStorageDir);

@@ -176,14 +176,58 @@ export function executeScript(
   js: string,
   replicadExports: Record<string, any>,
   shapeitupExports: Record<string, any>,
-  paramOverrides?: Record<string, number>
+  paramOverrides?: Record<string, number>,
+  /**
+   * Absolute path (or file:// URL) of the user's entry `.shape.ts` file.
+   *
+   * When provided, a `//# sourceURL=...` V8 pragma is emitted at the top of
+   * the `new Function(...)` source. Combined with the inline sourcemap the
+   * runtime bundler now embeds (`sourcemap: "inline"`), this makes stack
+   * traces resolve to `bracket.shape.ts:12:14` instead of the useless
+   * `Object.<anonymous>:48:52`. V8 reads the `sourceURL` directive first,
+   * then walks the inline sourcemap automatically — no extra dependencies.
+   *
+   * Callers that can't plumb the filename through (tests, direct users of
+   * `executeScript`) can omit this argument. If `js` contains a leading
+   * `//# sourceURL=` magic comment, we extract the URL from there as a
+   * graceful fallback — this is the path the VSCode extension and MCP
+   * engine use, since they can't add a parameter to `core.execute()`.
+   */
+  fileName?: string,
 ): {
   result: any;
   params: ParamDef[];
   material?: { density: number; name?: string };
   config?: { strict?: boolean };
 } {
-  const code = rewriteImports(js);
+  // Graceful fallback: callers that go through `core.execute()` can't extend
+  // that signature (owned by another agent), so they prepend a
+  // `//# sourceURL=file:///...` comment to the bundled JS instead. Extract
+  // it here so we can move it to the final wrapper's top — V8 honours the
+  // directive anywhere in the script body, but putting it ABOVE the IIFE
+  // gives the clearest attribution for unhandled-error stack frames.
+  let resolvedSourceURL: string | undefined = fileName;
+  let jsForRewrite = js;
+  if (!resolvedSourceURL) {
+    const leadingMatch = jsForRewrite.match(/^\/\/#\s*sourceURL=(\S+)\s*\r?\n/);
+    if (leadingMatch) {
+      resolvedSourceURL = leadingMatch[1];
+      jsForRewrite = jsForRewrite.slice(leadingMatch[0].length);
+    }
+  }
+
+  // Normalise a bare absolute path to a `file:///` URL. Pass a URL through
+  // unchanged — the extension host already hands us one. On Windows this
+  // turns `C:\Users\x\part.shape.ts` into `file:///C:/Users/x/part.shape.ts`.
+  let sourceURLDirective = "";
+  if (resolvedSourceURL) {
+    const url = /^[a-z]+:\/\//i.test(resolvedSourceURL)
+      ? resolvedSourceURL
+      : `file:///${resolvedSourceURL.replace(/\\/g, "/").replace(/^\/+/, "")}`;
+    sourceURLDirective = `//# sourceURL=${url}\n`;
+  }
+
+  const code = rewriteImports(jsForRewrite);
 
   const wrapped = `
     return (function(__replicad__, __shapeitup__, __paramOverrides__) {
@@ -255,11 +299,25 @@ export function executeScript(
     })(__replicadExports__, __shapeitupExports__, __paramOverrides__);
   `;
 
+  // Prepend the V8 `sourceURL` pragma so stack traces from user code are
+  // attributed to `file:///.../bracket.shape.ts` instead of
+  // `Object.<anonymous>`. The inline sourcemap that the runtime bundlers
+  // (viewer-provider.ts, mcp-server engine.ts) now embed handles the
+  // column/line resolution back to the original `.shape.ts`.
+  //
+  // Caveat: `new Function()` synthesises its own wrapper (`function anonymous
+  // (__replicadExports__, ...) { <wrapped> }`), which pushes the user's code
+  // down by ~2 lines in the raw frame. Esbuild's sourcemap is computed
+  // against the original `.shape.ts`, not the wrapped output, so when V8
+  // rewrites the frame through the sourcemap the offset disappears. If you
+  // ever see "off by one line" in a stack trace, this is where to look.
+  const wrappedWithSource = sourceURLDirective + wrapped;
+
   const fn = new Function(
     "__replicadExports__",
     "__shapeitupExports__",
     "__paramOverrides__",
-    wrapped
+    wrappedWithSource
   );
   const { result, params, material: rawMaterial, config: rawConfig } = fn(
     replicadExports,
