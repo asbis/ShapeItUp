@@ -53,6 +53,39 @@ export function extractParamsStatic(sourceCode: string): string[] {
 }
 
 /**
+ * Extract `export const config = { strict: true }` from source without
+ * executing the script. Parallels {@link extractParamsStatic} — same
+ * source-shape assumptions (esbuild ESM output or hand-written TS), same
+ * loose regex that falls through to `{}` when the declaration is absent or
+ * the value is too complex (spreads, computed keys).
+ *
+ * Feature #3: the only recognised key today is `strict` (opt-in promotion
+ * of silent-success warnings to thrown errors). Other keys are extracted
+ * but ignored — space left so later issues can add flags without changing
+ * the extractor's signature.
+ */
+export function extractConfigStatic(sourceCode: string): { strict?: boolean } {
+  const match = sourceCode.match(/export\s+const\s+config\s*=\s*\{([^}]*)\}/s);
+  if (!match) return {};
+  const body = match[1];
+  // Pair pattern matches `key: value` where key is identifier or quoted
+  // string, and value is a `true`/`false` literal. Handles quoted keys
+  // (`"strict": true`) and trailing commas. Other value forms (numbers,
+  // strings, nested objects) simply don't match — extractor returns an
+  // empty config rather than guessing.
+  const pairPattern =
+    /(?:^|[,{])\s*(?:"([^"]+)"|'([^']+)'|(\w+))\s*:\s*(true|false)\b/g;
+  const config: { strict?: boolean } = {};
+  let m: RegExpExecArray | null;
+  while ((m = pairPattern.exec(body)) !== null) {
+    const name = m[1] || m[2] || m[3];
+    const value = m[4] === "true";
+    if (name === "strict") config.strict = value;
+  }
+  return config;
+}
+
+/**
  * Phase A of script execution: rewrite user imports/exports so the bundled JS
  * can run inside a `new Function(...)` wrapper.
  *
@@ -144,7 +177,12 @@ export function executeScript(
   replicadExports: Record<string, any>,
   shapeitupExports: Record<string, any>,
   paramOverrides?: Record<string, number>
-): { result: any; params: ParamDef[]; material?: { density: number; name?: string } } {
+): {
+  result: any;
+  params: ParamDef[];
+  material?: { density: number; name?: string };
+  config?: { strict?: boolean };
+} {
   const code = rewriteImports(js);
 
   const wrapped = `
@@ -211,8 +249,9 @@ export function executeScript(
       }
 
       var __material__ = typeof material !== "undefined" ? material : undefined;
+      var __config__ = typeof config !== "undefined" ? config : undefined;
 
-      return { result: __result__, params: __params__, material: __material__ };
+      return { result: __result__, params: __params__, material: __material__, config: __config__ };
     })(__replicadExports__, __shapeitupExports__, __paramOverrides__);
   `;
 
@@ -222,7 +261,7 @@ export function executeScript(
     "__paramOverrides__",
     wrapped
   );
-  const { result, params, material: rawMaterial } = fn(
+  const { result, params, material: rawMaterial, config: rawConfig } = fn(
     replicadExports,
     shapeitupExports,
     paramOverrides || null
@@ -268,5 +307,17 @@ export function executeScript(
     };
   });
 
-  return { result, params: paramDefs, material };
+  // Feature #3: surface an `export const config` only when it's shaped
+  // like the expected flag bag. Unknown / malformed values are dropped
+  // silently so the user gets default (non-strict) behaviour instead of
+  // a confusing crash. `strict` must be a literal `true` to opt in —
+  // truthy non-booleans (e.g. `"yes"`, `1`) don't count.
+  let config: { strict?: boolean } | undefined;
+  if (rawConfig && typeof rawConfig === "object") {
+    const next: { strict?: boolean } = {};
+    if (rawConfig.strict === true) next.strict = true;
+    if (Object.keys(next).length > 0) config = next;
+  }
+
+  return { result, params: paramDefs, material, config };
 }

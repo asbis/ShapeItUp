@@ -10,7 +10,7 @@
 import type { ParamDef } from "@shapeitup/shared";
 import { executeScript } from "./executor";
 export { extractParamsStatic } from "./executor";
-import { normalizeParts, tessellatePart, type MeshQuality, type PartInput, type TessellatedPart } from "./tessellate";
+import { normalizeParts, tessellatePart, type MeshQuality, type PartInput, type PartStatsLevel, type TessellatedPart } from "./tessellate";
 import { exportShapes } from "./exporter";
 import {
   validateParts,
@@ -36,7 +36,7 @@ import {
   resetRuntimeWarnings,
 } from "./stdlib/warnings";
 
-export type { PartInput, TessellatedPart, MeshQuality } from "./tessellate";
+export type { PartInput, TessellatedPart, MeshQuality, PartStatsLevel } from "./tessellate";
 export { exportShapes } from "./exporter";
 
 // Re-export the shared externals list so MCP's engine (which already imports
@@ -515,6 +515,13 @@ export interface Core {
        * when there are 15+ parts in the returned assembly.
        */
       meshQuality?: MeshQuality;
+      /**
+       * Issue #6: how much per-part measurement to do. Default is `"bbox"` —
+       * fast CoM from the AABB centre, volume / surfaceArea omitted. Pass
+       * `"full"` only when the caller actually needs the OCCT-measured
+       * numbers (e.g. an aggregator computing total mass / CoM).
+       */
+      partStats?: PartStatsLevel;
     },
   ): Promise<ExecutionResult>;
   /**
@@ -615,6 +622,7 @@ export async function initCore(
       onStart?: (totalParts: number) => void;
       onPart?: (part: TessellatedPart, index: number, total: number) => void;
       meshQuality?: MeshQuality;
+      partStats?: PartStatsLevel;
     },
   ): Promise<ExecutionResult> {
     cleanup();
@@ -630,11 +638,13 @@ export async function initCore(
     let result: any;
     let params: ParamDef[];
     let material: { density: number; name?: string } | undefined;
+    let scriptConfig: { strict?: boolean } | undefined;
     try {
       const execResult = executeScript(js, replicadExports, shapeitupStdlib, paramOverrides);
       result = execResult.result;
       params = execResult.params;
       material = execResult.material;
+      scriptConfig = execResult.config;
     } catch (err) {
       cleanupGC();
       // If the user script threw a raw WASM pointer, wrap it in an Error with
@@ -662,6 +672,28 @@ export async function initCore(
     // first — they reflect events that happened during the user's script
     // and are almost always more actionable than the geometric checks.
     const stdlibWarnings = drainRuntimeWarnings();
+
+    // Feature #3 (strict mode): when the script exports
+    // `export const config = { strict: true }`, a curated set of
+    // silent-success warnings are promoted to hard errors. The patterns
+    // below match the no-op guards emitted by the cut / fuse prototype
+    // patches above and by the stdlib fillet/shell wrappers — these are
+    // exactly the "render SUCCESS but nothing happened" failure modes
+    // users asked to be loud about. Non-matching warnings still pass
+    // through to `warnings[]` as before so the strict mode stays
+    // surgical (doesn't upgrade, e.g., missing material hints).
+    if (scriptConfig?.strict) {
+      const STRICT_PATTERN =
+        /cut produced no material|fuse produced no new material|\.fillet.*0 edges|fillet.*no edge|\.shell.*0 faces|subsumed fuse/i;
+      const matched = stdlibWarnings.filter((w) => STRICT_PATTERN.test(w));
+      if (matched.length > 0) {
+        cleanupGC();
+        throw new Error(
+          `strict mode: ${matched.join("; ")}`,
+        );
+      }
+    }
+
     const geometryIssues = validateParts(parts, replicad);
     const geometryValid = !hasGeometryErrors(geometryIssues);
     const invalidPartNames = partsWithErrors(geometryIssues);
@@ -680,8 +712,26 @@ export async function initCore(
     // Threshold picked from the render-timeout investigation: below 15
     // parts the tolerance bbox scaling already keeps worst-case render
     // under ~5s, but past 15 the per-part fixed costs stack up.
+    //
+    // Issue #6 extension: also degrade when the assembly projects to more
+    // than ~50k triangles. We don't know the real triangle count until we
+    // tessellate, but `parts.length * 5000` is a decent upper-bound rough
+    // projection for moderately complex parts and matches the 15×5000 ≈
+    // 75k implicit threshold from the original part-count rule. Keeping
+    // the estimator simple and explicit (no bbox walk) makes the
+    // degradation decision cheap and deterministic.
+    const PROJECTED_TRIANGLE_BUDGET = 50_000;
+    const projectedTriangles = parts.length * 5000;
+    const shouldAutoDegrade =
+      parts.length >= 15 || projectedTriangles > PROJECTED_TRIANGLE_BUDGET;
     const effectiveQuality: MeshQuality =
-      streaming?.meshQuality ?? (parts.length >= 15 ? "preview" : "final");
+      streaming?.meshQuality ?? (shouldAutoDegrade ? "preview" : "final");
+    // Issue #6: gate per-part B-Rep measurement. On a 14-part assembly the
+    // two measureShape*Properties calls together spent ~2.5 s on the hot
+    // path. Default `"bbox"` skips both and derives centerOfMass from the
+    // AABB centre — that's still a useful approximation for assembly
+    // aggregation, and per-part volume/surfaceArea rarely gets consumed.
+    const partStats: PartStatsLevel = streaming?.partStats ?? "bbox";
     // Tessellate + measure + emit each part before moving to the next, so
     // `onPart` callers can stream to the viewer as the worker goes.
     for (let i = 0; i < parts.length; i++) {
@@ -708,39 +758,56 @@ export async function initCore(
         const isMeshShape =
           typeof shape?.volume === "function" &&
           typeof shape?.surfaceArea === "function";
-        if (isMeshShape) {
-          try {
-            const v = shape.volume();
-            if (Number.isFinite(v)) t.volume = v;
-          } catch {}
-          try {
-            const a = shape.surfaceArea();
-            if (Number.isFinite(a)) t.surfaceArea = a;
-          } catch {}
-          const com = computeMeshCoM(t.vertices, t.triangles);
-          if (com) t.centerOfMass = com;
-        } else {
-          try {
-            const volProps = replicadExports.measureShapeVolumeProperties?.(shape);
-            if (volProps) {
-              t.volume = volProps.volume;
-              t.centerOfMass = volProps.centerOfMass;
-              try { volProps.delete?.(); } catch {}
-            }
-          } catch {}
-          try {
-            const surfProps = replicadExports.measureShapeSurfaceProperties?.(shape);
-            if (surfProps) {
-              t.surfaceArea = surfProps.area;
-              try { surfProps.delete?.(); } catch {}
-            }
-          } catch {}
+        if (partStats === "full") {
+          if (isMeshShape) {
+            try {
+              const v = shape.volume();
+              if (Number.isFinite(v)) t.volume = v;
+            } catch {}
+            try {
+              const a = shape.surfaceArea();
+              if (Number.isFinite(a)) t.surfaceArea = a;
+            } catch {}
+            const com = computeMeshCoM(t.vertices, t.triangles);
+            if (com) t.centerOfMass = com;
+          } else {
+            try {
+              const volProps = replicadExports.measureShapeVolumeProperties?.(shape);
+              if (volProps) {
+                t.volume = volProps.volume;
+                t.centerOfMass = volProps.centerOfMass;
+                try { volProps.delete?.(); } catch {}
+              }
+            } catch {}
+            try {
+              const surfProps = replicadExports.measureShapeSurfaceProperties?.(shape);
+              if (surfProps) {
+                t.surfaceArea = surfProps.area;
+                try { surfProps.delete?.(); } catch {}
+              }
+            } catch {}
+          }
+          // Derive mass only when we have both a volume and a positive density.
+          // volume is in mm³; density is in g/cm³; so divide by 1000 to convert.
+          if (material && typeof t.volume === "number") {
+            t.mass = (material.density * t.volume) / 1000;
+          }
+        } else if (partStats === "bbox") {
+          // Cheap CoM: use the shape's AABB centre (O(1), no OCCT measure).
+          // volume / surfaceArea / mass stay omitted — callers who need
+          // exact numbers pass partStats: "full". Fall through silently if
+          // the shape has no usable bbox (MeshShape duck-type, test mocks).
+          const bounds = readBoundsSafe(shape);
+          if (bounds) {
+            t.centerOfMass = [
+              (bounds[0][0] + bounds[1][0]) / 2,
+              (bounds[0][1] + bounds[1][1]) / 2,
+              (bounds[0][2] + bounds[1][2]) / 2,
+            ];
+          }
         }
-        // Derive mass only when we have both a volume and a positive density.
-        // volume is in mm³; density is in g/cm³; so divide by 1000 to convert.
-        if (material && typeof t.volume === "number") {
-          t.mass = (material.density * t.volume) / 1000;
-        }
+        // partStats === "none": nothing to do. volume/surfaceArea/mass/CoM
+        // all stay undefined on the emitted part.
       }
       tessellated.push(t);
       streaming?.onPart?.(t, i, parts.length);

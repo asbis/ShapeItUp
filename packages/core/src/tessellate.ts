@@ -85,6 +85,25 @@ function chooseTolerance(shape: any): number {
 export type MeshQuality = "preview" | "final";
 
 /**
+ * How much per-part measurement work to do on the tessellation hot path.
+ *
+ * `"none"` — skip both `measureShapeVolumeProperties` and
+ * `measureShapeSurfaceProperties`; omit volume / surfaceArea / centerOfMass
+ * from the emitted part. Cheapest; use when the caller only needs geometry
+ * for rendering.
+ *
+ * `"bbox"` (default) — still skip the two OCCT measurement calls, but derive
+ * a centerOfMass from the shape's bounding-box centre so assemblies get a
+ * usable aggregate CoM without paying the ~200 ms/part B-Rep cost. volume /
+ * surfaceArea stay omitted.
+ *
+ * `"full"` — pre-partStats behaviour: call both measurement functions and
+ * populate volume / surfaceArea / centerOfMass (plus mass if a material is
+ * declared). Slowest; issue #6 measured ~2.5 s on a 14-part assembly.
+ */
+export type PartStatsLevel = "none" | "bbox" | "full";
+
+/**
  * Per-quality multipliers applied to the auto-computed tolerance. `final`
  * is the baseline (1× — behaviour unchanged from before the quality knob
  * existed). `preview` multiplies by 2.5× — enough to cut triangle counts
@@ -107,6 +126,16 @@ export interface TessellateOptions {
    * caller's policy decision — tessellatePart itself is neutral.
    */
   meshQuality?: MeshQuality;
+  /**
+   * How much per-part measurement work core should do AFTER tessellation.
+   * See {@link PartStatsLevel} for the full semantics. Consumed by the
+   * orchestration loop in `packages/core/src/index.ts`, not by
+   * `tessellatePart` itself (which never calls measureShape*Properties) —
+   * co-located here so callers configure all tess-time policy in one place.
+   * Default is `"bbox"` (issue #6: skip 2.5 s of B-Rep measurement on a
+   * 14-part assembly; derive CoM from the AABB centre instead).
+   */
+  partStats?: PartStatsLevel;
 }
 
 export function tessellatePart(part: PartInput, opts: TessellateOptions = {}): TessellatedPart {
