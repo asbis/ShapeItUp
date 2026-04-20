@@ -10,6 +10,7 @@ import {
   workspaceHasReplicadDependency,
   ensureMinimalTsconfig,
 } from "./workspace-types";
+import { registerMcpClientsView, showFirstRunNudgeIfNeeded } from "./mcp-clients-view";
 
 let viewerProvider: ViewerProvider;
 export const outputChannel = vscode.window.createOutputChannel("ShapeItUp");
@@ -61,6 +62,9 @@ export function activate(context: vscode.ExtensionContext) {
       uninstallMcpServer(outputChannel),
     ),
   );
+
+  registerMcpClientsView(context);
+  showFirstRunNudgeIfNeeded(context);
 
   // Manual preview command (still useful for opening the panel tab)
   context.subscriptions.push(

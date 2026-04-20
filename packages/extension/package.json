@@ -2,7 +2,7 @@
   "name": "shapeitup-vscode",
   "displayName": "ShapeItUp",
   "description": "Scripted CAD for VS Code — write TypeScript, see 3D, export STEP/STL. AI-powered with Claude Code MCP integration.",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "publisher": "shapeitup",
   "license": "MIT",
   "icon": "icon.png",
@@ -82,6 +82,12 @@
       {
         "command": "shapeitup.uninstallMcpServer",
         "title": "ShapeItUp: Uninstall MCP Server…"
+      },
+      {
+        "command": "shapeitup.refreshMcpClients",
+        "title": "Refresh",
+        "category": "ShapeItUp",
+        "icon": "$(refresh)"
       }
     ],
     "walkthroughs": [
@@ -124,15 +130,22 @@
           "id": "shapeitup.viewer",
           "name": "3D Preview"
         }
+      ],
+      "shapeitup-sidebar": [
+        {
+          "id": "shapeitup.mcpClients",
+          "name": "AI Clients (MCP)"
+        }
       ]
     },
-    "mcpServerDefinitionProviders": [
-      {
-        "id": "shapeitup-mcp",
-        "label": "ShapeItUp CAD"
-      }
-    ],
     "menus": {
+      "view/title": [
+        {
+          "command": "shapeitup.refreshMcpClients",
+          "when": "view == shapeitup.mcpClients",
+          "group": "navigation"
+        }
+      ],
       "editor/title": [
         {
           "command": "shapeitup.preview",
@@ -141,6 +154,12 @@
         }
       ]
     },
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "shapeitup-mcp",
+        "label": "ShapeItUp CAD"
+      }
+    ],
     "keybindings": [
       {
         "command": "shapeitup.preview",
