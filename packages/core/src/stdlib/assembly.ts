@@ -18,11 +18,13 @@ import {
   Part,
   type AttachedJoint,
   type JointSpec,
+  type MirrorPlane,
   type Vec3,
   translateTransform,
   rotateTransform,
   composeTransforms,
 } from "./parts";
+import type { Point3 } from "./standards";
 
 // ── mate() — data descriptor with pre-flight validation ────────────────────
 
@@ -304,6 +306,96 @@ export function entries(
   parts: Part[]
 ): Array<{ shape: Shape3D; name?: string; color?: string }> {
   return parts.flatMap((p) => p.toEntries());
+}
+
+// ── Symmetric pairs ─────────────────────────────────────────────────────────
+
+export interface SymmetricPairOptions {
+  /**
+   * Point on the mirror plane. Defaults to `[0, 0, 0]`. Only the component
+   * perpendicular to `plane` matters (e.g. for `"YZ"`, the mirror is
+   * through `x = origin[0]`).
+   */
+  origin?: Point3;
+  /**
+   * If provided, every joint on the LEFT (original) part is renamed to
+   * `<original><leftSuffix>`. Handy when the pair participates in a larger
+   * assembly and callers want unambiguous names per side. Default: no
+   * suffix (the original names are kept).
+   */
+  leftSuffix?: string;
+  /**
+   * If provided, every joint on the RIGHT (mirrored) part is renamed to
+   * `<original><rightSuffix>`. Default: no suffix.
+   */
+  rightSuffix?: string;
+}
+
+/**
+ * Build a symmetric pair `[left, right]` by mirroring `part` across the
+ * named plane. The LEFT element is the original `part` (unchanged); the
+ * RIGHT is `part.mirror(plane, origin)`.
+ *
+ * ```typescript
+ * const bracket = part({
+ *   shape: bracketShape,
+ *   name: "bracket",
+ *   joints: {
+ *     wallFace:  faceAt(0, { axis: "-Y" }),
+ *     shelfFace: faceAt(BRACKET_DEPTH, { axis: "+Y" }),
+ *   },
+ * });
+ *
+ * const [left, right] = symmetricPair(bracket, "YZ", {
+ *   leftSuffix: "L",
+ *   rightSuffix: "R",
+ * });
+ * // left.joints.wallFaceL   right.joints.wallFaceR
+ * // left.joints.shelfFaceL  right.joints.shelfFaceR
+ * ```
+ *
+ * ### Behavior
+ *
+ * - Joint roles are preserved on both sides — a male shaft on the left is
+ *   still a male shaft on the right. See `Part.mirror` for the rationale
+ *   (mirroring produces mirror-image geometry, not role inversion).
+ * - Joint positions + axes are reflected correctly on the right part via
+ *   `Part.mirror`; the left part is returned unchanged.
+ * - Suffixes are applied AFTER mirroring via `Part.renameJoints`. Omit
+ *   both to keep the original joint names on both parts (callers may
+ *   prefer this when each part is passed individually to `mate()`).
+ *
+ * @param part The Part to pair. Should be built at its local origin so the
+ *   mirrored partner lands symmetrically across the plane.
+ * @param plane Coordinate plane: `"YZ"` (mirror across x=0), `"XZ"`
+ *   (across y=0), or `"XY"` (across z=0). Pick the plane whose normal is
+ *   the symmetry axis of the pair (typically `"YZ"` for left/right pairs
+ *   along X).
+ * @param opts Optional `{ origin, leftSuffix, rightSuffix }`.
+ * @returns `[left, right]` — two Parts ready to drop into `assemble()`.
+ */
+export function symmetricPair(
+  part: Part,
+  plane: MirrorPlane,
+  opts: SymmetricPairOptions = {}
+): [Part, Part] {
+  let left = part;
+  let right = part.mirror(plane, opts.origin);
+  const { leftSuffix, rightSuffix } = opts;
+  if (leftSuffix || rightSuffix) {
+    const jointNames = Object.keys(left.joints);
+    if (leftSuffix) {
+      const renames: Record<string, string> = {};
+      for (const n of jointNames) renames[n] = `${n}${leftSuffix}`;
+      left = left.renameJoints(renames);
+    }
+    if (rightSuffix) {
+      const renames: Record<string, string> = {};
+      for (const n of jointNames) renames[n] = `${n}${rightSuffix}`;
+      right = right.renameJoints(renames);
+    }
+  }
+  return [left, right];
 }
 
 // ── Subassemblies ───────────────────────────────────────────────────────────

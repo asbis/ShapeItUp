@@ -1007,6 +1007,20 @@ return highlightJoints(positioned);   // use as main()'s return value
 
 `highlightJoints` is the fastest way to diagnose a misaligned mate — render the assembly and see where joints land as pink spheres, with part names in the parts panel.
 
+### Symmetric pairs (mirrored parts)
+
+When an assembly uses a left/right pair of the same geometric part (two brackets on a shelf, two end-caps on a frame), build it once at the origin and use `symmetricPair(part, plane, opts?)` to get `[left, right]` with all joint positions and axes reflected. Under the hood it calls `Part.mirror(plane, origin?)` — joint roles (male/female/face) are preserved (a shaft is still a shaft, just on the other side).
+
+```typescript
+import { part, faceAt, mate, assemble, symmetricPair } from "shapeitup";
+
+const bracket = part({ shape: bracketShape, name: "bracket", joints: { ... } });
+const [left, right] = symmetricPair(bracket, "YZ", { leftSuffix: "L", rightSuffix: "R" });
+// left.joints.wallFaceL, right.joints.wallFaceR — no name collision in mates
+```
+
+See `examples/stdlib/wall-mounted-shelf.shape.ts` for a full wall + L-bracket pair + shelf assembly.
+
 ### Standard part builders
 
 Common mechanical parts ship as pre-assembled `Part` builders with joints ready to mate. Skip the manual body+shaft+joint declaration boilerplate:
