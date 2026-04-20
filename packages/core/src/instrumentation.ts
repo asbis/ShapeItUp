@@ -1,5 +1,20 @@
 import { assertPositiveFinite } from "./stdlib/standards";
-import { pushRuntimeWarning } from "./stdlib/warnings";
+import {
+  claimNonXYPlaneHint,
+  emitExtrudePlaneHint,
+  pushRuntimeWarning,
+} from "./stdlib/warnings";
+
+/**
+ * WeakMap threading the plane-name from `Drawing.sketchOnPlane(plane)` to the
+ * returned Sketch instance, so `Sketch.extrude` can emit the plane-aware
+ * bounding-box hint (Issue #1 — silent Y ∈ [-20,0] on XZ sketches). Using a
+ * WeakMap keeps the association per-sketch, per-run without polluting the
+ * sketch object with enumerable properties that the user might observe. The
+ * entry is populated in the `sketchOnPlane` post-hook below and consumed
+ * lazily in `validateSketchExtrude`.
+ */
+const SKETCH_PLANE: WeakMap<object, string> = new WeakMap();
 
 interface TimingEntry {
   count: number;
@@ -224,8 +239,8 @@ const PROTO_VALIDATORS_RAW: Record<string, (self: any, ...args: any[]) => void> 
   // Replicad doesn't recognize them and the resulting error is an opaque
   // "Invalid plane name" from deep inside OCCT. Catch the negated form up
   // front and point the user at the right incantation.
-  sketchOnPlane: (_self: any, planeName: unknown) => {
-    validateSketchOnPlane(planeName);
+  sketchOnPlane: (self: any, planeName: unknown) => {
+    validateSketchOnPlane(self, planeName);
   },
 };
 
@@ -266,6 +281,44 @@ const PROTO_VALIDATORS: Record<string, (self: any, ...args: any[]) => void> = ((
     // extrude/revolve live on Sketch/Sketches only; sketchOnPlane lives on the
     // Drawing family. All other validators apply to every 3D class that
     // inherits _3DShape.
+    for (const cls of classes) {
+      out[`${cls}.${method}`] = fn;
+    }
+  }
+  return out;
+})();
+
+/**
+ * Post-call hooks, invoked after the wrapped OCCT method returns successfully.
+ * The hook receives the receiver, the returned value, and the original args so
+ * it can carry state forward — used to thread the sketch-plane name from
+ * `Drawing.sketchOnPlane(plane)` into the returned Sketch via WeakMap. Kept
+ * deliberately minimal (one hook today) to avoid growing a parallel
+ * validator pipeline; introduce a richer API only if a second use case
+ * appears.
+ */
+const PROTO_POST_HOOKS_RAW: Record<
+  string,
+  (self: any, result: any, ...args: any[]) => void
+> = {
+  sketchOnPlane: (_self: any, result: any, planeName?: unknown) => {
+    if (typeof planeName !== "string") return;
+    if (result && typeof result === "object") {
+      SKETCH_PLANE.set(result, planeName);
+    }
+  },
+};
+
+const PROTO_POST_HOOKS: Record<
+  string,
+  (self: any, result: any, ...args: any[]) => void
+> = (() => {
+  const out: Record<string, (self: any, result: any, ...args: any[]) => void> = {};
+  for (const method of Object.keys(PROTO_POST_HOOKS_RAW)) {
+    const fn = PROTO_POST_HOOKS_RAW[method];
+    // Today the only post-hook is on sketchOnPlane — expand only over the
+    // Drawing family, matching the pre-validator table above.
+    const classes = method === "sketchOnPlane" ? DRAWING_CLASSES : SHAPE3D_CLASSES;
     for (const cls of classes) {
       out[`${cls}.${method}`] = fn;
     }
@@ -546,6 +599,17 @@ function validateSketchExtrude(self: any, distance: unknown): void {
       `extrude: distance must be a finite non-zero number, got ${String(distance)} (${typeof distance}).`,
     );
   }
+  // Issue #1: if this Sketch came from a non-XY `sketchOnPlane`, the extrude
+  // will grow into the plane's signed normal — "XZ" produces a slab with
+  // Y ∈ [-L, 0], not the centered Y ∈ [-L/2, L/2] most users expect. Emit a
+  // one-shot bbox-interval hint BEFORE deferring to OCCT. The latch inside
+  // `emitExtrudePlaneHint` ensures we fire at most once per run, and the
+  // helper returns null for "XY" so the conventional case stays silent.
+  const plane = typeof self === "object" && self !== null ? SKETCH_PLANE.get(self) : undefined;
+  if (typeof plane === "string") {
+    const hint = emitExtrudePlaneHint(plane, distance);
+    if (hint) pushRuntimeWarning(hint);
+  }
   try {
     const bp = self?.blueprint;
     if (!bp) return;
@@ -575,17 +639,90 @@ function validateSketchExtrude(self: any, distance: unknown): void {
  * (custom planes, Plane objects). We only flag the specific negated-axis
  * form because it's a well-known user footgun with a known translation.
  */
-function validateSketchOnPlane(planeName: unknown): void {
+function validateSketchOnPlane(self: any, planeName: unknown): void {
   if (typeof planeName !== "string") return;
   const match = /^-(XY|XZ|YZ)$/.exec(planeName);
-  if (!match) return;
-  const swapMap: Record<string, string> = { XY: "YX", XZ: "ZX", YZ: "ZY" };
-  const swapped = swapMap[match[1]];
-  throw new TypeError(
-    `sketchOnPlane does not accept negated plane names ("${planeName}"). ` +
-      `Use "${swapped}" for the same plane viewed from the other side, or ` +
-      `pass a negative extrude length. Valid planes: XY, XZ, YZ, YX, ZX, ZY.`,
-  );
+  if (match) {
+    const swapMap: Record<string, string> = { XY: "YX", XZ: "ZX", YZ: "ZY" };
+    const swapped = swapMap[match[1]];
+    throw new TypeError(
+      `sketchOnPlane does not accept negated plane names ("${planeName}"). ` +
+        `Use "${swapped}" for the same plane viewed from the other side, or ` +
+        `pass a negative extrude length. Valid planes: XY, XZ, YZ, YX, ZX, ZY.`,
+    );
+  }
+  // One-shot advisory: sketching on any plane other than "XY" means the pen's
+  // hLine/vLine map to non-obvious world axes (e.g. on "ZX", hLine → world Z,
+  // not X). The full mapping table lives in skill/SKILL.md "Pen axis
+  // mapping". Fire at most once per run so a script with 50 sketches on XZ
+  // doesn't spam 50 identical warnings.
+  //
+  // P-1 polish: suppress the hint when the drawing's 2D bounding box is
+  // already centered on the origin (|cx| and |cy| each within 1 % of the
+  // larger of width/height). A centered bbox means the user almost certainly
+  // used coordinate-form primitives (drawRectangle, drawCircle — both
+  // centered by construction) rather than the pen's hLine/vLine, so the
+  // axis-mapping warning would just be noise. If the blueprint or its bbox
+  // can't be read (e.g. a unit-test stub without `.blueprint`), we fall back
+  // to firing the hint — preserving the prior behaviour for non-replicad
+  // receivers.
+  if (planeName !== "XY" && !isDrawingCenteredOnOrigin(self) && claimNonXYPlaneHint()) {
+    pushRuntimeWarning(
+      `sketchOnPlane("${planeName}"): pen hLine/vLine map to different world ` +
+        `axes on each plane (e.g. on "ZX", hLine → world Z, vLine → world X). ` +
+        `See skill/SKILL.md "Pen axis mapping" table before sketching.`,
+    );
+  }
+}
+
+/**
+ * Heuristic for P-1: "does this drawing look like it was built with
+ * coordinate-centered primitives (drawRectangle/drawCircle) rather than the
+ * pen's hLine/vLine?". A centered 2D bounding box is a strong indicator
+ * because the coordinate primitives place their geometry on origin while the
+ * pen draws relative to wherever `startAt` left off.
+ *
+ * Returns `false` when we can't cheaply inspect the bbox (missing blueprint,
+ * non-numeric center, inspection threw, etc.) so the caller defaults to
+ * firing the warning — preserving the pre-polish behaviour in ambiguous
+ * cases and keeping existing tests (which stub sketchOnPlane without a
+ * blueprint) unaffected.
+ */
+function isDrawingCenteredOnOrigin(self: any): boolean {
+  try {
+    // Drawings expose `.boundingBox` directly; Blueprints / CompoundBlueprints
+    // do too. The types share the BoundingBox2d shape (center: [cx, cy],
+    // width, height).
+    const bb = self?.boundingBox;
+    if (!bb) return false;
+    const center = bb.center;
+    const w = typeof bb.width === "number" ? bb.width : NaN;
+    const h = typeof bb.height === "number" ? bb.height : NaN;
+    if (!Number.isFinite(w) || !Number.isFinite(h)) return false;
+    // `center` is a 2D point — replicad returns a tuple [cx, cy], but some
+    // wrappers return {x, y}. Tolerate both.
+    let cx: number;
+    let cy: number;
+    if (Array.isArray(center)) {
+      cx = Number(center[0]);
+      cy = Number(center[1]);
+    } else if (center && typeof center === "object") {
+      cx = Number((center as any).x);
+      cy = Number((center as any).y);
+    } else {
+      return false;
+    }
+    if (!Number.isFinite(cx) || !Number.isFinite(cy)) return false;
+    // 1 % of the bigger dimension — generous enough to absorb float noise
+    // from compound fuses, tight enough that a pen-drawn path starting
+    // anywhere off-origin will fail the test.
+    const scale = Math.max(Math.abs(w), Math.abs(h));
+    if (scale === 0) return false;
+    const eps = scale * 0.01;
+    return Math.abs(cx) < eps && Math.abs(cy) < eps;
+  } catch {
+    return false;
+  }
 }
 
 function validateRevolveConfig(config: unknown): void {
@@ -665,6 +802,7 @@ function instrumentPrototype(
 function wrap(name: string, original: Function): Function {
   const validator = VALIDATORS[name];
   const protoValidator = PROTO_VALIDATORS[name];
+  const postHook = PROTO_POST_HOOKS[name];
   return function wrapped(this: any, ...args: any[]) {
     // Pre-call validation — throws BEFORE the WASM call and before timing.
     // Validator throws are user errors, not performance events, so keep them
@@ -676,10 +814,21 @@ function wrap(name: string, original: Function): Function {
     try {
       const result = original.apply(this, args);
       if (result && typeof (result as any).then === "function") {
+        const self = this;
         return (result as Promise<any>).then(
           (v) => {
             record(name, start);
             stack.pop();
+            // Post-hook only runs on successful resolve — a rejected promise
+            // has no meaningful return value to thread forward.
+            if (postHook) {
+              try {
+                postHook(self, v, ...args);
+              } catch {
+                // Post-hooks are advisory; never let a bookkeeping error
+                // corrupt the user's successful OCCT call.
+              }
+            }
             return v;
           },
           (err) => {
@@ -692,6 +841,13 @@ function wrap(name: string, original: Function): Function {
       }
       record(name, start);
       stack.pop();
+      if (postHook) {
+        try {
+          postHook(this, result, ...args);
+        } catch {
+          // See async branch above — post-hook failures must not propagate.
+        }
+      }
       return result;
     } catch (err) {
       record(name, start);
