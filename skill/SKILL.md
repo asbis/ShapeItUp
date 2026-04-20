@@ -1065,6 +1065,14 @@ Real helical threads via OCCT sweep. Mostly useful for STEP export to machine sh
 
 **Compound vs. Mesh form — pick one deliberately.** `threads.metric` and `threads.leadscrew` return a *Compound* (root cylinder + un-fused per-turn loops). That's fast and appropriate for **multi-part STEP export** where the thread renders as its own named part. It is **not fuse-safe**: OCCT's B-Rep boolean cannot merge the per-turn loops with another solid and produces non-manifold seams — `head.fuse(threads.metric(...))` will fail BRepCheck. Any time you want to combine a thread with another solid, use the `*Mesh` variants below — they route the boolean through the Manifold kernel (O(n log n), sub-second on WASM).
 
+**Z-convention — external vs. internal.** External factories (`threads.external`, `threads.metric`, `threads.metricMesh`, `threads.externalMesh`) return *positive shapes* on `Z ∈ [0, length]` — translate/rotate them into place on your part. Internal factories (`threads.internal`, `threads.tapInto`, `threads.tapIntoTrap`, `threads.internalMesh`) are *cut-tools* with the top at `Z=0` and the body extending into `-Z`, matching the `holes.*` convention so both compose the same way:
+
+```typescript
+plate.cut(threads.internal({ diameter: 5, pitch: 0.8, length: 8 }).translate(x, y, plateTop));
+```
+
+To flip direction, use `fromBack()` (see holes section) or `.rotate(180, [0,0,0], [1,0,0]).translate(...)` manually.
+
 ```typescript
 import { threads } from "shapeitup";
 
