@@ -213,16 +213,124 @@ export function registerMcpClientsView(context: vscode.ExtensionContext) {
 }
 
 /**
- * One-time activation nudge. Fires on the first activation after install (or
- * upgrade from a pre-1.3 version that did silent writes) to point users at
- * the install flow. Stored in globalState so it never fires twice.
+ * Detect and offer to repair broken `shapeitup` MCP entries left behind by
+ * pre-1.3 versions. Those versions wrote a versioned extension path into
+ * ~/.claude.json / ~/.cursor/mcp.json / Claude Desktop config and Gemini
+ * manifests; after the extension upgrades or is uninstalled, the path goes
+ * stale and the client logs "Failed to reconnect". We rewrite the entry to
+ * `npx -y @shapeitup/mcp-server` — but only with explicit consent, and only
+ * when the existing entry actually points at a non-existent path so we never
+ * clobber a hand-tuned setup.
+ */
+async function migrateStaleMcpEntriesIfNeeded(context: vscode.ExtensionContext) {
+  const KEY = "shapeitup.migrateStale.v1";
+  if (context.globalState.get(KEY)) return;
+
+  const home = os.homedir();
+  const platform = process.platform;
+  const candidates = [
+    { label: "Claude Code (~/.claude.json)", file: path.join(home, ".claude.json") },
+    { label: "Cursor (~/.cursor/mcp.json)", file: path.join(home, ".cursor", "mcp.json") },
+    {
+      label: "Claude Desktop",
+      file: platform === "darwin"
+        ? path.join(home, "Library", "Application Support", "Claude", "claude_desktop_config.json")
+        : platform === "win32"
+        ? path.join(home, "AppData", "Roaming", "Claude", "claude_desktop_config.json")
+        : path.join(home, ".config", "Claude", "claude_desktop_config.json"),
+    },
+    {
+      label: "Gemini CLI (~/.gemini/extensions/shapeitup)",
+      file: path.join(home, ".gemini", "extensions", "shapeitup", "gemini-extension.json"),
+    },
+  ];
+
+  const stale: Array<{ label: string; file: string; currentArg: string }> = [];
+  for (const c of candidates) {
+    if (!fs.existsSync(c.file)) continue;
+    const cfg = readJson(c.file);
+    const entry = cfg?.mcpServers?.shapeitup;
+    if (!entry) continue;
+    // Stale iff the entry uses `command: node` with an args[0] file path that
+    // no longer exists. An `npx -y @shapeitup/mcp-server` entry (the new
+    // canonical shape) is left alone.
+    const arg = Array.isArray(entry.args) ? entry.args[0] : undefined;
+    if (entry.command === "node" && typeof arg === "string" && !fs.existsSync(arg)) {
+      stale.push({ label: c.label, file: c.file, currentArg: arg });
+    }
+  }
+
+  if (stale.length === 0) {
+    await context.globalState.update(KEY, true);
+    return;
+  }
+
+  const choice = await vscode.window.showWarningMessage(
+    `ShapeItUp found ${stale.length} broken MCP entr${stale.length === 1 ? "y" : "ies"} ` +
+      `pointing at an old extension path that no longer exists. ` +
+      `Migrate to the npm-based install (npx -y @shapeitup/mcp-server)?`,
+    "Migrate",
+    "Show details",
+    "Not now",
+  );
+
+  if (choice === "Show details") {
+    const detail = stale.map((s) => `• ${s.label}\n  broken path: ${s.currentArg}`).join("\n\n");
+    const next = await vscode.window.showInformationMessage(
+      `Entries to migrate:\n\n${detail}`,
+      { modal: true },
+      "Migrate",
+      "Cancel",
+    );
+    if (next !== "Migrate") return;
+  } else if (choice !== "Migrate") {
+    // "Not now" / dismissed — don't set the flag, ask again next activation.
+    return;
+  }
+
+  const NEW_ENTRY = {
+    type: "stdio" as const,
+    command: "npx",
+    args: ["-y", "@shapeitup/mcp-server"],
+  };
+
+  let migrated = 0;
+  for (const s of stale) {
+    try {
+      const cfg = readJson(s.file);
+      if (!cfg?.mcpServers?.shapeitup) continue;
+      cfg.mcpServers.shapeitup = s.file.endsWith("gemini-extension.json")
+        ? { command: "npx", args: ["-y", "@shapeitup/mcp-server"] }
+        : NEW_ENTRY;
+      fs.writeFileSync(s.file, JSON.stringify(cfg, null, 2) + "\n");
+      migrated++;
+    } catch (e: any) {
+      vscode.window.showErrorMessage(`Failed to migrate ${s.label}: ${e.message}`);
+    }
+  }
+
+  await context.globalState.update(KEY, true);
+  if (migrated > 0) {
+    vscode.window.showInformationMessage(
+      `Migrated ${migrated} ShapeItUp MCP entr${migrated === 1 ? "y" : "ies"} to npx. ` +
+        `Restart your AI client to pick up the change.`,
+    );
+  }
+}
+
+/**
+ * One-time activation nudge. Fires on the first activation after install
+ * (when no MCP client has a shapeitup entry yet) to point users at the
+ * install flow. Stored in globalState so it never fires twice.
  */
 export async function showFirstRunNudgeIfNeeded(context: vscode.ExtensionContext) {
+  // Run the stale-entry migration first — if the user's broken 1.2.0 entry
+  // gets repaired, the nudge becomes redundant.
+  await migrateStaleMcpEntriesIfNeeded(context);
+
   const KEY = "shapeitup.firstRunNudge.v1";
   if (context.globalState.get(KEY)) return;
 
-  // If the user already has a shapeitup entry somewhere (migrating from a
-  // pre-1.3 install), don't nag them — mark as shown and move on.
   const clients = detectClients();
   const anyRegistered = clients.some((c) => c.status === "registered" && c.id !== "copilot");
   if (anyRegistered) {
