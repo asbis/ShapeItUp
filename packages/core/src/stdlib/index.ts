@@ -12,7 +12,7 @@ import * as bearings from "./bearings";
 import * as extrusions from "./extrusions";
 import * as patterns from "./patterns";
 import { screws, bolts, washers, inserts } from "./fasteners";
-import { fromBack, shape3d } from "./placement";
+import { fromBack, shape3d, placeOn } from "./placement";
 import { Part, joint, part, faceAt, shaftAt, boreAt } from "./parts";
 import { mate, assemble, subassembly, stackOnZ, entries, debugJoints, highlightJoints } from "./assembly";
 import { cylinder } from "./cylinder";
@@ -66,6 +66,7 @@ export {
   inserts,
   fromBack,
   shape3d,
+  placeOn,
   Part,
   joint,
   part,
@@ -102,6 +103,7 @@ export const shapeitupStdlib = {
   patterns,
   fromBack,
   shape3d,
+  placeOn,
   Part,
   joint,
   part,
