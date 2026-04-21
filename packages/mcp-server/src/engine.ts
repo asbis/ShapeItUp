@@ -15,8 +15,8 @@
  * critical path.
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { dirname, basename, resolve, join } from "node:path";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from "node:fs";
+import { dirname, basename, resolve, join, isAbsolute } from "node:path";
 import {
   BUNDLE_EXTERNALS,
   extractParamsStatic,
@@ -40,6 +40,110 @@ function ensureEsbuild(): Promise<void> {
     });
   }
   return esbuildInitPromise;
+}
+
+// ---------------------------------------------------------------------------
+// Bundle cache — avoids re-running esbuild.build() on unchanged inputs.
+// Keyed by the normalized absolute path of the entry file.
+// LRU eviction capped at MAX_BUNDLE_CACHE_SIZE entries.
+// ---------------------------------------------------------------------------
+
+export interface BundleCacheEntry {
+  /** Bundled JS output text. */
+  js: string;
+  /** Text of the entry file at the time of caching (read from disk). */
+  entryContent: string;
+  /** Normalized absolute path of the entry file (the map key). */
+  entryPath: string;
+  /** Absolute input path -> mtimeMs for every file esbuild pulled in. */
+  inputMtimes: Record<string, number>;
+}
+
+const MAX_BUNDLE_CACHE_SIZE = 32;
+/** Module-level LRU bundle cache (persists across tool calls in the same process). */
+const bundleCache = new Map<string, BundleCacheEntry>();
+
+/** Clear the bundle cache. Exported for test isolation. */
+export function clearBundleCache(): void {
+  bundleCache.clear();
+}
+
+/**
+ * Scan entry source for local `import ... from './...'` statements and return
+ * the set of relative specifiers that resolve to local files. Used by
+ * checkBundleCache to detect new imports not yet tracked in inputMtimes.
+ *
+ * Exported for unit testing.
+ */
+export function extractLocalImportSpecifiers(source: string): string[] {
+  // Match both: import ... from './path' and import './path' (side-effect imports)
+  const re = /\bfrom\s+['"](\.[^'"]+)['"]/g;
+  const sideEffect = /\bimport\s+['"](\.[^'"]+)['"]/g;
+  const specs: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) specs.push(m[1]);
+  while ((m = sideEffect.exec(source)) !== null) specs.push(m[1]);
+  return specs;
+}
+
+/**
+ * Check if a cached bundle entry is still valid for the given entry source.
+ * Returns null if the cache is reusable, or a short human-readable reason
+ * string if it must be invalidated.
+ *
+ * Also detects the "new-import bug": if the entry source contains local import
+ * specifiers that resolve to absolute paths NOT in `inputMtimes`, those files
+ * were added after the last bundle and we must miss.
+ *
+ * Exported for unit testing.
+ */
+export function checkBundleCache(
+  entry: BundleCacheEntry,
+  liveCode: string,
+  entryDir: string,
+): string | null {
+  if (entry.entryContent !== liveCode) {
+    return "entry file content changed";
+  }
+  try {
+    for (const [inputPath, recordedMtime] of Object.entries(entry.inputMtimes)) {
+      const stat = statSync(inputPath);
+      if (Math.abs(stat.mtimeMs - recordedMtime) > 1) {
+        return `input mtime changed: ${inputPath}`;
+      }
+    }
+  } catch (e: any) {
+    return `stat failed: ${e?.message ?? String(e)}`;
+  }
+  // New-import bug fix: if the entry source now imports a local file that was
+  // not in the last bundle's inputMtimes, the cache is stale.
+  const localSpecs = extractLocalImportSpecifiers(liveCode);
+  for (const spec of localSpecs) {
+    // Resolve the specifier to an absolute path for lookup. Try common extensions.
+    const candidates = [spec, `${spec}.ts`, `${spec}.shape.ts`].map((s) =>
+      isAbsolute(s) ? s : resolve(entryDir, s),
+    );
+    const tracked = Object.keys(entry.inputMtimes);
+    const inCache = candidates.some((c) =>
+      tracked.some((t) => t.toLowerCase() === c.toLowerCase()),
+    );
+    if (!inCache) {
+      return `new local import not in cache: ${spec}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Evict the oldest entry when the cache exceeds MAX_BUNDLE_CACHE_SIZE.
+ * Map insertion order == LRU order for our access pattern (we re-insert on
+ * hit below, so the oldest entry is always the first one).
+ */
+function evictIfNeeded(): void {
+  while (bundleCache.size >= MAX_BUNDLE_CACHE_SIZE) {
+    const oldest = bundleCache.keys().next().value;
+    if (oldest !== undefined) bundleCache.delete(oldest);
+  }
 }
 
 /**
@@ -403,6 +507,18 @@ export async function executeShapeFile(
 
   let js: string;
   try {
+    // --- Bundle cache lookup ---
+    const entryDir = dirname(absPath);
+    const cached = bundleCache.get(absPath);
+    const invalidReason = cached ? checkBundleCache(cached, code, entryDir) : "no cache entry";
+
+    if (cached && invalidReason === null) {
+      process.stderr.write(`[bundle-cache] hit absPath=${absPath}\n`);
+      js = cached.js;
+      // Re-insert to maintain LRU order (access = most-recent).
+      bundleCache.delete(absPath);
+      bundleCache.set(absPath, cached);
+    } else {
     // Preflight: catch `import { main } from './other.shape'` (hard error) and
     // warn on `import { params } from './other.shape'` (supported but fragile —
     // tune_params slider overrides only reach the entry's own params object).
@@ -483,6 +599,7 @@ export async function executeShapeFile(
       // `sourceURL` directive is present. No extra runtime deps — the
       // VM does the mapping.
       sourcemap: "inline",
+      metafile: true,
       logLevel: "silent",
     });
     // Treat "Could not resolve" warnings as hard errors — a missing local
@@ -526,6 +643,36 @@ export async function executeShapeFile(
     // normalised to forward slashes for the URL form.
     const fileURL = `file:///${absPath.replace(/\\/g, "/").replace(/^\/+/, "")}`;
     js = `//# sourceURL=${fileURL}\n${js}`;
+
+    // Populate cache from metafile. Record mtime for every local input esbuild
+    // discovered (skip the entry itself — covered by entryContent equality).
+    const inputMtimes: Record<string, number> = {};
+    try {
+      for (const inputPath of Object.keys(result.metafile?.inputs ?? {})) {
+        const abs = isAbsolute(inputPath) ? inputPath : resolve(entryDir, inputPath);
+        // Skip the synthetic wrapper stub (it's ephemeral, not a real file).
+        if (abs.toLowerCase().includes("__shapeitup_wrapper__")) continue;
+        // Skip the entry itself — covered by entryContent.
+        if (abs.toLowerCase() === absPath.toLowerCase()) continue;
+        try {
+          inputMtimes[abs] = statSync(abs).mtimeMs;
+        } catch {
+          // Can't stat an input — omit it; next run will fall through to rebundle.
+        }
+      }
+    } catch {
+      // Metafile walk failed entirely — leave inputMtimes empty.
+    }
+
+    process.stderr.write(`[bundle-cache] miss reason=${invalidReason} absPath=${absPath}\n`);
+    evictIfNeeded();
+    bundleCache.set(absPath, {
+      js,
+      entryContent: code,
+      entryPath: absPath,
+      inputMtimes,
+    });
+    } // end else (cache miss)
   } catch (e: any) {
     status.error = `Bundle failed: ${e.message}`;
     writeStatusFile(status, globalStorageDir);
