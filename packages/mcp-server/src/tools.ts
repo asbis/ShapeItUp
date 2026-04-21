@@ -6154,6 +6154,19 @@ that shifts the plane along its own normal. \`sketchOnPlane("XY", [0,0,20])\` pl
 sketch on XY raised 20 mm in +Z. For "XZ" the normal is -Y (so [0,-20,0] shifts 20 mm
 toward camera); for "YZ" the normal is +X. To translate within the plane, use \`drawing.translate(dx, dy)\` before \`sketchOnPlane\`, not the origin arg.
 
+Pen axis mapping (sketchOnPlane):
+  Plane  | pen h → world | pen v → world | extrudes toward
+  XY     | +X            | +Y            | +Z
+  YX     | +Y            | +X            | -Z
+  XZ     | +X            | +Z            | -Y
+  ZX     | +Z            | +X            | +Y
+  YZ     | +Y            | +Z            | +X
+  ZY     | +Z            | +Y            | -X
+
+Example (non-XY): drawRoundedRectangle(60, 30).sketchOnPlane("XZ").extrude(20)
+  → the 60mm side lies along world X, the 30mm side along world Z, extrude pushes 20mm toward -Y.
+  → If you want the sketch's "h" to walk world Z instead, pick plane "ZX".
+
 ## Composition Patterns
 
 All draw* factories return an origin-centered Drawing — most "constraint" questions
@@ -6426,6 +6439,7 @@ holes.tapped(size, { depth, axis? })                       // tap-drill sized (m
 holes.threaded(size, { depth, axis? })                     // FDM: threaded hole — screw self-taps into tap-drill hole (preferred over modeled threads at M2–M5)
 holes.teardrop(size, { depth, axis? })                     // horizontal hole, FDM-printable (axis: "+X"|"+Y")
 holes.keyhole({ largeD, smallD, slot, depth, axis? })      // hang-on-screw mount
+// axis names the face where the mouth opens; body penetrates opposite. Large circle centres on translate target; small-capture offsets along slot (rotated by axis). Example: wall.cut(holes.keyhole({ largeD: 10, smallD: 4, slot: 6, depth: 4, axis: '+X' }).translate(thickness, y, z))
 holes.slot({ length, width, depth, axis? })                // elongated hole
 \`\`\`
 
@@ -6590,11 +6604,11 @@ don't have to pick +Z vs -Z manually:
 
 | Helper | Role | Default axis |
 |---|---|---|
-| \`faceAt(z)\` | \`"face"\` | \`"+Z"\` |
-| \`shaftAt(z, diameter)\` | \`"male"\` | \`"+Z"\` |
-| \`boreAt(z, diameter)\` | \`"female"\` | \`"-Z"\` |
+| \`faceAt(z, { axis?, xy? })\` | \`"face"\` | \`"+Z"\` |
+| \`shaftAt(z, diameter, { axis?, xy? })\` | \`"male"\` | \`"+Z"\` |
+| \`boreAt(z, diameter, { axis?, xy? })\` | \`"female"\` | \`"-Z"\` |
 
-Pass \`{ axis: "-Z" }\` (or any other) to override the default.
+Pass \`{ axis: "-Z" }\` (or any other) to override the default. \`xy?: [number, number]\` off-centres the joint within the Z plane — essential for multi-joint parts on vertical walls or corner pivots (e.g. \`faceAt(50, { axis: "+X", xy: [-30, 10] })\`).
 
 **\`mate()\` pre-flight**: throws if male/female roles are incompatible, if
 face/face is mixed with male/female, or if matched diameters differ by
