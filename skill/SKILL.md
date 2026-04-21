@@ -424,9 +424,11 @@ f => f.containsPoint([x, y, z])
 
 ```typescript
 e.inDirection("Z").and(e2 => e2.atDistance(5, [0,0,0]))
-e.inDirection("X").or(e2 => e2.inDirection("Y"))
+e.either([e2 => e2.inDirection("X"), e2 => e2.inDirection("Y")])
 e.not(e2 => e2.inPlane("XY"))
 ```
+
+Note: `.either(...)` is the canonical OR combinator (Replicad API); some older docs called it `.or`.
 
 ### `highlightFinder` (injected into every script, no import)
 
@@ -766,7 +768,7 @@ Every cut-tool helper below takes an optional `axis: "+X" | "-X" | "+Y" | "-Y" |
 - `holes.through` / `holes.clearance` / `holes.counterbore` / `holes.countersink` / `holes.tapped` / `holes.threaded` — all 6 axes
 - `holes.throughAt` / `holes.tappedAt` / `holes.counterboreAt` — **preferred single-call form** (`(plate, size, { at: [x,y,z], ... })`) — auto-handles plate-top translation and warns when `at[2]` drifts off the top face
 - `holes.teardrop` — horizontal only (`+X` / `+Y` — intended for FDM-printable sideways holes)
-- `holes.keyhole` / `holes.slot` — all 6 axes
+- `holes.keyhole` / `holes.slot` — all 6 axes. For `keyhole`, `axis` names the face where the keyhole MOUTH opens; the body penetrates toward the opposite direction (same convention as the holes.* axis table above). The large circle centres on the translate target; the small-capture circle offsets along the slot direction (rotated by axis).
 - `inserts.pocket("M3", { axis })` — heat-set insert pocket
 - `motors.nema17_mountPlate({ thickness, axis })` / `nema23_mountPlate` / `nema14_mountPlate` — full 4-hole pattern + shaft bore + optional boss (see below)
 - `cylinder({ direction: "+Y" })` / `rod({...})` — positive cylinder, same axis union
@@ -840,7 +842,7 @@ Full parameter tables for every stdlib namespace are available via `get_api_refe
 - `pins` — `pin`, `pivot`, `teeBar` (shafts and hinge axles)
 - `cradles` — `cradle` (ball cup) and `band_post` (rubber-band anchor)
 - `standards.SPORTS_BALLS` — ITF tennis, pingpong, golf, baseball, soccer diameters
-- `part` / `faceAt` / `shaftAt` / `boreAt` / `mate` / `assemble` / `entries` — declarative joint-based assembly
+- `part` / `faceAt` / `shaftAt` / `boreAt` / `mate` / `assemble` / `entries` — declarative joint-based assembly. Each joint helper accepts `xy?: [number, number]` — e.g. `faceAt(50, { axis: "+X", xy: [-30, 10] })` positions the joint at (x, y, z) instead of (0, 0, z) when joints share a Z plane or sit on vertical walls.
 - `symmetricPair` — mirror a Part across a plane to get a matched left/right pair
 - `subassembly` — compose Parts of Parts; `stackOnZ` for simple coaxial stacks
 - `motors` / `couplers` — NEMA14/17/23 motor + flexible coupler Part builders with joints

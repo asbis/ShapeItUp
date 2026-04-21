@@ -1182,6 +1182,155 @@ export function checkBezierDegeneracy(code: string): string | null {
 }
 
 /**
+ * Pitfall #9 (AST-based): flag `patterns.cutAt(target, <non-factory>, ...)`.
+ * The runtime guard in `packages/core/src/stdlib/patterns.ts` (see `cutAt`)
+ * throws a TypeError when the second argument isn't a function, because
+ * Replicad's translate/rotate consume OCCT handles — a shared Shape3D passed
+ * directly would be deleted after the first placement, causing a cryptic
+ * WASM fault. We mirror that guard statically so callers get the fix hint
+ * at validate time rather than at execution.
+ *
+ * Matches both `patterns.cutAt(...)` and chained forms like
+ * `lib.patterns.cutAt(...)` (namespace stdlib imports). Only literal
+ * arrow-function or function-expression second arguments are considered
+ * safe — an identifier binding (`cutAt(plate, factory, ...)`) is skipped
+ * conservatively because we can't tell whether `factory` is a function
+ * without type resolution.
+ *
+ * Returns null when TypeScript isn't reachable, matching the lazy-load
+ * pattern of the other AST checks.
+ */
+export function checkPatternsCutAtFactory(code: string): string | null {
+  const tsMod = loadTypescript();
+  if (!tsMod) return null;
+  const ts: typeof import("typescript") = tsMod;
+  let source: import("typescript").SourceFile;
+  try {
+    source = ts.createSourceFile("__validate__.ts", code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  } catch {
+    return null;
+  }
+
+  // True iff `expr` is a property-access chain ending in `.patterns.cutAt`.
+  // Handles `patterns.cutAt` (root Identifier("patterns")) AND arbitrary
+  // dotted prefixes like `lib.patterns.cutAt` / `a.b.patterns.cutAt`.
+  function isPatternsCutAt(expr: import("typescript").Expression): boolean {
+    if (!ts.isPropertyAccessExpression(expr)) return false;
+    if (expr.name.text !== "cutAt") return false;
+    const parent = expr.expression;
+    if (ts.isIdentifier(parent)) return parent.text === "patterns";
+    if (ts.isPropertyAccessExpression(parent)) return parent.name.text === "patterns";
+    return false;
+  }
+
+  let warning: string | null = null;
+  function scan(node: import("typescript").Node): void {
+    if (warning) return;
+    if (ts.isCallExpression(node) && isPatternsCutAt(node.expression)) {
+      const factoryArg = node.arguments[1];
+      if (factoryArg && !ts.isArrowFunction(factoryArg) && !ts.isFunctionExpression(factoryArg)) {
+        warning =
+          "patterns.cutAt: the tool argument must be a factory function (`() => makeTool()`), not a Shape directly — " +
+          "Replicad's translate/rotate consume OCCT handles, so a shared tool is deleted after the first placement. " +
+          "Wrap it: `patterns.cutAt(plate, () => holes.through('M4'), placements)`.";
+        return;
+      }
+    }
+    ts.forEachChild(node, scan);
+  }
+  scan(source);
+  return warning;
+}
+
+/**
+ * Pitfall #10 (AST-based): flag `x.cut(x.something())` — passing a
+ * boolean-op argument whose root identifier is the SAME as the receiver's.
+ * Replicad's cut/fuse/intersect invalidate the receiver's OCCT handle; when
+ * the tool expression walks off the same binding (often through a translate
+ * or rotate, which also consume handles), the script crashes with a deleted-
+ * handle fault that looks like a WASM memory error.
+ *
+ * Conservative: only flags plain Identifier roots on BOTH the receiver and
+ * the argument. Computed receivers (`shapes[i].cut(...)`, `getTool().cut(...)`)
+ * are skipped — we can't prove aliasing without full type resolution, and
+ * a false-positive on an unrelated `shapes[i]` vs `shapes` would be worse
+ * than missing some cases. Returns null when TypeScript isn't reachable.
+ */
+export function checkShapeReuseAfterBoolean(code: string): string | null {
+  const tsMod = loadTypescript();
+  if (!tsMod) return null;
+  const ts: typeof import("typescript") = tsMod;
+  let source: import("typescript").SourceFile;
+  try {
+    source = ts.createSourceFile("__validate__.ts", code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  } catch {
+    return null;
+  }
+
+  const boolMethods = new Set(["cut", "fuse", "intersect"]);
+
+  // Walk a receiver/argument expression down to the root Identifier.
+  // Only descends through PropertyAccess and Call chains (the common
+  // translate/rotate/etc. method-chain shape); bails on anything else so
+  // we stay conservative. Returns null if no plain Identifier root exists.
+  function rootIdentifier(expr: import("typescript").Expression): string | null {
+    let cur: import("typescript").Expression = expr;
+    for (let guard = 0; guard < 64; guard++) {
+      if (ts.isParenthesizedExpression(cur)) {
+        cur = cur.expression;
+        continue;
+      }
+      if (ts.isPropertyAccessExpression(cur)) {
+        cur = cur.expression;
+        continue;
+      }
+      if (ts.isCallExpression(cur)) {
+        // For calls, the receiver is what carries identity (`x.translate()`
+        // keeps `x` as the root); a bare function call like `getTool()`
+        // has no plain Identifier root, bail.
+        if (ts.isPropertyAccessExpression(cur.expression)) {
+          cur = cur.expression.expression;
+          continue;
+        }
+        return null;
+      }
+      if (ts.isIdentifier(cur)) return cur.text;
+      return null;
+    }
+    return null;
+  }
+
+  let warning: string | null = null;
+  function scan(node: import("typescript").Node): void {
+    if (warning) return;
+    if (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      boolMethods.has(node.expression.name.text)
+    ) {
+      const receiver = node.expression.expression;
+      const receiverRoot = rootIdentifier(receiver);
+      if (receiverRoot) {
+        for (const arg of node.arguments) {
+          const argRoot = rootIdentifier(arg);
+          if (argRoot && argRoot === receiverRoot) {
+            warning =
+              `Shape reuse after boolean op: \`${receiverRoot}.cut/fuse/intersect(${receiverRoot}.*)\` — ` +
+              "Replicad's boolean ops invalidate the receiver's OCCT handle. " +
+              `Clone before transforming: \`${receiverRoot}.cut(${receiverRoot}.clone().translate(...))\` ` +
+              "or assign the transformed tool to a new variable first.";
+            return;
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, scan);
+  }
+  scan(source);
+  return warning;
+}
+
+/**
  * Compute the effective meshQuality to use for a render_preview call.
  *
  * Rule: when renderMode is "ai" (or absent — which defaults to "ai") AND
@@ -1420,7 +1569,17 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
       const flagged = new Set<string>();
       while ((fcMatch = filletChamferPattern.exec(code)) !== null) {
         const r = parseFloat(fcMatch[2]);
-        if (!isFinite(r) || r <= 0) continue;
+        if (!isFinite(r)) continue;
+        if (r < 0) {
+          const key = `neg:${fcMatch[1]}:${r}`;
+          if (flagged.has(key)) continue;
+          flagged.add(key);
+          semanticWarnings.push(
+            `Fillet/chamfer radius must be positive — \`.${fcMatch[1]}(${r})\` will throw at runtime.`
+          );
+          continue;
+        }
+        if (r === 0) continue; // zero radius is a no-op, not a bug
         if (r > smallest * 0.5) {
           const key = `${fcMatch[1]}:${r}:${smallest}`;
           if (flagged.has(key)) continue;
@@ -1441,6 +1600,26 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
     const bezierWarning = checkBezierDegeneracy(code);
     if (bezierWarning) {
       semanticWarnings.push(bezierWarning);
+    }
+
+    // 5c. patterns.cutAt must be called with a factory function, not a bare
+    //     Shape3D. The stdlib runtime guard throws a TypeError with the
+    //     same fix hint (see packages/core/src/stdlib/patterns.ts cutAt);
+    //     AST-based so we catch the split-variable `patterns.cutAt(plate,
+    //     tool, placements)` case at validate time. Skips silently when
+    //     TypeScript isn't resolvable.
+    const cutAtWarning = checkPatternsCutAtFactory(code);
+    if (cutAtWarning) {
+      semanticWarnings.push(cutAtWarning);
+    }
+
+    // 5d. Shape reuse after a boolean — `x.cut(x.translate(...))` crashes
+    //     because replicad's boolean ops consume the receiver's OCCT handle
+    //     while translate/rotate consume their input too. Conservative AST
+    //     check: only the plain-Identifier-on-both-sides case is flagged.
+    const reuseWarning = checkShapeReuseAfterBoolean(code);
+    if (reuseWarning) {
+      semanticWarnings.push(reuseWarning);
     }
 
     // 6. Hand-rolled boolean loops — classic "slow pattern" that crosses the
@@ -5335,6 +5514,31 @@ export function registerTools(server: McpServer) {
         const fmt = (x: number) => (Math.abs(x) >= 1000 ? x.toFixed(0) : x.toFixed(2));
         const fmtAngle = (a: number) => (Math.abs(a) >= 100 ? a.toFixed(1) : a.toFixed(2));
 
+        // Preflight: an assembly that already overlaps at the start position
+        // makes the per-angle intersect()s fragile — OCCT will happily
+        // boolean two solids that were colliding on input, and the resulting
+        // volumes conflate "static overlap" with "sweep overlap". On real-
+        // world assemblies it's usually the bug the user is actually hunting,
+        // so surface pre-existing overlaps up front rather than making the
+        // caller squint at noisy sweep output. Uses the same AABB-prefiltered
+        // pairwise intersect that check_collisions / verify_shape use via
+        // `extractCollisions` in verify-helpers.ts. `acceptedPairs` is left
+        // undefined because sweep_check doesn't expose that argument today
+        // (the sweep loop itself applies no pair-filter); when the tool grows
+        // one, it should be threaded here too so expected static contact
+        // isn't flagged as "pre-existing collision".
+        const preflight = extractCollisions(parts, { tolerance: tol, replicad });
+        if (preflight.real.length > 0) {
+          const nPre = preflight.real.length;
+          return {
+            content: [{
+              type: "text" as const,
+              text: `sweep_check: assembly has ${nPre} pre-existing collision(s) at the start position — resolve static collisions before sweeping. Use check_collisions for details.\n${JSON.stringify({ preExistingCollisions: preflight.real }, null, 2)}`,
+            }],
+            isError: true,
+          };
+        }
+
         type Collision = { step: number; angle: number; pairA: string; pairB: string; volume: number };
         const collisions: Collision[] = [];
         const failures: Array<{ step: number; angle: number; pairB: string; error: string }> = [];
@@ -6154,6 +6358,19 @@ that shifts the plane along its own normal. \`sketchOnPlane("XY", [0,0,20])\` pl
 sketch on XY raised 20 mm in +Z. For "XZ" the normal is -Y (so [0,-20,0] shifts 20 mm
 toward camera); for "YZ" the normal is +X. To translate within the plane, use \`drawing.translate(dx, dy)\` before \`sketchOnPlane\`, not the origin arg.
 
+Pen axis mapping (sketchOnPlane):
+  Plane  | pen h → world | pen v → world | extrudes toward
+  XY     | +X            | +Y            | +Z
+  YX     | +Y            | +X            | -Z
+  XZ     | +X            | +Z            | -Y
+  ZX     | +Z            | +X            | +Y
+  YZ     | +Y            | +Z            | +X
+  ZY     | +Z            | +Y            | -X
+
+Example (non-XY): drawRoundedRectangle(60, 30).sketchOnPlane("XZ").extrude(20)
+  → the 60mm side lies along world X, the 30mm side along world Z, extrude pushes 20mm toward -Y.
+  → If you want the sketch's "h" to walk world Z instead, pick plane "ZX".
+
 ## Composition Patterns
 
 All draw* factories return an origin-centered Drawing — most "constraint" questions
@@ -6426,6 +6643,7 @@ holes.tapped(size, { depth, axis? })                       // tap-drill sized (m
 holes.threaded(size, { depth, axis? })                     // FDM: threaded hole — screw self-taps into tap-drill hole (preferred over modeled threads at M2–M5)
 holes.teardrop(size, { depth, axis? })                     // horizontal hole, FDM-printable (axis: "+X"|"+Y")
 holes.keyhole({ largeD, smallD, slot, depth, axis? })      // hang-on-screw mount
+// axis names the face where the mouth opens; body penetrates opposite. Large circle centres on translate target; small-capture offsets along slot (rotated by axis). Example: wall.cut(holes.keyhole({ largeD: 10, smallD: 4, slot: 6, depth: 4, axis: '+X' }).translate(thickness, y, z))
 holes.slot({ length, width, depth, axis? })                // elongated hole
 \`\`\`
 
@@ -6590,11 +6808,11 @@ don't have to pick +Z vs -Z manually:
 
 | Helper | Role | Default axis |
 |---|---|---|
-| \`faceAt(z)\` | \`"face"\` | \`"+Z"\` |
-| \`shaftAt(z, diameter)\` | \`"male"\` | \`"+Z"\` |
-| \`boreAt(z, diameter)\` | \`"female"\` | \`"-Z"\` |
+| \`faceAt(z, { axis?, xy? })\` | \`"face"\` | \`"+Z"\` |
+| \`shaftAt(z, diameter, { axis?, xy? })\` | \`"male"\` | \`"+Z"\` |
+| \`boreAt(z, diameter, { axis?, xy? })\` | \`"female"\` | \`"-Z"\` |
 
-Pass \`{ axis: "-Z" }\` (or any other) to override the default.
+Pass \`{ axis: "-Z" }\` (or any other) to override the default. \`xy?: [number, number]\` off-centres the joint within the Z plane — essential for multi-joint parts on vertical walls or corner pivots (e.g. \`faceAt(50, { axis: "+X", xy: [-30, 10] })\`).
 
 **\`mate()\` pre-flight**: throws if male/female roles are incompatible, if
 face/face is mixed with male/female, or if matched diameters differ by
