@@ -61,6 +61,21 @@ interface BundleCacheEntry {
   inputMtimes: Record<string, number>;
 }
 
+/**
+ * Scan source for local `import ... from './...'` and `import './...'` statements,
+ * returning the array of relative specifiers. Used by checkBundleCache to detect
+ * new imports not yet tracked in `inputMtimes` (new-import bug fix).
+ */
+function extractLocalImportSpecifiers(source: string): string[] {
+  const re = /\bfrom\s+['"](\.[^'"]+)['"]/g;
+  const sideEffect = /\bimport\s+['"](\.[^'"]+)['"]/g;
+  const specs: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) specs.push(m[1]);
+  while ((m = sideEffect.exec(source)) !== null) specs.push(m[1]);
+  return specs;
+}
+
 export class ViewerProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private panel?: vscode.WebviewPanel;
@@ -697,6 +712,23 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       }
     } catch (e: any) {
       return `stat failed: ${e?.message ?? String(e)}`;
+    }
+    // New-import bug fix: detect local imports in the live entry source that are
+    // not tracked in inputMtimes. If the user added `import './newfile.ts'` since
+    // the last bundle, the new file was never in the cache and we must miss.
+    const entryDir = path.dirname(entry.entryPath);
+    const localSpecs = extractLocalImportSpecifiers(liveCode);
+    for (const spec of localSpecs) {
+      const candidates = [spec, `${spec}.ts`, `${spec}.shape.ts`].map((s) =>
+        path.isAbsolute(s) ? s : path.resolve(entryDir, s),
+      );
+      const tracked = Object.keys(entry.inputMtimes);
+      const inCache = candidates.some((c) =>
+        tracked.some((t) => t.toLowerCase() === c.toLowerCase()),
+      );
+      if (!inCache) {
+        return `new local import not in cache: ${spec}`;
+      }
     }
     return null;
   }

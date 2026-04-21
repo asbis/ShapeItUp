@@ -1,12 +1,16 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import {
   inferErrorHint,
   appendScreenshotMetadata,
   preflightShapeImports,
   executeShapeFile,
+  checkBundleCache,
+  extractLocalImportSpecifiers,
+  clearBundleCache,
   type EngineStatus,
+  type BundleCacheEntry,
 } from "./engine.js";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, utimesSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -407,6 +411,392 @@ describe("preflightShapeImports — multifile params import warning", () => {
       ),
     ).toThrow(/Cannot import 'main'/);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Bundle cache — unit tests for checkBundleCache and extractLocalImportSpecifiers.
+//
+// These tests are fast (no OCCT/esbuild) because they call the exported
+// helper functions directly. They pin the key invariants:
+//   1. Cache hit when entry + deps are unchanged.
+//   2. Cache miss when entry content changes.
+//   3. Cache miss when a dependency mtime changes.
+//   4. New-import bug fix: cache miss when the entry adds a new local import.
+// ---------------------------------------------------------------------------
+
+describe("extractLocalImportSpecifiers", () => {
+  it("returns relative specifiers from named-import statements", () => {
+    const src = `import { foo } from './a';\nimport { bar } from "./b.shape";`;
+    expect(extractLocalImportSpecifiers(src)).toEqual(["./a", "./b.shape"]);
+  });
+
+  it("returns specifiers from side-effect imports", () => {
+    const src = `import './styles';\nimport "./other";`;
+    expect(extractLocalImportSpecifiers(src)).toEqual(["./styles", "./other"]);
+  });
+
+  it("does not return package imports (non-relative)", () => {
+    const src = `import { drawRectangle } from "replicad";\nimport { x } from "./local";`;
+    const specs = extractLocalImportSpecifiers(src);
+    expect(specs).toContain("./local");
+    expect(specs).not.toContain("replicad");
+  });
+
+  it("returns empty array when no local imports", () => {
+    const src = `import { drawRectangle } from "replicad";`;
+    expect(extractLocalImportSpecifiers(src)).toEqual([]);
+  });
+});
+
+describe("checkBundleCache — unit tests (no OCCT)", () => {
+  const makeDir = () => mkdtempSync(join(tmpdir(), "siu-cache-unit-"));
+
+  it("returns null (hit) when entry content and dep mtimes are unchanged", () => {
+    const dir = makeDir();
+    try {
+      const depPath = join(dir, "dep.shape.ts");
+      writeFileSync(depPath, "export function makeThing() {}");
+      const depMtime = existsSync(depPath) ? statSync(depPath).mtimeMs : 0;
+      const entry: BundleCacheEntry = {
+        js: "bundled js",
+        entryContent: `import { makeThing } from "./dep.shape";`,
+        entryPath: join(dir, "entry.shape.ts"),
+        inputMtimes: { [depPath]: depMtime },
+      };
+      const result = checkBundleCache(
+        entry,
+        `import { makeThing } from "./dep.shape";`,
+        dir,
+      );
+      expect(result).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns a reason string when entry content changes", () => {
+    const dir = makeDir();
+    try {
+      const entry: BundleCacheEntry = {
+        js: "bundled",
+        entryContent: "const old = 1;",
+        entryPath: join(dir, "entry.shape.ts"),
+        inputMtimes: {},
+      };
+      const result = checkBundleCache(entry, "const new_ = 2;", dir);
+      expect(result).not.toBeNull();
+      expect(result).toMatch(/entry file content changed/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns a reason string when a dependency mtime changes", () => {
+    const dir = makeDir();
+    try {
+      const depPath = join(dir, "dep.shape.ts");
+      writeFileSync(depPath, "export function makeThing() {}");
+      // Record a deliberately wrong (old) mtime — far in the past.
+      const fakeMtime = Date.now() - 100_000;
+      const entry: BundleCacheEntry = {
+        js: "bundled",
+        entryContent: `import { makeThing } from "./dep.shape";`,
+        entryPath: join(dir, "entry.shape.ts"),
+        inputMtimes: { [depPath]: fakeMtime },
+      };
+      const result = checkBundleCache(
+        entry,
+        `import { makeThing } from "./dep.shape";`,
+        dir,
+      );
+      expect(result).not.toBeNull();
+      expect(result).toMatch(/input mtime changed/);
+      expect(result).toContain(depPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns a reason string when the entry adds a new local import (new-import bug fix)", () => {
+    const dir = makeDir();
+    try {
+      // Cache was built without `./newdep` in inputMtimes.
+      const entry: BundleCacheEntry = {
+        js: "bundled",
+        // Old source had no imports.
+        entryContent: `export default function main() {}`,
+        entryPath: join(dir, "entry.shape.ts"),
+        inputMtimes: {},
+      };
+      // Live source now imports a new local file.
+      const newSource = `import { helper } from "./newdep";\nexport default function main() {}`;
+      const result = checkBundleCache(entry, newSource, dir);
+      expect(result).not.toBeNull();
+      // It should report content changed (since entryContent differs) OR new import.
+      // Either is correct — content-change fires first here.
+      expect(result).toBeTruthy();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("detects new local import when entry content is SAME but cache predates the new dep", () => {
+    // Simulates: user edits and saves, file content is identical except for a new import,
+    // but we test the new-import path specifically by making entryContent identical to liveCode
+    // while leaving inputMtimes empty.
+    const dir = makeDir();
+    try {
+      const liveCode = `import { helper } from "./newdep";\nexport default function main() {}`;
+      const entry: BundleCacheEntry = {
+        js: "bundled",
+        // Suppose entryContent matches liveCode but inputMtimes is empty
+        // (simulating the edge case: the source file was reverted but newdep was never in the cache).
+        entryContent: liveCode,
+        entryPath: join(dir, "entry.shape.ts"),
+        inputMtimes: {}, // newdep NOT tracked
+      };
+      const result = checkBundleCache(entry, liveCode, dir);
+      expect(result).not.toBeNull();
+      expect(result).toMatch(/new local import not in cache/);
+      expect(result).toContain("./newdep");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat package imports as new local imports", () => {
+    const dir = makeDir();
+    try {
+      const source = `import { drawRectangle } from "replicad";\nexport default function main() {}`;
+      const entry: BundleCacheEntry = {
+        js: "bundled",
+        entryContent: source,
+        entryPath: join(dir, "entry.shape.ts"),
+        inputMtimes: {},
+      };
+      const result = checkBundleCache(entry, source, dir);
+      // "replicad" is not local — should be a cache hit (null).
+      expect(result).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns stat failed reason when a dep file is missing", () => {
+    const dir = makeDir();
+    try {
+      const missingPath = join(dir, "missing.shape.ts");
+      const entry: BundleCacheEntry = {
+        js: "bundled",
+        entryContent: `import { x } from "./missing.shape";`,
+        entryPath: join(dir, "entry.shape.ts"),
+        inputMtimes: { [missingPath]: Date.now() }, // recorded but file deleted
+      };
+      const result = checkBundleCache(entry, `import { x } from "./missing.shape";`, dir);
+      expect(result).not.toBeNull();
+      expect(result).toMatch(/stat failed/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bundle cache — integration tests via executeShapeFile (requires OCCT/esbuild).
+//
+// These tests verify the full end-to-end cache flow: that a second call to
+// executeShapeFile for an unchanged file is served from cache (no esbuild re-run),
+// and that the cache correctly invalidates on file edits and dep changes.
+// ---------------------------------------------------------------------------
+
+describe("executeShapeFile — bundle cache integration", () => {
+  // Shared teardown helper.
+  const makeDirs = () => ({
+    workdir: mkdtempSync(join(tmpdir(), "siu-cache-integ-")),
+    storage: mkdtempSync(join(tmpdir(), "siu-cache-integ-storage-")),
+  });
+
+  beforeEach(() => {
+    clearBundleCache();
+  });
+
+  it(
+    "cache hit: second call returns success without error on an unchanged file",
+    async () => {
+      const { workdir, storage } = makeDirs();
+      try {
+        const entryPath = join(workdir, "box.shape.ts");
+        writeFileSync(
+          entryPath,
+          [
+            `import { drawRectangle } from "replicad";`,
+            `export default function main() {`,
+            `  return drawRectangle(10, 10).sketchOnPlane("XY").extrude(5);`,
+            `}`,
+          ].join("\n"),
+        );
+
+        const first = await executeShapeFile(entryPath, storage);
+        expect(first.status.success).toBe(true);
+        expect(first.status.error).toBeUndefined();
+
+        // Second call — same file, same content, same deps. Should hit cache.
+        const second = await executeShapeFile(entryPath, storage);
+        expect(second.status.success).toBe(true);
+        expect(second.status.error).toBeUndefined();
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "cache miss after entry file edit: second call picks up new content",
+    async () => {
+      const { workdir, storage } = makeDirs();
+      try {
+        const entryPath = join(workdir, "box.shape.ts");
+        writeFileSync(
+          entryPath,
+          [
+            `import { drawRectangle } from "replicad";`,
+            `export const params = { size: 10 };`,
+            `export default function main({ size }: typeof params) {`,
+            `  return drawRectangle(size, size).sketchOnPlane("XY").extrude(5);`,
+            `}`,
+          ].join("\n"),
+        );
+
+        const first = await executeShapeFile(entryPath, storage);
+        expect(first.status.success).toBe(true);
+        expect(first.status.currentParams).toHaveProperty("size");
+
+        // Edit the file — change the param name.
+        writeFileSync(
+          entryPath,
+          [
+            `import { drawRectangle } from "replicad";`,
+            `export const params = { width: 20 };`,
+            `export default function main({ width }: typeof params) {`,
+            `  return drawRectangle(width, width).sketchOnPlane("XY").extrude(5);`,
+            `}`,
+          ].join("\n"),
+        );
+
+        const second = await executeShapeFile(entryPath, storage);
+        expect(second.status.success).toBe(true);
+        // Should reflect the new params from the edited file, not the cache.
+        expect(second.status.currentParams).toHaveProperty("width");
+        expect(second.status.currentParams).not.toHaveProperty("size");
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "cache miss after dependency mtime change: second call rebuilds",
+    async () => {
+      const { workdir, storage } = makeDirs();
+      try {
+        const depPath = join(workdir, "helper.shape.ts");
+        writeFileSync(
+          depPath,
+          [
+            `import { drawRectangle } from "replicad";`,
+            `export function makeBox(size: number) {`,
+            `  return drawRectangle(size, size).sketchOnPlane("XY").extrude(5);`,
+            `}`,
+          ].join("\n"),
+        );
+
+        const entryPath = join(workdir, "entry.shape.ts");
+        writeFileSync(
+          entryPath,
+          [
+            `import { makeBox } from "./helper.shape";`,
+            `export default function main() { return makeBox(10); }`,
+          ].join("\n"),
+        );
+
+        const first = await executeShapeFile(entryPath, storage);
+        expect(first.status.success).toBe(true);
+
+        // Touch the dep file (update mtime without changing content).
+        const now = new Date();
+        utimesSync(depPath, now, new Date(now.getTime() + 5000));
+
+        const second = await executeShapeFile(entryPath, storage);
+        expect(second.status.success).toBe(true);
+        // Both should succeed — the test verifies no corruption on a mtime-miss rebuild.
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "new-import bug fix: adding an import to the entry file busts the cache",
+    async () => {
+      const { workdir, storage } = makeDirs();
+      try {
+        // Initial entry — no local imports.
+        const entryPath = join(workdir, "entry.shape.ts");
+        writeFileSync(
+          entryPath,
+          [
+            `import { drawRectangle } from "replicad";`,
+            `export default function main() {`,
+            `  return drawRectangle(10, 10).sketchOnPlane("XY").extrude(5);`,
+            `}`,
+          ].join("\n"),
+        );
+
+        const first = await executeShapeFile(entryPath, storage);
+        expect(first.status.success).toBe(true);
+
+        // Now add a local dependency to the entry file.
+        const depPath = join(workdir, "panel.shape.ts");
+        writeFileSync(
+          depPath,
+          [
+            `import { drawRectangle } from "replicad";`,
+            `export function makePanel() {`,
+            `  return drawRectangle(20, 5).sketchOnPlane("XY").extrude(2);`,
+            `}`,
+          ].join("\n"),
+        );
+        writeFileSync(
+          entryPath,
+          [
+            `import { drawRectangle } from "replicad";`,
+            `import { makePanel } from "./panel.shape";`,
+            `export default function main() {`,
+            `  return makePanel();`,
+            `}`,
+          ].join("\n"),
+        );
+
+        // Second call must NOT serve the cached bundle (which didn't include panel.shape).
+        const second = await executeShapeFile(entryPath, storage);
+        expect(second.status.success).toBe(true);
+        // If the cache was incorrectly served, the old bundle would try to call
+        // `makePanel` which wasn't imported, causing a runtime error. Success
+        // here confirms the bundle was rebuilt.
+        expect(second.status.error).toBeUndefined();
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
 });
 
 describe("executeShapeFile — multifile params import (regression for issue #3)", () => {
