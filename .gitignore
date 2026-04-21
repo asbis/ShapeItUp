@@ -19,3 +19,17 @@ Thumbs.db
 
 # Claude Code local state
 .claude/plans/
+.claude/worktrees/
+
+# Internal notes / backlog
+.ideas/
+
+# Feedback reports (local working notes, not source)
+/*-feedback-*.txt
+/cad-review-feedback-*.txt
+
+# Auto-generated preview images
+shapeitup-previews/
+
+# Accidental hand-written declaration shadowing instrumentation.ts
+packages/core/src/instrumentation.d.ts
