@@ -5,11 +5,15 @@ import { join, resolve, basename, dirname, isAbsolute, sep } from "path";
 import { homedir } from "os";
 import {
   appendScreenshotMetadata,
+  canonicalParamsKey,
   executeShapeFile,
   exportLastToFile,
   getCore,
   getLastFileName,
   getLastParts,
+  lookupMeshCache,
+  populateMeshCache,
+  readSourceForCacheKey,
   resetCore,
   type EngineStatus,
   type ShapeProperties,
@@ -1545,6 +1549,17 @@ function mergeSidecarOverrides(
  * those win over the sidecar. This keeps the new persistence behavior OUT of
  * engine.ts (single-responsibility: engine doesn't care about sidecars) and
  * OUT of every individual handler's call-site (no duplicate merge logic).
+ *
+ * Mesh-result cache: when source contents + merged params + meshQuality match
+ * a prior successful execution, we serve the cached outcome WITHOUT live OCCT
+ * shape handles (those are scrubbed before storage — see sanitizeOutcomeForCache
+ * in engine.ts). Callers that need `parts[i].shape.intersect(...)` /
+ * `.shape.faces` etc. (check_collisions, describe_geometry, preview_finder,
+ * sweep_check, export_shape) MUST pass `force: true` so the cache is bypassed
+ * and the engine re-runs end-to-end. The brief explicitly scopes this to the
+ * mesh-only inspection path (render_preview is the canonical hot caller) —
+ * `partStats: "full"` also forces, since cached entries were tessellated under
+ * the default `"bbox"` fast path and don't carry the OCCT-measured volumes.
  */
 async function executeWithPersistedParams(
   absPath: string,
@@ -1553,11 +1568,59 @@ async function executeWithPersistedParams(
    * Forwarded to {@link executeShapeFile}. Only `export_shape`'s BOM sidecar
    * currently opts in to `"full"` — every other caller omits the arg so the
    * default fast path stays in play.
+   *
+   * `force: true` skips the mesh cache lookup and repopulates after the
+   * underlying execute. Use this from any caller that downstream-derefs
+   * `parts[i].shape` (live OCCT handle) — the cache layer scrubs those.
    */
-  opts?: { partStats?: "none" | "bbox" | "full" },
+  opts?: { partStats?: "none" | "bbox" | "full"; force?: boolean },
 ): ReturnType<typeof executeShapeFile> {
   const merged = mergeSidecarOverrides(absPath, callOverrides);
-  return executeShapeFile(absPath, GLOBAL_STORAGE, merged, opts);
+  const force = opts?.force === true;
+  // partStats === "full" path needs OCCT-measured volumes that cached entries
+  // (tessellated at the default "bbox" level) don't carry. Treat as a force.
+  const needsFreshMeasurement = opts?.partStats === "full";
+  const paramsKey = canonicalParamsKey(merged);
+  // Fixed bucket for now — the MCP engine doesn't surface a meshQuality
+  // override; core auto-degrades on large assemblies. The extension-level
+  // screenshot cache (planned in the brief) layers above this on a richer
+  // key that includes meshQuality, renderMode, cameraAngle, etc.
+  const meshQuality = "default";
+
+  if (!force && !needsFreshMeasurement) {
+    const head = readSourceForCacheKey(absPath);
+    if (head) {
+      const hit = lookupMeshCache(absPath, head.sourceHash, paramsKey, meshQuality);
+      if (hit) {
+        process.stderr.write(
+          `[mesh-cache] hit absPath=${absPath} hits=${hit.hitCount}\n`,
+        );
+        return hit.result;
+      }
+    }
+  }
+
+  const outcome = await executeShapeFile(absPath, GLOBAL_STORAGE, merged, opts);
+
+  // Only cache successful outcomes. Re-read mtime/source AFTER execution so
+  // the entry tracks what was actually rendered, not whatever the file looked
+  // like before our pre-read above (the user could have edited mid-flight on
+  // a slow render — better to cache the snapshot the engine actually saw).
+  if (outcome.status.success && !needsFreshMeasurement) {
+    const tail = readSourceForCacheKey(absPath);
+    if (tail) {
+      populateMeshCache(
+        absPath,
+        tail.sourceHash,
+        tail.mtimeMs,
+        paramsKey,
+        meshQuality,
+        outcome,
+      );
+    }
+  }
+
+  return outcome;
 }
 
 // ---------------------------------------------------------------------------
@@ -2163,10 +2226,13 @@ export function registerTools(server: McpServer) {
       // force `partStats: "full"` so the tessellation loop populates
       // volume/mass via OCCT measurement; otherwise the fast `"bbox"` default
       // stays in play (a BOM with every volume = undefined would be useless).
+      // Force-bypass the mesh cache: exportLastToFile pulls live OCCT shapes
+      // from core's per-process state (set by the most recent execute), and a
+      // cache hit would leave that state pointing at a different file.
       const { status, parts: execParts } = await executeWithPersistedParams(
         source,
         undefined,
-        bom === true ? { partStats: "full" } : undefined,
+        bom === true ? { partStats: "full", force: true } : { force: true },
       );
       if (!status.success) {
         return {
@@ -3978,8 +4044,10 @@ export function registerTools(server: McpServer) {
         if (wsErr) return wsErr;
       }
 
-      // Step 1: execute the user's script to get the live OCCT parts.
-      const { status, parts } = await executeWithPersistedParams(absPath);
+      // Step 1: execute the user's script to get the live OCCT parts. Force-
+      // bypass the mesh cache: we hand `target.shape` to a finder.find() call
+      // below, which needs a live OCCT shape (cached entries scrub `.shape`).
+      const { status, parts } = await executeWithPersistedParams(absPath, undefined, { force: true });
       if (!status.success || !parts || parts.length === 0) {
         return {
           content: [{ type: "text" as const, text: `Cannot preview finder — script failed to render.\n${formatStatusText(status)}` }],
@@ -4244,8 +4312,10 @@ export function registerTools(server: McpServer) {
 
       // Step 1: execute the script to get live OCCT parts. Failure here is
       // surfaced via formatStatusText so the agent sees the engine's own
-      // error hint (fillet too large, wire not closed, etc.).
-      const { status, parts } = await executeWithPersistedParams(absPath);
+      // error hint (fillet too large, wire not closed, etc.). Force-bypass
+      // the mesh cache: the per-pair intersect() below dereferences
+      // `parts[i].shape` which the cache layer scrubs.
+      const { status, parts } = await executeWithPersistedParams(absPath, undefined, { force: true });
       if (!status.success || !parts) {
         return {
           content: [{ type: "text" as const, text: `Cannot check collisions — script failed to render.\n${formatStatusText(status)}` }],
@@ -4700,7 +4770,10 @@ export function registerTools(server: McpServer) {
 
         // Execute the script. Same path as check_collisions — failures surface
         // through formatStatusText so the agent sees the engine's own hints.
-        const { status, parts } = await executeWithPersistedParams(absPath);
+        // Force-bypass the mesh cache: the sweep loop calls
+        // `movingPart.shape.clone().rotate(...).intersect(...)` per step, all
+        // of which need a live OCCT shape (cached entries scrub `.shape`).
+        const { status, parts } = await executeWithPersistedParams(absPath, undefined, { force: true });
         if (!status.success || !parts) {
           return {
             content: [{ type: "text" as const, text: `Cannot sweep — script failed to render.\n${formatStatusText(status)}` }],
@@ -4918,8 +4991,11 @@ export function registerTools(server: McpServer) {
           };
         }
 
-        // Step 1: execute the user's script.
-        const { status, parts } = await executeWithPersistedParams(absPath);
+        // Step 1: execute the user's script. Force-bypass the mesh cache:
+        // the per-part loop reads `part.shape.faces` / `part.shape.edges` to
+        // walk the topology, both of which need a live OCCT shape (cached
+        // entries scrub `.shape`).
+        const { status, parts } = await executeWithPersistedParams(absPath, undefined, { force: true });
         if (!status.success || !parts || parts.length === 0) {
           return {
             content: [{ type: "text" as const, text: `Cannot describe geometry — script failed to render.\n${formatStatusText(status)}` }],
