@@ -653,6 +653,18 @@ describe("extractParamsStatic", () => {
     `;
     expect(extractParamsStatic(src)).toEqual(["thickness", "screwSize"]);
   });
+
+  it("extracts shorthand keys mixed with colon-form keys", () => {
+    // ES2015 shorthand: `{ a, b: 3, c }` — identifiers `a` and `c` are both
+    // the keys and the values. Without the shorthand branch, the regex
+    // ignored them and engine.ts wrongly reported every runtime param key
+    // as "not declared". See P2 in the 2026-04-21 knitting-printer review.
+    const src = `
+      export const params = { a, b: 3, c };
+      export default function main() { return 1; }
+    `;
+    expect(extractParamsStatic(src)).toEqual(["a", "b", "c"]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -750,6 +762,72 @@ describe("patchShapeCutNoOpGuard — warns when cut removes zero material", () =
     const result = target.cut({});
     expect(result._tag).toBe("cut-result");
     expect(drainRuntimeWarnings()).toEqual([]);
+  });
+
+  it("adds a directional shift hint when the cutter is disjoint BELOW the target on Z", () => {
+    // Exercises the axisDisjointHint directional-remediation suffix. The
+    // target sits at Z ∈ [-7.5, 7.5], cutter at Z ∈ [-12.95, -9.55] — the
+    // canonical scenario from the user feedback that motivated this fix.
+    // Gap = -7.5 - (-9.55) = 2.05 mm, so the hint should say
+    // "cutter is BELOW target" and suggest `+2.05 mm on Z`.
+    const { replicad, volumeMap, _3DShape } = makeFakeReplicad();
+    patchShapeCutNoOpGuard(replicad);
+
+    const target: any = new _3DShape();
+    const tool: any = new _3DShape();
+    volumeMap.set(target, 1000);
+    target.boundingBox = { bounds: [[-5, -5, -7.5], [5, 5, 7.5]] };
+    tool.boundingBox = { bounds: [[-2, -2, -12.95], [2, 2, -9.55]] };
+
+    target.cut(tool);
+    const warnings = drainRuntimeWarnings();
+    expect(warnings).toHaveLength(1);
+    // Original disjoint-range message is preserved verbatim.
+    expect(warnings[0]).toMatch(
+      /Target Z ∈ \[-7\.50, 7\.50\], cutter Z ∈ \[-12\.95, -9\.55\] — disjoint on Z axis\./,
+    );
+    // New directional suffix names the side and the exact shift magnitude.
+    expect(warnings[0]).toMatch(/Cutter is BELOW target/);
+    expect(warnings[0]).toMatch(/Translate the tool by \+2\.05 mm on Z/);
+    expect(warnings[0]).toMatch(/so its body overlaps the target/);
+  });
+
+  it("reports ABOVE / LEFT-OF / IN-FRONT-OF for the matching disjoint directions", () => {
+    const { replicad, volumeMap, _3DShape } = makeFakeReplicad();
+    patchShapeCutNoOpGuard(replicad);
+
+    // Cutter entirely above the target on Z — expect "ABOVE" and a negative Z shift.
+    const tAbove: any = new _3DShape();
+    const cAbove: any = new _3DShape();
+    volumeMap.set(tAbove, 500);
+    tAbove.boundingBox = { bounds: [[-5, -5, 0], [5, 5, 10]] };
+    cAbove.boundingBox = { bounds: [[-2, -2, 15], [2, 2, 20]] };
+    tAbove.cut(cAbove);
+    let w = drainRuntimeWarnings();
+    expect(w[0]).toMatch(/Cutter is ABOVE target/);
+    expect(w[0]).toMatch(/Translate the tool by -5\.00 mm on Z/);
+
+    // Cutter entirely to the LEFT on X (cutter.xmax < target.xmin).
+    const tLeft: any = new _3DShape();
+    const cLeft: any = new _3DShape();
+    volumeMap.set(tLeft, 500);
+    tLeft.boundingBox = { bounds: [[0, -5, 0], [10, 5, 5]] };
+    cLeft.boundingBox = { bounds: [[-20, -5, 0], [-15, 5, 5]] };
+    tLeft.cut(cLeft);
+    w = drainRuntimeWarnings();
+    expect(w[0]).toMatch(/Cutter is LEFT-OF target/);
+    expect(w[0]).toMatch(/Translate the tool by \+15\.00 mm on X/);
+
+    // Cutter entirely IN-FRONT-OF the target on Y (cutter.ymax < target.ymin).
+    const tFront: any = new _3DShape();
+    const cFront: any = new _3DShape();
+    volumeMap.set(tFront, 500);
+    tFront.boundingBox = { bounds: [[-5, 0, 0], [5, 10, 5]] };
+    cFront.boundingBox = { bounds: [[-2, -20, 0], [2, -15, 5]] };
+    tFront.cut(cFront);
+    w = drainRuntimeWarnings();
+    expect(w[0]).toMatch(/Cutter is IN-FRONT-OF target/);
+    expect(w[0]).toMatch(/Translate the tool by \+15\.00 mm on Y/);
   });
 
   it("emits NO warning when input-volume measurement is unavailable", () => {
@@ -947,14 +1025,17 @@ describe("executeScript — multi-file entry disambiguation", () => {
     const g = globalThis as any;
     g.__SHAPEITUP_ENTRY_MAIN__ = undefined;
     g.__SHAPEITUP_ENTRY_PARAMS__ = undefined;
+    g.__SHAPEITUP_ENTRY_SENTINEL__ = undefined;
   });
 
   it("prefers the canonical __SHAPEITUP_ENTRY_MAIN__ marker over a bare bundled `main`", () => {
     // Simulate what a bundled multi-file script looks like after esbuild has
-    // renamed the imported module's main to `main2`, and the footer has
-    // stamped the entry's `main` onto globalThis. The wrapped code still
-    // contains bare `main` and `params` declarations (for esbuild internal
-    // reasons), but the executor must pick the entry one.
+    // renamed the imported module's main to `main2`, and the synthetic
+    // wrapper has stamped the entry's `main` onto globalThis. The wrapped
+    // code still contains bare `main` and `params` declarations (for
+    // esbuild internal reasons), but the executor must pick the entry one
+    // — BUT only when the sentinel is set (P5 guard against stale markers
+    // leaking from a prior execution in long-lived processes).
     const g = globalThis as any;
     // The "wrong" bundled main — this is what would win under the old
     // ambient-lookup path if it happened to be last. We make it fail the
@@ -966,9 +1047,10 @@ describe("executeScript — multi-file entry disambiguation", () => {
       var params = { entryFromBare: 1 };
       export { main as default, params };
     `;
-    // Stamp the entry marker, mimicking the esbuild footer.
+    // Stamp the entry marker + sentinel, mimicking the synthetic wrapper.
     g.__SHAPEITUP_ENTRY_MAIN__ = () => "ENTRY_MAIN_FROM_MARKER";
     g.__SHAPEITUP_ENTRY_PARAMS__ = { entryFromMarker: 42 };
+    g.__SHAPEITUP_ENTRY_SENTINEL__ = true;
 
     const { result, params } = executeScript(js, {}, {});
     expect(result).toBe("ENTRY_MAIN_FROM_MARKER");
@@ -979,6 +1061,7 @@ describe("executeScript — multi-file entry disambiguation", () => {
     const g = globalThis as any;
     g.__SHAPEITUP_ENTRY_MAIN__ = () => 1;
     g.__SHAPEITUP_ENTRY_PARAMS__ = { a: 1 };
+    g.__SHAPEITUP_ENTRY_SENTINEL__ = true;
     const js = `
       function main() { return 99; }
       export { main as default };
@@ -986,6 +1069,7 @@ describe("executeScript — multi-file entry disambiguation", () => {
     executeScript(js, {}, {});
     expect(g.__SHAPEITUP_ENTRY_MAIN__).toBeUndefined();
     expect(g.__SHAPEITUP_ENTRY_PARAMS__).toBeUndefined();
+    expect(g.__SHAPEITUP_ENTRY_SENTINEL__).toBeUndefined();
   });
 
   it("falls back to bare `main` / `params` when no canonical markers are set", () => {

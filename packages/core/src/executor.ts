@@ -57,7 +57,15 @@ export function extractParamsStatic(sourceCode: string): string[] {
   // Match key: value pairs — key is a plain identifier or quoted string.
   // Anchor on either start-of-body or a preceding `,` / `{` so we don't
   // mistake an inner object literal's field for a top-level key.
-  const pairPattern = /(?:^|[,{])\s*(?:"([^"]+)"|'([^']+)'|(\w+))\s*:/g;
+  //
+  // Two trailing forms accepted:
+  //   1. `key:` — the classic `key: value` form (including quoted keys).
+  //   2. `key,` / `key}` / `key` at end-of-body — ES2015 shorthand
+  //      (`{ length, width }`) where the identifier IS the key. Without this
+  //      branch, `{ length, width, thickness }` extracts as zero keys and
+  //      every runtime param then looks "undeclared" to engine.ts.
+  const pairPattern =
+    /(?:^|[,{])\s*(?:"([^"]+)"|'([^']+)'|(\w+))\s*(?::|(?=\s*[,}])|\s*$)/g;
   let m: RegExpExecArray | null;
   while ((m = pairPattern.exec(body)) !== null) {
     const name = m[1] || m[2] || m[3];
@@ -312,22 +320,34 @@ export function executeScript(
 
       ${code}
 
-      // Prefer the canonical entry markers when present. The esbuild footer
-      // in both bundling call sites (viewer-provider.ts + engine.ts) assigns
-      // \`main\` and \`params\` from the ENTRY file's scope after esbuild's
-      // internal rename pass, so when the entry imports another .shape.ts
-      // that also exports a default \`main\`, we still pick the entry's.
+      // Prefer the canonical entry markers when present — but only when the
+      // synthetic-wrapper sentinel flag is set in this same bundle. Both
+      // bundling call sites (viewer-provider.ts + engine.ts) wrap the entry
+      // in a synthetic stdin module that namespace-imports the user's file
+      // and stamps __SHAPEITUP_ENTRY_MAIN__ / __SHAPEITUP_ENTRY_PARAMS__ /
+      // __SHAPEITUP_ENTRY_SENTINEL__ onto globalThis. The sentinel gate
+      // protects against two failure modes:
+      //   1. A stale marker left by a prior execution in a long-lived
+      //      process (MCP engine) leaking into a new script.
+      //   2. A hypothetical future bundler dropping the wrapper but
+      //      leaving the reader path — we must NOT pick up whatever
+      //      happens to live at that key.
       //
-      // We read the markers then delete them immediately so subsequent
-      // executions on the same process (MCP engine lives across tool
-      // invocations) don't leak a stale "last run's entry main" into a
-      // script that forgot to declare one of its own.
-      var __entryMain__ = (typeof globalThis !== "undefined" && globalThis.__SHAPEITUP_ENTRY_MAIN__) || undefined;
-      var __entryParams__ = (typeof globalThis !== "undefined" && globalThis.__SHAPEITUP_ENTRY_PARAMS__) || undefined;
+      // All three globals are cleared immediately after reading so the next
+      // execution starts from a clean slate even if its own wrapper fails
+      // to set them for some reason.
+      var __entrySentinel__ = (typeof globalThis !== "undefined" && globalThis.__SHAPEITUP_ENTRY_SENTINEL__ === true);
+      var __entryMain__ = __entrySentinel__
+        ? (typeof globalThis !== "undefined" ? globalThis.__SHAPEITUP_ENTRY_MAIN__ : undefined)
+        : undefined;
+      var __entryParams__ = __entrySentinel__
+        ? (typeof globalThis !== "undefined" ? globalThis.__SHAPEITUP_ENTRY_PARAMS__ : undefined)
+        : undefined;
       try {
         if (typeof globalThis !== "undefined") {
           globalThis.__SHAPEITUP_ENTRY_MAIN__ = undefined;
           globalThis.__SHAPEITUP_ENTRY_PARAMS__ = undefined;
+          globalThis.__SHAPEITUP_ENTRY_SENTINEL__ = undefined;
         }
       } catch (e) {}
 

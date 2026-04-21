@@ -29,6 +29,7 @@ import {
 } from "./instrumentation";
 import { shapeitupStdlib } from "./stdlib";
 import {
+  drainCutAtOutcomes,
   drainExtrudeHints,
   drainRuntimeWarnings,
   nextCutCallIndex,
@@ -107,6 +108,15 @@ export interface ExecutionResult {
    * "use this to derive mass". Absent otherwise.
    */
   material?: { density: number; name?: string };
+  /**
+   * Per-call material-removal outcomes from `patterns.cutAt`. `true` means the
+   * cut removed material; `false` means it was a no-op (placements outside the
+   * target bbox, or volumes equal before/after). Callers aggregate this into
+   * a single "N/M cutAt calls removed no material" line. Empty array when the
+   * script didn't call `patterns.cutAt` or when no call produced a measurable
+   * outcome (kernel-free mocks).
+   */
+  cutAtOutcomes?: boolean[];
 }
 
 /**
@@ -312,10 +322,74 @@ function axisDisjointHint(
       const base =
         ` Target ${axes[i]} ∈ [${tMin.toFixed(2)}, ${tMax.toFixed(2)}], ` +
         `cutter ${axes[i]} ∈ [${cMin.toFixed(2)}, ${cMax.toFixed(2)}] — disjoint on ${axes[i]} axis.`;
-      return base + extrudeMirrorTieBack(axes[i], tMin, tMax, cMin, cMax);
+      return (
+        base +
+        directionalShiftHint(axes[i], tMin, tMax, cMin, cMax) +
+        extrudeMirrorTieBack(axes[i], tMin, tMax, cMin, cMax)
+      );
     }
   }
   return "";
+}
+
+/**
+ * Append a directional remediation to the axis-disjoint message. The caller
+ * has already established that the bboxes are disjoint on `axis`; we describe
+ * which side the cutter sits on (BELOW/ABOVE for Z, LEFT-OF/RIGHT-OF for X,
+ * IN-FRONT-OF/BEHIND for Y) and compute the exact shift needed to bring the
+ * cutter into contact with the target. The gap is intentionally the minimum
+ * translate magnitude that would OVERLAP by one pixel — real users almost
+ * always want the body to overlap by more than that, so we round-up-to-mm and
+ * frame the suggestion as "by ~Nmm so its body overlaps".
+ *
+ * We intentionally avoid naming the axis-flip form (e.g. `+Z` → `-Z`) because
+ * `.cut()` has no axis parameter — the only unambiguous remediation at this
+ * call site is a translate. Higher-level callers that DO have an axis
+ * parameter (e.g. `holes.through({ axis })`) can layer their own hint on top.
+ */
+function directionalShiftHint(
+  axis: "X" | "Y" | "Z",
+  tMin: number,
+  tMax: number,
+  cMin: number,
+  cMax: number,
+): string {
+  // Label pairs keyed by axis. "below/above" reads naturally for Z but not
+  // for X/Y, where "left-of/right-of" and "in-front-of/behind" match how
+  // engineers describe lateral offsets on a CAD screen.
+  const labels: Record<"X" | "Y" | "Z", [string, string]> = {
+    X: ["LEFT-OF", "RIGHT-OF"],
+    Y: ["IN-FRONT-OF", "BEHIND"],
+    Z: ["BELOW", "ABOVE"],
+  };
+  const [lowLabel, highLabel] = labels[axis];
+  // Two disjoint cases — cutter entirely below the target (cMax < tMin), or
+  // cutter entirely above (cMin > tMax). The gap is targetMin - cutterMax
+  // in the first case, cutterMin - targetMax in the second — both positive
+  // by construction (we only enter this function when the ranges are
+  // disjoint, so exactly one of these conditions holds).
+  let direction: string;
+  let gap: number;
+  if (cMax < tMin) {
+    direction = lowLabel;
+    gap = tMin - cMax;
+  } else {
+    direction = highLabel;
+    gap = cMin - tMax;
+  }
+  // Guard against non-finite gap (shouldn't happen — readBoundsSafe filters
+  // non-finite bounds — but defensive math is cheap).
+  if (!Number.isFinite(gap) || gap <= 0) return "";
+  const shiftMag = gap.toFixed(2);
+  // Direction of the translate that fixes things: positive on `axis` if the
+  // cutter is on the low side (shift it up toward the target), negative if
+  // it's on the high side.
+  const shiftSign = cMax < tMin ? "+" : "-";
+  return (
+    ` Cutter is ${direction} target. ` +
+    `Translate the tool by ${shiftSign}${shiftMag} mm on ${axis} ` +
+    `(or adjust the placement sign) so its body overlaps the target.`
+  );
 }
 
 /**
@@ -740,6 +814,12 @@ export async function initCore(
     // first — they reflect events that happened during the user's script
     // and are almost always more actionable than the geometric checks.
     const stdlibWarnings = drainRuntimeWarnings();
+    // Drain the `patterns.cutAt` material-removal outcomes alongside the
+    // warning buffer — they're part of the same per-execution ledger and
+    // live in the same module (stdlib/warnings.ts). Attached to
+    // ExecutionResult.cutAtOutcomes so MCP's EngineStatus can aggregate
+    // them into the `hasRemovedMaterial` flag + status-text summary line.
+    const cutAtOutcomes = drainCutAtOutcomes();
 
     // Feature #3 (strict mode): when the script exports
     // `export const config = { strict: true }`, a curated set of
@@ -923,6 +1003,7 @@ export async function initCore(
       geometryValid,
       geometryIssues: geometryIssues.length > 0 ? geometryIssues : undefined,
       material,
+      cutAtOutcomes,
     };
   }
 

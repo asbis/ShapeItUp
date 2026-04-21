@@ -13,7 +13,23 @@
 import type { Shape3D } from "replicad";
 import * as replicad from "replicad";
 import type { Point3 } from "./standards";
-import { nextCutAtCallIndex, pushRuntimeWarning } from "./warnings";
+import { nextCutAtCallIndex, pushCutAtOutcome, pushRuntimeWarning } from "./warnings";
+
+/**
+ * Stamp `__generated__` onto a placement array so `cutAt` knows these came
+ * from one of the built-in pattern generators (polar/grid/linear/etc.).
+ * Generator-produced misses stay warnings — users may have computed the
+ * geometry from live parameters and a runtime "just a warning" is right.
+ * User-assembled explicit placements arrays are treated as assertions: a
+ * miss means a typo or bad math, which `cutAt` promotes to a thrown error.
+ *
+ * Non-enumerable so the marker doesn't leak into `JSON.stringify`, tests
+ * that snapshot placements, or downstream code that iterates keys.
+ */
+function markGenerated<T extends Placement[]>(arr: T): T {
+  Object.defineProperty(arr, "__generated__", { value: true, enumerable: false });
+  return arr;
+}
 
 /**
  * Extract a shape's axis-aligned bounding box as `[[minX,minY,minZ],[maxX,maxY,maxZ]]`.
@@ -169,7 +185,7 @@ export function polar(
     }
     placements.push(placement);
   }
-  return placements;
+  return markGenerated(placements);
 }
 
 /**
@@ -204,7 +220,7 @@ export function grid(
       });
     }
   }
-  return placements;
+  return markGenerated(placements);
 }
 
 /**
@@ -251,32 +267,126 @@ export function onPlane(
   const remap = (pt: Point3): Point3 =>
     plane === "YZ" ? [0, pt[0], pt[1]] : [pt[0], 0, pt[1]];
 
-  return placements.map((p) => {
+  const mapped = placements.map((p) => {
     const out: Placement = { translate: remap(p.translate) };
     if (p.rotate !== undefined) out.rotate = p.rotate;
     if (p.axis !== undefined) out.axis = remap(p.axis);
     return out;
   });
+  // `.map()` produces a fresh array that has lost the source's `__generated__`
+  // marker (non-enumerable properties aren't copied). Re-apply so a generator
+  // → onPlane pipeline still marks downstream as generator-produced.
+  return markGenerated(mapped);
 }
 
 /**
- * N placements along a direction vector, starting at the origin.
+ * Rectangular grid placed directly on a named principal plane — shorthand
+ * for `onPlane(grid(nx, ny, dx, dy), plane)`. The grid is centered on the
+ * plane's origin by default (matches `grid`'s own centering behaviour); pass
+ * `centered: false` to anchor the first placement at the plane origin
+ * instead.
  *
- *   linear(5, [10, 0, 0])  // 5 positions: (0,0,0), (10,0,0), ..., (40,0,0)
- *   linear(3, [0, 15, 0])  // 3 positions along +Y
+ *   // 4×3 vent pattern on the XZ wall of an enclosure, 8 mm × 6 mm spacing:
+ *   patterns.rectOnPlane({ plane: "XZ", nx: 4, ny: 3, dx: 8, dy: 6 })
+ *
+ *   // Uncentered 2×2 grid anchored at the YZ-plane origin:
+ *   patterns.rectOnPlane({ plane: "YZ", nx: 2, ny: 2, dx: 5, dy: 5, centered: false })
+ *
+ * Implementation composes {@link grid} + {@link onPlane} so any future
+ * improvement to either helper (e.g. hex-offset rows on `grid`) propagates
+ * here automatically.
+ *
+ * @param opts.plane Principal plane: `"XY" | "YZ" | "XZ"`.
+ * @param opts.nx Number of columns along the plane's first axis (≥ 1).
+ * @param opts.ny Number of rows along the plane's second axis (≥ 1).
+ * @param opts.dx Spacing along the plane's first axis (mm).
+ * @param opts.dy Spacing along the plane's second axis (mm).
+ * @param opts.centered Default `true` — matches `grid`'s built-in centering.
+ *   Pass `false` to anchor the first cell at `[0, 0]` on the plane.
+ */
+export function rectOnPlane(opts: {
+  plane: "XY" | "YZ" | "XZ";
+  nx: number;
+  ny: number;
+  dx: number;
+  dy: number;
+  centered?: boolean;
+}): Placement[] {
+  if (!opts || typeof opts !== "object") {
+    throw new TypeError(
+      `patterns.rectOnPlane: opts must be { plane, nx, ny, dx, dy }, got ${String(opts)}.`,
+    );
+  }
+  const { plane, nx, ny, dx, dy } = opts;
+  const centered = opts.centered ?? true;
+  // Delegate argument validation to `grid` — it already enforces nx/ny >= 1
+  // and inherits the usual NaN-vs-finite coverage via arithmetic. `onPlane`
+  // throws on unknown plane strings.
+  const base = grid(nx, ny, dx, dy);
+  if (!centered) {
+    // `grid` is always centered; shift each placement back by `(nx-1)/2 * dx`
+    // (and similarly on Y) to land the first cell at the plane-origin before
+    // we delegate to `onPlane`. Done pre-remap so the shift uses grid's native
+    // XY axes — `onPlane` then maps the whole pattern into the target plane.
+    const shiftX = ((nx - 1) / 2) * dx;
+    const shiftY = ((ny - 1) / 2) * dy;
+    for (const p of base) {
+      p.translate = [
+        p.translate[0] + shiftX,
+        p.translate[1] + shiftY,
+        p.translate[2],
+      ];
+    }
+  }
+  // `onPlane` already re-marks its mapped output and identity-returns the
+  // already-marked array for XY. Mark explicitly for the XY path too, in case
+  // a future onPlane refactor changes the identity contract.
+  return markGenerated(onPlane(base, plane));
+}
+
+/**
+ * N placements along a direction vector.
+ *
+ * Default layout begins at the origin:
+ *
+ *   linear(5, [10, 0, 0])                    // (0,0,0), (10,0,0), …, (40,0,0)
+ *   linear(3, [0, 15, 0])                    // 3 positions along +Y
+ *
+ * Pass `{ centered: true }` to shift the whole run so it's symmetric about
+ * the origin (matches `grid`, which is already centered):
+ *
+ *   linear(4, [10, 0, 0], { centered: true }) // (-15,0,0), (-5,0,0), (5,0,0), (15,0,0)
  *
  * @param n Number of positions (≥ 1).
- * @param step Translation applied cumulatively at each step.
+ * @param step Per-step translation (multiplied by the position index).
+ * @param opts.centered When true, offsets every placement by `-((n-1)/2)*step`
+ *   so the pattern is symmetric about the origin. Default `false` so existing
+ *   callers are unaffected.
  */
-export function linear(n: number, step: Point3): Placement[] {
+export function linear(
+  n: number,
+  step: Point3,
+  opts: { centered?: boolean } = {}
+): Placement[] {
   if (n < 1) throw new Error(`linear: n must be >= 1, got ${n}`);
+  // Centering offset: shifts every placement by `-((n-1)/2)*step` so indices
+  // `0..n-1` land symmetric about the origin. For odd n the middle index
+  // lands exactly at 0; for even n placements straddle 0 with half-step gaps.
+  const shift = opts.centered === true ? (n - 1) / 2 : 0;
+  // Normalize `-0` → `+0` on zero components. `step[i] * k` yields `-0` when
+  // either operand is -0 OR when step[i] is 0 and k is negative (IEEE-754).
+  // Downstream translate math doesn't care, but test assertions and JSON
+  // round-trips surface the sign — normalize here so the pattern data is
+  // clean.
+  const norm = (v: number): number => (v === 0 ? 0 : v);
   const placements: Placement[] = [];
   for (let i = 0; i < n; i++) {
+    const k = i - shift;
     placements.push({
-      translate: [step[0] * i, step[1] * i, step[2] * i],
+      translate: [norm(step[0] * k), norm(step[1] * k), norm(step[2] * k)],
     });
   }
-  return placements;
+  return markGenerated(placements);
 }
 
 /**
@@ -323,7 +433,7 @@ export function linearAlongAxis(
       axis === "Z" ? mid : 0,
     ];
     placements.push({ translate: t });
-    return placements;
+    return markGenerated(placements);
   }
   const step = (end - start) / (count - 1);
   for (let i = 0; i < count; i++) {
@@ -336,7 +446,7 @@ export function linearAlongAxis(
       ],
     });
   }
-  return placements;
+  return markGenerated(placements);
 }
 
 /**
@@ -596,28 +706,51 @@ export function cutAt(
       ? `[${indices.join(", ")}]`
       : `[${indices.slice(0, 8).join(", ")}, ... ${indices.length - 8} more]`;
 
+  // Severity promotion (P9): generator-produced placement arrays carry a
+  // non-enumerable `__generated__` marker (see markGenerated in this file).
+  // Arrays built by hand (e.g. user-listed `[{ translate: [...] }, ...]`)
+  // don't have the marker — those are treated as explicit assertions, so a
+  // miss indicates a typo or bad math that should fail the render loudly
+  // rather than silently warn. Generator misses stay warnings because users
+  // often compute placements from live params and a warning is the right
+  // severity for "your math puts some copies outside the target".
+  const isExplicit = !(placements as any).__generated__;
+
   if (checkedCount > 0 && disjointCount === checkedCount) {
     // When every placement fails, the index list is largely redundant
     // ("all of them") — but for small arrays it's still mildly useful as
     // a sanity check (did the count match what the caller passed in?).
     // Skip it for brevity once the user obviously needs to re-examine
     // placement coordinates rather than individual indices.
-    pushRuntimeWarning(
+    const msg =
       `${label}: all ${checkedCount} tool placement${checkedCount === 1 ? "" : "s"} ` +
-        `${checkedCount === 1 ? "was" : "were"} outside the target's bounding box — no material removed. ` +
-        `Check placement coordinates against the target's position.`
-    );
+      `${checkedCount === 1 ? "was" : "were"} outside the target's bounding box — no material removed. ` +
+      `Check placement coordinates against the target's position.`;
+    if (isExplicit) {
+      // Record the outcome BEFORE throwing so aggregate reporting still
+      // includes the failed call (cutAt never returned a shape).
+      pushCutAtOutcome(false);
+      throw new Error(`[patterns.cutAt] ${msg}`);
+    }
+    pushRuntimeWarning(msg);
+    pushCutAtOutcome(false);
   } else if (disjointCount > 0) {
-    pushRuntimeWarning(
+    const msg =
       `${label}: ${disjointCount} of ${checkedCount} tool placements were outside the target's bounding box — ` +
-        `those cuts removed no material. Failed placement indices: ${formatFailedIndices(failedIndices)}.`
-    );
+      `those cuts removed no material. Failed placement indices: ${formatFailedIndices(failedIndices)}.`;
+    if (isExplicit) {
+      pushCutAtOutcome(false);
+      throw new Error(`[patterns.cutAt] ${msg}`);
+    }
+    pushRuntimeWarning(msg);
+    pushCutAtOutcome(false);
   }
 
   // Post-cut volume no-op guard. Only fires when we have BOTH a before and
   // after measurement AND neither bbox-disjoint warning fired (otherwise
   // we'd double-warn). Tolerance: 1e-6 mm³ — below OCCT's own measurement
   // noise floor on well-formed solids, so any real material removal beats it.
+  let volumeGuardFired = false;
   if (
     disjointCount === 0 &&
     typeof inputVolume === "number" &&
@@ -628,6 +761,7 @@ export function cutAt(
       typeof outputVolume === "number" &&
       Math.abs(outputVolume - inputVolume) < 1e-6
     ) {
+      volumeGuardFired = true;
       // Per-axis diagnostic using the first observed tool bbox. When the
       // cutter and target overlap on every axis the hint is empty — the
       // no-op is caused by something subtler (interior placement, tolerance)
@@ -635,15 +769,37 @@ export function cutAt(
       let axisHint = "";
       if (targetBounds && firstToolBounds) {
         const axes = ["X", "Y", "Z"] as const;
+        // Human-readable direction labels per axis. Matches the index-level
+        // `directionalShiftHint` wording so the two warning paths read the
+        // same way to engineers comparing raw `.cut()` vs `patterns.cutAt`.
+        const labels: Record<"X" | "Y" | "Z", [string, string]> = {
+          X: ["LEFT-OF", "RIGHT-OF"],
+          Y: ["IN-FRONT-OF", "BEHIND"],
+          Z: ["BELOW", "ABOVE"],
+        };
         for (let i = 0; i < 3; i++) {
           const tMin = targetBounds[0][i];
           const tMax = targetBounds[1][i];
           const cMin = firstToolBounds[0][i];
           const cMax = firstToolBounds[1][i];
           if (cMax < tMin || cMin > tMax) {
+            const axis = axes[i];
+            const [lowLabel, highLabel] = labels[axis];
+            const below = cMax < tMin;
+            const direction = below ? lowLabel : highLabel;
+            const gap = below ? tMin - cMax : cMin - tMax;
+            const shiftSign = below ? "+" : "-";
+            let shiftLine = "";
+            if (Number.isFinite(gap) && gap > 0) {
+              shiftLine =
+                `\n  Cutter is ${direction} target. ` +
+                `Translate the tool by ${shiftSign}${gap.toFixed(2)} mm on ${axis} ` +
+                `(or adjust the placement sign) so its body overlaps the target.`;
+            }
             axisHint =
-              `\n  Target ${axes[i]} ∈ [${tMin.toFixed(2)}, ${tMax.toFixed(2)}], ` +
-              `cutter ${axes[i]} ∈ [${cMin.toFixed(2)}, ${cMax.toFixed(2)}] — disjoint on ${axes[i]} axis.`;
+              `\n  Target ${axis} ∈ [${tMin.toFixed(2)}, ${tMax.toFixed(2)}], ` +
+              `cutter ${axis} ∈ [${cMin.toFixed(2)}, ${cMax.toFixed(2)}] — disjoint on ${axis} axis.` +
+              shiftLine;
             break;
           }
         }
@@ -656,6 +812,15 @@ export function cutAt(
           `  - the cutter is inside the solid but smaller than the measurement tolerance` +
           axisHint
       );
+      pushCutAtOutcome(false);
+    } else if (
+      typeof outputVolume === "number" &&
+      outputVolume < inputVolume
+    ) {
+      // Material actually came off — record a success outcome so the
+      // aggregate "N/M cutAt calls removed no material" summary in MCP
+      // knows this call was healthy.
+      pushCutAtOutcome(true);
     }
   }
 

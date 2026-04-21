@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import * as patterns from "./patterns";
-import { drainRuntimeWarnings, resetRuntimeWarnings } from "./warnings";
+import { drainCutAtOutcomes, drainRuntimeWarnings, resetRuntimeWarnings } from "./warnings";
 
 // Mock the `replicad` module used by patterns.ts for volume measurement.
 // patterns.ts reads `measureShapeVolumeProperties` off the module; we stub
@@ -100,6 +100,79 @@ describe("patterns.onPlane — plane remapper", () => {
 });
 
 // ---------------------------------------------------------------------------
+// `patterns.rectOnPlane` — composed grid + plane remap.
+// ---------------------------------------------------------------------------
+
+describe("patterns.rectOnPlane", () => {
+  it("exports `rectOnPlane`", () => {
+    expect(typeof patterns.rectOnPlane).toBe("function");
+  });
+
+  it("produces a centered nx*ny grid on the requested plane", () => {
+    // 3 columns × 2 rows with 10×5 spacing → nx*ny = 6 placements.
+    const out = patterns.rectOnPlane({
+      plane: "XZ",
+      nx: 3,
+      ny: 2,
+      dx: 10,
+      dy: 5,
+    });
+    expect(out).toHaveLength(6);
+
+    // XZ remap: base grid (XY) translate [x, y, 0] → [x, 0, y]. So every
+    // placement should live on the XZ plane (y == 0) with the 2-axis
+    // component coming from the original y.
+    for (const p of out) {
+      expect(p.translate[1]).toBe(0);
+    }
+
+    // Centered 3×2 grid values:
+    //   X ∈ {-10, 0, 10},  originalY ∈ {-2.5, 2.5}
+    // After XZ remap, Z picks up the originalY values.
+    const xz = out.map((p) => [p.translate[0], p.translate[2]]);
+    const expected = [
+      [-10, -2.5], [0, -2.5], [10, -2.5],
+      [-10, 2.5],  [0, 2.5],  [10, 2.5],
+    ];
+    expect(xz).toEqual(expected);
+  });
+
+  it("returns non-XY translate vectors for a YZ-plane rect", () => {
+    const out = patterns.rectOnPlane({
+      plane: "YZ",
+      nx: 2,
+      ny: 2,
+      dx: 6,
+      dy: 8,
+    });
+    // Every placement lives on the YZ plane (x == 0) and has at least one
+    // non-zero component in Y or Z.
+    for (const p of out) {
+      expect(p.translate[0]).toBe(0);
+      expect(p.translate[1] !== 0 || p.translate[2] !== 0).toBe(true);
+    }
+  });
+
+  it("uncentered anchors the first cell at the plane-origin", () => {
+    const out = patterns.rectOnPlane({
+      plane: "XY",
+      nx: 2,
+      ny: 2,
+      dx: 4,
+      dy: 4,
+      centered: false,
+    });
+    // First cell at [0, 0, 0], spacing 4 along both axes.
+    expect(out.map((p) => p.translate)).toEqual([
+      [0, 0, 0],
+      [4, 0, 0],
+      [0, 4, 0],
+      [4, 4, 0],
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // `patterns.cutAt` — runtime warnings for silent no-op cuts.
 //
 // Builds synthetic Shape3D stand-ins exposing just enough surface
@@ -149,17 +222,17 @@ describe("patterns.cutAt — silent no-op guards", () => {
     expect(drainRuntimeWarnings()).toEqual([]);
   });
 
-  it("warns when every placement is outside the target bounding box", () => {
+  it("warns when every placement is outside the target bounding box (generator-produced)", () => {
     // Target at origin; tools placed far outside (cut is a no-op).
     // Use cut-strategy "noop" so .cut returns identical volume — matches
     // reality for disjoint cutters.
     const target = mockShape([[-10, -10, 0], [10, 10, 5]], 1000, "noop");
     // Tool bounds start at x=100, so every placement remains disjoint.
     const tool = mockShape([[100, 100, 0], [110, 110, 5]], 10);
-    patterns.cutAt(target, () => tool, [
-      { translate: [0, 0, 0] },
-      { translate: [0, 0, 0] },
-    ]);
+    // Use a pattern generator so the array carries the `__generated__` marker
+    // — generator output keeps the warning severity (explicit placements
+    // throw; tested separately below).
+    patterns.cutAt(target, () => tool, patterns.linear(2, [0, 0, 0]));
     const warnings = drainRuntimeWarnings();
     // Bbox guard fires first — that's the one we care about here.
     expect(warnings.length).toBeGreaterThanOrEqual(1);
@@ -182,11 +255,30 @@ describe("patterns.cutAt — silent no-op guards", () => {
     expect(warnings[0]).toMatch(/sketchOnPlane\("XZ"\)\.extrude/);
   });
 
+  it("volume-equal warning has no directional axisHint when bboxes overlap on every axis", () => {
+    // Sanity-pin the patterns.cutAt axis-hint path: when every placement's
+    // bbox overlaps the target (so the volume guard is the one that fires),
+    // the `firstToolBounds`-based axisHint finds no disjoint axis and stays
+    // empty. This documents the intended symmetry with the index-level
+    // `axisDisjointHint` — the directional suffix only appears when there's
+    // a real axis mismatch to report.
+    const target = mockShape([[-10, -10, 0], [10, 10, 5]], 1000, "noop");
+    const tool = mockShape([[-1, -1, 0], [1, 1, 5]], 10);
+    patterns.cutAt(target, () => tool, [{ translate: [0, 0, 0] }]);
+    const warnings = drainRuntimeWarnings();
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toMatch(/no material removal/);
+    // With overlapping bboxes the directional hint MUST NOT be added.
+    expect(warnings[0]).not.toMatch(/Cutter is (BELOW|ABOVE|LEFT-OF|RIGHT-OF|IN-FRONT-OF|BEHIND) target/);
+  });
+
   it("skips the volume guard when the bbox-disjoint warning already fired", () => {
     // Don't double-warn when the bbox guard has already told the user why.
+    // Use a generator-produced placement array so the miss stays a warning
+    // rather than being promoted to a throw (P9 severity change).
     const target = mockShape([[-10, -10, 0], [10, 10, 5]], 1000, "noop");
     const tool = mockShape([[100, 100, 0], [110, 110, 5]], 10);
-    patterns.cutAt(target, () => tool, [{ translate: [0, 0, 0] }]);
+    patterns.cutAt(target, () => tool, patterns.linear(1, [0, 0, 0]));
     const warnings = drainRuntimeWarnings();
     expect(warnings.length).toBe(1);
     expect(warnings[0]).toMatch(/outside the target's bounding box/);
@@ -205,10 +297,11 @@ describe("patterns.cutAt — silent no-op guards", () => {
     patterns.cutAt(target, () => tool, [{ translate: [0, 0, 0] }]);
     drainRuntimeWarnings();
 
-    // Third call is disjoint — should warn as call #3.
+    // Third call is disjoint — should warn as call #3. Use generator output
+    // so the severity stays at warning (explicit arrays throw per P9).
     const noopTarget = mockShape([[-10, -10, 0], [10, 10, 5]], 1000, "noop");
     const farTool = mockShape([[100, 100, 0], [110, 110, 5]], 10);
-    patterns.cutAt(noopTarget, () => farTool, [{ translate: [0, 0, 0] }]);
+    patterns.cutAt(noopTarget, () => farTool, patterns.linear(1, [0, 0, 0]));
     const warnings = drainRuntimeWarnings();
     expect(warnings.length).toBe(1);
     expect(warnings[0]).toMatch(/^patterns\.cutAt call #3:/);
@@ -217,7 +310,8 @@ describe("patterns.cutAt — silent no-op guards", () => {
   it("prefers the caller-supplied `name` over the call ordinal", () => {
     const target = mockShape([[-10, -10, 0], [10, 10, 5]], 1000, "noop");
     const tool = mockShape([[100, 100, 0], [110, 110, 5]], 10);
-    patterns.cutAt(target, () => tool, [{ translate: [0, 0, 0] }], {
+    // Generator output so the disjoint miss stays a warning.
+    patterns.cutAt(target, () => tool, patterns.linear(1, [0, 0, 0]), {
       name: "motor-mount-holes",
     });
     const warnings = drainRuntimeWarnings();
@@ -329,7 +423,8 @@ describe("patterns.cutAt — silent no-op guards", () => {
     const factory = () =>
       cutter.rotate(90, [0, 0, 0], [1, 0, 0]).translate(0, 100, 20);
 
-    patterns.cutAt(target, factory, [{ translate: [0, 0, 0] }]);
+    // Generator-produced so disjoint stays a warning (P9).
+    patterns.cutAt(target, factory, patterns.linear(1, [0, 0, 0]));
     const warnings = drainRuntimeWarnings();
     expect(warnings.length).toBeGreaterThanOrEqual(1);
     expect(
@@ -377,6 +472,127 @@ describe("patterns.cutAt — silent no-op guards", () => {
       // @ts-expect-error — see above
       patterns.cutAt(target, tool, [{ translate: [0, 0, 0] }]),
     ).toThrow(/must be a factory function/);
+  });
+
+  // -------------------------------------------------------------------------
+  // P9 — severity promotion for explicit (non-generator) placement arrays.
+  //
+  // Generator output (polar/grid/linear/...) is brand-marked `__generated__`
+  // so a bbox miss stays a (loud) warning — users routinely compute copies
+  // from live params and the math can legitimately drift outside. A
+  // hand-authored `[{ translate: [...] }, ...]` is treated as an assertion:
+  // a miss indicates a typo or sign error, which should fail the render
+  // loudly so the engineer can't miss it in a 71-part assembly log.
+  // -------------------------------------------------------------------------
+  it("THROWS when every explicit placement misses the target bbox", () => {
+    const target = mockShape([[-10, -10, 0], [10, 10, 5]], 1000, "noop");
+    const tool = mockShape([[100, 100, 0], [110, 110, 5]], 10);
+    expect(() =>
+      patterns.cutAt(target, () => tool, [{ translate: [0, 0, 0] }]),
+    ).toThrow(/\[patterns\.cutAt\]/);
+    expect(() =>
+      patterns.cutAt(target, () => tool, [{ translate: [0, 0, 0] }]),
+    ).toThrow(/outside the target's bounding box/);
+  });
+
+  it("THROWS when some (but not all) explicit placements miss the target bbox", () => {
+    const target = mockShape([[-10, -10, 0], [10, 10, 5]], 1000, "noop");
+    // Two tools at different world positions — one over the target, one far
+    // outside. The .cut() path keeps volume identical (noop strategy), so
+    // it's purely the bbox-disjoint path that fires.
+    const farTool = mockShape([[100, 100, 0], [110, 110, 5]], 10);
+    const nearTool = mockShape([[-1, -1, 0], [1, 1, 5]], 10);
+    // The mock's factory returns a single tool; to simulate per-placement
+    // tool geometry we use a stateful factory.
+    let callN = 0;
+    const factory = () => (callN++ === 0 ? nearTool : farTool);
+    expect(() =>
+      patterns.cutAt(target, factory, [
+        { translate: [0, 0, 0] },
+        { translate: [0, 0, 0] },
+      ]),
+    ).toThrow(/\[patterns\.cutAt\]/);
+  });
+
+  it("does NOT throw when a generator placement array is all-disjoint — stays a warning", () => {
+    // Identical geometry to the explicit-miss test above, but with a
+    // generator-produced placement array → severity stays at warning.
+    const target = mockShape([[-10, -10, 0], [10, 10, 5]], 1000, "noop");
+    const tool = mockShape([[100, 100, 0], [110, 110, 5]], 10);
+    expect(() =>
+      patterns.cutAt(target, () => tool, patterns.linear(2, [0, 0, 0])),
+    ).not.toThrow();
+    const warnings = drainRuntimeWarnings();
+    expect(warnings.some((w) => /outside the target's bounding box/.test(w))).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
+  // P9 — `__generated__` brand preservation through helper pipelines.
+  //
+  // Pattern-building helpers (`onPlane`, `rectOnPlane`) post-process
+  // generator output with `.map(...)` which drops non-enumerable markers.
+  // The wrappers must re-apply the brand so composed pipelines
+  // (e.g. grid → onPlane) still classify as generator-produced.
+  // -------------------------------------------------------------------------
+  it("preserves the __generated__ brand through onPlane (XY identity)", () => {
+    const src = patterns.grid(2, 2, 10);
+    expect((src as any).__generated__).toBe(true);
+    const out = patterns.onPlane(src, "XY");
+    expect((out as any).__generated__).toBe(true);
+  });
+
+  it("preserves the __generated__ brand through onPlane (YZ remap)", () => {
+    const src = patterns.grid(2, 2, 10);
+    const out = patterns.onPlane(src, "YZ");
+    expect((out as any).__generated__).toBe(true);
+  });
+
+  it("preserves the __generated__ brand through rectOnPlane", () => {
+    const out = patterns.rectOnPlane({ plane: "XZ", nx: 3, ny: 2, dx: 5, dy: 5 });
+    expect((out as any).__generated__).toBe(true);
+  });
+
+  it("marks polar / linear / linearAlongAxis output as generated", () => {
+    expect((patterns.polar(4, 10) as any).__generated__).toBe(true);
+    expect((patterns.linear(3, [5, 0, 0]) as any).__generated__).toBe(true);
+    expect((patterns.linearAlongAxis(3, 0, 10, "X") as any).__generated__).toBe(true);
+  });
+
+  it("__generated__ marker is non-enumerable (does not pollute JSON)", () => {
+    const src = patterns.grid(2, 2, 10);
+    // The marker should NOT appear in JSON output — consumers shouldn't
+    // see an implementation-detail flag bleed into user data.
+    const json = JSON.parse(JSON.stringify(src));
+    expect(json).toEqual(src.map((p) => ({ ...p })));
+  });
+
+  // -------------------------------------------------------------------------
+  // P9 — `hasRemovedMaterial` / cutAt outcome buffer.
+  //
+  // Each cutAt call records whether material actually came off, and
+  // `drainCutAtOutcomes()` returns the per-call list so MCP can aggregate.
+  // -------------------------------------------------------------------------
+  it("records a `true` outcome when cutAt removes material", () => {
+    const target = mockShape([[-10, -10, 0], [10, 10, 5]], 1000, "real");
+    const tool = mockShape([[-1, -1, 0], [1, 1, 5]], 10);
+    patterns.cutAt(target, () => tool, [{ translate: [0, 0, 0] }]);
+    expect(drainCutAtOutcomes()).toEqual([true]);
+  });
+
+  it("records a `false` outcome when cutAt is a volume no-op (overlapping bboxes)", () => {
+    const target = mockShape([[-10, -10, 0], [10, 10, 5]], 1000, "noop");
+    const tool = mockShape([[-1, -1, 0], [1, 1, 5]], 10);
+    patterns.cutAt(target, () => tool, [{ translate: [0, 0, 0] }]);
+    drainRuntimeWarnings(); // drain the volume-guard warning we emit
+    expect(drainCutAtOutcomes()).toEqual([false]);
+  });
+
+  it("records a `false` outcome from the bbox-disjoint warning branch (generator-produced)", () => {
+    const target = mockShape([[-10, -10, 0], [10, 10, 5]], 1000, "noop");
+    const tool = mockShape([[100, 100, 0], [110, 110, 5]], 10);
+    patterns.cutAt(target, () => tool, patterns.linear(1, [0, 0, 0]));
+    drainRuntimeWarnings();
+    expect(drainCutAtOutcomes()).toEqual([false]);
   });
 });
 
@@ -474,6 +690,46 @@ describe("patterns.cutTop / cutBottom — plate-face cut sugar", () => {
     expect(() =>
       patterns.cutBottom(bad, () => trackingTool([[-1, -1, 0], [1, 1, 5]]), [0, 0]),
     ).toThrow(/cannot read plate bounding box/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `patterns.linear` — optional symmetric-about-origin centering.
+//
+// Default (centered: false) is the existing zero-origin behaviour; the new
+// `centered: true` shifts every placement by `-((n-1)/2) * step` so the run
+// straddles the origin the same way `grid` does.
+// ---------------------------------------------------------------------------
+
+describe("patterns.linear — centered option", () => {
+  it("defaults to uncentered (placements start at the origin)", () => {
+    const out = patterns.linear(4, [10, 0, 0]);
+    expect(out.map((p) => p.translate)).toEqual([
+      [0, 0, 0],
+      [10, 0, 0],
+      [20, 0, 0],
+      [30, 0, 0],
+    ]);
+  });
+
+  it("even n: centered placements straddle the origin with half-step gaps", () => {
+    // 4 positions, step 10 — centered run spans [-15, +15] with half-steps.
+    const out = patterns.linear(4, [10, 0, 0], { centered: true });
+    expect(out.map((p) => p.translate)).toEqual([
+      [-15, 0, 0],
+      [-5, 0, 0],
+      [5, 0, 0],
+      [15, 0, 0],
+    ]);
+  });
+
+  it("odd n: centered places the middle placement exactly on the origin", () => {
+    const out = patterns.linear(3, [0, 8, 0], { centered: true });
+    expect(out.map((p) => p.translate)).toEqual([
+      [0, -8, 0],
+      [0, 0, 0],
+      [0, 8, 0],
+    ]);
   });
 });
 

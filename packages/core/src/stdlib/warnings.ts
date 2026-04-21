@@ -33,6 +33,7 @@ export function resetRuntimeWarnings(): void {
   resetExtrudePlaneHint();
   resetPendingExtrudeHints();
   resetAmbiguousRawSeen();
+  resetCutAtOutcomes();
 }
 
 // Per-execute latch for the "raw diameter matches a metric nominal" advisory
@@ -329,6 +330,35 @@ export function nextCutAtCallIndex(): number {
 /** Reset the `cutAt` call ordinal. Called from resetRuntimeWarnings(). */
 export function resetCutAtCounter(): void {
   cutAtCounter = 0;
+}
+
+// Per-execution record of each `patterns.cutAt` call's material-removal
+// outcome. `true` means the cut removed material (volume dropped), `false`
+// means the call was a no-op (all placements outside bbox, or volumes
+// unchanged). Aggregate reporting up the stack (`EngineStatus.hasRemovedMaterial`
+// + `Cut material removal: …` line in the MCP status text) reads the array
+// to summarise "all succeeded" vs "N/M failed".
+//
+// Not every cutAt call pushes an entry — calls where we can't measure
+// volume (kernel-free mock paths, missing boundingBox) intentionally omit
+// so we don't misattribute "unknown" as a failure.
+let cutAtMaterialOutcomes: boolean[] = [];
+
+/** Record whether a `patterns.cutAt` call removed material. */
+export function pushCutAtOutcome(removed: boolean): void {
+  cutAtMaterialOutcomes.push(removed);
+}
+
+/** Snapshot + clear the outcomes list. Called by core at drain time. */
+export function drainCutAtOutcomes(): boolean[] {
+  const out = cutAtMaterialOutcomes.slice();
+  cutAtMaterialOutcomes.length = 0;
+  return out;
+}
+
+/** Reset the outcomes list. Called from resetRuntimeWarnings(). */
+export function resetCutAtOutcomes(): void {
+  cutAtMaterialOutcomes.length = 0;
 }
 
 // Parallel counter for plain `.cut()` calls (the prototype-patched guard in

@@ -87,6 +87,129 @@ export function extractLocalImportSpecifiers(source: string): string[] {
   return specs;
 }
 
+/** Result of {@link scanImportBindings} — one entry per LOCAL binding. */
+export interface ImportBinding {
+  /** Name used in the importing file (after any `as` rename). */
+  binding: string;
+  /** Relative specifier of the source module (e.g. `"./constants"`). */
+  source: string;
+  /** 1-based line number of the import statement in the source text. */
+  line: number;
+}
+
+/**
+ * Scan source for every local binding introduced by a named or default
+ * import, returning `{ binding, source, line }` triples. Used by
+ * {@link inferErrorHint} to enrich "X is not defined" errors with the
+ * origin of the symbol (so the fix hint can name the actual import line
+ * instead of just pointing at the throw site).
+ *
+ * Only RELATIVE imports are tracked — package imports don't help diagnose
+ * the "I forgot to export it" / "I renamed the export" failure modes. The
+ * scanner handles:
+ *
+ *   import { A, B as C } from "./foo";    // named with optional rename
+ *   import D from "./bar";                 // default
+ *   import D, { E } from "./baz";          // default + named
+ *
+ * Namespace imports (`import * as X from "..."`) are NOT included — those
+ * never produce a bare "X is not defined" error shape; they fail with a
+ * different property-access trace.
+ *
+ * Exported for unit testing.
+ */
+export function scanImportBindings(source: string): ImportBinding[] {
+  const out: ImportBinding[] = [];
+  // Scan every `import ... from "<spec>"` statement regardless of specifier,
+  // then filter to relative specifiers. Doing the broad scan first avoids
+  // the greedy-backtracking trap where a lazy `[\s\S]*?` slurps across
+  // multiple imports when the first specifier isn't relative but a later
+  // one is (the regex engine backtracks past the non-matching `from` and
+  // mis-attributes the first import's bindings to the second specifier).
+  const re = /\bimport\s+([\s\S]*?)\s+from\s+['"]([^'"]+)['"]/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source)) !== null) {
+    const bindingText = m[1].trim();
+    const specifier = m[2];
+    // Only track LOCAL (relative) imports — package imports can't be
+    // diagnosed by "module doesn't export this symbol" hints.
+    if (!specifier.startsWith(".")) continue;
+    const line = source.slice(0, m.index).split("\n").length;
+
+    // Pull the optional default-binding identifier that appears before any
+    // `{...}` clause: `D` or `D, {...}`. The `!startsWith('{')` guard stops
+    // us from treating the opening of a named-only import as a default.
+    const defaultMatch = bindingText.match(/^([A-Za-z_$][\w$]*)\s*(?:,|$)/);
+    if (defaultMatch && !bindingText.startsWith("{")) {
+      out.push({ binding: defaultMatch[1], source: specifier, line });
+    }
+
+    // Extract the named-bindings block `{ A, B as C }`.
+    const namedMatch = bindingText.match(/\{([^}]*)\}/);
+    if (namedMatch) {
+      for (const raw of namedMatch[1].split(",")) {
+        const trimmed = raw.trim();
+        if (!trimmed) continue;
+        // `Foo` or `Foo as Bar` → local name is the last token.
+        const parts = trimmed.split(/\s+as\s+/).map((s) => s.trim());
+        const local = parts[1] ?? parts[0];
+        if (local) out.push({ binding: local, source: specifier, line });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Walk an esbuild metafile.inputs graph starting at `entryKey` (the metafile
+ * key for the wrapper / entry), chasing `imports[].path` recursively so that
+ * TRANSITIVE dependencies land in the returned set along with direct ones.
+ * Returns the set of absolute paths for every real file reachable through the
+ * graph — excludes the synthetic wrapper stub and the entry file itself (the
+ * entry is already covered by `entryContent` equality).
+ *
+ * `metafileInputs` is shape `{ [relPath]: { imports: [{ path }], ... } }`.
+ * Paths inside the metafile are relative to `absWorkingDir`, except when they
+ * are already absolute (e.g. the wrapper's `import * as __e from "<absPath>"`
+ * which esbuild echoes back as-is). We resolve each to an absolute form so
+ * the returned set is suitable for `statSync` without further normalization.
+ *
+ * Uses a `visited` set to tolerate cycles. Exported for unit testing.
+ */
+export function collectBundleInputsRecursive(
+  metafileInputs: Record<string, { imports?: Array<{ path?: string }> }>,
+  entryKey: string,
+  absWorkingDir: string,
+  entryAbsPath: string,
+): string[] {
+  const out = new Set<string>();
+  const visited = new Set<string>();
+
+  const toAbs = (p: string): string => (isAbsolute(p) ? p : resolve(absWorkingDir, p));
+  const isWrapper = (abs: string): boolean =>
+    abs.toLowerCase().includes("__shapeitup_wrapper__");
+  const isEntry = (abs: string): boolean => abs.toLowerCase() === entryAbsPath.toLowerCase();
+
+  const walk = (nodeKey: string): void => {
+    if (visited.has(nodeKey)) return;
+    visited.add(nodeKey);
+    const node = metafileInputs[nodeKey];
+    if (!node) return;
+    for (const imp of node.imports ?? []) {
+      if (!imp?.path) continue;
+      const childKey = imp.path;
+      const childAbs = toAbs(childKey);
+      if (!isWrapper(childAbs) && !isEntry(childAbs)) {
+        out.add(childAbs);
+      }
+      walk(childKey);
+    }
+  };
+
+  walk(entryKey);
+  return [...out];
+}
+
 /**
  * Check if a cached bundle entry is still valid for the given entry source.
  * Returns null if the cache is reusable, or a short human-readable reason
@@ -133,6 +256,37 @@ export function checkBundleCache(
     }
   }
   return null;
+}
+
+/**
+ * Convert the internal bundle-cache invalidation reason string into a
+ * user-facing warning line that MCP callers see in `status.warnings`.
+ * Returns null for reasons that shouldn't produce a warning (cold start).
+ *
+ * Exported for unit testing.
+ */
+export function bundleCacheReasonToWarning(reason: string | null): string | null {
+  if (reason === null) return null;
+  // First-ever render of a file isn't an "invalidation" — there was nothing
+  // to invalidate. Stay quiet; MCP callers only want to hear about rebuilds
+  // that replaced a previous cached bundle.
+  if (reason === "no cache entry") return null;
+
+  // Expected-edit reasons: a user saving the .shape.ts file between
+  // render_preview/modify_shape calls is the common case, not an anomaly.
+  // Emitting "Cache invalidated: …" on every edit teaches callers to tune
+  // out the warning, which hides the genuinely unexpected invalidations
+  // below. Suppress these routine rebuilds silently — the cache did its job.
+  if (reason === "entry file content changed") return null;
+  if (/^input mtime changed:/.test(reason)) return null;
+  if (/^new local import not in cache:/.test(reason)) return null;
+
+  if (reason === "force=true") return "Cache invalidated: force=true";
+
+  // Pass-through for unexpected reasons (e.g. "stat failed: EACCES …",
+  // internal cache corruption, checksum mismatch) so they still reach the
+  // caller — better to show something than to eat a real bug.
+  return `Cache invalidated: ${reason}`;
 }
 
 /**
@@ -287,6 +441,22 @@ export interface EngineStatus {
    * this as a warning line alongside `Current params`.
    */
   importedParamsWarning?: string;
+  /**
+   * Aggregate outcome of `patterns.cutAt` material-removal checks.
+   *   - `true`  — every cutAt call in the script removed material.
+   *   - `false` — at least one cutAt call was a no-op (placements outside
+   *     bbox, or volumes equal before/after).
+   *   - `undefined` — the script didn't call `patterns.cutAt`, or none of the
+   *     calls produced a measurable outcome (kernel-free mock paths).
+   *
+   * Formatted into a one-line summary by `formatStatusText` so agents see
+   * "Cut material removal: all succeeded" or "2/5 calls removed no material".
+   */
+  hasRemovedMaterial?: boolean;
+  /** Number of `patterns.cutAt` calls measured this run. 0 ⇔ absent. */
+  cutAtCallCount?: number;
+  /** Number of those calls that removed no material. */
+  cutAtFailedCount?: number;
   timestamp: string;
   /**
    * Monotonic record of the most recent screenshot produced by `render_preview`,
@@ -696,7 +866,16 @@ export async function executeShapeFile(
    * ~200 ms/part OCCT measurement. Default undefined → `core.execute` picks
    * its own (currently `"bbox"`), so normal renders keep their fast path.
    */
-  opts?: { partStats?: "none" | "bbox" | "full" }
+  opts?: {
+    partStats?: "none" | "bbox" | "full";
+    /**
+     * When true, skip the bundle cache entirely — always re-invoke esbuild.
+     * Surfaces a `Cache invalidated: force=true` line in `status.warnings`.
+     * Use only when you suspect the mtime-tracked cache is stale; normal
+     * render paths get correct invalidation automatically.
+     */
+    forceBundleRebuild?: boolean;
+  }
 ): Promise<ExecuteOutcome> {
   const absPath = resolve(filePath);
   const status: EngineStatus = {
@@ -731,7 +910,15 @@ export async function executeShapeFile(
     // --- Bundle cache lookup ---
     const entryDir = dirname(absPath);
     const cached = bundleCache.get(absPath);
-    const invalidReason = cached ? checkBundleCache(cached, code, entryDir) : "no cache entry";
+    // `forceBundleRebuild` short-circuits the cache check with a dedicated
+    // reason so the MCP caller sees WHY their bypass took effect — same
+    // shape as the mtime/content reasons the cache itself produces, but
+    // unambiguous for the "I passed the flag on purpose" case.
+    const invalidReason = opts?.forceBundleRebuild
+      ? "force=true"
+      : cached
+        ? checkBundleCache(cached, code, entryDir)
+        : "no cache entry";
 
     if (cached && invalidReason === null) {
       process.stderr.write(`[bundle-cache] hit absPath=${absPath}\n`);
@@ -784,6 +971,10 @@ export async function executeShapeFile(
       `import * as __shapeitup_entry__ from ${JSON.stringify(entryImportPath)};\n` +
       `try { globalThis.__SHAPEITUP_ENTRY_MAIN__ = __shapeitup_entry__.default; } catch (e) {}\n` +
       `try { globalThis.__SHAPEITUP_ENTRY_PARAMS__ = __shapeitup_entry__.params; } catch (e) {}\n` +
+      // Sentinel: tells the executor this marker was set by a trusted wrapper
+      // (vs leaked from a prior execution in the long-lived MCP-server process).
+      // The executor reads and clears it together with MAIN/PARAMS.
+      `try { globalThis.__SHAPEITUP_ENTRY_SENTINEL__ = true; } catch (e) {}\n` +
       `export default __shapeitup_entry__.default;\n` +
       `export const params = __shapeitup_entry__.params;\n` +
       `export const material = __shapeitup_entry__.material;\n` +
@@ -865,16 +1056,34 @@ export async function executeShapeFile(
     const fileURL = `file:///${absPath.replace(/\\/g, "/").replace(/^\/+/, "")}`;
     js = `//# sourceURL=${fileURL}\n${js}`;
 
-    // Populate cache from metafile. Record mtime for every local input esbuild
-    // discovered (skip the entry itself — covered by entryContent equality).
+    // Populate cache from metafile. Walk `inputs[entry].imports[].path`
+    // recursively so TRANSITIVE dependencies land in inputMtimes alongside
+    // direct ones — a user editing `constants.ts` (imported by `body.shape.ts`,
+    // imported by `assembly.shape.ts`) must invalidate the assembly's cache
+    // entry even though esbuild lists `constants.ts` under `body.shape.ts`'s
+    // imports, not the assembly's. The recursive walk closes that gap.
+    //
+    // The entry key in the metafile is the synthetic wrapper's relative path
+    // (esbuild normalises it against absWorkingDir). We locate it by its
+    // unique `__shapeitup_wrapper__` marker rather than string-matching a
+    // computed relative form, because Windows/POSIX path joins diverge.
     const inputMtimes: Record<string, number> = {};
     try {
-      for (const inputPath of Object.keys(result.metafile?.inputs ?? {})) {
-        const abs = isAbsolute(inputPath) ? inputPath : resolve(entryDir, inputPath);
-        // Skip the synthetic wrapper stub (it's ephemeral, not a real file).
-        if (abs.toLowerCase().includes("__shapeitup_wrapper__")) continue;
-        // Skip the entry itself — covered by entryContent.
-        if (abs.toLowerCase() === absPath.toLowerCase()) continue;
+      const metafileInputs = result.metafile?.inputs ?? {};
+      const wrapperKey = Object.keys(metafileInputs).find((k) =>
+        k.toLowerCase().includes("__shapeitup_wrapper__"),
+      );
+      const absInputs = wrapperKey
+        ? collectBundleInputsRecursive(metafileInputs, wrapperKey, entryDir, absPath)
+        : // Fallback: no wrapper key (shouldn't happen with the synthetic-entry
+          // config above, but keep the flat metafile walk as a safety net so a
+          // future refactor that drops the wrapper doesn't silently lose
+          // invalidation coverage).
+          Object.keys(metafileInputs)
+            .map((p) => (isAbsolute(p) ? p : resolve(entryDir, p)))
+            .filter((abs) => !abs.toLowerCase().includes("__shapeitup_wrapper__"))
+            .filter((abs) => abs.toLowerCase() !== absPath.toLowerCase());
+      for (const abs of absInputs) {
         try {
           inputMtimes[abs] = statSync(abs).mtimeMs;
         } catch {
@@ -886,6 +1095,23 @@ export async function executeShapeFile(
     }
 
     process.stderr.write(`[bundle-cache] miss reason=${invalidReason} absPath=${absPath}\n`);
+
+    // Surface the invalidation reason to MCP callers. Previously this was
+    // only visible in the VS Code output-channel log, so an agent inspecting
+    // the render response couldn't tell whether a dependency edit actually
+    // busted the cache or whether it silently served a stale bundle.
+    // Mapping:
+    //   "force=true"                      → "Cache invalidated: force=true"
+    //   "entry file content changed"      → no warning (user-edit: expected rebuild)
+    //   "input mtime changed: <abs path>" → no warning (dep-edit: expected rebuild)
+    //   "new local import not in cache…"  → no warning (dep-edit: expected rebuild)
+    //   "no cache entry" (first render)   → no warning (cold start isn't an invalidation)
+    //   "stat failed: …"                  → pass-through, prefixed (unexpected)
+    const warningLine = bundleCacheReasonToWarning(invalidReason);
+    if (warningLine) {
+      status.warnings = [warningLine, ...(status.warnings ?? [])];
+    }
+
     evictIfNeeded();
     bundleCache.set(absPath, {
       js,
@@ -938,21 +1164,57 @@ export async function executeShapeFile(
     const currentParams: Record<string, number> = {};
     for (const p of result.params) currentParams[p.name] = p.value;
 
-    // When the entry declared no `export const params` but the executor
-    // still harvested a non-empty params object, those entries came from an
-    // imported module's bundled-in declaration — not from the file the user
-    // is editing. Surface this explicitly so "Current params: {...}" in the
-    // formatted status isn't silently misleading.
-    const entryDeclaredNone =
-      !status.declaredParams || status.declaredParams.length === 0;
+    // When the runtime `params` object carries KEYS that the entry file never
+    // declared, those keys leaked in from an imported module's
+    // `export const params` (esbuild inlines the sibling and its declaration
+    // shows up in the merged scope). Surface this explicitly so
+    // "Current params: {...}" in the formatted status isn't silently
+    // misleading about where sliders actually bind.
+    //
+    // Three cases, only one warns:
+    //   (a) Entry has NO `export const params` token at all.
+    //       → Imports are an implementation detail; the user never claimed
+    //         sliders for this file. Silent.
+    //   (b) Entry has `export const params = {...}` (any form, including
+    //       empty-object). Every runtime key is also a declared key.
+    //       → Expected happy path. Silent.
+    //   (c) Entry declared params, but runtime params has extra keys not in
+    //       the declared set.
+    //       → Imported module's params shadowed/merged with the local one.
+    //         Warn so the user knows their declared sliders aren't the
+    //         whole story.
+    //
+    // The `export const params` source-text probe is a cheap token check —
+    // independent of `declaredParams` (which comes back `[]` both for
+    // "declaration absent" and "declaration present but empty"), because
+    // those two states want DIFFERENT warnings here.
+    const entryHasParamsDeclaration = /\bexport\s+const\s+params\s*=/.test(code);
+    const declaredSet = new Set(status.declaredParams ?? []);
+    const runtimeKeys = Object.keys(currentParams);
+    const extraKeys = runtimeKeys.filter((k) => !declaredSet.has(k));
     const importedParamsWarning =
-      entryDeclaredNone && Object.keys(currentParams).length > 0
-        ? "Entry file declares no 'export const params'. Current params shown are from an imported module."
+      entryHasParamsDeclaration && extraKeys.length > 0
+        ? `Entry file's 'export const params' does not declare [${extraKeys.join(", ")}]. Imported module's params are being merged into the slider set — consumers (tune_params UI, render status) may show keys that edits to this file cannot change.`
         : undefined;
 
     const geometryErrorParts = (result.geometryIssues ?? [])
       .filter((i) => i.severity === "error")
       .map((i) => i.part);
+    // Aggregate patterns.cutAt outcomes → `hasRemovedMaterial` (tri-state).
+    // Absent outcomes (no cutAt calls, or calls without a measurable volume)
+    // collapse to `undefined` so the status-text formatter can skip the line
+    // entirely on scripts that don't exercise this helper.
+    const outcomes = result.cutAtOutcomes ?? [];
+    const hasRemovedMaterial: boolean | undefined =
+      outcomes.length === 0
+        ? undefined
+        : outcomes.every((o) => o === true);
+    // Counts drive the "N/M calls removed no material" half of the
+    // formatStatusText summary line. Kept alongside `hasRemovedMaterial` so
+    // consumers that want the richer form don't have to re-derive it from
+    // raw outcomes (not surfaced to the status file for privacy/size).
+    const cutAtFailedCount = outcomes.filter((o) => !o).length;
+    const cutAtCallCount = outcomes.length;
     const successStatus: EngineStatus = {
       success: true,
       fileName: absPath,
@@ -979,6 +1241,9 @@ export async function executeShapeFile(
       properties,
       material: result.material,
       importedParamsWarning,
+      hasRemovedMaterial,
+      cutAtCallCount: cutAtCallCount > 0 ? cutAtCallCount : undefined,
+      cutAtFailedCount: cutAtCallCount > 0 ? cutAtFailedCount : undefined,
       timestamp: new Date().toISOString(),
     };
     writeStatusFile(successStatus, globalStorageDir);
@@ -1166,36 +1431,174 @@ function boundingBoxFromParts(parts: ExecutedPart[]): { x: number; y: number; z:
 const DEFAULT_NOZZLE_MM = 0.4;
 
 /**
- * Compute the shortest triangle edge length across a tessellated part. The
- * tessellator places vertices along real feature boundaries (sharp edges,
- * cylinder seams, thread roots), so the smallest edge tracks the narrowest
- * detail the CAD asked the slicer to reproduce.
+ * Threshold for "this edge lies on a smooth/tangent seam between two faces".
+ * Empirical: cylinder/flat boolean cuts produce micro-seams where adjacent
+ * triangle normals differ by ~3–15°. A sharp FDM feature edge (outer corner,
+ * wall boundary) gets normals differing by 45°+ — a clean gap.
  *
- * Hot path: iterates every triangle exactly once with flat arithmetic. We
- * carry the squared minimum through the loop and only take one sqrt at the
- * end so a 100k-triangle part pays one sqrt call, not 300k. Returns +Infinity
- * for empty meshes — callers should check `Number.isFinite` before emitting.
+ * dot(n1, n2) > 0.95 corresponds to an angle < ~18° — well clear of real
+ * feature edges while still catching OCCT's boolean-tangent artefacts.
  */
-function minTriangleEdgeMm(vertices: Float32Array, triangles: Uint32Array): number {
-  let minSq = Infinity;
-  for (let i = 0; i < triangles.length; i += 3) {
-    const i0 = triangles[i] * 3;
-    const i1 = triangles[i + 1] * 3;
-    const i2 = triangles[i + 2] * 3;
-    const x0 = vertices[i0], y0 = vertices[i0 + 1], z0 = vertices[i0 + 2];
-    const x1 = vertices[i1], y1 = vertices[i1 + 1], z1 = vertices[i1 + 2];
-    const x2 = vertices[i2], y2 = vertices[i2 + 1], z2 = vertices[i2 + 2];
-    let dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
-    let d = dx * dx + dy * dy + dz * dz;
-    if (d < minSq) minSq = d;
-    dx = x2 - x1; dy = y2 - y1; dz = z2 - z1;
-    d = dx * dx + dy * dy + dz * dz;
-    if (d < minSq) minSq = d;
-    dx = x0 - x2; dy = y0 - y2; dz = z0 - z2;
-    d = dx * dx + dy * dy + dz * dz;
-    if (d < minSq) minSq = d;
+const TANGENT_DOT_THRESHOLD = 0.95;
+
+/**
+ * Fallback minimum when every triangle edge in a part lies on a tangent
+ * seam. 0.5 mm is the smallest feature the default 0.4 mm nozzle can still
+ * render with acceptable fidelity, so using it as a floor means a
+ * tangent-only mesh never forces a printability warning that isn't real.
+ */
+const TANGENT_FALLBACK_FLOOR_MM = 0.5;
+
+/**
+ * Per-triangle normal as the mean of its three vertex normals (which already
+ * come smoothed from OCCT's tessellator). Using the triangle face normal via
+ * cross product would be equivalent for flat facets but slightly different
+ * across a curved/subdivided surface, and we want to measure the SMOOTHED
+ * surface tangency that the slicer will see.
+ */
+function triangleMeanNormal(
+  normals: Float32Array,
+  triangles: Uint32Array,
+  triIdx: number,
+): [number, number, number] {
+  const base = triIdx * 3;
+  const i0 = triangles[base] * 3;
+  const i1 = triangles[base + 1] * 3;
+  const i2 = triangles[base + 2] * 3;
+  const nx = (normals[i0]     + normals[i1]     + normals[i2])     / 3;
+  const ny = (normals[i0 + 1] + normals[i1 + 1] + normals[i2 + 1]) / 3;
+  const nz = (normals[i0 + 2] + normals[i1 + 2] + normals[i2 + 2]) / 3;
+  const len = Math.hypot(nx, ny, nz);
+  if (len < 1e-9) return [0, 0, 0];
+  return [nx / len, ny / len, nz / len];
+}
+
+/**
+ * Compute the shortest triangle edge length across a tessellated part,
+ * ignoring edges that lie on smooth/tangent seams between two coplanar-ish
+ * neighbours. OCCT booleans (cylinder cut against flat face near-tangentially)
+ * produce 0.04–0.05 mm micro-edges that aren't real thin walls — they just
+ * mark where the mesher subdivided along a curvature-smooth ridge. Treating
+ * them as "smallest features" produces spurious sub-nozzle warnings on every
+ * export.
+ *
+ * Algorithm: build a triangle-adjacency map keyed on canonical (min, max)
+ * vertex-index pairs. For each edge, if exactly two triangles share it AND
+ * their smoothed normals have dot > 0.95 (≤ ~18° angle), skip the edge —
+ * it's a tangent seam, not a feature boundary. All other edges (including
+ * boundary edges with only one incident triangle, which ARE real features
+ * such as hole rims) participate in the min.
+ *
+ * Returns the shortest non-tangent edge; if every edge is tangent (unusual,
+ * e.g. a perfectly smooth sphere with no sharp boundaries) returns
+ * {@link TANGENT_FALLBACK_FLOOR_MM}. Returns +Infinity for empty meshes —
+ * callers should check `Number.isFinite` before emitting.
+ *
+ * The `normals` arg is optional for back-compat with pre-normal tessellators
+ * (tests that hand-craft a mesh without normals): omit it and the function
+ * falls back to the naive shortest-edge loop.
+ */
+function minTriangleEdgeMm(
+  vertices: Float32Array,
+  triangles: Uint32Array,
+  normals?: Float32Array,
+): number {
+  const triCount = triangles.length / 3;
+  if (triCount === 0) return Infinity;
+
+  // Flat path: no normals → can't classify tangent edges → return the raw
+  // shortest edge. Preserves the previous contract for callers that don't
+  // have normals handy (unit tests, old cached snapshots).
+  if (!normals || normals.length < vertices.length) {
+    let minSq = Infinity;
+    for (let i = 0; i < triangles.length; i += 3) {
+      const i0 = triangles[i] * 3;
+      const i1 = triangles[i + 1] * 3;
+      const i2 = triangles[i + 2] * 3;
+      const x0 = vertices[i0], y0 = vertices[i0 + 1], z0 = vertices[i0 + 2];
+      const x1 = vertices[i1], y1 = vertices[i1 + 1], z1 = vertices[i1 + 2];
+      const x2 = vertices[i2], y2 = vertices[i2 + 1], z2 = vertices[i2 + 2];
+      let dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
+      let d = dx * dx + dy * dy + dz * dz;
+      if (d < minSq) minSq = d;
+      dx = x2 - x1; dy = y2 - y1; dz = z2 - z1;
+      d = dx * dx + dy * dy + dz * dz;
+      if (d < minSq) minSq = d;
+      dx = x0 - x2; dy = y0 - y2; dz = z0 - z2;
+      d = dx * dx + dy * dy + dz * dz;
+      if (d < minSq) minSq = d;
+    }
+    return minSq === Infinity ? Infinity : Math.sqrt(minSq);
   }
-  return minSq === Infinity ? Infinity : Math.sqrt(minSq);
+
+  // Build edge → incident-triangle map. Canonical key is "minIdx:maxIdx"
+  // so both (a,b) and (b,a) collapse to the same bucket.
+  const edgeKey = (a: number, b: number): string =>
+    a < b ? `${a}:${b}` : `${b}:${a}`;
+  const edgeToTris = new Map<string, number[]>();
+  const addEdge = (a: number, b: number, triIdx: number) => {
+    const k = edgeKey(a, b);
+    const list = edgeToTris.get(k);
+    if (list) list.push(triIdx);
+    else edgeToTris.set(k, [triIdx]);
+  };
+  for (let t = 0; t < triCount; t++) {
+    const base = t * 3;
+    const v0 = triangles[base];
+    const v1 = triangles[base + 1];
+    const v2 = triangles[base + 2];
+    addEdge(v0, v1, t);
+    addEdge(v1, v2, t);
+    addEdge(v2, v0, t);
+  }
+
+  // Pre-compute per-triangle smoothed normals once; we'd otherwise recompute
+  // them for every edge visit on shared triangles.
+  const triNormals = new Float32Array(triCount * 3);
+  for (let t = 0; t < triCount; t++) {
+    const [nx, ny, nz] = triangleMeanNormal(normals, triangles, t);
+    const base = t * 3;
+    triNormals[base] = nx;
+    triNormals[base + 1] = ny;
+    triNormals[base + 2] = nz;
+  }
+
+  let minSqFeature = Infinity;
+  let minSqAny = Infinity;
+  for (const [key, tris] of edgeToTris) {
+    const [aStr, bStr] = key.split(":");
+    const a = Number(aStr) * 3;
+    const b = Number(bStr) * 3;
+    const dx = vertices[a]     - vertices[b];
+    const dy = vertices[a + 1] - vertices[b + 1];
+    const dz = vertices[a + 2] - vertices[b + 2];
+    const lenSq = dx * dx + dy * dy + dz * dz;
+    if (lenSq < minSqAny) minSqAny = lenSq;
+
+    let isTangent = false;
+    if (tris.length === 2) {
+      const tA = tris[0] * 3;
+      const tB = tris[1] * 3;
+      const dot =
+        triNormals[tA]     * triNormals[tB] +
+        triNormals[tA + 1] * triNormals[tB + 1] +
+        triNormals[tA + 2] * triNormals[tB + 2];
+      if (dot > TANGENT_DOT_THRESHOLD) isTangent = true;
+    }
+    // Boundary edges (tris.length === 1) and junction edges (length > 2) are
+    // ALWAYS real features — a hole rim is a boundary edge, an edge shared
+    // by three+ triangles is a non-manifold junction that's definitely not
+    // a smooth seam. Only skip the classic two-triangle tangent case.
+    if (!isTangent && lenSq < minSqFeature) minSqFeature = lenSq;
+  }
+
+  if (minSqFeature === Infinity) {
+    // Every edge was tangent — degenerate case (pure sphere, etc.). Avoid a
+    // false "sub-nozzle feature" warning by returning a safe floor that keeps
+    // downstream printability thresholds quiet.
+    return minSqAny === Infinity ? Infinity : Math.max(TANGENT_FALLBACK_FLOOR_MM, Math.sqrt(minSqAny));
+  }
+  return Math.sqrt(minSqFeature);
 }
 
 function aggregateProperties(
@@ -1206,14 +1609,55 @@ function aggregateProperties(
   const runtimeWarnings = opts?.runtimeWarnings ?? [];
   const perPart = parts.map((p) => {
     const bbox = boundingBoxFromVertices(p.vertices);
-    const minEdge = minTriangleEdgeMm(p.vertices, p.triangles);
+    // Per-part opt-out for printability analysis. Mockup / reference parts
+    // (a servo body, a tube included only for collision checks) get
+    // `analyze: false` in the script's return array — the user isn't
+    // printing them, so minFeature + manifold warnings are noise. We still
+    // emit the part in the BOM (volume/mass/bbox/qty/material preserved);
+    // only the `printability` heuristic is skipped. ExecutedPart extends
+    // TessellatedPart which propagates the flag from PartInput.
+    const skipAnalysis = p.analyze === false;
+
+    const base = {
+      name: p.name,
+      volume: p.volume,
+      surfaceArea: p.surfaceArea,
+      centerOfMass: p.centerOfMass,
+      // Skip the field entirely for empty/degenerate meshes so consumers don't
+      // render a misleading "0x0x0".
+      ...(bbox ? { boundingBox: bbox } : {}),
+      ...(typeof p.mass === "number" ? { mass: p.mass } : {}),
+      // Propagate optional BOM metadata from PartInput so consumers
+      // (export_shape bom sidecar, future BOM-aware tools) don't have to
+      // walk a second data source. Absent when the script didn't declare them.
+      ...(typeof p.qty === "number" ? { qty: p.qty } : {}),
+      ...(p.material ? { material: p.material } : {}),
+    };
+
+    if (skipAnalysis) {
+      // Omit `printability` entirely — consumers treat "no printability field"
+      // as "not analyzed" (vs "analyzed and clean", which sets the field with
+      // an empty issues[] array). The part still appears in every BOM/mass/
+      // bbox rollup because we return it above.
+      return base;
+    }
+
+    const minEdge = minTriangleEdgeMm(p.vertices, p.triangles, p.normals);
     const issues: string[] = [];
     if (!geometryValid) {
       issues.push("Non-manifold geometry — OCCT validation failed");
     }
-    if (Number.isFinite(minEdge) && minEdge < DEFAULT_NOZZLE_MM) {
+    // Boolean operations routinely leave sub-mm sliver edges at cut/fuse
+    // boundaries — firing a printability warning on every part that ever
+    // called .cut() was pure noise (48 identical lines on the
+    // knitting-printer review). Narrow the threshold to 1/4 of a typical
+    // nozzle: below 0.1 mm is far enough past boolean-artefact territory
+    // that it probably IS a genuinely thin face, and the rewording admits
+    // the ambiguity instead of asserting "below nozzle" as a fact.
+    const MIN_EDGE_WARN_MM = DEFAULT_NOZZLE_MM / 4;
+    if (Number.isFinite(minEdge) && minEdge < MIN_EDGE_WARN_MM) {
       issues.push(
-        `Smallest feature ${minEdge.toFixed(2)} mm is below typical ${DEFAULT_NOZZLE_MM.toFixed(1)} mm FDM nozzle width`,
+        `Minimum edge fragment ${minEdge.toFixed(2)} mm — likely boolean artefact, not a printability concern unless a real face is thin`,
       );
     }
     // Attribute any drained runtime warning that names this part or calls out
@@ -1233,22 +1677,7 @@ function aggregateProperties(
       minFeatureSize_mm: Number.isFinite(minEdge) ? minEdge : 0,
       issues,
     };
-    return {
-      name: p.name,
-      volume: p.volume,
-      surfaceArea: p.surfaceArea,
-      centerOfMass: p.centerOfMass,
-      // Skip the field entirely for empty/degenerate meshes so consumers don't
-      // render a misleading "0x0x0".
-      ...(bbox ? { boundingBox: bbox } : {}),
-      ...(typeof p.mass === "number" ? { mass: p.mass } : {}),
-      // Propagate optional BOM metadata from PartInput so consumers
-      // (export_shape bom sidecar, future BOM-aware tools) don't have to
-      // walk a second data source. Absent when the script didn't declare them.
-      ...(typeof p.qty === "number" ? { qty: p.qty } : {}),
-      ...(p.material ? { material: p.material } : {}),
-      printability,
-    };
+    return { ...base, printability };
   });
   let totalVolume = 0;
   let totalSurfaceArea = 0;
@@ -1539,6 +1968,31 @@ export function inferErrorHint(
     // Otherwise: fall through. A "reading '0'" or "reading 'translate'" error
     // almost always means a type mismatch (wrong shape of argument) — the
     // stdlib-typo hint would be actively misleading.
+  }
+
+  // "X is not defined" — ReferenceError thrown by the JS runtime when a
+  // bare identifier isn't bound in scope. When the identifier is one the
+  // entry imports from a LOCAL module, the bug is almost always that the
+  // module doesn't actually export that symbol (rename / typo / removed
+  // export). Enrich the hint with the specific import location so the
+  // agent knows where to look instead of only seeing the usage site.
+  //
+  // Guard: only fire the enrichment when the symbol truly appears in the
+  // import list. A generic "X is not defined" with no matching import
+  // entry gets the plain generic hint — misattributing to a LOCAL import
+  // when the symbol came from a package (or was a typo the user expected
+  // to resolve via `const X = ...`) would be actively misleading.
+  const notDefined = msg.match(/(\w+) is not defined/);
+  if (notDefined) {
+    const symbol = notDefined[1];
+    if (source) {
+      const imports = scanImportBindings(source);
+      const match = imports.find((b) => b.binding === symbol);
+      if (match) {
+        return `'${symbol}' is imported from '${match.source}' at line ${match.line} — check that module actually exports it (typo? rename? removed export?). Open '${match.source}' and confirm 'export const ${symbol} = ...' (or an equivalent named export) is present.`;
+      }
+    }
+    return `'${symbol}' is not defined in the current scope. If you meant to import it, add an import statement at the top of the file; if it's a typo, fix the usage; if the symbol is expected to come from a sibling .shape.ts, confirm the export and the specifier path.`;
   }
 
   return undefined;

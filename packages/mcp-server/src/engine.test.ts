@@ -13,6 +13,8 @@ import {
   lookupMeshCache,
   populateMeshCache,
   readSourceForCacheKey,
+  scanImportBindings,
+  collectBundleInputsRecursive,
   type EngineStatus,
   type BundleCacheEntry,
 } from "./engine.js";
@@ -803,6 +805,57 @@ describe("executeShapeFile — bundle cache integration", () => {
     },
     60_000,
   );
+
+  it(
+    "forceBundleRebuild: plain hit emits no warning, force=true emits 'Cache invalidated: force=true'",
+    async () => {
+      const { workdir, storage } = makeDirs();
+      try {
+        const entryPath = join(workdir, "box.shape.ts");
+        writeFileSync(
+          entryPath,
+          [
+            `import { drawRectangle } from "replicad";`,
+            `export default function main() {`,
+            `  return drawRectangle(10, 10).sketchOnPlane("XY").extrude(5);`,
+            `}`,
+          ].join("\n"),
+        );
+
+        // First render seeds the bundle cache. No warning expected from the
+        // bundle cache itself (cold start — "no cache entry" maps to null).
+        const first = await executeShapeFile(entryPath, storage);
+        expect(first.status.success).toBe(true);
+        const firstCacheWarnings = (first.status.warnings ?? []).filter((w) =>
+          w.startsWith("Cache invalidated"),
+        );
+        expect(firstCacheWarnings).toEqual([]);
+
+        // Second render with no edits: plain cache hit, no invalidation warning.
+        const second = await executeShapeFile(entryPath, storage);
+        expect(second.status.success).toBe(true);
+        const secondCacheWarnings = (second.status.warnings ?? []).filter((w) =>
+          w.startsWith("Cache invalidated"),
+        );
+        expect(secondCacheWarnings).toEqual([]);
+
+        // Third render with forceBundleRebuild: must emit exactly the
+        // "force=true" invalidation line.
+        const third = await executeShapeFile(entryPath, storage, undefined, {
+          forceBundleRebuild: true,
+        });
+        expect(third.status.success).toBe(true);
+        const thirdCacheWarnings = (third.status.warnings ?? []).filter((w) =>
+          w.startsWith("Cache invalidated"),
+        );
+        expect(thirdCacheWarnings).toContain("Cache invalidated: force=true");
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
 });
 
 describe("executeShapeFile — multifile params import (regression for issue #3)", () => {
@@ -1131,4 +1184,388 @@ describe("mesh cache + executeShapeFile (real OCCT)", () => {
     },
     60_000,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Fix 1 — transitive-import cache invalidation.
+//
+// The bundle cache was invalidating on the direct deps it saw in
+// metafile.inputs, but a deep edit (constants.ts → body.shape.ts →
+// assembly.shape.ts) didn't bust the assembly's cache and stale JS ran.
+// The recursive walker closes that gap.
+// ---------------------------------------------------------------------------
+describe("collectBundleInputsRecursive — transitive-import walker", () => {
+  it("chases imports through multiple hops into a flat set", () => {
+    // Hand-rolled metafile: entry → dep → transitive.
+    const metafile = {
+      "__shapeitup_wrapper__.ts": {
+        imports: [{ path: "entry.shape.ts" }],
+      },
+      "entry.shape.ts": {
+        imports: [{ path: "dep.shape.ts" }],
+      },
+      "dep.shape.ts": {
+        imports: [{ path: "transitive.ts" }],
+      },
+      "transitive.ts": { imports: [] },
+    };
+    const absWorkingDir = join(tmpdir(), "siu-walker-test");
+    const entryAbs = join(absWorkingDir, "entry.shape.ts");
+
+    const result = collectBundleInputsRecursive(
+      metafile,
+      "__shapeitup_wrapper__.ts",
+      absWorkingDir,
+      entryAbs,
+    );
+
+    // Must include dep.shape.ts AND transitive.ts. Must NOT include the
+    // entry (entryContent covers it) nor the wrapper (ephemeral).
+    expect(result.map((p) => p.replace(/\\/g, "/"))).toEqual(
+      expect.arrayContaining([
+        join(absWorkingDir, "dep.shape.ts").replace(/\\/g, "/"),
+        join(absWorkingDir, "transitive.ts").replace(/\\/g, "/"),
+      ]),
+    );
+    expect(result.map((p) => p.replace(/\\/g, "/"))).not.toContain(
+      entryAbs.replace(/\\/g, "/"),
+    );
+    expect(result.join("|")).not.toMatch(/__shapeitup_wrapper__/);
+  });
+
+  it("tolerates import cycles via visited set", () => {
+    // A → B → A. Must not infinite-loop.
+    const metafile = {
+      "__shapeitup_wrapper__.ts": { imports: [{ path: "a.ts" }] },
+      "a.ts": { imports: [{ path: "b.ts" }] },
+      "b.ts": { imports: [{ path: "a.ts" }] },
+    };
+    const absWorkingDir = join(tmpdir(), "siu-cycle");
+    const entryAbs = join(absWorkingDir, "a.ts");
+    // Treat a.ts as the entry here (for this contrived case).
+    const result = collectBundleInputsRecursive(
+      metafile,
+      "__shapeitup_wrapper__.ts",
+      absWorkingDir,
+      entryAbs,
+    );
+    const norm = result.map((p) => p.replace(/\\/g, "/"));
+    // b.ts should be in the set; a.ts (entry) should not.
+    expect(norm).toContain(join(absWorkingDir, "b.ts").replace(/\\/g, "/"));
+    expect(norm).not.toContain(entryAbs.replace(/\\/g, "/"));
+  });
+
+  it("handles absolute paths in metafile imports (wrapper → absPath form)", () => {
+    // The synthetic wrapper imports the entry by its full absolute path; the
+    // metafile echoes that path back as-is instead of making it relative.
+    const absWorkingDir = join(tmpdir(), "siu-abspath");
+    const entryAbs = join(absWorkingDir, "entry.shape.ts");
+    const metafile = {
+      "__shapeitup_wrapper__.ts": {
+        imports: [{ path: entryAbs }],
+      },
+      [entryAbs]: {
+        imports: [{ path: "helper.ts" }],
+      },
+      "helper.ts": { imports: [] },
+    };
+    const result = collectBundleInputsRecursive(
+      metafile,
+      "__shapeitup_wrapper__.ts",
+      absWorkingDir,
+      entryAbs,
+    );
+    const norm = result.map((p) => p.replace(/\\/g, "/"));
+    // helper.ts is relative, resolved against absWorkingDir.
+    expect(norm).toContain(join(absWorkingDir, "helper.ts").replace(/\\/g, "/"));
+    // Entry itself excluded.
+    expect(norm).not.toContain(entryAbs.replace(/\\/g, "/"));
+  });
+});
+
+describe("executeShapeFile — transitive-import cache invalidation (Fix 1)", () => {
+  beforeEach(() => {
+    clearBundleCache();
+  });
+
+  it(
+    "baseline: cache HIT when nothing changes across two runs",
+    async () => {
+      const workdir = mkdtempSync(join(tmpdir(), "siu-transitive-hit-"));
+      const storage = mkdtempSync(join(tmpdir(), "siu-transitive-hit-storage-"));
+      try {
+        // entry → dep → transitive
+        writeFileSync(
+          join(workdir, "transitive.ts"),
+          `export const SIZE = 10;\n`,
+        );
+        writeFileSync(
+          join(workdir, "dep.shape.ts"),
+          [
+            `import { drawRectangle } from "replicad";`,
+            `import { SIZE } from "./transitive";`,
+            `export function makeBox() {`,
+            `  return drawRectangle(SIZE, SIZE).sketchOnPlane("XY").extrude(2);`,
+            `}`,
+          ].join("\n"),
+        );
+        const entryPath = join(workdir, "entry.shape.ts");
+        writeFileSync(
+          entryPath,
+          [
+            `import { makeBox } from "./dep.shape";`,
+            `export default function main() { return makeBox(); }`,
+          ].join("\n"),
+        );
+
+        const first = await executeShapeFile(entryPath, storage);
+        expect(first.status.success).toBe(true);
+
+        const second = await executeShapeFile(entryPath, storage);
+        expect(second.status.success).toBe(true);
+        // No invalidation warning on a plain hit — the routine-rebuild reasons
+        // are silenced, but a hit emits none to begin with.
+        const cacheWarnings = (second.status.warnings ?? []).filter((w) =>
+          w.startsWith("Cache invalidated"),
+        );
+        expect(cacheWarnings).toEqual([]);
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "cache MISS when a TRANSITIVE dep (2 hops deep) is edited",
+    async () => {
+      const workdir = mkdtempSync(join(tmpdir(), "siu-transitive-miss-"));
+      const storage = mkdtempSync(join(tmpdir(), "siu-transitive-miss-storage-"));
+      try {
+        const transitivePath = join(workdir, "transitive.ts");
+        writeFileSync(
+          transitivePath,
+          `export const SIZE = 10;\n`,
+        );
+        writeFileSync(
+          join(workdir, "dep.shape.ts"),
+          [
+            `import { drawRectangle } from "replicad";`,
+            `import { SIZE } from "./transitive";`,
+            `export function makeBox() {`,
+            `  return drawRectangle(SIZE, SIZE).sketchOnPlane("XY").extrude(2);`,
+            `}`,
+          ].join("\n"),
+        );
+        const entryPath = join(workdir, "entry.shape.ts");
+        writeFileSync(
+          entryPath,
+          [
+            `import { makeBox } from "./dep.shape";`,
+            `export default function main() { return makeBox(); }`,
+          ].join("\n"),
+        );
+
+        const first = await executeShapeFile(entryPath, storage);
+        expect(first.status.success).toBe(true);
+
+        // Edit the TRANSITIVE dep (2 hops from the entry). This is the
+        // precise bug the recursive walker fixes — the flat metafile walk
+        // already caught this case, but the recursive walker pins the
+        // contract so no future esbuild change can silently regress.
+        writeFileSync(
+          transitivePath,
+          `export const SIZE = 40;\n`,
+        );
+        // Advance mtime so the stat comparison sees a real change. Windows
+        // FAT mtimes have ~1s resolution.
+        const future = new Date(Date.now() + 3000);
+        utimesSync(transitivePath, future, future);
+
+        const second = await executeShapeFile(entryPath, storage);
+        expect(second.status.success).toBe(true);
+        // The rebundled bundle must reflect the new SIZE. The easiest
+        // behavioural check is that the bounding box changed (10×10×2 →
+        // 40×40×2). This is the "the new bundle reflects the edit"
+        // assertion from the spec.
+        expect(second.status.boundingBox).toBeDefined();
+        expect(second.status.boundingBox!.x).toBeCloseTo(40, 1);
+        expect(second.status.boundingBox!.y).toBeCloseTo(40, 1);
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Fix 2 — importedParamsWarning distinguishes three states.
+//
+// The warning used to fire whenever the entry declared no `export const params`
+// but esbuild's merged scope carried some. That's correct when the user has
+// a declaration but shadow-merging kicks in; it's noise when the entry
+// legitimately has none. The three-state rule trims the false positives.
+// Covered at the `status.importedParamsWarning` boundary by executeShapeFile.
+// ---------------------------------------------------------------------------
+describe("executeShapeFile — importedParamsWarning (Fix 2)", () => {
+  beforeEach(() => {
+    clearBundleCache();
+  });
+
+  it(
+    "no warning when entry has NO `export const params` at all",
+    async () => {
+      const workdir = mkdtempSync(join(tmpdir(), "siu-ipw-none-"));
+      const storage = mkdtempSync(join(tmpdir(), "siu-ipw-none-storage-"));
+      try {
+        writeFileSync(
+          join(workdir, "util.ts"),
+          `import { drawRectangle } from "replicad";\n` +
+          `export const params = { width: 20 };\n` +
+          `export function makePart() { return drawRectangle(params.width, 5).sketchOnPlane("XY").extrude(1); }\n`,
+        );
+        const entryPath = join(workdir, "entry.shape.ts");
+        writeFileSync(
+          entryPath,
+          [
+            `import { makePart } from "./util";`,
+            `export default function main() { return makePart(); }`,
+          ].join("\n"),
+        );
+        const { status } = await executeShapeFile(entryPath, storage);
+        expect(status.success).toBe(true);
+        expect(status.importedParamsWarning).toBeUndefined();
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "no warning when entry declares empty `export const params = {}`",
+    async () => {
+      const workdir = mkdtempSync(join(tmpdir(), "siu-ipw-empty-"));
+      const storage = mkdtempSync(join(tmpdir(), "siu-ipw-empty-storage-"));
+      try {
+        const entryPath = join(workdir, "entry.shape.ts");
+        writeFileSync(
+          entryPath,
+          [
+            `import { drawRectangle } from "replicad";`,
+            `export const params = {};`,
+            `export default function main() { return drawRectangle(10, 10).sketchOnPlane("XY").extrude(2); }`,
+          ].join("\n"),
+        );
+        const { status } = await executeShapeFile(entryPath, storage);
+        expect(status.success).toBe(true);
+        expect(status.importedParamsWarning).toBeUndefined();
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Fix 5 — "X is not defined" hint names the import source + line.
+// ---------------------------------------------------------------------------
+describe("scanImportBindings", () => {
+  it("returns binding + source + 1-based line for named imports", () => {
+    const src = [
+      `import { drawRectangle } from "replicad";`,  // package import — skipped
+      `import { CAM_HEIGHT } from './constants';`,
+      `export default function main() {}`,
+    ].join("\n");
+    const bindings = scanImportBindings(src);
+    expect(bindings).toEqual([
+      { binding: "CAM_HEIGHT", source: "./constants", line: 2 },
+    ]);
+  });
+
+  it("tracks `as` renames (local name, not export name)", () => {
+    const src = [
+      `import { FOO as BAR } from './x';`,
+    ].join("\n");
+    const bindings = scanImportBindings(src);
+    expect(bindings).toEqual([
+      { binding: "BAR", source: "./x", line: 1 },
+    ]);
+  });
+
+  it("tracks default + named together", () => {
+    const src = [
+      `// leading comment`,
+      `import Default, { Named } from "./mixed";`,
+    ].join("\n");
+    const bindings = scanImportBindings(src);
+    expect(bindings).toEqual([
+      { binding: "Default", source: "./mixed", line: 2 },
+      { binding: "Named", source: "./mixed", line: 2 },
+    ]);
+  });
+
+  it("ignores package imports (non-relative specifier)", () => {
+    const src = `import { foo } from "replicad";\n`;
+    expect(scanImportBindings(src)).toEqual([]);
+  });
+
+  it("returns empty list when the file has no imports at all", () => {
+    expect(scanImportBindings(`export default function main() { return 1; }`)).toEqual([]);
+  });
+});
+
+describe("inferErrorHint — 'X is not defined' enrichment (Fix 5)", () => {
+  it("names the import source AND line when the symbol is imported from a local module", () => {
+    const source = [
+      `import { drawRectangle } from "replicad";`,
+      `import { CAM_HEIGHT } from './constants';`,
+      `export default function main() {`,
+      `  return drawRectangle(CAM_HEIGHT, 10).sketchOnPlane("XY").extrude(CAM_HEIGHT);`,
+      `}`,
+    ].join("\n");
+    const hint = inferErrorHint(
+      `ReferenceError: CAM_HEIGHT is not defined`,
+      undefined,
+      undefined,
+      source,
+    );
+    expect(hint).toBeDefined();
+    expect(hint).toMatch(/CAM_HEIGHT/);
+    expect(hint).toMatch(/'\.\/constants'/);
+    expect(hint).toMatch(/line 2/);
+  });
+
+  it("falls back to generic hint when the symbol isn't in any local import", () => {
+    const source = [
+      `import { drawRectangle } from "replicad";`,
+      `export default function main() { return drawRectangle(UNDECLARED, 10); }`,
+    ].join("\n");
+    const hint = inferErrorHint(
+      `ReferenceError: UNDECLARED is not defined`,
+      undefined,
+      undefined,
+      source,
+    );
+    expect(hint).toBeDefined();
+    expect(hint).not.toMatch(/line \d+/);
+    // Generic hint must not claim a made-up source.
+    expect(hint).not.toMatch(/'\.\//);
+  });
+
+  it("falls back to generic hint when source is not provided", () => {
+    const hint = inferErrorHint(
+      `ReferenceError: X is not defined`,
+      undefined,
+      undefined,
+    );
+    expect(hint).toBeDefined();
+    expect(hint).toMatch(/not defined/i);
+  });
 });

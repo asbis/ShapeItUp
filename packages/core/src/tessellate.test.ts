@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { tessellatePart, type MeshQuality, type PartInput } from "./tessellate";
+import {
+  normalizeParts,
+  tessellatePart,
+  type MeshQuality,
+  type PartInput,
+} from "./tessellate";
 
 // ---------------------------------------------------------------------------
 // P3-10 — meshQuality option.
@@ -97,5 +102,33 @@ describe("tessellatePart — meshQuality option", () => {
     tess(shape, "preview");
     expect(shape.lastMeshOpts!.tolerance).toBeGreaterThan(2.5);
     expect(shape.lastMeshOpts!.tolerance).toBeCloseTo(4.5, 3);
+  });
+});
+
+describe("analyze flag — pipeline propagation", () => {
+  it("normalizeParts preserves analyze: false on a wrapped part", () => {
+    const shape = makeMockShape(10);
+    const out = normalizeParts([{ shape, name: "mockup", color: null, analyze: false }]);
+    expect(out[0].analyze).toBe(false);
+  });
+
+  it("normalizeParts omits analyze when the script didn't set it", () => {
+    const shape = makeMockShape(10);
+    const out = normalizeParts([{ shape, name: "part", color: null }]);
+    expect(out[0].analyze).toBeUndefined();
+  });
+
+  it("tessellatePart carries analyze: false through to TessellatedPart", () => {
+    const shape = makeMockShape(10);
+    const part: PartInput = { shape, name: "servo", color: null, analyze: false };
+    const out = tessellatePart(part);
+    expect(out.analyze).toBe(false);
+  });
+
+  it("tessellatePart omits analyze when the input had none", () => {
+    const shape = makeMockShape(10);
+    const part: PartInput = { shape, name: "bracket", color: null };
+    const out = tessellatePart(part);
+    expect(out.analyze).toBeUndefined();
   });
 });

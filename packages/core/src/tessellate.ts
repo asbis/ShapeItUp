@@ -17,6 +17,16 @@ export interface PartInput {
    * material (if any).
    */
   material?: { density: number; name?: string };
+  /**
+   * Opt out of printability / minFeature / geometry-quality analysis for
+   * this part. When the script marks a part `analyze: false` (e.g. a servo
+   * mockup, a reference tube included only for collision checks) downstream
+   * consumers should skip issuing warnings that only make sense for parts
+   * the user will actually fabricate. Undefined / true = analyze as normal;
+   * false = mockup, skip analysis. Defaulting to "analyze" preserves every
+   * existing script's behaviour.
+   */
+  analyze?: boolean;
 }
 
 export interface TessellatedPart {
@@ -39,6 +49,8 @@ export interface TessellatedPart {
   qty?: number;
   /** Propagated from PartInput — see {@link PartInput.material}. */
   material?: { density: number; name?: string };
+  /** Propagated from PartInput — see {@link PartInput.analyze}. */
+  analyze?: boolean;
 }
 
 export function normalizeParts(result: any): PartInput[] {
@@ -87,6 +99,13 @@ export function normalizeParts(result: any): PartInput[] {
             ? { name: item.material.name }
             : {}),
         };
+      }
+      // Preserve the analyze opt-out flag. Only `false` is meaningful (opt
+      // out of printability / minFeature warnings); `true` is the default
+      // so we only materialize the field when the script explicitly set it
+      // — keeps downstream serializers noise-free.
+      if (item.analyze === false) {
+        out.analyze = false;
       }
       return out;
     }
@@ -219,5 +238,6 @@ export function tessellatePart(part: PartInput, opts: TessellateOptions = {}): T
     // serializers don't render noise (`qty: undefined` / `material: undefined`).
     ...(typeof part.qty === "number" ? { qty: part.qty } : {}),
     ...(part.material ? { material: part.material } : {}),
+    ...(part.analyze === false ? { analyze: false as const } : {}),
   };
 }
