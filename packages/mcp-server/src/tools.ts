@@ -29,6 +29,7 @@ import {
   type GeometryFacesFilter,
   type GeometryEdgesFilter,
 } from "./verify-helpers.js";
+import { getDetectedAppsAsync } from "./app-detector.js";
 
 /**
  * Shared globalStorage dir with the VSCode extension. Both processes write and
@@ -45,8 +46,10 @@ const GLOBAL_STORAGE = join(
 
 // --- File-based IPC to the extension (optional, best-effort) ---
 // Only used for UI-sync commands: set_render_mode, toggle_dimensions,
-// list_installed_apps, open-in-app. If VSCode isn't running these report that
-// honestly — everything else works without VSCode.
+// open-in-app. If VSCode isn't running these report that honestly —
+// everything else works without VSCode. (list_installed_apps used to route
+// through here too; it was ported in-process so the standalone MCP server
+// can answer it without a running extension.)
 
 const ID_PREFIX = `${process.pid}-${Date.now().toString(36)}-`;
 let commandCounter = 0;
@@ -62,8 +65,8 @@ const WAIT_GRACE_MS = 30_000;
 // "extension crashed / disappeared" from "extension is alive but render is
 // slower than the budget". Reset to null on every successful resolution.
 // Module-level rather than a return-shape change to keep the diff minimal
-// across the several callers (list_installed_apps, open-in-app, export_shape,
-// preview_finder, render_preview).
+// across the several callers (open-in-app, export_shape, preview_finder,
+// render_preview).
 let lastWaitTimeoutReason: "dead" | "slow" | null = null;
 
 // Workspace-resolution note throttle. When `create_shape` (and any future
@@ -2933,19 +2936,21 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "list_installed_apps",
-    "List 3D apps detected on the user's machine (PrusaSlicer, Cura, Bambu Studio, OrcaSlicer, FreeCAD, Fusion 360). Requires VSCode extension — it owns the filesystem scanning logic.",
+    "List 3D apps detected on the user's machine (PrusaSlicer, Cura, Bambu Studio, OrcaSlicer, FreeCAD, Fusion 360). Runs standalone — scans the filesystem directly from the MCP server, no VSCode extension required.",
     {},
     safeHandler("list_installed_apps", async () => {
-      if (!isExtensionAlive()) return extensionOfflineError("list_installed_apps");
-      const cmdId = sendExtensionCommand("list-installed-apps", {});
-      if (!cmdId) {
-        return { content: [{ type: "text" as const, text: "Failed to send command to extension" }], isError: true };
-      }
-      const result = await waitForResult(cmdId, 15000);
-      if (!result) {
-        return { content: [{ type: "text" as const, text: "list_installed_apps timed out after 15s." }], isError: true };
-      }
-      const apps: Array<{ id: string; name: string; preferredFormat: string }> = result.apps || [];
+      // Port of the extension's detection logic (see ./app-detector.ts).
+      // Runs in-process so the MCP server answers this tool even when no
+      // VSCode window is open — the old path routed through file-based IPC
+      // and failed as soon as the extension wasn't running.
+      const detected = await getDetectedAppsAsync();
+      // Keep the response shape identical to the previous IPC path so
+      // downstream agents/tests don't regress: same fields, same order.
+      const apps = detected.map((a) => ({
+        id: a.id,
+        name: a.name,
+        preferredFormat: a.preferredFormat,
+      }));
       if (apps.length === 0) {
         return { content: [{ type: "text" as const, text: "No compatible 3D apps detected on this machine." }] };
       }
