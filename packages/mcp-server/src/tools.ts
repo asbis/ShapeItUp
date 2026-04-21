@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync, renameSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync, renameSync, watch as fsWatch } from "fs";
 import { join, resolve, basename, dirname, isAbsolute, sep } from "path";
 import { homedir } from "os";
 import {
@@ -412,6 +412,45 @@ async function waitForResult(commandId: string, timeoutMs: number): Promise<any>
   let deadline = start + timeoutMs;
   let graceGranted = false;
   lastWaitTimeoutReason = null;
+
+  // T6.B: watch the parent directory for writes to mcp-result.json; race each
+  // watch event against a 250ms safety backstop so we don't stall when the OS
+  // fs.watch notification fires late or is suppressed (e.g. network drives).
+  // We watch the DIRECTORY rather than the file so fs.watch doesn't error on a
+  // not-yet-existing result file, and so we receive the event on every write
+  // (file-watches on Linux can miss subsequent writes after a rename).
+  const watchDir = GLOBAL_STORAGE;
+
+  /**
+   * Wait for EITHER a fs.watch change event on watchDir OR a 250ms timeout.
+   * Returns a promise that resolves when either fires.
+   */
+  function waitForWriteOrBackstop(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const settle = () => {
+        if (!settled) {
+          settled = true;
+          try { watcher.close(); } catch {}
+          clearTimeout(timer);
+          resolve();
+        }
+      };
+      const timer = setTimeout(settle, 250);
+      let watcher: ReturnType<typeof fsWatch>;
+      try {
+        watcher = fsWatch(watchDir, (_event: string, filename: string | null) => {
+          if (filename === "mcp-result.json" || filename === null) settle();
+        });
+        watcher.on("error", settle);
+      } catch {
+        // fs.watch unavailable (e.g. Docker tmpfs) — fall through to backstop.
+        clearTimeout(timer);
+        setTimeout(resolve, 250);
+      }
+    });
+  }
+
   while (true) {
     if (Date.now() >= deadline) {
       // Deadline reached. If the extension still looks alive AND we haven't
@@ -427,7 +466,8 @@ async function waitForResult(commandId: string, timeoutMs: number): Promise<any>
       lastWaitTimeoutReason = isExtensionAlive() ? "slow" : "dead";
       return null;
     }
-    await new Promise((r) => setTimeout(r, 100));
+    // Wait for a write event or the 250ms backstop — whichever comes first.
+    await waitForWriteOrBackstop();
     const result = readExtensionResult();
     if (result && result._id === commandId) {
       lastWaitTimeoutReason = null;
@@ -970,11 +1010,10 @@ export function computeEffectiveMeshQuality(
 }
 
 /**
- * Pure syntax + pitfall validator. Extracted from the `validate_syntax` /
- * `validate_script` MCP tools so unit tests can call it directly without
- * spinning up an MCP server. Returns the same text the tools emit, plus a
- * boolean signalling "hard parse failure" (so the caller can set isError on
- * the MCP envelope).
+ * Pure syntax + pitfall validator. Extracted from the `validate_syntax`
+ * MCP tool so unit tests can call it directly without spinning up an MCP
+ * server. Returns the same text the tool emits, plus a boolean signalling
+ * "hard parse failure" (so the caller can set isError on the MCP envelope).
  *
  * Catches two classes of problem:
  *   1. Real JS syntax errors — evaluated via `new Function(stripped)` after a
@@ -2457,7 +2496,6 @@ export function registerTools(server: McpServer) {
     })
   );
 
-  // Shared implementation for validate_syntax (and backward-compat alias validate_script).
   // Thin wrapper around the pure `validateSyntaxPure` — kept separate so the
   // MCP `content: [...]` envelope lives here and the logic stays unit-testable.
   const validateSyntaxImpl = async ({ code }: { code: string }) => {
@@ -2479,14 +2517,9 @@ export function registerTools(server: McpServer) {
     safeHandler("validate_syntax", validateSyntaxImpl)
   );
 
-  // Backward-compat alias — kept so existing MCP clients calling validate_script continue to work.
-  // Deprecated: prefer validate_syntax.
-  server.tool(
-    "validate_script",
-    "[Deprecated — use validate_syntax] Validate TypeScript syntax and detect 6 common CAD pitfalls. Does NOT verify imports, types, or runtime behavior.",
-    validateSyntaxSchema,
-    safeHandler("validate_script", validateSyntaxImpl)
-  );
+  // Note: validate_script alias was removed in T6.C — it was a verbatim
+  // duplicate of validate_syntax that wasted ~150 tokens of system prompt.
+  // Use validate_syntax instead.
 
   server.tool(
     "preview_shape",
@@ -6179,6 +6212,83 @@ printHints.firstLayerPad(shape, { padding?, thickness? })  // thin adhesion pad 
 \`overhangChamfer\` is a v1 stub — returns the shape unchanged with a
 \`console.warn\` on complex geometry. For known-good cases (simple brackets,
 plates) it cuts a reasonable chamfer.
+
+**Print orientation helpers** — re-orient a part for FDM printing and pack
+multiple parts onto one build plate:
+
+\`\`\`typescript
+import { printHints } from "shapeitup";
+
+const laidFlat = [bracket, lid, shaft].map(printHints.flatForPrint);
+return printHints.layoutOnBed(laidFlat, { spacing: 5, bedWidth: 220 });
+\`\`\`
+
+\`flatForPrint(shape)\` picks the largest planar face, rotates its outward normal
+to -Z, and translates so \`bbox.min.z === 0\`. \`layoutOnBed(shapes, { spacing,
+bedWidth })\` shelf-packs on the XY plane, wrapping to a new Y-shelf when
+\`bedWidth\` is exceeded. Both clone their inputs — the original assembly-posed
+shapes survive unchanged, so you can use the same Part in \`assemble()\` AND
+in a print-layout return from \`main()\` without double-transforming.
+
+---
+
+## pins — shafts, pivots, cross-pins (mechanism primitives)
+
+\`\`\`typescript
+pins.pin({ diameter, length, headDia?, headThk?, axis?, chamfer? })   // shaft, optional shoulder, tip chamfer
+pins.pivot({ size, fit?, length })                                     // matched { pin, hole, clearance } pair for a hinge axle
+pins.teeBar({ mainDia, mainLen, crossDia, crossLen, crossAt? })        // T-handle / cross-pin
+\`\`\`
+
+\`pins.pin\` — base at origin extending along \`axis\` (default \`"+Z"\`). Passing
+\`headDia\` adds a shoulder at the far end so the pin can't fall through a
+matching bore. \`pins.pivot\` wraps \`pin\` with a matching cylinder cut-tool sized
+to the fit allowance (default \`"slip"\` for rotating joints) — keeps pin and bore
+diameters in sync automatically. \`teeBar\`: main axis +Z, cross axis +X.
+
+---
+
+## cradles — ball cups and elastic anchors
+
+\`\`\`typescript
+cradles.cradle({ ballDiameter, wall?, capturePercent?, axis? })        // hollow cup sized for a sphere
+cradles.band_post({ postR, hookR, height, headThk?, axis? })           // shaft + mushroom head, retains a rubber band
+\`\`\`
+
+\`capturePercent\` controls how much of the sphere wraps the ball: \`0.4\` is a
+shallow saucer, \`0.5\` a hemisphere (default), values approaching \`1\` approach
+a nearly-closed shell. For FDM, orient so the opening faces \`-Z\` — the cavity's
+ceiling prints without support. Pair with \`standards.SPORTS_BALLS[...].diameter\`
+for standard-sized payloads.
+
+---
+
+## standards.SPORTS_BALLS — ball dimension tables
+
+\`\`\`typescript
+standards.SPORTS_BALLS.tennis     // { diameter: 67,    name: "Tennis ball (ITF)" }
+standards.SPORTS_BALLS.pingpong   // { diameter: 40,    name: "Table tennis ball" }
+standards.SPORTS_BALLS.golf       // { diameter: 42.67, name: "Golf ball (R&A/USGA)" }
+standards.SPORTS_BALLS.baseball   // { diameter: 73,    name: "Baseball (MLB)" }
+standards.SPORTS_BALLS.soccer     // { diameter: 216,   name: "Soccer ball (FIFA size 5)" }
+\`\`\`
+
+---
+
+## symmetricPair — mirrored part pairs
+
+When an assembly uses a left/right pair of the same geometric part, build it
+once at the origin and use \`symmetricPair(part, plane, opts?)\` to get
+\`[left, right]\` with all joint positions and axes reflected. Joint roles
+(male/female/face) are preserved across the mirror.
+
+\`\`\`typescript
+import { part, faceAt, symmetricPair } from "shapeitup";
+
+const bracket = part({ shape: bracketShape, name: "bracket", joints: { ... } });
+const [left, right] = symmetricPair(bracket, "YZ", { leftSuffix: "L", rightSuffix: "R" });
+// left.joints.wallFaceL, right.joints.wallFaceR — no name collision in mates
+\`\`\`
 
 ---
 
