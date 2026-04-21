@@ -5174,6 +5174,7 @@ holes.clearance(size, { depth?, fit?, axis? })             // alias of through �
 holes.counterbore(spec, { plateThickness, fit?, axis? })   // socket-head pocket + shaft
 holes.countersink(spec, { plateThickness, fit?, axis? })   // 90° flat-head flare + shaft
 holes.tapped(size, { depth, axis? })                       // tap-drill sized (metal taps or skip — use inserts.pocket for FDM)
+holes.threaded(size, { depth, axis? })                     // FDM: threaded hole — screw self-taps into tap-drill hole (preferred over modeled threads at M2–M5)
 holes.teardrop(size, { depth, axis? })                     // horizontal hole, FDM-printable (axis: "+X"|"+Y")
 holes.keyhole({ largeD, smallD, slot, depth, axis? })      // hang-on-screw mount
 holes.slot({ length, width, depth, axis? })                // elongated hole
@@ -5479,10 +5480,20 @@ comparison to the flat version.
 
 ## threads — helical metric + trapezoidal
 
+> ⚠️ **FDM WARNING**: Modeled helical threads at M2–M5 (pitch < 1 mm) are
+> below typical FDM nozzle resolution. Slicers (Cura, PrusaSlicer, Bambu
+> Studio) produce unsliceable or non-watertight STLs at these sizes. For
+> 3D printing, prefer \`holes.threaded(size, { depth })\` and let the screw
+> self-tap into the tap-drill hole, OR \`inserts.pocket\` + a brass
+> heat-set insert. Modeled threads are correct for STEP export to
+> CNC/molding and for M6+ on FDM. Each \`threads.tapInto/metric/metricMesh/
+> externalMesh/internalMesh\` call at M2–M5 emits a runtime warning
+> redirecting you to the self-tap pathway.
+
 Real helical threads via OCCT sweep. Mostly useful for STEP export,
 visual fidelity, and large printable threads (jar lids, leadscrews, M8+).
 **Small threads (M2–M5) don't survive FDM printing reliably** — use
-\`inserts.pocket\` + heat-set inserts instead.
+\`holes.threaded\` (self-tap) or \`inserts.pocket\` + heat-set inserts instead.
 
 **Compound vs. Mesh form.** \`threads.metric\` and \`threads.leadscrew\`
 return a Compound (root cylinder + un-fused per-turn loops). That is fast
@@ -5511,6 +5522,8 @@ threads.tapHole("M5", 8)                           // cut-tool for a tapped hole
 plate.cut(threads.tapHole("M5", 8).translate(x, y, plateTop))
 
 // Modeled internal threads — real helical ridges, return fuse-safe MeshShape:
+// ⚠️ FDM: M2–M5 modeled threads print poorly. For 3D printing, prefer
+//         holes.threaded("M4", { depth }) + let the screw self-tap.
 threads.tapInto(plate, "M5", 8, [x, y, plateTop])               // metric
 threads.tapIntoTrap(plate, "TR8x8", 16, [x, y, plateTop])       // trapezoidal (leadscrew nuts)
 
