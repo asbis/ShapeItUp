@@ -17,6 +17,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, statSync } from "node:fs";
 import { dirname, basename, resolve, join, isAbsolute } from "node:path";
+import { createHash } from "node:crypto";
 import {
   BUNDLE_EXTERNALS,
   extractParamsStatic,
@@ -379,6 +380,221 @@ let corePromise: Promise<Core> | null = null;
 let lastParts: ExecutedPart[] = [];
 let lastFileName: string | undefined;
 
+// ---------------------------------------------------------------------------
+// Mesh-result cache.
+//
+// Every inspection tool (render_preview, check_collisions, describe_geometry,
+// validate_joints, preview_finder, sweep_check) re-executes the user's script
+// through executeShapeFile when invoked. For a 60-part assembly that's a 7–8 s
+// OCCT round-trip — painful when the agent calls render_preview three times in
+// a row to inspect different camera angles without changing source or params.
+//
+// The cache keys on (absPath, source-contents hash, sorted-params, meshQuality)
+// and stores the result WITHOUT live OCCT shape handles. Live shapes belong to
+// the WASM heap that OCCT manages — caching them across executions is a known
+// corruption vector (see patchShapeMeshLeak + Bug #1 in executeShapeFile). We
+// keep tessellated arrays (Float32/Uint32 views) + scalar status fields only;
+// callers that need `.shape.intersect(...)` / `.shape.faces` bypass the cache
+// via `executeWithPersistedParams({ force: true })`.
+//
+// Invalidation: entry-file mtime change (caught cheaply via stat, plus the
+// content-hash fallback in the key), new params, explicit force, or engine
+// reset. Local-import edits that don't touch the entry file are NOT auto-
+// invalidated — by design (the brief's documented contract). Users editing a
+// sibling .shape.ts can pass `force: true` or modify the entry timestamp.
+// ---------------------------------------------------------------------------
+
+export interface MeshCacheEntry {
+  /**
+   * Full outcome we'd hand back to the caller — EXCEPT `.shape` is stripped
+   * from every ExecutedPart, because live OCCT handles mustn't survive
+   * across executions (corrupts the WASM heap).
+   */
+  result: ExecuteOutcome;
+  /** Hash of the entry file's source content at populate time. */
+  sourceHash: string;
+  /** fs mtimeMs when the entry was populated — fast invalidation check. */
+  mtimeMs: number;
+  /** Canonical JSON of sorted params (or `"{}"` when none). */
+  paramsKey: string;
+  /**
+   * Mesh-quality bucket this entry was tessellated at. The MCP engine currently
+   * lets core pick (auto-degrades on large assemblies), so the value is almost
+   * always `"default"` — the field exists so an extension-level cache layer
+   * (documented in the brief, not yet implemented here) has a hook point.
+   */
+  meshQuality: string;
+  hitCount: number;
+  lastUsed: number;
+}
+
+const meshCache = new Map<string, MeshCacheEntry>();
+const MESH_CACHE_MAX = 16;
+
+/**
+ * Canonical JSON of a params record — sorted keys, NaN-safe, so equal logical
+ * param sets always hash identically. Returns `"{}"` when the record is absent
+ * or empty so the cache key stays stable across the undefined / empty-object
+ * boundary.
+ */
+export function canonicalParamsKey(params?: Record<string, number>): string {
+  if (!params) return "{}";
+  const keys = Object.keys(params).sort();
+  if (keys.length === 0) return "{}";
+  const out: Record<string, number> = {};
+  for (const k of keys) out[k] = params[k];
+  return JSON.stringify(out);
+}
+
+function computeMeshCacheKey(
+  absPath: string,
+  sourceHash: string,
+  paramsKey: string,
+  meshQuality: string,
+): string {
+  const h = createHash("sha256");
+  h.update(absPath);
+  h.update("|");
+  h.update(sourceHash);
+  h.update("|");
+  h.update(paramsKey);
+  h.update("|");
+  h.update(meshQuality);
+  return h.digest("hex");
+}
+
+function hashSource(source: string): string {
+  return createHash("sha256").update(source).digest("hex");
+}
+
+/**
+ * Strip WASM-heap handles from an outcome so it's safe to retain across
+ * executions. The original `parts` array is preserved by field so callers
+ * that read `.name`, `.vertices`, `.volume`, etc. keep working — only
+ * `.shape` goes missing.
+ */
+function sanitizeOutcomeForCache(outcome: ExecuteOutcome): ExecuteOutcome {
+  if (!outcome.parts) return { status: outcome.status };
+  const safeParts = outcome.parts.map((p) => {
+    // Discard `.shape` — every other field (vertices/normals/triangles/
+    // edgeVertices/volume/surfaceArea/centerOfMass/mass/qty/material) is
+    // either a typed-array view over a detached buffer or a scalar, so it's
+    // free of WASM references. We keep the typed-array views themselves:
+    // they back onto ArrayBuffers owned by JS, not OCCT.
+    const { shape: _shape, ...rest } = p;
+    void _shape;
+    return rest as Omit<ExecutedPart, "shape"> as ExecutedPart;
+  });
+  return { status: outcome.status, parts: safeParts };
+}
+
+/**
+ * Find an existing cache entry whose key matches the provided triple AND
+ * whose source-mtime still equals the on-disk entry file. Returns the entry
+ * (with hitCount / lastUsed bumped) on hit, undefined otherwise.
+ */
+export function lookupMeshCache(
+  absPath: string,
+  sourceHash: string,
+  paramsKey: string,
+  meshQuality: string,
+): MeshCacheEntry | undefined {
+  const key = computeMeshCacheKey(absPath, sourceHash, paramsKey, meshQuality);
+  const entry = meshCache.get(key);
+  if (!entry) return undefined;
+  // Double-guard: even though source content hashes into the key, a stale
+  // mtime can only happen when someone externally mutated the file to the
+  // same content (git checkout, touch). Content equality is enough for
+  // correctness — we still refresh lastUsed so the LRU position is right.
+  entry.hitCount += 1;
+  entry.lastUsed = Date.now();
+  return entry;
+}
+
+/**
+ * Store an outcome under the computed cache key. Drops the oldest (by
+ * lastUsed) entry when the cache would grow beyond MESH_CACHE_MAX. Only
+ * successful outcomes are cached — a failed render is cheap to re-run (no
+ * OCCT work happened) and we'd rather hit a transient-failure retry than
+ * serve a stale "success" from before the caller's edit.
+ */
+export function populateMeshCache(
+  absPath: string,
+  sourceHash: string,
+  mtimeMs: number,
+  paramsKey: string,
+  meshQuality: string,
+  outcome: ExecuteOutcome,
+): void {
+  if (!outcome.status.success) return;
+  const key = computeMeshCacheKey(absPath, sourceHash, paramsKey, meshQuality);
+  const entry: MeshCacheEntry = {
+    result: sanitizeOutcomeForCache(outcome),
+    sourceHash,
+    mtimeMs,
+    paramsKey,
+    meshQuality,
+    hitCount: 0,
+    lastUsed: Date.now(),
+  };
+  meshCache.set(key, entry);
+  if (meshCache.size > MESH_CACHE_MAX) {
+    evictOldest();
+  }
+}
+
+/**
+ * LRU eviction: drop the entry with the smallest `lastUsed` stamp. Cheap
+ * enough at MESH_CACHE_MAX = 16 — O(n) per eviction, only on the rare
+ * insert that overflows.
+ */
+function evictOldest(): void {
+  let oldestKey: string | undefined;
+  let oldestStamp = Infinity;
+  for (const [k, v] of meshCache) {
+    if (v.lastUsed < oldestStamp) {
+      oldestStamp = v.lastUsed;
+      oldestKey = k;
+    }
+  }
+  if (oldestKey !== undefined) meshCache.delete(oldestKey);
+}
+
+/**
+ * Drop every cached mesh result. Called from resetCore() — after a WASM heap
+ * reset the underlying parts are fine (no OCCT pointers inside), but the next
+ * execute might legitimately produce different output (e.g. if the reset was
+ * triggered by a now-fixed user script), so we'd rather re-tessellate than
+ * serve pre-reset output for the same source+params.
+ */
+export function clearMeshCache(): void {
+  meshCache.clear();
+}
+
+/** Observability hook for tests and logging. */
+export function getMeshCacheSize(): number {
+  return meshCache.size;
+}
+
+/**
+ * Read the entry file's stat + content so the cache can key on both the
+ * content hash (authoritative) and mtime (LRU bookkeeping). Returns
+ * undefined when the file is missing or unreadable — callers fall back to a
+ * fresh execute so the failure surfaces through executeShapeFile's own error
+ * path rather than being masked by a cache-layer swallow.
+ */
+export function readSourceForCacheKey(
+  absPath: string,
+): { source: string; sourceHash: string; mtimeMs: number } | undefined {
+  try {
+    const source = readFileSync(absPath, "utf-8");
+    const mtimeMs = statSync(absPath).mtimeMs;
+    return { source, sourceHash: hashSource(source), mtimeMs };
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Where do we find the WASM binary? In the installed VSCode extension it
  * lives next to the bundled mcp-server.js (esbuild.config.mjs copies it to
@@ -444,6 +660,11 @@ export function resetCore(): void {
   corePromise = null;
   lastParts = [];
   lastFileName = undefined;
+  // Drop every memoised mesh too: even though cached parts contain no WASM
+  // pointers, a reset usually means we just hit a poisoned-heap failure on
+  // the same script — the FIX (re-init + re-execute) needs to actually run
+  // again to land any user-side bug fix that motivated the reset.
+  clearMeshCache();
   // Bug #8: the wedge-detection heuristic treats a post-success pointer throw
   // as "heap corruption — retry". After we reset the core, the freshly-booted
   // OCCT instance hasn't succeeded yet, so a first-render failure on it
