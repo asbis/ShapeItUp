@@ -946,6 +946,30 @@ export function checkBezierDegeneracy(code: string): string | null {
 }
 
 /**
+ * Compute the effective meshQuality to use for a render_preview call.
+ *
+ * Rule: when renderMode is "ai" (or absent — which defaults to "ai") AND
+ * the caller did NOT explicitly supply meshQuality, force "final" so the AI
+ * agent always analyses accurate geometry rather than a coarsely-faceted
+ * preview mesh.
+ *
+ * When the caller explicitly passes meshQuality (even "preview") their
+ * choice is respected — they opted in knowingly.
+ *
+ * Extracted so unit tests can verify the policy without spinning up the
+ * full MCP server.
+ */
+export function computeEffectiveMeshQuality(
+  renderMode: string | undefined,
+  meshQuality: "preview" | "final" | undefined
+): "preview" | "final" | undefined {
+  if ((renderMode === "ai" || renderMode === undefined) && meshQuality === undefined) {
+    return "final";
+  }
+  return meshQuality;
+}
+
+/**
  * Pure syntax + pitfall validator. Extracted from the `validate_syntax` /
  * `validate_script` MCP tools so unit tests can call it directly without
  * spinning up an MCP server. Returns the same text the tools emit, plus a
@@ -2903,6 +2927,20 @@ export function registerTools(server: McpServer) {
       } else if (Array.isArray(cameraAngle)) {
         cameraAngle = cameraAngle.map(normalizeAngle) as typeof cameraAngle;
       }
+
+      // AI render mode quality guard: faceted preview meshes mislead an AI
+      // agent doing visual analysis of the screenshot. When renderMode is
+      // "ai" (the default) and the caller did NOT explicitly set meshQuality,
+      // force "final" so the AI always sees accurate geometry.
+      // If the caller explicitly passes meshQuality (including "preview") we
+      // respect their choice — they know what they want.
+      const effectiveMeshQuality = computeEffectiveMeshQuality(renderMode, meshQuality);
+      if (effectiveMeshQuality !== meshQuality) {
+        console.error(
+          `[render] auto-upgrade meshQuality preview→final because renderMode=${renderMode ?? "ai"} (default)`
+        );
+      }
+
       // Resolve which file to render: explicit > engine's last-executed > status file.
       const explicitFilePath = filePath !== undefined && filePath !== null;
       let source: string | undefined = filePath ? resolveShapePath(filePath) : getLastFileName();
@@ -3095,7 +3133,7 @@ export function registerTools(server: McpServer) {
               height: perH,
               focusPart,
               hideParts,
-              meshQuality,
+              meshQuality: effectiveMeshQuality,
             });
             if (!cmdId) {
               return { content: [{ type: "text" as const, text: "Failed to send command to extension" }], isError: true };
@@ -3358,9 +3396,9 @@ export function registerTools(server: McpServer) {
           height: height || 960,
           focusPart,
           hideParts,
-          // P3-10: forward the user's quality preference (undefined → the
-          // core auto-degrades based on part count).
-          meshQuality,
+          // P3-10: forward the effective quality (auto-upgraded to "final" for
+          // ai render mode when the caller didn't explicitly set meshQuality).
+          meshQuality: effectiveMeshQuality,
         });
         if (!cmdId) {
           return { content: [{ type: "text" as const, text: "Failed to send command to extension" }], isError: true };

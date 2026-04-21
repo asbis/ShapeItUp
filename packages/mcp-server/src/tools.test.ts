@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { validateSyntaxPure, detectPathDoubling, detectPathDoublingInfo, extractSignatures, safeHandler, computePartsLine } from "./tools.js";
+import { validateSyntaxPure, detectPathDoubling, detectPathDoublingInfo, extractSignatures, safeHandler, computePartsLine, computeEffectiveMeshQuality } from "./tools.js";
 
 // ---------------------------------------------------------------------------
 // Bug #6 — validate_syntax must trust .method() calls whose receiver was
@@ -574,5 +574,48 @@ describe("computePartsLine — Bug #5 focusPart unification", () => {
       "focused — other parts hidden in screenshot",
     );
     expect(line).toBe("\nParts: lid (focused — other parts hidden in screenshot)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// computeEffectiveMeshQuality — AI render mode auto-upgrade
+//
+// When renderMode is "ai" (or unset, which defaults to "ai") and the caller
+// did NOT explicitly pass meshQuality, the effective quality must be "final"
+// so the AI agent analyses accurate geometry. Explicit caller overrides
+// (including "preview") are always respected.
+// ---------------------------------------------------------------------------
+
+describe("computeEffectiveMeshQuality — AI render mode auto-upgrade", () => {
+  it("auto-upgrades to 'final' when renderMode=ai and meshQuality is not set", () => {
+    expect(computeEffectiveMeshQuality("ai", undefined)).toBe("final");
+  });
+
+  it("auto-upgrades to 'final' when renderMode is undefined (default 'ai') and meshQuality is not set", () => {
+    // renderMode absent == "ai" in the handler (renderMode || "ai").
+    expect(computeEffectiveMeshQuality(undefined, undefined)).toBe("final");
+  });
+
+  it("respects explicit meshQuality:'preview' even with renderMode=ai", () => {
+    // Caller opted in knowingly — do NOT override.
+    expect(computeEffectiveMeshQuality("ai", "preview")).toBe("preview");
+  });
+
+  it("respects explicit meshQuality:'final' with renderMode=ai (no-op upgrade)", () => {
+    expect(computeEffectiveMeshQuality("ai", "final")).toBe("final");
+  });
+
+  it("does NOT auto-upgrade when renderMode='dark' and meshQuality is not set", () => {
+    // Dark mode is for human review, not AI analysis — respect the absence
+    // of meshQuality (passes through as undefined → extension auto-degrades).
+    expect(computeEffectiveMeshQuality("dark", undefined)).toBeUndefined();
+  });
+
+  it("respects explicit meshQuality:'preview' with renderMode=dark", () => {
+    expect(computeEffectiveMeshQuality("dark", "preview")).toBe("preview");
+  });
+
+  it("respects explicit meshQuality:'final' with renderMode=dark", () => {
+    expect(computeEffectiveMeshQuality("dark", "final")).toBe("final");
   });
 });
