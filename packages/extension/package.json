@@ -173,12 +173,12 @@
   },
   "dependencies": {
     "@resvg/resvg-wasm": "^2.6.2",
-    "esbuild-wasm": "^0.28.0",
-    "ws": "^8.20.0"
+    "esbuild-wasm": "^0.28.0"
   },
   "devDependencies": {
     "@shapeitup/shared": "workspace:*",
     "@types/vscode": "^1.106.0",
-    "@types/ws": "^8.18.1"
+    "@types/ws": "^8.18.1",
+    "ws": "^8.20.0"
   }
 }

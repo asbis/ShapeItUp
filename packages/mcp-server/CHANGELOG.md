@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.6.1 (2026-04-21)
+
+Patch release. Shipped alongside extension `1.7.0` to unblock the VSIX
+publish that failed on `1.6.0` due to `ws` being symlinked into the
+pnpm store. mcp-server's own tarball was unaffected (`ws` was already
+correctly classified).
+
+### Fixed
+- Extension VSIX packaging: `ws` moved from `dependencies` to
+  `devDependencies` in `packages/extension/package.json` — it is
+  bundled by the extension's esbuild output, so vsce's
+  `npm list --production` audit no longer trips on pnpm symlinks to
+  ws's dev deps.
+- CI/publish smoke tests now accept the expected `timeout 10` kill
+  (exit 124) when a valid `serverInfo`/`protocolVersion` response
+  has already been captured. The server deliberately keeps the
+  subscriber-bus WebSocket listener open, so a clean EOF exit is not
+  expected.
+
 ## 1.6.0 (2026-04-21)
 
 Headless, standalone-ready MCP server. API-compatible for MCP clients; the

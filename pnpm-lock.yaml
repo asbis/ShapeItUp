@@ -48,9 +48,6 @@ importers:
       esbuild-wasm:
         specifier: ^0.28.0
         version: 0.28.0
-      ws:
-        specifier: ^8.20.0
-        version: 8.20.0
     devDependencies:
       '@shapeitup/shared':
         specifier: workspace:*
@@ -61,6 +58,9 @@ importers:
       '@types/ws':
         specifier: ^8.18.1
         version: 8.18.1
+      ws:
+        specifier: ^8.20.0
+        version: 8.20.0
 
   packages/mcp-server:
     dependencies:
