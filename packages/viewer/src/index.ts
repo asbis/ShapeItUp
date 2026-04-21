@@ -409,12 +409,7 @@ function setCameraAngle(position: [number, number, number]) {
 
   const dir = new THREE.Vector3(...position).normalize();
   camera.position.copy(center.clone().add(dir.multiplyScalar(dist)));
-  // Preset views should always be Z-up — ArcballControls doesn't call
-  // lookAt() inside update(), so we set the orientation explicitly here.
-  // During free drag the arcball is free to rotate past the poles; this
-  // only anchors the preset angles.
-  camera.up.set(0, 0, 1);
-  camera.lookAt(center);
+  camera.up.set(0, 0, 1); // Z-up for CAD
   controls.target.copy(center);
   controls.update();
 }
@@ -1143,10 +1138,13 @@ onMessage("installed-apps", (msg) => {
 // CAMERA_ANGLE_PRESETS and trigger the orthographic capture path when used
 // by the screenshot pipeline. The interactive viewport still renders through
 // the perspective camera in both cases — live orbit/zoom remains unchanged.
-document.getElementById("vc-top")!.addEventListener("click", () => setCameraAngle([0, 0, 1]));
-document.getElementById("vc-front")!.addEventListener("click", () => setCameraAngle([0, -1, 0]));
-document.getElementById("vc-right")!.addEventListener("click", () => setCameraAngle([1, 0, 0]));
 document.getElementById("vc-iso")!.addEventListener("click", () => setCameraAngle([1, -1, 0.7]));
+document.getElementById("vc-top")!.addEventListener("click", () => setCameraAngle([0, 0, 1]));
+document.getElementById("vc-bottom")!.addEventListener("click", () => setCameraAngle([0, 0, -1]));
+document.getElementById("vc-front")!.addEventListener("click", () => setCameraAngle([0, -1, 0]));
+document.getElementById("vc-back")!.addEventListener("click", () => setCameraAngle([0, 1, 0]));
+document.getElementById("vc-right")!.addEventListener("click", () => setCameraAngle([1, 0, 0]));
+document.getElementById("vc-left")!.addEventListener("click", () => setCameraAngle([-1, 0, 0]));
 
 // --- Parameter Sliders ---
 import type { ParamDef } from "@shapeitup/shared";

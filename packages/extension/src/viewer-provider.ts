@@ -399,18 +399,22 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     #view-toolbar button:hover { background: #3c3c3c; color: #fff; }
     #view-toolbar button.active { background: #0e639c; color: #fff; }
 
-    /* ViewCube */
+    /* ViewCube — 3×2 grid of axis views (top/bottom, front/back, right/left)
+       plus a full-width Iso row. Gives one-click access to every side so
+       users don't need to drag past the pole to see the underside. */
     #viewcube {
       position: absolute; bottom: 40px; right: 10px; z-index: 20;
-      display: flex; flex-direction: column; gap: 2px;
+      display: grid; grid-template-columns: 1fr 1fr; gap: 2px;
       background: rgba(37,37,38,0.85); padding: 4px; border-radius: 5px;
       border: 1px solid #3c3c3c;
     }
     #viewcube button {
       background: transparent; border: none; color: #999; cursor: pointer;
       font-size: 10px; padding: 3px 6px; border-radius: 2px; font-family: inherit;
+      min-width: 44px;
     }
     #viewcube button:hover { background: #3c3c3c; color: #fff; }
+    #viewcube button.vc-iso { grid-column: 1 / span 2; }
 
     /* Parameters panel (bottom of parts panel) */
     #params-panel {
@@ -517,10 +521,13 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       </div>
 
       <div id="viewcube">
-        <button id="vc-top" title="Top view">Top</button>
-        <button id="vc-front" title="Front view">Front</button>
-        <button id="vc-right" title="Right view">Right</button>
-        <button id="vc-iso" title="Isometric view">Iso</button>
+        <button id="vc-iso" class="vc-iso" title="Isometric view (1)">Iso</button>
+        <button id="vc-top" title="Top view — looking down -Z (4)">Top</button>
+        <button id="vc-bottom" title="Bottom view — looking up +Z (7)">Bottom</button>
+        <button id="vc-front" title="Front view — looking along +Y (2)">Front</button>
+        <button id="vc-back" title="Back view — looking along -Y (5)">Back</button>
+        <button id="vc-right" title="Right view — looking along -X (3)">Right</button>
+        <button id="vc-left" title="Left view — looking along +X (6)">Left</button>
       </div>
 
       <div id="section-controls">
