@@ -6213,6 +6213,83 @@ printHints.firstLayerPad(shape, { padding?, thickness? })  // thin adhesion pad 
 \`console.warn\` on complex geometry. For known-good cases (simple brackets,
 plates) it cuts a reasonable chamfer.
 
+**Print orientation helpers** — re-orient a part for FDM printing and pack
+multiple parts onto one build plate:
+
+\`\`\`typescript
+import { printHints } from "shapeitup";
+
+const laidFlat = [bracket, lid, shaft].map(printHints.flatForPrint);
+return printHints.layoutOnBed(laidFlat, { spacing: 5, bedWidth: 220 });
+\`\`\`
+
+\`flatForPrint(shape)\` picks the largest planar face, rotates its outward normal
+to -Z, and translates so \`bbox.min.z === 0\`. \`layoutOnBed(shapes, { spacing,
+bedWidth })\` shelf-packs on the XY plane, wrapping to a new Y-shelf when
+\`bedWidth\` is exceeded. Both clone their inputs — the original assembly-posed
+shapes survive unchanged, so you can use the same Part in \`assemble()\` AND
+in a print-layout return from \`main()\` without double-transforming.
+
+---
+
+## pins — shafts, pivots, cross-pins (mechanism primitives)
+
+\`\`\`typescript
+pins.pin({ diameter, length, headDia?, headThk?, axis?, chamfer? })   // shaft, optional shoulder, tip chamfer
+pins.pivot({ size, fit?, length })                                     // matched { pin, hole, clearance } pair for a hinge axle
+pins.teeBar({ mainDia, mainLen, crossDia, crossLen, crossAt? })        // T-handle / cross-pin
+\`\`\`
+
+\`pins.pin\` — base at origin extending along \`axis\` (default \`"+Z"\`). Passing
+\`headDia\` adds a shoulder at the far end so the pin can't fall through a
+matching bore. \`pins.pivot\` wraps \`pin\` with a matching cylinder cut-tool sized
+to the fit allowance (default \`"slip"\` for rotating joints) — keeps pin and bore
+diameters in sync automatically. \`teeBar\`: main axis +Z, cross axis +X.
+
+---
+
+## cradles — ball cups and elastic anchors
+
+\`\`\`typescript
+cradles.cradle({ ballDiameter, wall?, capturePercent?, axis? })        // hollow cup sized for a sphere
+cradles.band_post({ postR, hookR, height, headThk?, axis? })           // shaft + mushroom head, retains a rubber band
+\`\`\`
+
+\`capturePercent\` controls how much of the sphere wraps the ball: \`0.4\` is a
+shallow saucer, \`0.5\` a hemisphere (default), values approaching \`1\` approach
+a nearly-closed shell. For FDM, orient so the opening faces \`-Z\` — the cavity's
+ceiling prints without support. Pair with \`standards.SPORTS_BALLS[...].diameter\`
+for standard-sized payloads.
+
+---
+
+## standards.SPORTS_BALLS — ball dimension tables
+
+\`\`\`typescript
+standards.SPORTS_BALLS.tennis     // { diameter: 67,    name: "Tennis ball (ITF)" }
+standards.SPORTS_BALLS.pingpong   // { diameter: 40,    name: "Table tennis ball" }
+standards.SPORTS_BALLS.golf       // { diameter: 42.67, name: "Golf ball (R&A/USGA)" }
+standards.SPORTS_BALLS.baseball   // { diameter: 73,    name: "Baseball (MLB)" }
+standards.SPORTS_BALLS.soccer     // { diameter: 216,   name: "Soccer ball (FIFA size 5)" }
+\`\`\`
+
+---
+
+## symmetricPair — mirrored part pairs
+
+When an assembly uses a left/right pair of the same geometric part, build it
+once at the origin and use \`symmetricPair(part, plane, opts?)\` to get
+\`[left, right]\` with all joint positions and axes reflected. Joint roles
+(male/female/face) are preserved across the mirror.
+
+\`\`\`typescript
+import { part, faceAt, symmetricPair } from "shapeitup";
+
+const bracket = part({ shape: bracketShape, name: "bracket", joints: { ... } });
+const [left, right] = symmetricPair(bracket, "YZ", { leftSuffix: "L", rightSuffix: "R" });
+// left.joints.wallFaceL, right.joints.wallFaceR — no name collision in mates
+\`\`\`
+
 ---
 
 ## Complete worked example

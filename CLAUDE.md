@@ -104,7 +104,7 @@ import { makeBolt } from "./bolt.shape";
 ## MCP Server
 
 Registered globally in `~/.claude/settings.json`. Provides 9 tools:
-- `create_shape`, `modify_shape`, `read_shape`, `list_shapes`, `validate_script`
+- `create_shape`, `modify_shape`, `read_shape`, `list_shapes`, `validate_syntax`
 - `render_preview` (captures screenshot in AI high-contrast mode with dimensions)
 - `set_render_mode`, `toggle_dimensions`
 - `get_api_reference` (returns Replicad API docs by category)
