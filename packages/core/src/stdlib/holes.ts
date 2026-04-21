@@ -99,6 +99,14 @@ function warnAmbiguousRawDiameter(
  *   "+Y"  opening at Y=0,  body Y ∈ [-depth, 0]   (drill points -Y)
  *   "-Y"  opening at Y=0,  body Y ∈ [0, depth]    (drill points +Y)
  *
+ * Per-axis mnemonic — "drill enters from the named face, body penetrates opposite":
+ *   "+X"  drill enters from the +X-facing side; body penetrates toward -X
+ *   "-X"  drill enters from the -X-facing side; body penetrates toward +X
+ *   "+Y"  drill enters from the +Y-facing side; body penetrates toward -Y
+ *   "-Y"  drill enters from the -Y-facing side; body penetrates toward +Y
+ *   "+Z"  drill enters from the +Z-facing side (top); body penetrates toward -Z
+ *   "-Z"  drill enters from the -Z-facing side (bottom); body penetrates toward +Z
+ *
  * So for a wall with its +X face at X=`thickness`, `axis: "+X"` plus
  * `.translate(thickness, y, z)` drills a hole INTO the wall from the +X
  * side — exactly matching engineering intuition.

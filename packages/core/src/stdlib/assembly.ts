@@ -574,3 +574,201 @@ export function highlightJoints(
   }
   return [...partEntries, ...markers];
 }
+
+// ── composeAssembly — merge parametric main() exports into one top-level ────
+
+/** A single entry in the assembly's returned part list. Shape-3D + metadata. */
+export interface ComposedAssemblyPart {
+  shape: Shape3D;
+  name?: string;
+  color?: string;
+  qty?: number;
+  material?: { density: number; name?: string };
+  analyze?: boolean;
+  [key: string]: unknown;
+}
+
+/**
+ * One file contributes its `main()` export plus its own `params` dict. The
+ * optional `transform` runs on every part the `main` produces, AFTER the
+ * shape is cloned (Replicad's translate/rotate consume their input — a
+ * transform that consumed the caller's shape would invalidate any cached
+ * handle upstream).
+ */
+export interface ComposedPart {
+  main: (params?: Record<string, number>) => unknown;
+  params?: Record<string, number>;
+  transform?: (part: ComposedAssemblyPart) => ComposedAssemblyPart;
+}
+
+export interface ComposeAssemblyOptions {
+  parts: ComposedPart[];
+}
+
+export interface ComposedAssembly {
+  main: (allParams?: Record<string, number>) => ComposedAssemblyPart[];
+  params: Record<string, number>;
+}
+
+/**
+ * Normalize whatever `main()` handed back into a uniform array of
+ * `{ shape, ... }` records. Accepts the full shape-entry polymorphism:
+ *
+ *   - a single Shape3D                     → `[{ shape }]`
+ *   - a single `{ shape, name, color }`    → `[that]`
+ *   - an array of either                   → flattened into records
+ *
+ * Anything else throws — the composer cannot silently drop parts the caller
+ * produced because of a return-type mistake.
+ */
+function normalizeMainResult(
+  result: unknown,
+  partLabel: string,
+): ComposedAssemblyPart[] {
+  if (result == null) {
+    throw new Error(`composeAssembly: part "${partLabel}" main() returned ${result}`);
+  }
+  const asEntry = (item: unknown, index: number): ComposedAssemblyPart => {
+    if (item && typeof item === "object") {
+      const obj = item as Record<string, unknown>;
+      if (obj.shape && typeof (obj.shape as any).clone === "function") {
+        return { ...(obj as ComposedAssemblyPart) };
+      }
+      if (typeof (obj as any).clone === "function") {
+        return { shape: obj as unknown as Shape3D };
+      }
+    }
+    throw new Error(
+      `composeAssembly: part "${partLabel}" main() returned item #${index} ` +
+        `that is not a Shape3D or { shape, ... } object`,
+    );
+  };
+  if (Array.isArray(result)) {
+    return result.map((it, i) => asEntry(it, i));
+  }
+  return [asEntry(result, 0)];
+}
+
+/**
+ * Compose several parametric `.shape.ts` files' `main()` exports into a
+ * single top-level assembly. Each child contributes its own `params` dict;
+ * `composeAssembly` merges them into one flat object and returns a new
+ * `main` that dispatches overrides to the right child by key.
+ *
+ * Duplicate param keys are rejected up front with a message naming both
+ * contributing parts — silent overwriting would make the tune_params slider
+ * behaviour depend on part order, which is exactly the bug this helper
+ * exists to prevent.
+ *
+ * ```typescript
+ * // assembly.shape.ts
+ * import * as body from "./body.shape";
+ * import * as cam  from "./cam.shape";
+ * const assembly = composeAssembly({
+ *   parts: [
+ *     { main: body.default, params: body.params },
+ *     { main: cam.default,  params: cam.params,
+ *       transform: (p) => ({ ...p, shape: p.shape.translate(0, 0, 20) }) },
+ *   ],
+ * });
+ * export const params = assembly.params;
+ * export default assembly.main;
+ * ```
+ */
+export function composeAssembly(opts: ComposeAssemblyOptions): ComposedAssembly {
+  if (!opts || !Array.isArray(opts.parts) || opts.parts.length === 0) {
+    throw new Error("composeAssembly: `parts` must be a non-empty array");
+  }
+  // Validate each entry and build a per-part label up-front. Labels prefer
+  // the function's `.name` (so errors read like "part 'makeBody'" instead of
+  // "part #0"); fall back to the index when the caller passed an anonymous
+  // arrow.
+  const labels: string[] = [];
+  for (let i = 0; i < opts.parts.length; i++) {
+    const p = opts.parts[i];
+    if (!p || typeof p.main !== "function") {
+      throw new Error(
+        `composeAssembly: parts[${i}].main must be a function (got ${typeof p?.main})`,
+      );
+    }
+    if (p.transform !== undefined && typeof p.transform !== "function") {
+      throw new Error(
+        `composeAssembly: parts[${i}].transform must be a function when provided`,
+      );
+    }
+    if (p.params !== undefined && (typeof p.params !== "object" || p.params === null || Array.isArray(p.params))) {
+      throw new Error(
+        `composeAssembly: parts[${i}].params must be a plain object when provided`,
+      );
+    }
+    const label = (p.main as { name?: string }).name?.trim() || `part[${i}]`;
+    labels.push(label);
+  }
+
+  // Merge params. Track which part contributed each key so a collision
+  // names both sides.
+  const mergedParams: Record<string, number> = {};
+  const owners: Record<string, string> = {};
+  for (let i = 0; i < opts.parts.length; i++) {
+    const partParams = opts.parts[i].params;
+    if (!partParams) continue;
+    for (const key of Object.keys(partParams)) {
+      if (Object.prototype.hasOwnProperty.call(owners, key)) {
+        throw new Error(
+          `composeAssembly: param "${key}" is declared by both "${owners[key]}" and "${labels[i]}". ` +
+            `Rename one side — merged params must be unambiguous so slider overrides dispatch correctly.`,
+        );
+      }
+      mergedParams[key] = partParams[key];
+      owners[key] = labels[i];
+    }
+  }
+
+  const main = (allParams?: Record<string, number>): ComposedAssemblyPart[] => {
+    const overrides = allParams ?? {};
+    const out: ComposedAssemblyPart[] = [];
+    for (let i = 0; i < opts.parts.length; i++) {
+      const part = opts.parts[i];
+      const label = labels[i];
+      // Pass only keys this part declared. A child that doesn't declare
+      // `params` at all receives `undefined` — matching the pattern in
+      // SKILL.md where a factory's default-argument pulls from its own
+      // module-level params.
+      let subset: Record<string, number> | undefined;
+      if (part.params) {
+        subset = {};
+        for (const key of Object.keys(part.params)) {
+          subset[key] =
+            Object.prototype.hasOwnProperty.call(overrides, key)
+              ? overrides[key]
+              : part.params[key];
+        }
+      }
+      const raw = part.main(subset);
+      const entries = normalizeMainResult(raw, label);
+      for (const entry of entries) {
+        if (part.transform) {
+          // Replicad's translate/rotate DELETE the input — clone before
+          // handing the shape to user code that's about to transform it.
+          const cloned: ComposedAssemblyPart = {
+            ...entry,
+            shape: entry.shape.clone(),
+          };
+          const transformed = part.transform(cloned);
+          if (!transformed || !transformed.shape) {
+            throw new Error(
+              `composeAssembly: part "${label}" transform returned ${transformed} ` +
+                `(expected a { shape, ... } object)`,
+            );
+          }
+          out.push(transformed);
+        } else {
+          out.push(entry);
+        }
+      }
+    }
+    return out;
+  };
+
+  return { main, params: mergedParams };
+}
