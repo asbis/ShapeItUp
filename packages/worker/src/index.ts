@@ -31,11 +31,31 @@ self.onmessage = async (event: MessageEvent) => {
 
   try {
     switch (msg.type) {
-      case "init":
+      case "init": {
+        // Cached-bytes fast path: extension shipped pre-read OCCT (and
+        // optionally Manifold) bytes. The browser-loader uses `wasmBinary`
+        // to skip Emscripten's internal fetch entirely, eliminating the
+        // ~2s respawn cold cost. URL fields stay populated as a fallback
+        // for any sidecar locateFile resolution.
+        const occtCached = msg.occt?.loaderJs && msg.occt?.wasmBytes ? msg.occt : undefined;
+        const manifoldCached =
+          msg.manifold?.loaderJs && msg.manifold?.wasmBytes ? msg.manifold : undefined;
+        if (!occtCached && !msg.wasmLoaderUrl) {
+          // The viewer must supply at least one path — bytes or URLs.
+          // eslint-disable-next-line no-console
+          console.warn(
+            "[shapeitup worker] init missing both cached OCCT bytes and fallback URLs",
+          );
+        }
         core = await initCore(
-          () => loadOCCTBrowser(msg.wasmLoaderUrl, msg.wasmUrl),
-          msg.manifoldLoaderUrl && msg.manifoldWasmUrl
-            ? () => loadManifoldBrowser(msg.manifoldLoaderUrl, msg.manifoldWasmUrl)
+          () => loadOCCTBrowser(msg.wasmLoaderUrl, msg.wasmUrl, occtCached),
+          manifoldCached || (msg.manifoldLoaderUrl && msg.manifoldWasmUrl)
+            ? () =>
+                loadManifoldBrowser(
+                  msg.manifoldLoaderUrl,
+                  msg.manifoldWasmUrl,
+                  manifoldCached,
+                )
             : undefined,
         );
         self.postMessage({ type: "ready" });
@@ -50,6 +70,7 @@ self.onmessage = async (event: MessageEvent) => {
           await executeUserScript(queued.js, queued.paramOverrides, queued.meshQuality);
         }
         break;
+      }
       case "execute":
         if (executing) return;
         if (!core) {
