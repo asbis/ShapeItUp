@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (tsc -b)
+        run: pnpm lint
+
+      - name: Test @shapeitup/mcp-server
+        run: pnpm --filter @shapeitup/mcp-server exec vitest run
+
+      - name: Test @shapeitup/core
+        run: pnpm --filter @shapeitup/core exec vitest run
+
+      - name: Test shapeitup-vscode (extension)
+        run: pnpm --filter shapeitup-vscode exec vitest run
+
+      - name: Build
+        run: pnpm build
+
+      - name: Tarball smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Pack @shapeitup/mcp-server into a tarball.
+          cd packages/mcp-server
+          pnpm pack
+          TGZ="$(ls shapeitup-mcp-server-*.tgz | head -n1)"
+          if [ -z "$TGZ" ]; then
+            echo "pnpm pack produced no tarball" >&2
+            exit 1
+          fi
+          TGZ_ABS="$(pwd)/$TGZ"
+          cd "$GITHUB_WORKSPACE"
+
+          # Fresh tmp dir outside the repo.
+          TMPDIR="$(mktemp -d)"
+          echo "Smoke-installing $TGZ_ABS into $TMPDIR"
+          pushd "$TMPDIR" >/dev/null
+
+          npm init -y >/dev/null
+          npm install "$TGZ_ABS"
+
+          # Pipe a single MCP initialize request into the installed server.
+          # timeout 10 guarantees a hang fails the step instead of running forever.
+          INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci-smoke","version":"0"}}}'
+          set +e
+          OUT="$(echo "$INIT_REQ" | timeout 10 node node_modules/@shapeitup/mcp-server/dist/index.js 2>&1)"
+          RC=$?
+          set -e
+
+          echo "--- server output ---"
+          echo "$OUT"
+          echo "--- end output ---"
+
+          if [ $RC -ne 0 ]; then
+            echo "mcp-server exited with code $RC" >&2
+            exit $RC
+          fi
+
+          echo "$OUT" | grep -q '"serverInfo"'
+          echo "$OUT" | grep -q '"protocolVersion"'
+          echo "Smoke test OK: serverInfo + protocolVersion found."
+
+          popd >/dev/null
+          rm -rf "$TMPDIR"
+          rm -f "$TGZ_ABS"

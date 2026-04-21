@@ -11,20 +11,100 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-
       - uses: pnpm/action-setup@v4
         with:
           version: 10
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: 'pnpm'
+
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (tsc -b)
+        run: pnpm lint
+
+      - name: Test @shapeitup/mcp-server
+        run: pnpm --filter @shapeitup/mcp-server exec vitest run
+
+      - name: Test @shapeitup/core
+        run: pnpm --filter @shapeitup/core exec vitest run
+
+      - name: Test shapeitup-vscode (extension)
+        run: pnpm --filter shapeitup-vscode exec vitest run
 
       - name: Build
         run: pnpm build
+
+      - name: Verify release tag matches package.json version
+        # Only runs for GitHub `release` events (workflow_dispatch has no tag).
+        # Strips a leading `v` from the tag (e.g. v1.5.0 -> 1.5.0) and compares
+        # against packages/mcp-server/package.json .version. Fails loudly on
+        # mismatch so we never publish a server labelled with the wrong tag.
+        if: github.event_name == 'release'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./packages/mcp-server/package.json').version")"
+          echo "Git tag (stripped): $TAG"
+          echo "package.json version: $PKG_VERSION"
+          if [ "$TAG" != "$PKG_VERSION" ]; then
+            echo "::error::Release tag '$GITHUB_REF_NAME' (-> '$TAG') does not match packages/mcp-server/package.json version '$PKG_VERSION'." >&2
+            exit 1
+          fi
+
+      - name: Tarball smoke test
+        # Belt and suspenders: even though CI runs this on every PR/push, the
+        # final release build could differ (clean install, git state, etc.)
+        # so we re-verify the exact tarball we are about to publish.
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd packages/mcp-server
+          pnpm pack
+          TGZ="$(ls shapeitup-mcp-server-*.tgz | head -n1)"
+          if [ -z "$TGZ" ]; then
+            echo "pnpm pack produced no tarball" >&2
+            exit 1
+          fi
+          TGZ_ABS="$(pwd)/$TGZ"
+          cd "$GITHUB_WORKSPACE"
+
+          TMPDIR="$(mktemp -d)"
+          echo "Smoke-installing $TGZ_ABS into $TMPDIR"
+          pushd "$TMPDIR" >/dev/null
+
+          npm init -y >/dev/null
+          npm install "$TGZ_ABS"
+
+          INIT_REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"publish-smoke","version":"0"}}}'
+          set +e
+          OUT="$(echo "$INIT_REQ" | timeout 10 node node_modules/@shapeitup/mcp-server/dist/index.js 2>&1)"
+          RC=$?
+          set -e
+
+          echo "--- server output ---"
+          echo "$OUT"
+          echo "--- end output ---"
+
+          if [ $RC -ne 0 ]; then
+            echo "mcp-server exited with code $RC" >&2
+            exit $RC
+          fi
+
+          echo "$OUT" | grep -q '"serverInfo"'
+          echo "$OUT" | grep -q '"protocolVersion"'
+          echo "Smoke test OK: serverInfo + protocolVersion found."
+
+          popd >/dev/null
+          rm -rf "$TMPDIR"
+          # Leave the tarball in place in case later steps want it; the runner
+          # is ephemeral anyway.
 
       - name: Dereference WASM symlinks for VSIX packaging
         # pnpm's install places runtime deps in packages/extension/node_modules
@@ -54,10 +134,12 @@ jobs:
         # works for every MCP client without the VS Code extension installed.
         # Uses --no-git-checks because pnpm otherwise refuses to publish from
         # a workspace with uncommitted lockfile tweaks on CI.
+        # NOTE: no `continue-on-error` here — a failed npm publish MUST abort
+        # the workflow so the VSIX below never ships referencing a server
+        # version that wasn't actually released.
         run: pnpm --filter @shapeitup/mcp-server publish --no-git-checks --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        continue-on-error: true
 
       - name: Publish to VS Marketplace
         run: cd packages/extension && npx @vscode/vsce publish
