@@ -203,6 +203,20 @@ const PROTO_VALIDATORS_RAW: Record<string, (self: any, ...args: any[]) => void> 
   shell: (self: any, thickness: unknown, finder?: unknown) => {
     if (typeof thickness === "number") {
       assertPositiveFinite("shell", "thickness", thickness);
+      // Wall-thickness-vs-bounding-box guard. Mirrors the fillet wall-
+      // thickness check: if the requested shell thickness exceeds 50% of the
+      // shape's minimum bounding-box dimension, the inward offset walls
+      // would meet or cross inside the solid — OCCT reports this as an
+      // opaque pointer exception deep inside BRepOffsetAPI_MakeThickSolid.
+      // The 50% threshold is the geometric cutoff: a uniform inward offset
+      // of `thickness` eats `thickness` from BOTH sides of the thinnest
+      // axis, so 2 * thickness must be strictly less than minDim.
+      const minDim = collectShapeMinDimension(self);
+      if (minDim !== null && thickness > minDim * 0.5) {
+        throw new Error(
+          `shell: thickness ${thickness}mm exceeds 50% of minimum part dimension ${minDim.toFixed(2)}mm. Reduce thickness to < ${(minDim * 0.5).toFixed(2)}mm, or filter faces to shell only a thicker region.`,
+        );
+      }
     }
     // W2 empty-finder guard: if the user passed a face-filter callback and
     // it evaluates to zero faces, the shell will silently no-op (or throw
@@ -609,6 +623,17 @@ function validateSketchExtrude(self: any, distance: unknown): void {
   if (typeof distance !== "number" || !Number.isFinite(distance) || distance === 0) {
     throw new TypeError(
       `extrude: distance must be a finite non-zero number, got ${String(distance)} (${typeof distance}).`,
+    );
+  }
+  // Negative extrude distances reach OCCT as a raw WASM pointer exception —
+  // Replicad's pipeline doesn't sign-check before handing the length to
+  // BRepPrimAPI_MakePrism. Sketchers reach for a negative length when they
+  // want to flip direction; the idiomatic Replicad fix is to sketch on the
+  // mirrored plane name instead (XY ↔ YX, etc.), which reverses the plane's
+  // normal without changing the length.
+  if (distance < 0) {
+    throw new Error(
+      `extrude: distance must be positive (got ${distance}mm). Negative lengths aren't supported — use a positive distance and flip the plane name to reverse direction (XY ↔ YX, XZ ↔ ZX, YZ ↔ ZY).`,
     );
   }
   // Issue #1: if this Sketch came from a non-XY `sketchOnPlane`, the extrude

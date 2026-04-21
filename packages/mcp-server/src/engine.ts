@@ -1785,6 +1785,15 @@ export function inferErrorHint(
   // replicad surfaces when the wrapped OCCT call fails.
   const notDone = /BRep_API.*not done|StdFail_NotDone/i.test(msg);
 
+  // why: "no edge was selected" comes from Replicad's FilletBuilder when the
+  // user's filter callback matched zero edges. OCCT itself never ran — we
+  // just didn't hand it any work. Steer the agent at `preview_finder` (the
+  // same advice the chamfer empty-filter instrumentation emits) so they can
+  // visualize which edges their selector actually covers before retrying.
+  if (/fillet|chamfer/.test(op) && /no edge was selected|no edge.*select/i.test(msg)) {
+    return `Fillet/chamfer: selector matched 0 edges — no fillet was applied. Use \`preview_finder\` to visualize which edges match your selector before calling fillet/chamfer — e.g. \`preview_finder("new EdgeFinder().inDirection('Z')")\`.`;
+  }
+
   if (notDone && /fillet|chamfer/.test(op)) {
     // Try to pull a concrete radius number out of the operation / stack so
     // the agent gets "radius 5 is too large" instead of generic advice.
