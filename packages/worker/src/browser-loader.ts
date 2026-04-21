@@ -35,10 +35,54 @@ async function fetchWithRetry(url: string, label: string): Promise<string> {
   return response.text();
 }
 
+/**
+ * Cached WASM bytes the extension host shipped to the webview during the
+ * `init` handshake. When present, callers skip the URL fetch + eval and pass
+ * the raw WASM directly to Emscripten via `wasmBinary`. Both fields must be
+ * present together — passing only one is a programmer error and falls through
+ * to the URL-fetch path with a warning.
+ */
+export interface CachedWasmInputs {
+  loaderJs: string;
+  wasmBytes: Uint8Array;
+}
+
 export async function loadOCCTBrowser(
-  wasmLoaderUrl: string,
-  wasmUrl: string,
+  wasmLoaderUrl: string | undefined,
+  wasmUrl: string | undefined,
+  cached?: CachedWasmInputs,
 ): Promise<any> {
+  // Fast path: extension shipped cached bytes. Skip both the loader fetch
+  // and Emscripten's internal `fetch(.wasm)` by passing wasmBinary.
+  if (cached?.loaderJs && cached?.wasmBytes && cached.wasmBytes.byteLength > 0) {
+    let loaderCode = cached.loaderJs.replace(/export\s+default\s+Module\s*;?\s*$/, "");
+    const initFn = new Function(`
+      ${loaderCode}
+      return Module;
+    `)();
+    if (!initFn || typeof initFn !== "function") {
+      throw new Error("OCCT loader (cached) did not produce a Module function");
+    }
+    return initFn({
+      // Emscripten reads `wasmBinary` before locateFile and skips its own
+      // fetch entirely when present — exactly the cold-cost we want to elide.
+      wasmBinary: cached.wasmBytes,
+      locateFile: (filename: string) => {
+        // Still provide a URL fallback for any sidecar files the loader may
+        // request (in practice OCCT only loads the .wasm — but harmless).
+        if (filename.endsWith(".wasm") && wasmUrl) return wasmUrl;
+        return filename;
+      },
+    });
+  }
+
+  // URL-fetch fallback (pre-cache behavior). Used when activation lost the
+  // race or the bundled .wasm is missing from dist/.
+  if (!wasmLoaderUrl || !wasmUrl) {
+    throw new Error(
+      "loadOCCTBrowser: no cached WASM bytes provided AND no fallback URLs — cannot initialize OCCT",
+    );
+  }
   let loaderCode = await fetchWithRetry(wasmLoaderUrl, "OCCT loader");
   loaderCode = loaderCode.replace(/export\s+default\s+Module\s*;?\s*$/, "");
 
@@ -64,18 +108,44 @@ export async function loadOCCTBrowser(
  * Manifold module ready to pass to replicad's `setManifold()`.
  */
 export async function loadManifoldBrowser(
-  loaderUrl: string,
-  wasmUrl: string,
+  loaderUrl: string | undefined,
+  wasmUrl: string | undefined,
+  cached?: CachedWasmInputs,
 ): Promise<any> {
-  let loaderCode = await fetchWithRetry(loaderUrl, "Manifold loader");
-  // manifold.js is shipped as an ES module: strip `export{Module as default}`.
-  loaderCode = loaderCode.replace(/export\s*\{\s*Module\s+as\s+default\s*\}\s*;?\s*$/, "");
-  loaderCode = loaderCode.replace(/export\s+default\s+Module\s*;?\s*$/, "");
-  // `import.meta` is only valid in ES modules — but manifold's Node-specific
-  // branch references it (`createRequire(import.meta.url)`) even though that
-  // branch can never execute in a web worker. Replace with a parse-safe stub;
-  // ENVIRONMENT_IS_NODE guards the runtime behavior.
-  loaderCode = loaderCode.replace(/import\.meta/g, '({url:""})');
+  // Same scrubbing logic as the URL path — manifold's loader needs the ES
+  // module exports stripped and `import.meta` stubbed before eval.
+  const scrub = (raw: string): string => {
+    let code = raw;
+    code = code.replace(/export\s*\{\s*Module\s+as\s+default\s*\}\s*;?\s*$/, "");
+    code = code.replace(/export\s+default\s+Module\s*;?\s*$/, "");
+    code = code.replace(/import\.meta/g, '({url:""})');
+    return code;
+  };
+
+  if (cached?.loaderJs && cached?.wasmBytes && cached.wasmBytes.byteLength > 0) {
+    const loaderCode = scrub(cached.loaderJs);
+    const initFn = new Function(`
+      ${loaderCode}
+      return Module;
+    `)();
+    if (!initFn || typeof initFn !== "function") {
+      throw new Error("Manifold loader (cached) did not produce a Module function");
+    }
+    return initFn({
+      wasmBinary: cached.wasmBytes,
+      locateFile: (filename: string) => {
+        if (filename.endsWith(".wasm") && wasmUrl) return wasmUrl;
+        return filename;
+      },
+    });
+  }
+
+  if (!loaderUrl || !wasmUrl) {
+    throw new Error(
+      "loadManifoldBrowser: no cached WASM bytes provided AND no fallback URLs",
+    );
+  }
+  const loaderCode = scrub(await fetchWithRetry(loaderUrl, "Manifold loader"));
 
   const initFn = new Function(`
     ${loaderCode}

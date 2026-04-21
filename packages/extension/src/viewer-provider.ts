@@ -5,6 +5,7 @@ import * as fs from "fs";
 import { BUNDLE_EXTERNALS, type ExportFormat } from "@shapeitup/shared";
 import type { DetectedApp } from "./app-detector";
 import { getDetectedApps } from "./app-detector";
+import { getCachedWasmAssets } from "./wasm-cache";
 
 let esbuildInitPromise: Promise<void> | null = null;
 
@@ -590,6 +591,39 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           this.partWarnings.push(msg.message);
         }
         break;
+      case "request-wasm-assets":
+        // Webview asks for cached OCCT (+ Manifold) bytes on every (re)spawn
+        // of the worker. We serve from the in-memory cache populated on
+        // activation (see extension.ts → getCachedWasmAssets). On error,
+        // reply with an empty payload so the webview falls back to URL
+        // fetch instead of hanging on its 2s timeout.
+        this.serveWasmAssets();
+        break;
+    }
+  }
+
+  /**
+   * Reply to a `request-wasm-assets` message. Reads from the extension-host
+   * cache (warm after activation) and posts the bytes back to the active
+   * webview. Failures degrade gracefully — the worker has a URL fallback.
+   */
+  private async serveWasmAssets(): Promise<void> {
+    const webview = this.getActiveWebview();
+    if (!webview) return;
+    const distDir = path.join(this.context.extensionUri.fsPath, "dist");
+    try {
+      const assets = await getCachedWasmAssets(distDir);
+      webview.postMessage({
+        type: "wasm-assets",
+        occt: assets.occt,
+        manifold: assets.manifold,
+      });
+    } catch (err: any) {
+      this.output.appendLine(
+        `[wasm-cache] serve failed (${err?.message ?? err}) — viewer will fall back to URL fetch`,
+      );
+      // Reply with an empty payload so the webview's 2s timeout doesn't fire.
+      webview.postMessage({ type: "wasm-assets" });
     }
   }
 
