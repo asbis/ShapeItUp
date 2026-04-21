@@ -280,6 +280,66 @@ export function linear(n: number, step: Point3): Placement[] {
 }
 
 /**
+ * `count` evenly-spaced placements along a single world axis between `start`
+ * and `end` (inclusive endpoints). Complements {@link linear}, which takes a
+ * step vector from the origin — `linearAlongAxis` takes the interval instead,
+ * matching how users describe "6 holes from x=10 to x=90".
+ *
+ *   linearAlongAxis(1, 0, 10, "X")  // midpoint only → [{ translate: [5, 0, 0] }]
+ *   linearAlongAxis(3, 0, 10, "X")  // [0,0,0], [5,0,0], [10,0,0]
+ *   linearAlongAxis(5, -20, 20, "Y")  // 5 positions along Y from -20 to +20
+ *
+ * @param count Number of positions (≥ 1). When 1, the single placement lands
+ *   at the midpoint of [start, end] (the most common "just center it"
+ *   degenerate case).
+ * @param start Axis coordinate of the first placement.
+ * @param end Axis coordinate of the last placement.
+ * @param axis World axis the line runs along: "X" | "Y" | "Z".
+ */
+export function linearAlongAxis(
+  count: number,
+  start: number,
+  end: number,
+  axis: "X" | "Y" | "Z",
+): Placement[] {
+  if (!Number.isInteger(count) || count < 1) {
+    throw new Error(`linearAlongAxis: count must be an integer >= 1, got ${count}`);
+  }
+  if (!Number.isFinite(start) || !Number.isFinite(end)) {
+    throw new Error(
+      `linearAlongAxis: start and end must be finite numbers, got (${start}, ${end})`,
+    );
+  }
+  if (axis !== "X" && axis !== "Y" && axis !== "Z") {
+    throw new Error(`linearAlongAxis: axis must be "X", "Y", or "Z", got ${JSON.stringify(axis)}`);
+  }
+
+  const placements: Placement[] = [];
+  if (count === 1) {
+    const mid = (start + end) / 2;
+    const t: Point3 = [
+      axis === "X" ? mid : 0,
+      axis === "Y" ? mid : 0,
+      axis === "Z" ? mid : 0,
+    ];
+    placements.push({ translate: t });
+    return placements;
+  }
+  const step = (end - start) / (count - 1);
+  for (let i = 0; i < count; i++) {
+    const v = start + step * i;
+    placements.push({
+      translate: [
+        axis === "X" ? v : 0,
+        axis === "Y" ? v : 0,
+        axis === "Z" ? v : 0,
+      ],
+    });
+  }
+  return placements;
+}
+
+/**
  * Fuse N copies of the shape produced by `makeShape()`, one per placement.
  * Used with positive shapes (screw heads, spokes, motor mounts) to build
  * a patterned part.

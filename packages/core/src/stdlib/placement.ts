@@ -6,6 +6,7 @@
  */
 
 import type { DrawingInterface, Shape3D } from "replicad";
+import { getSketchPlane } from "../instrumentation";
 
 /**
  * Flip a cut-tool shape so it opens upward from Z=0 instead of downward — the
@@ -273,6 +274,122 @@ export function placeOn(
   // Translating the locally-owned `extruded` consumes its handle — fine
   // because we just built it and nothing outside this function holds a
   // reference. See `project_replicad_destructive_translate` memory note.
+  const dx = entry.axis === "X" ? shift : 0;
+  const dy = entry.axis === "Y" ? shift : 0;
+  const dz = entry.axis === "Z" ? shift : 0;
+  return extruded.translate(dx, dy, dz);
+}
+
+// ---------------------------------------------------------------------------
+// extrudeCentered — extrude a sketch symmetrically about its plane.
+//
+// Ergonomic replacement for:
+//
+//   drawRect(40, 50).sketchOnPlane("XZ").extrude(20)   // Y ∈ [-20, 0] — surprise
+//   → .translate(0, 10, 0)                              // manual re-centering
+//
+// `extrudeCentered(sketch, 20)` returns a solid whose bbox on the plane's
+// normal axis is exactly [-distance/2, +distance/2], regardless of the plane.
+// Also narrows the over-wide `Solid | Compound` extrude return type back to
+// `Shape3D` so `.cut()` / `.fuse()` chains don't need an `as Shape3D` cast
+// (Fix #10).
+//
+// Origin tagging: because this function lives in `/stdlib/`, the
+// call-stack-based check in `warnings.ts#enqueueExtrudeHint` automatically
+// tags the hint as `origin: "stdlib"` and `drainExtrudeHints` drops it. No
+// explicit wrap needed — verified against the regex `/[\\/]stdlib[\\/]/` the
+// enqueue helper uses. The separate pen-axis hint emitted by
+// `sketchOnPlane` fires before this helper runs (the user already called
+// `.sketchOnPlane(plane)` to build the Sketch), so extrudeCentered cannot
+// suppress it.
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal structural type for the sketch-like inputs `extrudeCentered`
+ * accepts. Matches replicad's `Sketch`, `Sketches`, `CompoundSketch`, and the
+ * public `SketchInterface` — all expose `.extrude(d)` returning a 3D shape.
+ */
+export interface SketchLike {
+  extrude(distance: number, config?: unknown): unknown;
+}
+
+/** Options for the `plane`-explicit overload of {@link extrudeCentered}. */
+export interface ExtrudeCenteredOpts {
+  /** Override the plane the sketch was built on. Required when the Sketch
+   *  wasn't produced by an instrumented `.sketchOnPlane()` call (no WeakMap
+   *  entry), or when you want to pin it explicitly. */
+  plane?: PlaneName;
+}
+
+/**
+ * Extrude a sketch by `distance` mm, symmetrically about the plane the sketch
+ * was built on, and return a narrowed `Shape3D`.
+ *
+ * On XY this is equivalent to `sketch.extrude(distance).translate(0, 0, -distance/2)`.
+ * On any other plane the translation is along the plane's normal axis (see
+ * {@link PLANE_AXIS}). The result's bounding box on the normal axis is
+ * always `[-distance/2, +distance/2]`.
+ *
+ *   // XZ plane — bbox Y ∈ [-10, 10] (instead of the default [-20, 0]):
+ *   const plate = extrudeCentered(
+ *     drawRectangle(40, 50).sketchOnPlane("XZ"),
+ *     20,
+ *   );
+ *
+ * Plane detection: the instrumentation layer threads the plane name from
+ * `Drawing.sketchOnPlane(name)` to the returned Sketch via a WeakMap. This
+ * helper reads that WeakMap. If the Sketch came from a source that bypasses
+ * the instrumentation (a raw replicad export, a test stub, etc.), pass
+ * `{ plane }` as the third argument to disambiguate.
+ *
+ * @param sketch A replicad `Sketch` / `Sketches` / `CompoundSketch` or any
+ *   object implementing `SketchInterface` (exposes `.extrude(d)`).
+ * @param distance Extrusion thickness in mm. Must be a positive finite number.
+ * @param opts Optional `{ plane }` override. Required when the plane cannot
+ *   be recovered from the sketch via the instrumentation WeakMap.
+ * @returns A Shape3D centered on its plane's normal axis.
+ */
+export function extrudeCentered(
+  sketch: SketchLike,
+  distance: number,
+  opts?: ExtrudeCenteredOpts,
+): Shape3D {
+  const fn = "extrudeCentered";
+  assertPositiveFiniteLocal(fn, "distance", distance);
+  if (sketch == null || typeof (sketch as { extrude?: unknown }).extrude !== "function") {
+    throw new TypeError(
+      `${fn}: sketch must be a replicad Sketch / Sketches / CompoundSketch ` +
+        `(got ${sketch === null ? "null" : typeof sketch}). Build one with ` +
+        `drawing.sketchOnPlane("XY") first.`,
+    );
+  }
+
+  // --- Resolve plane: explicit opts override, else WeakMap, else error. ----
+  let plane: PlaneName | undefined = opts?.plane;
+  if (plane === undefined) {
+    const recovered = getSketchPlane(sketch);
+    if (typeof recovered === "string" && isPlaneName(recovered)) {
+      plane = recovered;
+    }
+  }
+  if (plane === undefined) {
+    throw new Error(
+      `${fn}: could not determine the sketch's plane automatically. ` +
+        `Pass the plane explicitly: extrudeCentered(sketch, ${distance}, { plane: "XZ" }).`,
+    );
+  }
+  const entry = PLANE_AXIS[plane];
+
+  // --- Extrude (narrow replicad's Solid | Compound union to Shape3D) -------
+  const extruded = sketch.extrude(distance) as Shape3D;
+
+  // --- Translate to center on the plane's normal axis ----------------------
+  // Native bbox on entry.axis: [0, +distance] when nativeSign=+1, else
+  // [-distance, 0]. To land the bbox symmetric around 0, we want
+  //   [-distance/2, +distance/2]
+  // so the shift is -(native midpoint) = -(nativeSign * distance / 2).
+  const shift = -entry.nativeSign * (distance / 2);
+  if (shift === 0) return extruded;
   const dx = entry.axis === "X" ? shift : 0;
   const dy = entry.axis === "Y" ? shift : 0;
   const dz = entry.axis === "Z" ? shift : 0;

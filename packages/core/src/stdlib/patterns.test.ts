@@ -476,3 +476,40 @@ describe("patterns.cutTop / cutBottom — plate-face cut sugar", () => {
     ).toThrow(/cannot read plate bounding box/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// `patterns.linearAlongAxis` — axis-interval placement helper.
+// ---------------------------------------------------------------------------
+
+describe("patterns.linearAlongAxis", () => {
+  it("count=1 returns a single midpoint placement", () => {
+    const out = patterns.linearAlongAxis(1, 0, 10, "X");
+    expect(out).toHaveLength(1);
+    expect(out[0].translate).toEqual([5, 0, 0]);
+  });
+
+  it("count=3 evenly spaces endpoints-inclusive over [0, 10] on X", () => {
+    const out = patterns.linearAlongAxis(3, 0, 10, "X");
+    expect(out).toHaveLength(3);
+    expect(out[0].translate).toEqual([0, 0, 0]);
+    expect(out[1].translate).toEqual([5, 0, 0]);
+    expect(out[2].translate).toEqual([10, 0, 0]);
+  });
+
+  it("respects the requested axis (Y)", () => {
+    const out = patterns.linearAlongAxis(3, -10, 10, "Y");
+    expect(out.map((p) => p.translate)).toEqual([
+      [0, -10, 0],
+      [0, 0, 0],
+      [0, 10, 0],
+    ]);
+  });
+
+  it("rejects non-integer count and non-finite bounds", () => {
+    expect(() => patterns.linearAlongAxis(0, 0, 10, "X")).toThrow(/count/);
+    expect(() => patterns.linearAlongAxis(1.5, 0, 10, "X")).toThrow(/count/);
+    expect(() =>
+      patterns.linearAlongAxis(2, NaN, 10, "X"),
+    ).toThrow(/finite/);
+  });
+});

@@ -24,6 +24,7 @@
  */
 
 import * as replicad from "replicad";
+import { pushRuntimeWarning } from "./warnings";
 
 /**
  * Non-enumerable marker attached to every non-fuse-safe thread Compound.
@@ -59,6 +60,17 @@ const GUARD_MESSAGE =
   "or `threads.fuseThreaded(head, size, length, position)` to build a\n" +
   "bolt directly. See stdlib docs on Compound vs. Mesh threads.";
 
+// One-shot latch for the auto-promote advisory. Module-level (not
+// per-execute) because the latch's purpose is to avoid repeating the same
+// nudge N times within a single script — a fresh run will happen from a
+// fresh process/worker in practice, and even when it doesn't the hint is
+// still safely deduplicated by call-site count below.
+const AUTO_PROMOTE_WARNED = new Set<string>();
+const AUTO_PROMOTE_KEY = "fuse";
+const AUTO_PROMOTE_MESSAGE =
+  "Auto-promoted non-fuse-safe thread Compound to Manifold kernel; this is " +
+  "slower than `threads.metricMesh()`. Consider switching for production.";
+
 let patched = false;
 
 /**
@@ -82,16 +94,82 @@ export function patchThreadGuard(mod: any): void {
       other: any,
       ...rest: unknown[]
     ) {
-      if (
-        (this && this[THREAD_COMPOUND_MARKER]) ||
-        (other && other[THREAD_COMPOUND_MARKER])
-      ) {
+      const selfMarked = this && this[THREAD_COMPOUND_MARKER];
+      const otherMarked = other && other[THREAD_COMPOUND_MARKER];
+      if (selfMarked || otherMarked) {
+        // `.cut()` preserves its historical throw: cutting with (or into) a
+        // marked thread Compound has no well-defined semantics — the thread
+        // is made of interfering loops whose boolean result is unstable —
+        // and silently auto-promoting would hide a real modeling error.
+        // Only `.fuse()` has a clean auto-promote path (Manifold union of
+        // meshed operands) that preserves user intent.
+        if (method !== "fuse") {
+          throw new Error(GUARD_MESSAGE);
+        }
+        // Auto-promote: mesh both operands via their respective `meshShape`
+        // (Shape3D) or identity (already-mesh) and fuse via Manifold. The
+        // tolerance mirrors the one used by `threads.tapInto` for consistency
+        // — 0.01 mm is below the visible threshold on printed parts.
+        const promoted = tryAutoPromoteFuse(this, other);
+        if (promoted !== undefined) {
+          if (!AUTO_PROMOTE_WARNED.has(AUTO_PROMOTE_KEY)) {
+            AUTO_PROMOTE_WARNED.add(AUTO_PROMOTE_KEY);
+            pushRuntimeWarning(AUTO_PROMOTE_MESSAGE);
+          }
+          return promoted;
+        }
+        // Fall back to the original guard error if promotion isn't possible
+        // (e.g. neither operand exposes `meshShape` / the mesh kernel isn't
+        // loaded). Better to surface the clear message than crash in OCCT.
         throw new Error(GUARD_MESSAGE);
       }
       return original.call(this, other, ...rest);
     };
     (Klass.prototype[method] as any).__shapeitupThreadGuard = true;
   }
+}
+
+/**
+ * Promote both operands to `MeshShape` and fuse via Manifold. Returns the
+ * fused MeshShape, or undefined if promotion isn't possible (needed inputs
+ * missing `meshShape()` and aren't already mesh). A caller that gets
+ * undefined should fall back to the throw path — we never silently corrupt
+ * geometry just to avoid an error.
+ */
+function tryAutoPromoteFuse(a: any, b: any): any | undefined {
+  const MESH_TOLERANCE = 0.01;
+  const toMesh = (s: any): any | undefined => {
+    if (s == null) return undefined;
+    // MeshShape has `.fuse()` but no `.meshShape()` — the duck-type below
+    // is also how `threads.asMeshShape` distinguishes the two.
+    if (typeof s.meshShape === "function") {
+      try {
+        return s.meshShape({ tolerance: MESH_TOLERANCE });
+      } catch {
+        return undefined;
+      }
+    }
+    // Already a mesh (or mesh-like) — pass through.
+    if (typeof s.fuse === "function") return s;
+    return undefined;
+  };
+  const ma = toMesh(a);
+  const mb = toMesh(b);
+  if (!ma || !mb) return undefined;
+  try {
+    return ma.fuse(mb);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Clear the one-shot auto-promote warning latch. Exported for tests so they
+ * can assert the "warn once per run" contract without needing to reach into
+ * the module's private state.
+ */
+export function resetAutoPromoteWarned(): void {
+  AUTO_PROMOTE_WARNED.clear();
 }
 
 /**

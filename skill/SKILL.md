@@ -206,7 +206,7 @@ Signatures only — full reference: `get_api_reference({ category: "drawing" })`
 |----------|-------------|
 | `draw(origin?)` | Freeform 2D pen-builder (returns DrawingPen) |
 | `drawRectangle(w, h)` | Rectangle centered at origin |
-| `drawRoundedRectangle(w, h, r)` | Rounded rectangle |
+| `drawRoundedRectangle(w, h, r)` | Rounded rectangle. `r` is either a uniform number or `{ rx, ry }` for elliptical corners. Per-corner radii (`{ tl, tr, bl, br }`) are NOT supported — if you need per-corner rounding, build the outline with `draw()` + `sagittaArcTo` instead. Examples: `drawRoundedRectangle(80, 50, 5)` (uniform 5 mm) or `drawRoundedRectangle(80, 50, { rx: 8, ry: 3 })` (wider horizontal fillets). |
 | `drawCircle(r)` | Circle |
 | `drawEllipse(majorR, minorR)` | Ellipse (majorR along X) |
 | `drawPolysides(radius, nSides)` | Regular polygon |
@@ -470,7 +470,22 @@ export default function main() {
 
 `main()` is only invoked when a file is the top-level shape — it's NOT imported. Export named factory functions for reuse. If you see `No matching export in "x.shape.ts" for import "makeX"`, you're trying to import something that's only reachable via `main()`'s return value.
 
-Library `.shape.ts` modules should export **named factories** (`export function makeBolt(p) { ... }`) — never import `main` or `params` from another file. The executor treats those names as reserved entry-point symbols.
+Library `.shape.ts` modules should export **named factories** (`export function makeBolt(p) { ... }`) — never import `main` from another file (the executor strips that export before bundling; the import will fail).
+
+**Sharing parameters across files.** Importing `{ params }` from a sibling is supported but fragile: both files end up in one esbuild bundle, and `tune_params` slider overrides only mutate the entry file's own `params` — imported ones stay at their declared defaults. Prefer the factory-with-default-params pattern, where the child consumes its own `params` via a default argument and the entry just calls the factory with no argument:
+
+```typescript
+// needle.shape.ts
+export const params = { length: 17, width: 3 };
+export function makeNeedle(p = params) {
+  return drawRectangle(p.length, p.width).sketchOnPlane("XY").extrude(1);
+}
+
+// assembly.shape.ts — no explicit params arg; makeNeedle uses its own.
+import { makeNeedle } from "./needle.shape";
+export const params = { scale: 1 };
+export default function main() { return makeNeedle(); }
+```
 
 ```typescript
 // bolt.shape.ts

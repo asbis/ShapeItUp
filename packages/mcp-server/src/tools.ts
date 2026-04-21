@@ -536,7 +536,7 @@ function formatLastScreenshotLine(status: EngineStatus): string {
   return `\nLast screenshot: ${ls.path}${when}${mode}${cam}`;
 }
 
-function formatStatusText(status: EngineStatus): string {
+function formatStatusText(status: EngineStatus, verbosity: "summary" | "full" = "summary"): string {
   const lastShot = formatLastScreenshotLine(status);
   if (!status.success) {
     const hint = status.hint ? `\nHint: ${status.hint}` : "";
@@ -598,7 +598,7 @@ function formatStatusText(status: EngineStatus): string {
         ? `\nGeometry errors (part validation failed):\n - ${status.warnings.join("\n - ")}\nNote: Volume/area/mass omitted for invalid parts.`
         : `\nGeometry warnings:\n - ${status.warnings.join("\n - ")}`)
     : "";
-  const properties = formatProperties(status.properties);
+  const properties = formatProperties(status.properties, verbosity);
   const bbox = status.boundingBox
     ? `\nBounding box: ${status.boundingBox.x} x ${status.boundingBox.y} x ${status.boundingBox.z} mm`
     : "";
@@ -1431,9 +1431,9 @@ export function registerTools(server: McpServer) {
     "setup_shape_project",
     "Bootstrap a folder so `.shape.ts` files get correct types in editors. Writes node_modules/shapeitup and node_modules/replicad type stubs + a minimal tsconfig.json if missing. Idempotent — safe to call repeatedly. Does NOT run npm install; replicad and OCCT are bundled inside this MCP server at runtime. Typically you don't need to call this manually: create_shape auto-bootstraps on first write.",
     {
-      directory: z.string().describe("Absolute path to the project folder to bootstrap."),
+      directory: z.string().optional().describe("Absolute path (defaults to current working directory)."),
     },
-    safeHandler("setup_shape_project", async ({ directory }) => {
+    safeHandler("setup_shape_project", async ({ directory = process.cwd() }) => {
       const r = setupShapeProject(directory);
       const parts: string[] = [`Project: ${r.cwd}`];
       if (r.created.length > 0) parts.push(`Created:\n  ${r.created.join("\n  ")}`);
@@ -1456,8 +1456,9 @@ export function registerTools(server: McpServer) {
       directory: z.string().optional().describe("Directory to create the file in. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first match wins), falling back to process.cwd(). When omitted, defaults to the active VSCode workspace root."),
       overwrite: z.boolean().optional().describe("Set to true to overwrite an existing file (default: false)"),
       allowPathDuplication: z.boolean().optional().describe("Set to true to proceed (with a warning) when the resolved directory has a duplicated last-two segments (e.g. `.../examples/examples`). Default: false — the call refuses in that case and lists the recovery options. Absolute `directory` paths bypass this refusal regardless."),
+      verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats. 'summary' (default) caps at 10 parts then prints a '… and N more' line — keeps the response inside the MCP token budget on large assemblies. 'full' dumps every part (may be large for 20+ part assemblies)."),
     },
-    safeHandler("create_shape", async ({ name, code, directory, overwrite, allowPathDuplication }) => {
+    safeHandler("create_shape", async ({ name, code, directory, overwrite, allowPathDuplication, verbosity }) => {
       // Resolve `directory` with the same unified precedence as resolveShapePath:
       // absolute → use as-is; relative → probe each workspace root for an
       // existing directory; else anchor to cwd. For `create_shape` the
@@ -1624,7 +1625,7 @@ export function registerTools(server: McpServer) {
       const bootstrapPrefix = bootstrapNote ? `${bootstrapNote}\n` : "";
       const prefix = `${bootstrapPrefix}${actionWord} ${filePath}${cwdNote}${fallbackWarning}${doubledWarning}\n`;
       return {
-        content: [{ type: "text" as const, text: prefix + formatStatusText(status) }],
+        content: [{ type: "text" as const, text: prefix + formatStatusText(status, verbosity ?? "summary") }],
         isError: !status.success,
       };
     })
@@ -1632,11 +1633,13 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "open_shape",
-    "Execute an existing .shape.ts file and (if VSCode is open) also bring it up in the viewer. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd().",
+    "Execute an existing .shape.ts file and (if VSCode is open) also bring it up in the viewer. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd(). Pass `capture: true` to also take a screenshot (same path render_preview uses); a capture failure does not fail the whole call — it's reported as a warning line.",
     {
       filePath: z.string().describe("Path to the .shape.ts file to execute. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
+      capture: z.boolean().optional().describe("If true, after opening, also capture a PNG screenshot (isometric, AI mode, default size) via the VSCode extension. Requires the extension. Capture failures are reported as warnings; the handler still reports the execution status as success."),
+      verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats. 'summary' (default) caps at 10 parts. 'full' dumps every part."),
     },
-    safeHandler("open_shape", async ({ filePath }) => {
+    safeHandler("open_shape", async ({ filePath, capture, verbosity }) => {
       const absPath = resolveShapePath(filePath);
       if (!existsSync(absPath)) {
         return {
@@ -1648,8 +1651,64 @@ export function registerTools(server: McpServer) {
       const { status } = await executeWithPersistedParams(absPath);
       notifyExtensionOfShape(absPath);
 
+      let captureLine = "";
+      let captureImage: { type: "image"; data: string; mimeType: string } | null = null;
+      if (capture === true && status.success) {
+        try {
+          if (!isExtensionAlive()) {
+            captureLine = "\nCapture: skipped — VSCode extension is not running.";
+          } else {
+            const previewsDir = join(dirname(absPath), "shapeitup-previews");
+            const userBase = basename(absPath).replace(/\.shape\.ts$/, "");
+            const outPath = join(previewsDir, `shapeitup-preview-${userBase}-isometric.png`);
+            try { mkdirSync(previewsDir, { recursive: true }); } catch {}
+            const cmdId = sendExtensionCommand("render-preview", {
+              filePath: absPath,
+              outputPath: outPath,
+              targetWorkspaceRoot: computeTargetWorkspaceRoot(absPath),
+              renderMode: "ai",
+              showDimensions: true,
+              showAxes: true,
+              cameraAngle: "isometric",
+              width: 1280,
+              height: 960,
+            });
+            if (!cmdId) {
+              captureLine = "\nCapture: failed to send command to extension.";
+            } else {
+              const result = await waitForResult(cmdId, 60_000);
+              if (!result) {
+                captureLine = "\nCapture: timed out after 60000ms (open_shape result still valid).";
+              } else if (result.error) {
+                captureLine = `\nCapture: failed — ${result.error}`;
+              } else if (result.screenshotPath && existsSync(result.screenshotPath)) {
+                captureLine = `\nScreenshot: ${result.screenshotPath}`;
+                try {
+                  const st = statSync(result.screenshotPath);
+                  if (st.size <= 10 * 1024 * 1024) {
+                    captureImage = {
+                      type: "image",
+                      data: readFileSync(result.screenshotPath).toString("base64"),
+                      mimeType: "image/png",
+                    };
+                  }
+                } catch {
+                  // inline read failed — path is still reported
+                }
+              } else {
+                captureLine = "\nCapture: extension did not report a screenshot path.";
+              }
+            }
+          }
+        } catch (e: any) {
+          captureLine = `\nCapture: unexpected failure — ${e?.message ?? e}`;
+        }
+      }
+
+      const content: any[] = [{ type: "text" as const, text: formatStatusText(status, verbosity ?? "summary") + captureLine }];
+      if (captureImage) content.push(captureImage);
       return {
-        content: [{ type: "text" as const, text: formatStatusText(status) }],
+        content,
         isError: !status.success,
       };
     })
@@ -1657,12 +1716,14 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "modify_shape",
-    "Overwrite an existing .shape.ts file with new code and execute it. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd().",
+    "Overwrite an existing .shape.ts file with new code and execute it, OR (when `code` is omitted and `params` is provided) re-execute the file with ephemeral param overrides — skipping the disk write entirely. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd(). If both `code` and `params` are provided, `code` wins and `params` is reported as ignored.",
     {
       filePath: z.string().describe("Path to the .shape.ts file. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
-      code: z.string().describe("New TypeScript source code"),
+      code: z.string().optional().describe("New TypeScript source code. Omit when you only want to re-run with different `params`."),
+      params: z.record(z.string(), z.number()).optional().describe("Optional ephemeral param overrides. If `code` is NOT provided, the file on disk is untouched and only the overrides are applied for this execution. If `code` IS provided, `params` is ignored (note appears in response)."),
+      verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats. 'summary' (default) caps at 10 parts. 'full' dumps every part."),
     },
-    safeHandler("modify_shape", async ({ filePath, code }) => {
+    safeHandler("modify_shape", async ({ filePath, code, params, verbosity }) => {
       const absPath = resolveShapePath(filePath);
       if (!existsSync(absPath)) {
         return {
@@ -1670,14 +1731,32 @@ export function registerTools(server: McpServer) {
           isError: true,
         };
       }
-      writeFileSync(absPath, code, "utf-8");
+      if (code === undefined && params === undefined) {
+        return {
+          content: [{ type: "text" as const, text: "modify_shape: provide `code` (to overwrite the file) or `params` (to re-run with overrides), or both." }],
+          isError: true,
+        };
+      }
 
-      const { status } = await executeWithPersistedParams(absPath);
+      let actionLabel: string;
+      let paramsIgnoredNote = "";
+      if (code !== undefined) {
+        writeFileSync(absPath, code, "utf-8");
+        actionLabel = "Updated";
+        if (params !== undefined) {
+          paramsIgnoredNote = "\nNote: `params` ignored — `code` was provided, so the file was overwritten and executed with its declared param defaults.";
+        }
+      } else {
+        actionLabel = "Re-executed (file NOT modified) with params override";
+      }
+
+      const callOverrides = code === undefined ? params : undefined;
+      const { status } = await executeWithPersistedParams(absPath, callOverrides);
       notifyExtensionOfShape(absPath);
 
-      const prefix = `Updated ${absPath}\n`;
+      const prefix = `${actionLabel} ${absPath}${paramsIgnoredNote}\n`;
       return {
-        content: [{ type: "text" as const, text: prefix + formatStatusText(status) }],
+        content: [{ type: "text" as const, text: prefix + formatStatusText(status, verbosity ?? "summary") }],
         isError: !status.success,
       };
     })
@@ -2709,14 +2788,14 @@ export function registerTools(server: McpServer) {
       filePath: z.string().optional().describe("Optional .shape.ts to execute first. Defaults to the last-executed shape."),
       cameraAngle: z
         .union([
-          z.enum(["isometric", "top", "bottom", "front", "right", "back", "left"]),
+          z.enum(["isometric", "iso", "top", "bottom", "front", "right", "back", "left"]),
           z
-            .array(z.enum(["isometric", "top", "bottom", "front", "right", "back", "left"]))
+            .array(z.enum(["isometric", "iso", "top", "bottom", "front", "right", "back", "left"]))
             .min(1)
             .max(4),
         ])
         .optional()
-        .describe("Camera angle preset (default: 'isometric'). Also accepts an array of 1–4 angles — each is captured separately and composited into one collage PNG (1×N strip for 2–3 angles, 2×2 grid for 4)."),
+        .describe("Camera angle preset (default: 'isometric'). Aliases: 'iso' → 'isometric'. Also accepts an array of 1–4 angles — each is captured separately and composited into one collage PNG (1×N strip for 2–3 angles, 2×2 grid for 4)."),
       grid: z
         .boolean()
         .optional()
@@ -2742,8 +2821,17 @@ export function registerTools(server: McpServer) {
         .optional()
         .describe("Tessellation-quality preset. `'final'` (default for <15-part assemblies) matches the pre-existing render quality. `'preview'` coarsens the mesh ~2.5× for faster first-render on large assemblies, at the cost of visibly chunkier facets — choose this for layout checks on 15+ part assemblies. If omitted, the extension auto-degrades to `'preview'` when the part count is >= 15 and uses `'final'` otherwise."),
       inline: z.boolean().optional().describe("Return the rendered PNG inline as base64 image content on top of the usual text + file path. Default true — agents see the image directly without an extra `get_preview` round trip. Skipped inline if the file exceeds 10 MB. Pass false to skip the base64 payload (saves ~30% response size) when you only need the path."),
+      verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats in the status text. 'summary' (default) caps at 10 parts. 'full' dumps every part."),
     },
-    safeHandler("render_preview", async ({ filePath, cameraAngle, grid, showDimensions, showAxes, renderMode, width, height, timeoutMs, focusPart, hideParts, finder, partName, partIndex, meshQuality, inline }) => {
+    safeHandler("render_preview", async ({ filePath, cameraAngle, grid, showDimensions, showAxes, renderMode, width, height, timeoutMs, focusPart, hideParts, finder, partName, partIndex, meshQuality, inline, verbosity }) => {
+      // Fix #4: normalize "iso" alias → "isometric" so downstream code and the
+      // extension IPC only ever see the canonical preset name.
+      const normalizeAngle = (a: string): string => (a === "iso" ? "isometric" : a);
+      if (typeof cameraAngle === "string") {
+        cameraAngle = normalizeAngle(cameraAngle) as typeof cameraAngle;
+      } else if (Array.isArray(cameraAngle)) {
+        cameraAngle = cameraAngle.map(normalizeAngle) as typeof cameraAngle;
+      }
       // Resolve which file to render: explicit > engine's last-executed > status file.
       const explicitFilePath = filePath !== undefined && filePath !== null;
       let source: string | undefined = filePath ? resolveShapePath(filePath) : getLastFileName();
@@ -3265,7 +3353,7 @@ export function registerTools(server: McpServer) {
         try {
           const status: EngineStatus = JSON.parse(readFileSync(join(GLOBAL_STORAGE, "shapeitup-status.json"), "utf-8"));
           if (status.success) {
-            statusText = `\nStats: ${status.stats}${formatProperties(status.properties)}`;
+            statusText = `\nStats: ${status.stats}${formatProperties(status.properties, verbosity ?? "summary")}`;
           }
           if (Array.isArray(status.partNames)) renderedPartNames = status.partNames;
         } catch {}
@@ -3314,7 +3402,7 @@ export function registerTools(server: McpServer) {
               timestamp: Date.now(),
               path: screenshotPath,
               renderMode: renderMode || "ai",
-              cameraAngle: cameraAngle || "isometric",
+              cameraAngle: singleAngle || "isometric",
               fileName: basename(source),
               sourceFile: source,
             },
@@ -4093,6 +4181,125 @@ export function registerTools(server: McpServer) {
   );
 
   server.tool(
+    "validate_joints",
+    "Best-effort validator for declared mate joints: executes the shape, looks for a `joints` map on each rendered part (the shape returned `{ shape, name, joints }` objects, or the stdlib `Part.joints` field survived to the render result), and measures each joint point's distance to the owning part's tessellated surface. Reports joints that float above the surface (> tolerance) or are buried inside the body. Returns a plain OK summary when no issues are found. NOTE: joint introspection depends on the executor passing `.joints` through — when it doesn't, the tool reports that cleanly rather than failing.",
+    {
+      path: z.string().describe("Path to the .shape.ts file to validate."),
+      tolerance: z.number().optional().describe("Max acceptable joint-to-surface distance in mm. Default 0.1."),
+    },
+    safeHandler("validate_joints", async ({ path, tolerance }) => {
+      const absPath = resolveShapePath(path);
+      if (!existsSync(absPath)) {
+        return {
+          content: [{ type: "text" as const, text: `File not found: ${absPath}` }],
+          isError: true,
+        };
+      }
+      const tol = typeof tolerance === "number" && tolerance > 0 ? tolerance : 0.1;
+
+      const { status, parts } = await executeWithPersistedParams(absPath);
+      if (!status.success || !parts) {
+        return {
+          content: [{ type: "text" as const, text: `Cannot validate joints — script failed to render.\n${formatStatusText(status)}` }],
+          isError: true,
+        };
+      }
+
+      // TODO: this relies on the executor/engine preserving `.joints` on the
+      // returned part objects. The current engine returns render-oriented
+      // `{ name, shape, vertices, ... }` only — if user scripts return
+      // `Part` instances (stdlib convention) and the executor passes them
+      // through, `.joints` will be present here. When it isn't, report
+      // cleanly rather than pretending validation ran.
+      type JointInfo = { part: string; name: string; point: [number, number, number] };
+      const joints: JointInfo[] = [];
+      for (const p of parts) {
+        const anyP = p as any;
+        const jmap = anyP.joints;
+        if (!jmap || typeof jmap !== "object") continue;
+        for (const [jname, spec] of Object.entries(jmap)) {
+          const s = spec as any;
+          const pos = s?.position ?? s?.point ?? s?.origin;
+          if (Array.isArray(pos) && pos.length >= 3 && pos.every((n: any) => typeof n === "number" && isFinite(n))) {
+            joints.push({ part: p.name, name: jname, point: [pos[0], pos[1], pos[2]] });
+          }
+        }
+      }
+
+      if (joints.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: `validate_joints: no introspectable joints found on any part. Either the assembly declares none, or the executor did not preserve .joints on the render result. Parts scanned: ${parts.map((p) => p.name).join(", ")}` }],
+        };
+      }
+
+      // Compute per-part AABB + closest-vertex distance. Closest-vertex on a
+      // tessellated mesh is a conservative UPPER bound on the true surface
+      // distance (real OCCT distance would need BRepExtrema_DistShapeShape);
+      // for the floating/buried detection we ALSO use the AABB
+      // inside/outside test to distinguish the two cases. This is a heuristic
+      // — a point inside the AABB but outside the solid reads as "buried"
+      // here. Acceptable per the spec's "best-effort" allowance.
+      type Box = { minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number };
+      const boxByName = new Map<string, Box>();
+      const vertsByName = new Map<string, ArrayLike<number>>();
+      for (const p of parts) {
+        const v = (p as any).vertices;
+        if (!v || v.length < 3) continue;
+        let minX = Infinity, minY = Infinity, minZ = Infinity;
+        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+        for (let i = 0; i < v.length; i += 3) {
+          if (v[i] < minX) minX = v[i]; if (v[i] > maxX) maxX = v[i];
+          if (v[i + 1] < minY) minY = v[i + 1]; if (v[i + 1] > maxY) maxY = v[i + 1];
+          if (v[i + 2] < minZ) minZ = v[i + 2]; if (v[i + 2] > maxZ) maxZ = v[i + 2];
+        }
+        boxByName.set(p.name, { minX, minY, minZ, maxX, maxY, maxZ });
+        vertsByName.set(p.name, v);
+      }
+
+      const warnings: string[] = [];
+      for (const j of joints) {
+        const verts = vertsByName.get(j.part);
+        const box = boxByName.get(j.part);
+        if (!verts || !box) {
+          warnings.push(`joint "${j.name}" on "${j.part}": owning part has no tessellated geometry — cannot validate.`);
+          continue;
+        }
+        // Min vertex-distance².
+        let best = Infinity;
+        for (let i = 0; i < verts.length; i += 3) {
+          const dx = verts[i] - j.point[0];
+          const dy = verts[i + 1] - j.point[1];
+          const dz = verts[i + 2] - j.point[2];
+          const d2 = dx * dx + dy * dy + dz * dz;
+          if (d2 < best) best = d2;
+        }
+        const dist = Math.sqrt(best);
+        if (dist <= tol) continue;
+        const inside =
+          j.point[0] > box.minX && j.point[0] < box.maxX &&
+          j.point[1] > box.minY && j.point[1] < box.maxY &&
+          j.point[2] > box.minZ && j.point[2] < box.maxZ;
+        const kind = inside ? "buried" : "floats";
+        const prep = inside ? "inside body" : "off surface";
+        warnings.push(`joint "${j.name}" on "${j.part}" ${kind} ${dist.toFixed(3)}mm ${prep}`);
+      }
+
+      const summary = `validate_joints: checked ${joints.length} joint${joints.length === 1 ? "" : "s"} across ${parts.length} part${parts.length === 1 ? "" : "s"} (tolerance=${tol}mm).`;
+      if (warnings.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: `${summary}\nOK — all joints are within tolerance of their owning part's surface.` }],
+        };
+      }
+      return {
+        content: [{
+          type: "text" as const,
+          text: `${summary}\nWarnings (${warnings.length}):\n${warnings.map((w) => `  - ${w}`).join("\n")}`,
+        }],
+      };
+    })
+  );
+
+  server.tool(
     "sweep_check",
     "Rotate a single named part through a range of angles around a pivot+axis and report any collisions it would make with the other parts at each step. Useful for articulated mechanisms (hinges, arms, linkages) where static collision checks miss motion conflicts. The moving part is cloned at every step so the original assembly is never mutated. Also reports the swept-volume AABB — the union of the moving part's axis-aligned bounds across every step — so you can size clearance envelopes. Pass either `filePath` or `code` (mutually exclusive, same rules as check_collisions).",
     {
@@ -4660,7 +4867,15 @@ export function registerTools(server: McpServer) {
   );
 }
 
-function formatProperties(props: ShapeProperties | undefined): string {
+// Fix #1: large assemblies (Asbjørn's 86-part build) blow the MCP token cap
+// when every part's per-row stats are emitted. Default to a 10-row cap;
+// callers can opt into the full list with verbosity: "full".
+const SUMMARY_PARTS_CAP = 10;
+
+function formatProperties(
+  props: ShapeProperties | undefined,
+  verbosity: "summary" | "full" = "summary",
+): string {
   if (!props) return "";
   const fmt = (n: number) =>
     Math.abs(n) >= 1000 ? n.toFixed(0) : n.toFixed(2);
@@ -4681,7 +4896,10 @@ function formatProperties(props: ShapeProperties | undefined): string {
     lines.push(`  center of mass: ${fmtPt(props.centerOfMass)} mm`);
   }
   if (props.parts && props.parts.length > 1) {
-    for (const p of props.parts) {
+    const allParts = props.parts;
+    const capped = verbosity === "summary" && allParts.length > SUMMARY_PARTS_CAP;
+    const visible = capped ? allParts.slice(0, SUMMARY_PARTS_CAP) : allParts;
+    for (const p of visible) {
       const bits: string[] = [];
       if (typeof p.volume === "number") bits.push(`V=${fmt(p.volume)}mm³`);
       if (typeof p.surfaceArea === "number") bits.push(`A=${fmt(p.surfaceArea)}mm²`);
@@ -4715,6 +4933,9 @@ function formatProperties(props: ShapeProperties | undefined): string {
       for (const issue of pr.issues) {
         lines.push(`    \u26a0 ${issue}`);
       }
+    }
+    if (capped) {
+      lines.push(`  … and ${allParts.length - SUMMARY_PARTS_CAP} more parts (use get_render_status for full list)`);
     }
   }
   return lines.length ? `\nGeometric properties:\n${lines.join("\n")}` : "";
@@ -4797,7 +5018,7 @@ export function extractSignatures(body: string, category: string): string {
   //
   // Parens may nest one level deep (covers `foo(opts: { x: number })` and
   // `foo(x: Array<number>)` since `<` / `>` are just word-chars for us).
-  const sigWithReturn = /^\.?[A-Za-z_][\w.]*\s*\(([^()]|\([^()]*\))*\)\s*(?:→|=>|:)\s*\S/;
+  const sigWithReturn = /^\.?[A-Za-z_][\w.]*\s*\(([^()]|\([^()]*\))*\)\s*(?:→|=>|:|—)\s*\S/;
   const isSignatureLine = (s: string): boolean => sigWithReturn.test(s);
 
   // Obvious non-signature shapes. Dropping these even if they accidentally
@@ -4822,7 +5043,9 @@ export function extractSignatures(body: string, category: string): string {
 
     if (inFence) {
       // Top-level declarations only — indented repeats are examples.
-      if (isTopLevelDeclaration(line)) {
+      // Check example-call shape first: `const sketch = drawCircle(…).sketchOnPlane(…)`
+      // parses as a `const` declaration but is a recipe, not an API signature.
+      if (isTopLevelDeclaration(line) && !looksLikeExampleCall(line.trim())) {
         kept.push(line.trim());
         continue;
       }

@@ -16,6 +16,18 @@ import {
  */
 const SKETCH_PLANE: WeakMap<object, string> = new WeakMap();
 
+/**
+ * Read-only accessor for the sketch→plane association the `sketchOnPlane`
+ * post-hook populates. Exposed so stdlib helpers (e.g.
+ * `placement.extrudeCentered`) can recover the plane a caller-supplied Sketch
+ * was built on without duplicating the WeakMap. Returns undefined when the
+ * receiver wasn't produced by an instrumented `sketchOnPlane` call.
+ */
+export function getSketchPlane(sketch: unknown): string | undefined {
+  if (typeof sketch !== "object" || sketch === null) return undefined;
+  return SKETCH_PLANE.get(sketch as object);
+}
+
 interface TimingEntry {
   count: number;
   totalMs: number;

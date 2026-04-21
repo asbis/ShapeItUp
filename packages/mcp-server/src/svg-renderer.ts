@@ -12,6 +12,14 @@
  * pane auto-scales to fit, annotates the bounding box, and preserves relative
  * part sizes via a shared world-to-pane scale factor.
  *
+ * Fix #9 (scoped): in addition to edges we now paint per-part, low-opacity
+ * color fills behind the wireframe using each part's declared `color` (the
+ * same field STEP export preserves). Triangles are projected from the
+ * tessellated mesh and drawn back-to-front by view-space centroid depth so
+ * overlaps in each orthographic view render correctly. This dramatically
+ * improves legibility of thin features (needles, fins) that would otherwise
+ * get lost in edge noise.
+ *
  * No external dependencies — pure string concatenation. Ships inside the
  * bundled MCP server.
  */
@@ -21,17 +29,23 @@ import type { ExecutedPart } from "@shapeitup/core";
 interface View {
   name: string;
   project: (x: number, y: number, z: number) => [number, number];
+  /**
+   * View-space depth used for back-to-front painter's-algorithm ordering.
+   * LARGER value = further from the viewer. For axis-aligned orthographic
+   * views this is the axis the camera looks along (negated when the camera
+   * points in the negative direction).
+   */
+  depth: (x: number, y: number, z: number) => number;
 }
 
 const VIEWS: View[] = [
-  // Top: look down +Z → map (x, y) → (u, -v). Negate v so "north" is up.
-  { name: "Top (XY)", project: (x, y, _z) => [x, -y] },
-  // Front: look along -Y → map (x, z) → (u, -v).
-  { name: "Front (XZ)", project: (x, _y, z) => [x, -z] },
-  // Right: look along -X → map (y, z) → (u, -v).
-  { name: "Right (YZ)", project: (_x, y, z) => [y, -z] },
-  // Isometric: classic 30° projection. World axes X/Y/Z each angled 30° apart
-  // in screen space.
+  // Top: camera looks down −Z so larger z = closer to the viewer → depth = −z.
+  { name: "Top (XY)", project: (x, y, _z) => [x, -y], depth: (_x, _y, z) => -z },
+  // Front: camera looks along +Y direction, larger y = further.
+  { name: "Front (XZ)", project: (x, _y, z) => [x, -z], depth: (_x, y, _z) => y },
+  // Right: camera looks along +X direction, larger x = further.
+  { name: "Right (YZ)", project: (_x, y, z) => [y, -z], depth: (x, _y, _z) => x },
+  // Isometric: view direction ≈ (1,1,1) so depth ∝ −(x+y+z).
   {
     name: "Iso",
     project: (x, y, z) => {
@@ -40,12 +54,26 @@ const VIEWS: View[] = [
       const v = -(z - x * Math.sin(a) - y * Math.sin(a));
       return [u, v];
     },
+    depth: (x, y, z) => -(x + y + z),
   },
 ];
+
+interface Triangle {
+  u1: number; v1: number;
+  u2: number; v2: number;
+  u3: number; v3: number;
+  depth: number;
+  color: string;
+}
+
+const FILL_OPACITY = 0.25;
+const DEFAULT_FILL = "#8899aa";
 
 interface ProjectedPane {
   name: string;
   segments: Array<[number, number, number, number]>; // x1,y1,x2,y2
+  /** Triangles pre-sorted back-to-front for painter's-algorithm compositing. */
+  triangles: Triangle[];
   partBounds: Array<{ name: string; color: string | null; min: [number, number]; max: [number, number] }>;
   min: [number, number];
   max: [number, number];
@@ -53,10 +81,36 @@ interface ProjectedPane {
 
 function projectParts(parts: ExecutedPart[], view: View): ProjectedPane {
   const segments: ProjectedPane["segments"] = [];
+  const triangles: Triangle[] = [];
   const partBounds: ProjectedPane["partBounds"] = [];
   let gminU = Infinity, gminV = Infinity, gmaxU = -Infinity, gmaxV = -Infinity;
 
   for (const part of parts) {
+    const fill = part.color || DEFAULT_FILL;
+
+    // Collect filled triangles per part (Fix #9 silhouette tint).
+    const verts = part.vertices;
+    const tris = part.triangles;
+    if (verts && tris && tris.length >= 3) {
+      for (let i = 0; i + 2 < tris.length; i += 3) {
+        const a = tris[i] * 3, b = tris[i + 1] * 3, c = tris[i + 2] * 3;
+        const ax = verts[a], ay = verts[a + 1], az = verts[a + 2];
+        const bx = verts[b], by = verts[b + 1], bz = verts[b + 2];
+        const cx = verts[c], cy = verts[c + 1], cz = verts[c + 2];
+        const [u1, v1] = view.project(ax, ay, az);
+        const [u2, v2] = view.project(bx, by, bz);
+        const [u3, v3] = view.project(cx, cy, cz);
+        const dCx = (ax + bx + cx) / 3;
+        const dCy = (ay + by + cy) / 3;
+        const dCz = (az + bz + cz) / 3;
+        triangles.push({
+          u1, v1, u2, v2, u3, v3,
+          depth: view.depth(dCx, dCy, dCz),
+          color: fill,
+        });
+      }
+    }
+
     const ev = part.edgeVertices;
     let pminU = Infinity, pminV = Infinity, pmaxU = -Infinity, pmaxV = -Infinity;
     for (let i = 0; i < ev.length; i += 6) {
@@ -77,9 +131,13 @@ function projectParts(parts: ExecutedPart[], view: View): ProjectedPane {
     }
   }
 
+  // Painter's algorithm — furthest first, closest last (drawn on top).
+  triangles.sort((a, b) => b.depth - a.depth);
+
   return {
     name: view.name,
     segments,
+    triangles,
     partBounds,
     min: [gminU, gminV],
     max: [gmaxU, gmaxV],
@@ -109,7 +167,24 @@ function renderPane(pane: ProjectedPane, originX: number, originY: number, paneS
   const bboxH = height * scale;
   lines.push(`<rect x="${bboxX.toFixed(1)}" y="${bboxY.toFixed(1)}" width="${bboxW.toFixed(1)}" height="${bboxH.toFixed(1)}" fill="none" stroke="#e0e4e8" stroke-width="0.5" stroke-dasharray="2,2"/>`);
 
-  // Edges.
+  // Fix #9: per-part silhouette fill, sorted back-to-front. Grouped in one
+  // <g> with the shared opacity so SVG renderers only apply alpha once per
+  // layer (keeps output size manageable even for high-triangle assemblies).
+  if (pane.triangles.length) {
+    const fills: string[] = [];
+    for (const t of pane.triangles) {
+      const x1 = (t.u1 * scale + tx).toFixed(1);
+      const y1 = (t.v1 * scale + ty).toFixed(1);
+      const x2 = (t.u2 * scale + tx).toFixed(1);
+      const y2 = (t.v2 * scale + ty).toFixed(1);
+      const x3 = (t.u3 * scale + tx).toFixed(1);
+      const y3 = (t.v3 * scale + ty).toFixed(1);
+      fills.push(`<polygon points="${x1},${y1} ${x2},${y2} ${x3},${y3}" fill="${t.color}"/>`);
+    }
+    lines.push(`<g fill-opacity="${FILL_OPACITY}" stroke="none">${fills.join("")}</g>`);
+  }
+
+  // Edges — drawn on top of fills so the wireframe stays readable.
   const path: string[] = [];
   for (const [u1, v1, u2, v2] of pane.segments) {
     path.push(`M${(u1 * scale + tx).toFixed(1)} ${(v1 * scale + ty).toFixed(1)}L${(u2 * scale + tx).toFixed(1)} ${(v2 * scale + ty).toFixed(1)}`);

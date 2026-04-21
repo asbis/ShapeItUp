@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { inferErrorHint, appendScreenshotMetadata, type EngineStatus } from "./engine.js";
+import {
+  inferErrorHint,
+  appendScreenshotMetadata,
+  preflightShapeImports,
+  executeShapeFile,
+  type EngineStatus,
+} from "./engine.js";
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -353,4 +359,122 @@ describe("appendScreenshotMetadata — monotonic lastScreenshot breadcrumb", () 
       } catch {}
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #3 — multifile params import (Asbjørn's report).
+//
+// When a `.shape.ts` file imports `{ params as needleParams }` from a sibling
+// `.shape.ts` and passes the imported object into a factory, the factory saw
+// `undefined` for every property. Root cause was the esbuild bundle footer
+// stamping a bare `params` identifier onto globalThis: when the entry AND a
+// sibling both declared `export const params`, esbuild's collision-renaming
+// could swap which binding kept the bare name, stamping the wrong object
+// onto `__SHAPEITUP_ENTRY_PARAMS__` and mis-wiring the executor's param flow.
+//
+// The fix replaced the footer with a synthetic-wrapper entry that namespace-
+// imports the user's file and resolves the entry exports through the
+// unambiguous `__shapeitup_entry__.*` binding — no bare-identifier lookup in
+// the merged scope, so collisions can't re-introduce the bug.
+// ---------------------------------------------------------------------------
+describe("preflightShapeImports — multifile params import warning", () => {
+  it("warns (non-fatal) when a sibling .shape.ts's `params` is imported", () => {
+    const { warnings } = preflightShapeImports(
+      `import { params as needleParams, makeNeedle } from "./needle.shape";\n` +
+        `export default function main() { return makeNeedle(needleParams); }\n`,
+      "/abs/entry.shape.ts",
+    );
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toMatch(/Importing 'params'/);
+    expect(warnings[0]).toMatch(/needleParams/);
+    expect(warnings[0]).toMatch(/factory-with-default-params/);
+  });
+
+  it("does NOT warn when only named factories are imported", () => {
+    const { warnings } = preflightShapeImports(
+      `import { makeBolt } from "./bolt.shape";\n` +
+        `export default function main() { return makeBolt(); }\n`,
+      "/abs/entry.shape.ts",
+    );
+    expect(warnings).toEqual([]);
+  });
+
+  it("still throws on `import { main }` (reserved runtime entry)", () => {
+    expect(() =>
+      preflightShapeImports(
+        `import { main } from "./x.shape";\n`,
+        "/abs/entry.shape.ts",
+      ),
+    ).toThrow(/Cannot import 'main'/);
+  });
+});
+
+describe("executeShapeFile — multifile params import (regression for issue #3)", () => {
+  // OCCT init is the most expensive thing in this test file (~500ms on a
+  // cold WASM load) and this test has to run it to exercise the end-to-end
+  // bundle+execute path. Keep to a single render — we only need to confirm
+  // that the child's `params` flows through correctly when the entry passes
+  // it into a named factory.
+  it(
+    "passes a child module's imported `params` into a factory without losing fields",
+    async () => {
+      const workdir = mkdtempSync(join(tmpdir(), "siu-multifile-"));
+      const storage = mkdtempSync(join(tmpdir(), "siu-multifile-storage-"));
+      try {
+        // Child module: declares its own `params` AND exports a factory that
+        // consumes it. Both the entry and the child export `params` so the
+        // bundle has the name collision that used to mis-wire the footer.
+        writeFileSync(
+          join(workdir, "needle.shape.ts"),
+          [
+            `import { drawRectangle } from "replicad";`,
+            // Note: properties here are used inside makeNeedle. Before the
+            // fix, they came through as undefined when the entry passed
+            // `params` (imported) positionally into makeNeedle.
+            `export const params = { needleLength: 17, needleWidth: 3 };`,
+            `export function makeNeedle(p) {`,
+            `  if (!p || typeof p.needleLength !== "number") {`,
+            `    throw new Error("needleLength is " + typeof (p && p.needleLength));`,
+            `  }`,
+            `  return drawRectangle(p.needleLength, p.needleWidth).sketchOnPlane("XY").extrude(1);`,
+            `}`,
+          ].join("\n"),
+        );
+
+        // Entry: imports the child's params AND factory, passes params
+        // explicitly (the pattern that used to break). The entry also
+        // declares its OWN `params` to force the esbuild collision case.
+        const entryPath = join(workdir, "entry.shape.ts");
+        writeFileSync(
+          entryPath,
+          [
+            `import { makeNeedle, params as needleParams } from "./needle.shape";`,
+            `export const params = { scale: 1 };`,
+            `export default function main() {`,
+            `  return makeNeedle(needleParams);`,
+            `}`,
+          ].join("\n"),
+        );
+
+        const { status } = await executeShapeFile(entryPath, storage);
+        // Success confirms the child factory received a populated params
+        // object. Before the fix, makeNeedle threw "needleLength is undefined".
+        expect(status.error).toBeUndefined();
+        expect(status.success).toBe(true);
+        // The ENTRY's params must win in the returned status (it's the file
+        // with sliders in the UI), even though the child also declares params.
+        expect(status.currentParams).toBeDefined();
+        expect(status.currentParams).toHaveProperty("scale");
+        // Non-fatal preflight warning surfaced — users should be pointed
+        // toward the factory-default-param pattern.
+        expect(status.warnings ?? []).toEqual(
+          expect.arrayContaining([expect.stringMatching(/Importing 'params'/)]),
+        );
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
 });

@@ -50,22 +50,39 @@ function ensureEsbuild(): Promise<void> {
  * for both humans and AI agents. Only the entry is scanned: utility modules that
  * happen to export a symbol called `main` from non-`.shape` files are untouched.
  */
-function preflightShapeImports(sourceCode: string, filePath: string): void {
+export function preflightShapeImports(
+  sourceCode: string,
+  filePath: string,
+): { warnings: string[] } {
+  const warnings: string[] = [];
+  // Two import-binding forms to handle:
+  //   import { a, b as c } from './x.shape'     — named
+  //   import foo, { a } from './x.shape'        — default + named (NOT parsed
+  //     here: the default-binding form is rare for .shape files; if we see
+  //     `import main from './x.shape'` it's fine since `main` is the binding
+  //     name, not `main`-the-export).
   const re = /import\s*\{([^}]+)\}\s*from\s*['"](\.[^'"]*\.shape(?:\.ts)?)['"]/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(sourceCode)) !== null) {
     const imported = m[1];
     const source = m[2];
-    const names = imported
+    const entries = imported
       .split(",")
-      .map((s) => s.trim().split(/\s+as\s+/)[0].trim())
-      .filter((s) => s.length > 0);
-    const bad = names.filter((n) => n === "main" || n === "params");
-    if (bad.length > 0) {
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+      .map((s) => {
+        const parts = s.split(/\s+as\s+/).map((x) => x.trim());
+        return { exportName: parts[0], localName: parts[1] ?? parts[0] };
+      });
+    // Importing `main` from a sibling .shape.ts is a hard error: the
+    // executor strips the default export before bundling so the symbol
+    // simply doesn't exist at runtime.
+    const badMain = entries.filter((e) => e.exportName === "main");
+    if (badMain.length > 0) {
       throw new Error(
-        `Cannot import ${bad.map((n) => `'${n}'`).join(" / ")} from '${source}' in ${filePath}.\n\n` +
-        `ShapeItUp reserves 'main' and 'params' as runtime entry points — the renderer invokes them, ` +
-        `but other scripts cannot import them (the executor strips their exports before bundling).\n\n` +
+        `Cannot import 'main' from '${source}' in ${filePath}.\n\n` +
+        `ShapeItUp reserves 'main' as a runtime entry point — the renderer invokes it, ` +
+        `but other scripts cannot import it (the executor strips its export before bundling).\n\n` +
         `To reuse logic across scripts, export a named factory function:\n\n` +
         `  // in ${source}:\n` +
         `  export function makeEnclosure(opts) { /* ... */ }\n\n` +
@@ -74,7 +91,25 @@ function preflightShapeImports(sourceCode: string, filePath: string): void {
         `  export default function main() { return makeEnclosure({ ... }); }\n`
       );
     }
+    // Importing `params` from a sibling is supported but fragile — esbuild
+    // inlines both modules into one scope and renames colliding `params`
+    // declarations, and slider overrides set via `tune_params` only mutate
+    // the ENTRY file's `params` object. When we can detect this pattern we
+    // surface a non-fatal warning with the factory-default-param fix, which
+    // is the pattern that never breaks.
+    const paramImports = entries.filter((e) => e.exportName === "params");
+    if (paramImports.length > 0) {
+      const localNames = paramImports.map((e) => `'${e.localName}'`).join(" / ");
+      warnings.push(
+        `Importing 'params' from '${source}' as ${localNames} is supported but ` +
+        `fragile: slider overrides from 'tune_params' only apply to the entry file's ` +
+        `own 'params', not to imported ones. Prefer the factory-with-default-params ` +
+        `pattern: 'export function makeFoo(p = params) { ... }' inside '${source}', ` +
+        `and call 'makeFoo()' (no arg) from the entry.`,
+      );
+    }
   }
+  return { warnings };
 }
 import { loadOCCTNode } from "./node-loader.js";
 import { loadManifoldNode } from "./manifold-node-loader.js";
@@ -368,21 +403,64 @@ export async function executeShapeFile(
 
   let js: string;
   try {
-    // Preflight: catch `import { main, params } from './other.shape'` before
-    // esbuild emits its generic "No matching export" — the executor strips
-    // those exports, so a custom error with the factory-function workaround
-    // is far more actionable.
-    preflightShapeImports(code, absPath);
+    // Preflight: catch `import { main } from './other.shape'` (hard error) and
+    // warn on `import { params } from './other.shape'` (supported but fragile —
+    // tune_params slider overrides only reach the entry's own params object).
+    const preflightResult = preflightShapeImports(code, absPath);
     await ensureEsbuild();
+    // Multi-file .shape.ts disambiguation (v2).
+    //
+    // Previous approach was a bundle footer that read `params` / `main` as
+    // bare identifiers in the final merged scope. When the entry imported
+    // a sibling `.shape.ts` that ALSO exported `params`, esbuild's
+    // collision-renaming could keep the imported module's `params` under
+    // the bare name and rename the entry's to `params2` (output ordering
+    // dependent). The footer then stamped the WRONG params onto globalThis —
+    // slider values shown in the UI, but more importantly the params object
+    // consumed by the executor, both diverged from the entry file's own
+    // declaration.
+    //
+    // Synthetic wrapper approach (approach B from the design doc): we feed
+    // esbuild a tiny stdin module that does
+    //
+    //   import * as __shapeitup_entry__ from "<absPath>";
+    //   globalThis.__SHAPEITUP_ENTRY_MAIN__   = __shapeitup_entry__.default;
+    //   globalThis.__SHAPEITUP_ENTRY_PARAMS__ = __shapeitup_entry__.params;
+    //   export default __shapeitup_entry__.default;
+    //   export const params   = __shapeitup_entry__.params;
+    //   export const material = __shapeitup_entry__.material;
+    //   export const config   = __shapeitup_entry__.config;
+    //
+    // The namespace import gives esbuild an unambiguous, dedicated binding
+    // for the entry file's exports. No matter what gets renamed inside the
+    // bundle, `__shapeitup_entry__.params` is ALWAYS the entry's own
+    // `export const params` — the issue is structurally impossible to
+    // re-introduce here.
+    //
+    // The re-exports keep back-compat with the executor's ambient lookups
+    // for `material` and `config` (it reads them via `typeof foo !==
+    // "undefined"` in the IIFE scope), so declaring them at top-level in
+    // the bundle still works. `rewriteImports` strips the trailing
+    // `export { ... }` block unchanged.
+    const entryImportPath = absPath.replace(/\\/g, "/");
+    const syntheticEntry =
+      `import * as __shapeitup_entry__ from ${JSON.stringify(entryImportPath)};\n` +
+      `try { globalThis.__SHAPEITUP_ENTRY_MAIN__ = __shapeitup_entry__.default; } catch (e) {}\n` +
+      `try { globalThis.__SHAPEITUP_ENTRY_PARAMS__ = __shapeitup_entry__.params; } catch (e) {}\n` +
+      `export default __shapeitup_entry__.default;\n` +
+      `export const params = __shapeitup_entry__.params;\n` +
+      `export const material = __shapeitup_entry__.material;\n` +
+      `export const config = __shapeitup_entry__.config;\n`;
     const result = await esbuild.build({
       stdin: {
-        contents: code,
+        contents: syntheticEntry,
         resolveDir: dirname(absPath),
-        // Absolute path so the inline sourcemap's `sources[0]` points at the
-        // real .shape.ts. Paired with the `//# sourceURL=` pragma we
-        // prepend below, V8 resolves user-script stack frames to
-        // `bracket.shape.ts:12:14` instead of `Object.<anonymous>:48:52`.
-        sourcefile: absPath,
+        // IMPORTANT: this MUST differ from `absPath`. If we used the user's
+        // real file path here, esbuild would conflate the stdin contents
+        // with the entry it's trying to import (`import * from "./entry"`)
+        // and short-circuit the bundle — the user's code gets tree-shaken
+        // out and both `default` and `params` come back `undefined`.
+        sourcefile: join(dirname(absPath), "__shapeitup_wrapper__.ts"),
         loader: "ts",
       },
       bundle: true,
@@ -392,20 +470,19 @@ export async function executeShapeFile(
       external: [...BUNDLE_EXTERNALS],
       platform: "neutral",
       absWorkingDir: dirname(absPath),
+      // With the synthetic-wrapper entry the user's file is resolved by its
+      // absolute path (including the `.shape.ts` double-extension). esbuild
+      // treats `.shape.ts` as an unknown loader because it dispatches on the
+      // FULL extension — map it explicitly to the TS loader. `.ts` remains
+      // the default. Imported sibling `.shape` files (the form without the
+      // trailing `.ts`, common in the skill docs) resolve via esbuild's
+      // module resolver and also need the loader override.
+      loader: { ".shape.ts": "ts", ".shape": "ts" },
       // Inline sourcemap (base64 data URL appended as
       // `//# sourceMappingURL=data:...`). V8 reads it automatically when the
       // `sourceURL` directive is present. No extra runtime deps — the
       // VM does the mapping.
       sourcemap: "inline",
-      // Multi-file .shape.ts disambiguation: see viewer-provider.ts for the
-      // full rationale. esbuild renames imported `main`/`params` bindings
-      // (e.g. `main2`) while the entry's stay bare; stamping the entry's
-      // names onto globalThis AFTER the rename pass lets the executor
-      // pick the correct entry `main` regardless of output ordering.
-      footer: {
-        js: ';try { if (typeof main !== "undefined") globalThis.__SHAPEITUP_ENTRY_MAIN__ = main; } catch(e){}\n'
-          + ';try { if (typeof params !== "undefined") globalThis.__SHAPEITUP_ENTRY_PARAMS__ = params; } catch(e){}',
-      },
       logLevel: "silent",
     });
     // Treat "Could not resolve" warnings as hard errors — a missing local
@@ -421,8 +498,14 @@ export async function executeShapeFile(
       return { status };
     }
     // Surface other warnings (non-fatal) in the status so the user sees them.
-    if (result.warnings.length > 0) {
-      status.warnings = result.warnings.map((w) => w.text);
+    // Combine esbuild warnings with any preflight warnings (e.g. importing
+    // `params` from a sibling .shape.ts — supported but fragile).
+    const combinedWarnings = [
+      ...preflightResult.warnings,
+      ...result.warnings.map((w) => w.text),
+    ];
+    if (combinedWarnings.length > 0) {
+      status.warnings = combinedWarnings;
     }
     js = result.outputFiles[0].text;
     // Prepend `//# sourceURL=file:///...` so the core executor can lift it
@@ -505,7 +588,14 @@ export async function executeShapeFile(
       // sources depending on the success bit.
       declaredParams: status.declaredParams,
       timings: result.timings,
-      warnings: result.warnings,
+      // Merge runtime warnings from core.execute with any bundle-phase
+      // warnings (preflight + esbuild) accumulated in `status.warnings`.
+      // Without this merge, the preflight "Importing 'params' from sibling"
+      // warning would be silently dropped on a successful render.
+      warnings: [
+        ...(status.warnings ?? []),
+        ...((result.warnings as string[] | undefined) ?? []),
+      ],
       geometryValid: result.geometryValid,
       geometryErrorParts: geometryErrorParts.length > 0 ? geometryErrorParts : undefined,
       properties,
