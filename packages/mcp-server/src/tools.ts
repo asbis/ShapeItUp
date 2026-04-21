@@ -1521,6 +1521,182 @@ async function executeWithPersistedParams(
   return executeShapeFile(absPath, GLOBAL_STORAGE, merged, opts);
 }
 
+// ---------------------------------------------------------------------------
+// Pure formatting helpers — exported for unit tests. These are the pure
+// report-rendering functions used by check_collisions and sweep_check; they
+// do NOT touch OCCT or the filesystem.
+// ---------------------------------------------------------------------------
+
+export type CollisionReportFormat = "summary" | "full" | "ids";
+
+export type CollisionEntry = {
+  a: string;
+  b: string;
+  volume: number;
+  region?: { min: [number, number, number]; max: [number, number, number] };
+  center?: [number, number, number];
+};
+
+/** Render the per-pair collision block for check_collisions. */
+export function formatCollisionPairs(
+  realC: CollisionEntry[],
+  pressFitC: CollisionEntry[],
+  acceptedC: CollisionEntry[],
+  pressFit: number,
+  reportFormat: CollisionReportFormat,
+  accountingText: string,
+): string {
+  const fmt = (n: number) => (Math.abs(n) >= 1000 ? n.toFixed(0) : n.toFixed(2));
+  const fmtPt = (p: [number, number, number]) =>
+    `(${fmt(p[0])}, ${fmt(p[1])}, ${fmt(p[2])})`;
+  const fmtRange = (lo: number, hi: number) => `[${fmt(lo)}, ${fmt(hi)}]`;
+
+  if (reportFormat === "ids") {
+    const tuples = realC.map((c) => [c.a, c.b, parseFloat(fmt(c.volume))]);
+    return JSON.stringify(tuples);
+  }
+
+  const sections: string[] = [accountingText];
+
+  if (realC.length > 0 || pressFitC.length > 0 || acceptedC.length > 0) {
+    if (realC.length > 0) {
+      if (reportFormat === "full") {
+        const lines: string[] = [];
+        for (const c of realC) {
+          lines.push(`  - ${c.a} \u2194 ${c.b}: ${fmt(c.volume)} mm\u00b3 overlap`);
+          if (c.region) {
+            const r = c.region;
+            lines.push(
+              `    Region: x${fmtRange(r.min[0], r.max[0])} y${fmtRange(r.min[1], r.max[1])} z${fmtRange(r.min[2], r.max[2])} mm`,
+            );
+          }
+          if (c.center) {
+            lines.push(`    Center: ${fmtPt(c.center)} mm`);
+          }
+        }
+        sections.push(`\nCollisions (sorted by volume desc):\n${lines.join("\n")}`);
+      } else {
+        const lines: string[] = [];
+        const [worst, ...rest] = realC;
+        lines.push(`  - ${worst.a} \u2194 ${worst.b}: ${fmt(worst.volume)} mm\u00b3 overlap`);
+        if (worst.region) {
+          const r = worst.region;
+          lines.push(
+            `    Region: x${fmtRange(r.min[0], r.max[0])} y${fmtRange(r.min[1], r.max[1])} z${fmtRange(r.min[2], r.max[2])} mm`,
+          );
+        }
+        if (worst.center) {
+          lines.push(`    Center: ${fmtPt(worst.center)} mm`);
+        }
+        for (const c of rest) {
+          lines.push(`  - ${c.a} vs ${c.b} \u2014 ${fmt(c.volume)} mm\u00b3`);
+        }
+        sections.push(`\nCollisions (sorted by volume desc):\n${lines.join("\n")}`);
+      }
+    }
+
+    if (pressFitC.length > 0) {
+      const lines = pressFitC.map(
+        (c) => `  - ${c.a} \u2194 ${c.b}: ${fmt(c.volume)} mm\u00b3`,
+      );
+      sections.push(
+        `\nNominal contact (volume \u2264 ${fmt(pressFit)} mm\u00b3 \u2014 press fits, touching interfaces):\n${lines.join("\n")}`,
+      );
+    }
+
+    if (acceptedC.length > 0) {
+      const volumes = acceptedC.map((c) => c.volume);
+      const minV = Math.min(...volumes);
+      const maxV = Math.max(...volumes);
+      sections.push(
+        `\nAccepted (pre-declared expected): ${acceptedC.length} pair${acceptedC.length === 1 ? "" : "s"}, volume ${fmt(minV)}\u2013${fmt(maxV)} mm\u00b3.`,
+      );
+    }
+  }
+
+  return sections.join("\n");
+}
+
+export type SweepCollisionEntry = {
+  step: number;
+  angle: number;
+  pairA: string;
+  pairB: string;
+  volume: number;
+};
+
+/** Render the per-step collision block for sweep_check. */
+export function formatSweepCollisions(
+  collisions: SweepCollisionEntry[],
+  angles: number[],
+  sweepFormat: CollisionReportFormat,
+): string {
+  const fmt = (x: number) => (Math.abs(x) >= 1000 ? x.toFixed(0) : x.toFixed(2));
+  const fmtAngle = (a: number) => (Math.abs(a) >= 100 ? a.toFixed(1) : a.toFixed(2));
+  const n = angles.length;
+
+  if (sweepFormat === "ids") {
+    const byStep = new Map<number, Array<[string, string, number]>>();
+    for (const c of collisions) {
+      const entry = byStep.get(c.step) ?? [];
+      entry.push([c.pairA, c.pairB, parseFloat(fmt(c.volume))]);
+      byStep.set(c.step, entry);
+    }
+    const tuples = Array.from(byStep.entries()).map(([step, pairs]) => [step, pairs]);
+    return JSON.stringify(tuples);
+  }
+
+  const sections: string[] = [];
+  const colidingSteps = new Set(collisions.map((c) => c.step));
+  const firstCollide = n > 0
+    ? Array.from({ length: n }, (_, i) => i).find((i) => colidingSteps.has(i))
+    : undefined;
+
+  if (firstCollide === undefined) {
+    sections.push(`  \u2713 Clear through all ${n} steps (angles ${fmtAngle(angles[0])}\u00b0 \u2026 ${fmtAngle(angles[n - 1])}\u00b0)`);
+  } else if (firstCollide > 0) {
+    sections.push(
+      `  \u2713 Clear through steps 0\u2013${firstCollide - 1} (angles ${fmtAngle(angles[0])}\u00b0 \u2026 ${fmtAngle(angles[firstCollide - 1])}\u00b0)`,
+    );
+  }
+
+  if (sweepFormat === "full") {
+    for (const c of collisions) {
+      sections.push(
+        `  \u2717 Step ${c.step} (angle ${fmtAngle(c.angle)}\u00b0): ${c.pairA} \u2194 ${c.pairB} ${fmt(c.volume)} mm\u00b3`,
+      );
+    }
+  } else {
+    // summary: per-step counts + worst step detail
+    if (collisions.length > 0) {
+      const stepCounts = new Map<number, number>();
+      const stepVolumes = new Map<number, number>();
+      for (const c of collisions) {
+        stepCounts.set(c.step, (stepCounts.get(c.step) ?? 0) + 1);
+        stepVolumes.set(c.step, (stepVolumes.get(c.step) ?? 0) + c.volume);
+      }
+      const sortedSteps = Array.from(stepCounts.keys()).sort((a, b) => a - b);
+      for (const s of sortedSteps) {
+        const cnt = stepCounts.get(s)!;
+        sections.push(
+          `  \u2717 Step ${s} (${fmtAngle(angles[s])}\u00b0): ${cnt} collision${cnt === 1 ? "" : "s"}`,
+        );
+      }
+      let worstStep = sortedSteps[0];
+      for (const s of sortedSteps) {
+        if ((stepVolumes.get(s) ?? 0) > (stepVolumes.get(worstStep) ?? 0)) worstStep = s;
+      }
+      const worstPairs = collisions.filter((c) => c.step === worstStep);
+      sections.push(`\n  Worst step: ${worstStep} (${fmtAngle(angles[worstStep])}\u00b0)`);
+      for (const c of worstPairs) {
+        sections.push(`    ${c.pairA} \u2194 ${c.pairB}: ${fmt(c.volume)} mm\u00b3`);
+      }
+    }
+  }
+
+  return sections.join("\n");
+}
+
 export function registerTools(server: McpServer) {
   server.tool(
     "setup_shape_project",
@@ -4000,7 +4176,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "check_collisions",
-    "Detects pairwise intersections between named parts in a multi-part assembly. AABB prefilter skips obviously-disjoint pairs; remaining pairs are tested with Replicad's 3D intersect (which can fail on complex curved solids — those pairs are reported as 'intersect failed' rather than silently ignored). Tolerance filters out numerical-noise contacts (default 0.001 mm³); very large assemblies (100+ parts) will be slow because work grows as N². Pass `acceptedPairs` to suppress EXPECTED intersections (needles resting in grooves, bolt shafts in through-holes) — accepted pairs are rolled into a summary count so unexpected bugs surface faster. Collisions with volume at or below `pressFitThreshold` are listed under 'Nominal contact' (press fits, touching interfaces) instead of the main 'Collisions' block. The main block is sorted by overlap volume descending so the biggest (most likely bug) is the first line. Pass either `filePath` (existing shape) or `code` (inline snippet) — they are mutually exclusive.",
+    "Detects pairwise intersections between named parts in a multi-part assembly. AABB prefilter skips obviously-disjoint pairs; remaining pairs are tested with Replicad's 3D intersect (which can fail on complex curved solids — those pairs are reported as 'intersect failed' rather than silently ignored). Tolerance filters out numerical-noise contacts (default 0.001 mm³); very large assemblies (100+ parts) will be slow because work grows as N². Pass `acceptedPairs` to suppress EXPECTED intersections (needles resting in grooves, bolt shafts in through-holes) — accepted pairs are rolled into a summary count so unexpected bugs surface faster. Collisions with volume at or below `pressFitThreshold` are listed under 'Nominal contact' (press fits, touching interfaces) instead of the main 'Collisions' block. The main block is sorted by overlap volume descending so the biggest (most likely bug) is the first line. Pass either `filePath` (existing shape) or `code` (inline snippet) — they are mutually exclusive. Pass `format: 'full'` for per-pair geometry; default summary keeps responses compact.",
     {
       filePath: z.string().optional().describe("Path to the .shape.ts file to check for part collisions. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first existing match wins), else anchor to process.cwd(). Mutually exclusive with `code`."),
       code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning an array of parts. Written to a throwaway temp file, executed, and deleted afterwards. Use `workingDir` to make local `./` imports resolve. Mutually exclusive with `filePath`."),
@@ -4008,8 +4184,9 @@ export function registerTools(server: McpServer) {
       tolerance: z.number().optional().describe("Minimum intersection volume in mm³ to count as a collision. Defaults to 0.001 — filters out numerical-noise overlaps on touching-but-not-overlapping parts. Negative values are clamped to 0."),
       acceptedPairs: z.array(z.tuple([z.string(), z.string()])).optional().describe("Pairs of part names whose intersection is EXPECTED and should not be flagged — e.g. [['needle','bed'], ['bolt','plate']]. Accepted pairs are rolled into a single-line summary count (with volume range) instead of listed individually. Order is symmetric: ['a','b'] also covers ['b','a']. When a name appears on multiple parts, every such pair is accepted."),
       pressFitThreshold: z.number().optional().describe("Volume threshold (mm³) at or below which a collision is classified as 'nominal contact' (press fit / touching interface) and listed in a compact section instead of the main Collisions block. Default 0.5 mm³. Set to 0 to disable the tag (every non-accepted collision is treated as real)."),
+      format: z.enum(["summary", "full", "ids"]).optional().describe("Report verbosity. summary (default): count + worst pair detail + per-pair {a,b,volume}. full: per-pair with region+center geometry. ids: minimal [a,b,vol] tuples."),
     },
-    safeHandler("check_collisions", async ({ filePath, code, workingDir, tolerance, acceptedPairs, pressFitThreshold }) => {
+    safeHandler("check_collisions", async ({ filePath, code, workingDir, tolerance, acceptedPairs, pressFitThreshold, format }) => {
       // Input validation: filePath and code are mutually exclusive, one required.
       if (filePath !== undefined && code !== undefined) {
         return {
@@ -4257,7 +4434,6 @@ export function registerTools(server: McpServer) {
       acceptedC.sort((a, b) => b.volume - a.volume);
 
       // Step 6: format the summary.
-      const fmt = (n: number) => (Math.abs(n) >= 1000 ? n.toFixed(0) : n.toFixed(2));
       const pairWord = (n: number) => `${n} pair${n === 1 ? "" : "s"}`;
 
       // Full pair accounting — always show total/skipped/tested so callers
@@ -4290,78 +4466,44 @@ export function registerTools(server: McpServer) {
         accounting.push(`  - ${pairWord(tested)} tested for 3D intersection${testedSuffix}.`);
       }
 
-      const sections: string[] = [accounting.join("\n")];
+      const reportFormat: CollisionReportFormat = format ?? "summary";
 
-      if (collisions.length > 0) {
-        const fmtPt = (p: [number, number, number]) =>
-          `(${fmt(p[0])}, ${fmt(p[1])}, ${fmt(p[2])})`;
-        const fmtRange = (lo: number, hi: number) => `[${fmt(lo)}, ${fmt(hi)}]`;
+      // Delegate pair rendering to the exported pure helper.
+      let text = formatCollisionPairs(realC, pressFitC, acceptedC, pressFit, reportFormat, accounting.join("\n"));
 
-        if (realC.length > 0) {
-          const lines: string[] = [];
-          for (const c of realC) {
-            lines.push(`  - ${c.a} \u2194 ${c.b}: ${fmt(c.volume)} mm\u00b3 overlap`);
-            if (c.region) {
-              const r = c.region;
-              lines.push(
-                `    Region: x${fmtRange(r.min[0], r.max[0])} y${fmtRange(r.min[1], r.max[1])} z${fmtRange(r.min[2], r.max[2])} mm`,
-              );
-            }
-            if (c.center) {
-              lines.push(`    Center: ${fmtPt(c.center)} mm`);
-            }
-          }
-          sections.push(`\nCollisions (sorted by volume desc):\n${lines.join("\n")}`);
+      // For summary/full, append failures and warnings after the pairs block.
+      if (reportFormat !== "ids") {
+        const extra: string[] = [];
+
+        if (failures.length > 0) {
+          const lines = failures.map((f) => `  - ${f.a} \u2194 ${f.b}: ${f.error}`);
+          extra.push(`\nIntersect failures (retry with mold-cut or report to developer):\n${lines.join("\n")}`);
         }
 
-        if (pressFitC.length > 0) {
-          // Compact format — one line per pair. No region/center; press-fit
-          // overlaps are expected so the reader doesn't need their geometry.
-          const lines = pressFitC.map(
-            (c) => `  - ${c.a} \u2194 ${c.b}: ${fmt(c.volume)} mm\u00b3`,
-          );
-          sections.push(
-            `\nNominal contact (volume \u2264 ${fmt(pressFit)} mm\u00b3 \u2014 press fits, touching interfaces):\n${lines.join("\n")}`,
-          );
+        if (degenerateWarnings.length > 0) {
+          extra.push(`\nWarnings:\n${degenerateWarnings.join("\n")}`);
         }
 
-        if (acceptedC.length > 0) {
-          // Summary only — the user already told us these are expected.
-          const volumes = acceptedC.map((c) => c.volume);
-          const minV = Math.min(...volumes);
-          const maxV = Math.max(...volumes);
-          sections.push(
-            `\nAccepted (pre-declared expected): ${acceptedC.length} pair${acceptedC.length === 1 ? "" : "s"}, volume ${fmt(minV)}\u2013${fmt(maxV)} mm\u00b3.`,
-          );
+        // All-clear footer when nothing collided, nothing failed, and at least
+        // one pair was actually tested (otherwise the AABB prefilter skipped
+        // everything and "no collisions detected" would be misleading).
+        // Accepted and press-fit overlaps are NOT trouble — they get their own
+        // sections above but don't invalidate the "no real collisions" state.
+        if (
+          realC.length === 0 &&
+          failures.length === 0 &&
+          skippedByAABB < totalPairs &&
+          pressFitC.length === 0 &&
+          acceptedC.length === 0
+        ) {
+          extra.push(`\nNo collisions detected.`);
         }
-      }
 
-      if (failures.length > 0) {
-        const lines = failures.map((f) => `  - ${f.a} \u2194 ${f.b}: ${f.error}`);
-        sections.push(`\nIntersect failures (retry with mold-cut or report to developer):\n${lines.join("\n")}`);
-      }
-
-      if (degenerateWarnings.length > 0) {
-        sections.push(`\nWarnings:\n${degenerateWarnings.join("\n")}`);
-      }
-
-      // All-clear footer when nothing collided, nothing failed, and at least
-      // one pair was actually tested (otherwise the AABB prefilter skipped
-      // everything and "no collisions detected" would be misleading).
-      // Accepted and press-fit overlaps are NOT trouble — they get their own
-      // sections above but don't invalidate the "no real collisions" state.
-      if (
-        realC.length === 0 &&
-        failures.length === 0 &&
-        skippedByAABB < totalPairs &&
-        pressFitC.length === 0 &&
-        acceptedC.length === 0
-      ) {
-        sections.push(`\nNo collisions detected.`);
+        if (extra.length > 0) text += extra.join("\n");
       }
 
       return {
-        content: [{ type: "text" as const, text: sections.join("\n") }],
+        content: [{ type: "text" as const, text }],
       };
       }); // close withShapeFile callback
     })
@@ -4488,7 +4630,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "sweep_check",
-    "Rotate a single named part through a range of angles around a pivot+axis and report any collisions it would make with the other parts at each step. Useful for articulated mechanisms (hinges, arms, linkages) where static collision checks miss motion conflicts. The moving part is cloned at every step so the original assembly is never mutated. Also reports the swept-volume AABB — the union of the moving part's axis-aligned bounds across every step — so you can size clearance envelopes. Pass either `filePath` or `code` (mutually exclusive, same rules as check_collisions).",
+    "Rotate a single named part through a range of angles around a pivot+axis and report any collisions it would make with the other parts at each step. Useful for articulated mechanisms (hinges, arms, linkages) where static collision checks miss motion conflicts. The moving part is cloned at every step so the original assembly is never mutated. Also reports the swept-volume AABB — the union of the moving part's axis-aligned bounds across every step — so you can size clearance envelopes. Pass either `filePath` or `code` (mutually exclusive, same rules as check_collisions). Pass `format: 'full'` for per-pair geometry; default summary keeps responses compact.",
     {
       filePath: z.string().optional().describe("Path to the .shape.ts file to sweep. Absolute passes through; relative probes workspace roots. Mutually exclusive with `code`."),
       code: z.string().optional().describe("Inline .shape.ts source — written to a temp file, executed, then deleted. Use `workingDir` for relative-import resolution. Mutually exclusive with `filePath`."),
@@ -4499,8 +4641,9 @@ export function registerTools(server: McpServer) {
       range: z.array(z.number()).length(2).describe("[startDeg, endDeg] sweep range in degrees. Direction matters — [0, 90] sweeps positive, [0, -90] sweeps negative."),
       steps: z.number().int().positive().describe("Number of angle samples (inclusive endpoints). 8-24 is typical; more samples = finer resolution but linear slowdown."),
       tolerance: z.number().optional().describe("Minimum intersection volume in mm³ to count as a collision. Defaults to 0.001 — filters out numerical-noise touches. Negative values clamp to 0."),
+      format: z.enum(["summary", "full", "ids"]).optional().describe("Report verbosity. summary (default): per-step counts only + worst step detail. full: per-step per-pair dump. ids: [step, [[a,b,vol],...]] tuples."),
     },
-    safeHandler("sweep_check", async ({ filePath, code, workingDir, moving, pivot, axis, range, steps, tolerance }) => {
+    safeHandler("sweep_check", async ({ filePath, code, workingDir, moving, pivot, axis, range, steps, tolerance, format }) => {
       if (filePath !== undefined && code !== undefined) {
         return {
           content: [{ type: "text" as const, text: "sweep_check: pass either `filePath` OR `code`, not both." }],
@@ -4664,34 +4807,21 @@ export function registerTools(server: McpServer) {
         }
 
         // ---- Formatting -------------------------------------------------
-        const sections: string[] = [];
+        const sweepFormat: CollisionReportFormat = format ?? "summary";
         const rangeHdr = `[${fmtAngle(startDeg)}\u00b0, ${fmtAngle(endDeg)}\u00b0]`;
-        sections.push(
-          `Sweep check: '${moving}' rotating ${rangeHdr} in ${n} steps around [${fmt(pivot[0])},${fmt(pivot[1])},${fmt(pivot[2])}] axis [${fmt(axis[0])},${fmt(axis[1])},${fmt(axis[2])}]`,
-        );
 
-        // Collapse the contiguous-clear prefix/infix into a single "Clear
-        // through steps a–b" line so long clean sweeps don't spam 24 lines.
-        const colidingSteps = new Set(collisions.map((c) => c.step));
-        const firstCollide = n > 0
-          ? Array.from({ length: n }, (_, i) => i).find((i) => colidingSteps.has(i))
-          : undefined;
-        if (firstCollide === undefined) {
-          // Entirely clear sweep.
-          sections.push(`  \u2713 Clear through all ${n} steps (angles ${fmtAngle(angles[0])}\u00b0 \u2026 ${fmtAngle(angles[n - 1])}\u00b0)`);
-        } else if (firstCollide > 0) {
-          sections.push(
-            `  \u2713 Clear through steps 0\u2013${firstCollide - 1} (angles ${fmtAngle(angles[0])}\u00b0 \u2026 ${fmtAngle(angles[firstCollide - 1])}\u00b0)`,
-          );
+        // ids format: delegate entirely to the pure helper, no header prose.
+        if (sweepFormat === "ids") {
+          return {
+            content: [{ type: "text" as const, text: formatSweepCollisions(collisions, angles, "ids") }],
+          };
         }
 
-        // Per-collision lines — every step with at least one collision gets
-        // one line per offending pair. Preserve sweep order.
-        for (const c of collisions) {
-          sections.push(
-            `  \u2717 Step ${c.step} (angle ${fmtAngle(c.angle)}\u00b0): ${c.pairA} \u2194 ${c.pairB} ${fmt(c.volume)} mm\u00b3`,
-          );
-        }
+        // summary / full: header + pure formatting helper + envelope trailer.
+        const headerLine = `Sweep check: '${moving}' rotating ${rangeHdr} in ${n} steps around [${fmt(pivot[0])},${fmt(pivot[1])},${fmt(pivot[2])}] axis [${fmt(axis[0])},${fmt(axis[1])},${fmt(axis[2])}]`;
+        const collisionBlock = formatSweepCollisions(collisions, angles, sweepFormat);
+        const sections: string[] = [headerLine];
+        if (collisionBlock) sections.push(collisionBlock);
 
         if (failures.length > 0) {
           sections.push(`\nProbe failures (recorded, not counted as collisions):`);

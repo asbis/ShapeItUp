@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { validateSyntaxPure, detectPathDoubling, detectPathDoublingInfo, extractSignatures, safeHandler, computePartsLine, computeEffectiveMeshQuality } from "./tools.js";
+import { validateSyntaxPure, detectPathDoubling, detectPathDoublingInfo, extractSignatures, safeHandler, computePartsLine, computeEffectiveMeshQuality, formatCollisionPairs, formatSweepCollisions, type CollisionEntry, type SweepCollisionEntry } from "./tools.js";
 
 // ---------------------------------------------------------------------------
 // Bug #6 — validate_syntax must trust .method() calls whose receiver was
@@ -592,12 +592,10 @@ describe("computeEffectiveMeshQuality — AI render mode auto-upgrade", () => {
   });
 
   it("auto-upgrades to 'final' when renderMode is undefined (default 'ai') and meshQuality is not set", () => {
-    // renderMode absent == "ai" in the handler (renderMode || "ai").
     expect(computeEffectiveMeshQuality(undefined, undefined)).toBe("final");
   });
 
   it("respects explicit meshQuality:'preview' even with renderMode=ai", () => {
-    // Caller opted in knowingly — do NOT override.
     expect(computeEffectiveMeshQuality("ai", "preview")).toBe("preview");
   });
 
@@ -606,8 +604,6 @@ describe("computeEffectiveMeshQuality — AI render mode auto-upgrade", () => {
   });
 
   it("does NOT auto-upgrade when renderMode='dark' and meshQuality is not set", () => {
-    // Dark mode is for human review, not AI analysis — respect the absence
-    // of meshQuality (passes through as undefined → extension auto-degrades).
     expect(computeEffectiveMeshQuality("dark", undefined)).toBeUndefined();
   });
 
@@ -617,5 +613,204 @@ describe("computeEffectiveMeshQuality — AI render mode auto-upgrade", () => {
 
   it("respects explicit meshQuality:'final' with renderMode=dark", () => {
     expect(computeEffectiveMeshQuality("dark", "final")).toBe("final");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatCollisionPairs — unit tests for check_collisions format param
+//
+// These tests exercise the pure formatting helper that the tool delegates to.
+// No WASM required — just collision data fixtures.
+// ---------------------------------------------------------------------------
+
+/** Build a minimal collision entry fixture. */
+function makeCollision(a: string, b: string, volume: number, withGeometry = false): CollisionEntry {
+  if (withGeometry) {
+    return {
+      a, b, volume,
+      region: { min: [0, 0, 0], max: [5, 3, 2] },
+      center: [2.5, 1.5, 1.0],
+    };
+  }
+  return { a, b, volume };
+}
+
+describe("formatCollisionPairs — check_collisions format param", () => {
+  // A fixture with 5 real collisions so we can check summary < full in length.
+  const realC: CollisionEntry[] = [
+    makeCollision("bodyA", "bodyB", 12.5, true),
+    makeCollision("bodyC", "bodyD", 8.3),
+    makeCollision("bodyE", "bodyF", 5.1),
+    makeCollision("bodyG", "bodyH", 3.7),
+    makeCollision("bodyI", "bodyJ", 1.9),
+  ];
+  const accounting = "Checked 10 parts → 45 pairs total.\n  - 45 pairs tested for 3D intersection.";
+
+  it("default (no format → summary): includes worst-pair detail, compact lines for rest", () => {
+    const out = formatCollisionPairs(realC, [], [], 0.5, "summary", accounting);
+    // Worst pair has region+center.
+    expect(out).toContain("bodyA ↔ bodyB");
+    expect(out).toContain("Region:");
+    expect(out).toContain("Center:");
+    // Other pairs are one-line compact.
+    expect(out).toContain("bodyC vs bodyD");
+    expect(out).toContain("bodyE vs bodyF");
+    // Compact lines must NOT include Region/Center for non-worst pairs.
+    const lines = out.split("\n");
+    const regionLines = lines.filter((l) => l.trim().startsWith("Region:") || l.trim().startsWith("Center:"));
+    // Only the worst pair (one Region + one Center line).
+    expect(regionLines).toHaveLength(2);
+  });
+
+  it("format=full: every pair gets Region and Center when available", () => {
+    // Give all pairs geometry so we can count.
+    const allWithGeo: CollisionEntry[] = [
+      makeCollision("a", "b", 10, true),
+      makeCollision("c", "d", 8, true),
+      makeCollision("e", "f", 5, true),
+      makeCollision("g", "h", 3, true),
+      makeCollision("i", "j", 1, true),
+    ];
+    const out = formatCollisionPairs(allWithGeo, [], [], 0.5, "full", accounting);
+    const lines = out.split("\n");
+    const regionLines = lines.filter((l) => l.trim().startsWith("Region:"));
+    // Every one of the 5 pairs should have a Region line.
+    expect(regionLines).toHaveLength(5);
+    const centerLines = lines.filter((l) => l.trim().startsWith("Center:"));
+    expect(centerLines).toHaveLength(5);
+  });
+
+  it("format=ids: returns compact JSON array, no prose", () => {
+    const out = formatCollisionPairs(realC, [], [], 0.5, "ids", accounting);
+    // Must be valid JSON.
+    expect(() => JSON.parse(out)).not.toThrow();
+    const tuples = JSON.parse(out) as unknown[];
+    expect(Array.isArray(tuples)).toBe(true);
+    expect(tuples).toHaveLength(5);
+    // Each tuple is [a, b, vol].
+    const first = tuples[0] as [string, string, number];
+    expect(first[0]).toBe("bodyA");
+    expect(first[1]).toBe("bodyB");
+    expect(typeof first[2]).toBe("number");
+    // No accounting prose in the ids output.
+    expect(out).not.toContain("Checked");
+    expect(out).not.toContain("Collisions");
+  });
+
+  it("summary is shorter than full for an assembly with 5+ collisions", () => {
+    const allWithGeo: CollisionEntry[] = Array.from({ length: 6 }, (_, i) =>
+      makeCollision(`part${i}a`, `part${i}b`, (6 - i) * 3, true),
+    );
+    const summaryOut = formatCollisionPairs(allWithGeo, [], [], 0.5, "summary", accounting);
+    const fullOut = formatCollisionPairs(allWithGeo, [], [], 0.5, "full", accounting);
+    expect(summaryOut.length).toBeLessThan(fullOut.length);
+  });
+
+  it("format=full is regression-guarded: same output as old behavior for single pair", () => {
+    const single: CollisionEntry[] = [makeCollision("cap", "body", 7.5, true)];
+    const out = formatCollisionPairs(single, [], [], 0.5, "full", accounting);
+    expect(out).toContain("cap \u2194 body: 7.50 mm\u00b3 overlap");
+    expect(out).toContain("Region: x[0.00, 5.00] y[0.00, 3.00] z[0.00, 2.00] mm");
+    expect(out).toContain("Center: (2.50, 1.50, 1.00) mm");
+  });
+
+  it("ids format: empty collisions returns empty array", () => {
+    const out = formatCollisionPairs([], [], [], 0.5, "ids", accounting);
+    expect(JSON.parse(out)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatSweepCollisions — unit tests for sweep_check format param
+// ---------------------------------------------------------------------------
+
+/** Build sweep collision fixtures. */
+function makeSweepCollisions(stepVolumes: Array<[number, number, string, string]>): SweepCollisionEntry[] {
+  return stepVolumes.map(([step, volume, pairA, pairB]) => ({
+    step,
+    angle: step * 10,
+    pairA,
+    pairB,
+    volume,
+  }));
+}
+
+describe("formatSweepCollisions — sweep_check format param", () => {
+  // 5 collisions across 3 steps: step 0 (1 pair), step 2 (2 pairs), step 4 (2 pairs)
+  const collisions = makeSweepCollisions([
+    [0, 3.0, "arm", "wall"],
+    [2, 8.5, "arm", "wall"],
+    [2, 6.2, "arm", "floor"],
+    [4, 5.0, "arm", "wall"],
+    [4, 4.1, "arm", "ceiling"],
+  ]);
+  // angles array: step index → angle in degrees (0,10,20,30,40)
+  const angles = [0, 10, 20, 30, 40];
+
+  it("default (no format → summary): emits per-step counts, not per-pair lines", () => {
+    const out = formatSweepCollisions(collisions, angles, "summary");
+    // Should show count per step.
+    expect(out).toMatch(/Step 0.*1 collision/);
+    expect(out).toMatch(/Step 2.*2 collision/);
+    expect(out).toMatch(/Step 4.*2 collision/);
+    // Must NOT list individual pair lines for each collision.
+    const pairLines = out.split("\n").filter((l) => l.includes(" \u2194 ") && !l.includes("Worst"));
+    // Only worst step detail — worst is step 2 (volume 8.5+6.2=14.7), its pairs are listed.
+    // But they're indented under "Worst step:" not as top-level ✗ lines.
+    expect(pairLines.length).toBeLessThanOrEqual(2);
+  });
+
+  it("default summary: includes worst step with pair detail", () => {
+    const out = formatSweepCollisions(collisions, angles, "summary");
+    // Worst step = step 2 (14.7 total vol vs step 4's 9.1 and step 0's 3.0).
+    expect(out).toContain("Worst step: 2");
+    expect(out).toContain("arm \u2194 wall");
+    expect(out).toContain("arm \u2194 floor");
+  });
+
+  it("format=full: emits one \u2717 line per collision pair", () => {
+    const out = formatSweepCollisions(collisions, angles, "full");
+    // Each collision gets its own ✗ line.
+    const crossLines = out.split("\n").filter((l) => l.includes("\u2717"));
+    expect(crossLines).toHaveLength(5);
+    // Must contain per-pair detail.
+    expect(out).toContain("arm \u2194 wall");
+  });
+
+  it("summary is shorter than full when there are 5+ collisions", () => {
+    const summaryOut = formatSweepCollisions(collisions, angles, "summary");
+    const fullOut = formatSweepCollisions(collisions, angles, "full");
+    expect(summaryOut.length).toBeLessThan(fullOut.length);
+  });
+
+  it("format=ids: returns [step, pairs] tuples as JSON, no prose", () => {
+    const out = formatSweepCollisions(collisions, angles, "ids");
+    expect(() => JSON.parse(out)).not.toThrow();
+    const tuples = JSON.parse(out) as Array<[number, Array<[string, string, number]>]>;
+    expect(Array.isArray(tuples)).toBe(true);
+    // 3 unique steps.
+    expect(tuples).toHaveLength(3);
+    // Step 2 has 2 pairs.
+    const step2 = tuples.find(([s]) => s === 2);
+    expect(step2).toBeDefined();
+    expect(step2![1]).toHaveLength(2);
+    // No prose in ids output.
+    expect(out).not.toContain("Sweep check");
+    expect(out).not.toContain("Clear");
+  });
+
+  it("ids: empty collisions returns empty array", () => {
+    const out = formatSweepCollisions([], [0, 10, 20], "ids");
+    expect(JSON.parse(out)).toEqual([]);
+  });
+
+  it("summary with no collisions: reports clear through all steps", () => {
+    const out = formatSweepCollisions([], [0, 10, 20, 30, 40], "summary");
+    expect(out).toContain("\u2713 Clear through all 5 steps");
+  });
+
+  it("full with no collisions: reports clear through all steps", () => {
+    const out = formatSweepCollisions([], [0, 10, 20, 30, 40], "full");
+    expect(out).toContain("\u2713 Clear through all 5 steps");
   });
 });
