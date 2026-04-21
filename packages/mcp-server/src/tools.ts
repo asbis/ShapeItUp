@@ -1010,11 +1010,10 @@ export function computeEffectiveMeshQuality(
 }
 
 /**
- * Pure syntax + pitfall validator. Extracted from the `validate_syntax` /
- * `validate_script` MCP tools so unit tests can call it directly without
- * spinning up an MCP server. Returns the same text the tools emit, plus a
- * boolean signalling "hard parse failure" (so the caller can set isError on
- * the MCP envelope).
+ * Pure syntax + pitfall validator. Extracted from the `validate_syntax`
+ * MCP tool so unit tests can call it directly without spinning up an MCP
+ * server. Returns the same text the tool emits, plus a boolean signalling
+ * "hard parse failure" (so the caller can set isError on the MCP envelope).
  *
  * Catches two classes of problem:
  *   1. Real JS syntax errors — evaluated via `new Function(stripped)` after a
@@ -2497,7 +2496,6 @@ export function registerTools(server: McpServer) {
     })
   );
 
-  // Shared implementation for validate_syntax (and backward-compat alias validate_script).
   // Thin wrapper around the pure `validateSyntaxPure` — kept separate so the
   // MCP `content: [...]` envelope lives here and the logic stays unit-testable.
   const validateSyntaxImpl = async ({ code }: { code: string }) => {
@@ -2519,14 +2517,9 @@ export function registerTools(server: McpServer) {
     safeHandler("validate_syntax", validateSyntaxImpl)
   );
 
-  // Backward-compat alias — kept so existing MCP clients calling validate_script continue to work.
-  // Deprecated: prefer validate_syntax.
-  server.tool(
-    "validate_script",
-    "[Deprecated — use validate_syntax] Validate TypeScript syntax and detect 6 common CAD pitfalls. Does NOT verify imports, types, or runtime behavior.",
-    validateSyntaxSchema,
-    safeHandler("validate_script", validateSyntaxImpl)
-  );
+  // Note: validate_script alias was removed in T6.C — it was a verbatim
+  // duplicate of validate_syntax that wasted ~150 tokens of system prompt.
+  // Use validate_syntax instead.
 
   server.tool(
     "preview_shape",
