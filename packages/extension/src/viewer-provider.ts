@@ -77,6 +77,44 @@ function extractLocalImportSpecifiers(source: string): string[] {
   return specs;
 }
 
+/**
+ * Walk esbuild's `metafile.inputs` graph starting at the entry's metafile key,
+ * chasing `imports[].path` recursively so transitive dependencies are tracked
+ * alongside direct ones. Without this walk, editing a file like `constants.ts`
+ * (imported by `body.shape.ts`, imported by the entry) wouldn't invalidate the
+ * entry's bundle cache because esbuild lists `constants.ts` under
+ * `body.shape.ts`'s imports — not the entry's. Returns absolute paths,
+ * excludes the entry file itself (already covered by entryContent equality).
+ */
+function collectBundleInputsRecursive(
+  metafileInputs: Record<string, { imports?: Array<{ path?: string }> }>,
+  entryKey: string,
+  absWorkingDir: string,
+  entryAbsPath: string,
+): string[] {
+  const out = new Set<string>();
+  const visited = new Set<string>();
+  const toAbs = (p: string): string => (path.isAbsolute(p) ? p : path.resolve(absWorkingDir, p));
+  const isEntry = (abs: string): boolean => abs.toLowerCase() === entryAbsPath.toLowerCase();
+
+  const walk = (nodeKey: string): void => {
+    if (visited.has(nodeKey)) return;
+    visited.add(nodeKey);
+    const node = metafileInputs[nodeKey];
+    if (!node) return;
+    for (const imp of node.imports ?? []) {
+      if (!imp?.path) continue;
+      const childKey = imp.path;
+      const childAbs = toAbs(childKey);
+      if (!isEntry(childAbs)) out.add(childAbs);
+      walk(childKey);
+    }
+  };
+
+  walk(entryKey);
+  return [...out];
+}
+
 export class ViewerProvider implements vscode.WebviewViewProvider {
   private view?: vscode.WebviewView;
   private panel?: vscode.WebviewPanel;
@@ -88,6 +126,12 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
   private pendingScript?: { js: string; fileName: string; paramOverrides?: Record<string, number>; meshQuality?: "preview" | "final" };
   private lastScreenshotPath?: string;
   private lastExecutedFile?: string;
+  // P1 fix: capture the most recent webview-worker error so the render-preview
+  // handler can surface it to MCP instead of silently proceeding to capture
+  // a stale screenshot of the previous successful render. Consume-once: the
+  // render-preview command drains this via takeLastRenderError() and clears
+  // it. Armed/cleared per armPendingRender() call.
+  private lastRenderError?: { message: string; stack?: string; operation?: string; timestamp: number; fileName?: string };
   // Buffer for per-part visibility warnings surfaced by the viewer while a
   // screenshot is being prepared. The render-preview handler clears this
   // before dispatching and drains it into the MCP result afterwards.
@@ -546,6 +590,23 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         // second instance of the same compile, and a failure here (often a
         // divergent esbuild bundler) would clobber the engine's success
         // status (see Bug #2).
+        // P1 fix: capture worker error state BEFORE rejecting the pending
+        // render. The render-preview handler reads this via
+        // takeLastRenderError() after awaitNextRender's rejection bubbles
+        // up, and uses it to suppress the stale-PNG screenshot path.
+        this.lastRenderError = {
+          message: typeof msg.message === "string" ? msg.message : String(msg.message ?? ""),
+          stack: typeof msg.stack === "string" ? msg.stack : undefined,
+          operation: typeof msg.operation === "string" ? msg.operation : undefined,
+          timestamp: Date.now(),
+          fileName: typeof msg.fileName === "string" ? msg.fileName : this.lastExecutedFile,
+        };
+        // Defence-in-depth: write a sibling status file so the MCP server
+        // can surface the error even if the command-file round trip never
+        // completes (e.g. the extension host crashed after dispatching).
+        // Deliberately does NOT clobber shapeitup-status.json — see the
+        // comment block above about the engine being authoritative.
+        this.writeViewerErrorFile(this.lastRenderError);
         // Bug C: unblock any awaitNextRender() caller so the render-preview
         // command doesn't just hang on its 8s timeout after a viewer error.
         this.rejectPendingRender(`viewer error: ${msg.message}`);
@@ -657,6 +718,11 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
    * a render that's been superseded).
    */
   armPendingRender(): void {
+    // P1 fix: clear any stale worker-error state from a previous render.
+    // Without this, takeLastRenderError() could return an error produced by
+    // the prior render and mis-attribute it to the render we're about to
+    // start.
+    this.lastRenderError = undefined;
     if (this.pendingRenderReject) {
       this.pendingRenderReject(new Error("render superseded by new executeScript"));
     }
@@ -667,6 +733,61 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     // Swallow unhandled rejections on superseded promises — callers who care
     // attach their own .catch via awaitNextRender.
     this.pendingRenderPromise.catch(() => {});
+  }
+
+  /**
+   * P1 fix: consume-once accessor for the most recent webview-worker error.
+   * Returns the error payload and clears it so repeat callers don't see a
+   * stale error. Called by the render-preview command handler after
+   * awaitNextRender rejects, so the MCP response can include the real worker
+   * failure instead of silently capturing a screenshot of the previous
+   * successful render.
+   */
+  takeLastRenderError(): { message: string; stack?: string; operation?: string; timestamp: number; fileName?: string } | undefined {
+    const err = this.lastRenderError;
+    this.lastRenderError = undefined;
+    return err;
+  }
+
+  /**
+   * Expose webview-ready state so the heartbeat payload can report whether
+   * the viewer is mounted AND its worker finished WASM init. Used by
+   * getViewerStatus() on the MCP side to distinguish "extension running,
+   * viewer loading" from "extension running, viewer ready to render".
+   */
+  get viewerReady(): boolean {
+    return this.isReady && !!this.getActiveWebview();
+  }
+
+  /**
+   * P1 fix: write a sibling JSON status file next to shapeitup-status.json
+   * when the webview worker reports an error. The MCP server reads this if
+   * its timestamp is newer than shapeitup-status.json's, surfacing
+   * webview-only errors that the extension-host path never got to see.
+   *
+   * Deliberately writes to shapeitup-viewer-error.json — the existing
+   * `writeStatusFile` comment explains why clobbering shapeitup-status.json
+   * from the webview path is unsafe (divergent bundlers can overwrite a
+   * successful engine record with a spurious "failure").
+   */
+  private writeViewerErrorFile(err: { message: string; stack?: string; operation?: string; timestamp: number; fileName?: string }): void {
+    try {
+      const dir = this.context.globalStorageUri.fsPath;
+      fs.mkdirSync(dir, { recursive: true });
+      const p = path.join(dir, "shapeitup-viewer-error.json");
+      fs.writeFileSync(
+        p,
+        JSON.stringify({
+          message: err.message,
+          stack: err.stack,
+          operation: err.operation,
+          timestamp: err.timestamp,
+          fileName: err.fileName,
+        }),
+      );
+    } catch {
+      // Best effort — observability, not load-bearing.
+    }
   }
 
   /**
@@ -864,15 +985,42 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         // those exports, so a custom error with the factory-function workaround
         // is far more actionable.
         preflightShapeImports(code, normalizedPath);
+        // Multi-file .shape.ts disambiguation (synthetic-wrapper approach).
+        //
+        // Earlier implementation used an esbuild `footer.js` that stamped
+        // `main` / `params` onto globalThis. That form was ambiguous when the
+        // entry imported a sibling `.shape.ts` whose `export default main` got
+        // hoisted under the bare name `main` — the footer would then pick the
+        // WRONG one (see P5). The synthetic-wrapper pattern mirrors the MCP
+        // engine (packages/mcp-server/src/engine.ts around line 953): we feed
+        // esbuild a tiny stdin module that namespace-imports the user's entry,
+        // then assigns the entry's default/params to globals. The
+        // `__shapeitup_entry__.default` reference is structurally unambiguous,
+        // so renames inside the bundle can't break it.
+        //
+        // The sentinel __SHAPEITUP_ENTRY_SENTINEL__ tells the executor this
+        // marker was set by a trusted wrapper (vs leaked from a prior
+        // execution). The wrapper also clears the three globals in a try/catch
+        // so a subsequent execution can't read a stale entry.
+        const entryImportPath = normalizedPath.replace(/\\/g, "/");
+        const syntheticEntry =
+          `import * as __shapeitup_entry__ from ${JSON.stringify(entryImportPath)};\n` +
+          `try { globalThis.__SHAPEITUP_ENTRY_MAIN__ = __shapeitup_entry__.default; } catch (e) {}\n` +
+          `try { globalThis.__SHAPEITUP_ENTRY_PARAMS__ = __shapeitup_entry__.params; } catch (e) {}\n` +
+          `try { globalThis.__SHAPEITUP_ENTRY_SENTINEL__ = true; } catch (e) {}\n` +
+          `export default __shapeitup_entry__.default;\n` +
+          `export const params = __shapeitup_entry__.params;\n` +
+          `export const material = __shapeitup_entry__.material;\n` +
+          `export const config = __shapeitup_entry__.config;\n`;
         const result = await esbuild.build({
           stdin: {
-            contents: code,
+            contents: syntheticEntry,
             resolveDir,
-            // Pass the full normalized path so the inline sourcemap's
-            // `sources[0]` points at the real .shape.ts instead of a bare
-            // basename — V8 needs an unambiguous URL to resolve frames
-            // back when `//# sourceURL` is set.
-            sourcefile: normalizedPath,
+            // Must differ from `normalizedPath` — if it matched the user's
+            // file path, esbuild would try to treat the stdin as the same
+            // module it's trying to `import * from …` and short-circuit the
+            // bundle (both `default` and `params` come back undefined).
+            sourcefile: path.join(resolveDir, "__shapeitup_wrapper__.ts"),
             loader: "ts",
           },
           bundle: true,
@@ -883,6 +1031,10 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           platform: "browser",
           absWorkingDir: resolveDir,
           metafile: true,
+          // With the synthetic wrapper the user's file is resolved by its
+          // full `.shape.ts` absolute path. esbuild dispatches on the FULL
+          // extension, so map `.shape.ts` and `.shape` explicitly to TS.
+          loader: { ".shape.ts": "ts", ".shape": "ts" },
           // `sourcemap: "inline"` appends `//# sourceMappingURL=data:...` to
           // the bundle. V8 uses that (together with the `//# sourceURL=`
           // directive the core executor emits) to resolve user-script stack
@@ -890,20 +1042,6 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           // `Object.<anonymous>:48:52`. Zero extra runtime deps — V8 does
           // all the mapping.
           sourcemap: "inline",
-          // Multi-file .shape.ts disambiguation: stamp the entry file's
-          // `main` and `params` bindings onto globalThis AFTER esbuild's
-          // rename pass. When the entry imports another .shape.ts that also
-          // has `export default main`, esbuild renames the imported one to
-          // `main2` while the entry's stays bare `main`; without this
-          // marker the executor's `typeof main !== "undefined"` lookup
-          // could bind to the wrong one (depending on output ordering) and
-          // render the wrong part with matching-but-wrong stats. Wrapped in
-          // try/catch so a script that doesn't declare one (or runs in a
-          // locked-down global) still loads cleanly.
-          footer: {
-            js: ';try { if (typeof main !== "undefined") globalThis.__SHAPEITUP_ENTRY_MAIN__ = main; } catch(e){}\n'
-              + ';try { if (typeof params !== "undefined") globalThis.__SHAPEITUP_ENTRY_PARAMS__ = params; } catch(e){}',
-          },
           logLevel: "silent",
         });
 
@@ -916,28 +1054,52 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           const msg = resolutionErrors.map((w) => w.text).join("\n");
           throw new Error(`Unresolved imports:\n${msg}`);
         }
+        // Filter out "Import 'X' will always be undefined" warnings for the
+        // optional names the synthetic wrapper re-exports (`config`, `material`,
+        // `params`). These fire on every file that doesn't declare one of them
+        // — which is most — and the re-export pattern is deliberate.
+        const OPTIONAL_REEXPORT_NAMES = /Import "(config|material|params)" will always be undefined/;
         // Surface other (non-fatal) warnings in the output channel.
         for (const w of result.warnings) {
+          if (OPTIONAL_REEXPORT_NAMES.test(w.text)) continue;
           this.output.appendLine(`[warn] ${w.text}`);
         }
 
         js = result.outputFiles[0].text;
 
         // Record mtime for every LOCAL import esbuild discovered so we can
-        // invalidate next time if any of them changes on disk. We explicitly
-        // skip the entry file: its freshness is already handled by the
+        // invalidate next time if any of them changes on disk. Walks
+        // `inputs[entry].imports[].path` recursively so TRANSITIVE
+        // dependencies land in inputMtimes alongside direct ones (without
+        // this, editing `constants.ts` two levels deep wouldn't invalidate
+        // the root entry's cache and stale JS would run). Explicitly skips
+        // the entry file: its freshness is already handled by the
         // entryContent equality check, and mtime can flicker on Windows
-        // (editor touches, indexers) without content changing — double-checking
-        // here causes spurious cache misses.
+        // (editor touches, indexers) without content changing — double-
+        // checking here causes spurious cache misses.
         const inputMtimes: Record<string, number> = {};
         try {
-          for (const inputPath of Object.keys(result.metafile?.inputs ?? {})) {
-            if (inputPath.startsWith("<stdin>")) continue;
-            const abs = path.isAbsolute(inputPath)
-              ? inputPath
-              : path.resolve(resolveDir, inputPath);
-            // Skip the entry file — covered by entryContent.
-            if (abs.toLowerCase() === document.fileName.toLowerCase()) continue;
+          const metafileInputs = result.metafile?.inputs ?? {};
+          // With the synthetic-wrapper entry the metafile's entry key is the
+          // wrapper's relative path (esbuild normalises it against
+          // absWorkingDir). Locate it by its unique `__shapeitup_wrapper__`
+          // marker rather than string-matching a computed relative form,
+          // because Windows/POSIX path joins diverge.
+          const wrapperKey = Object.keys(metafileInputs).find((k) =>
+            k.toLowerCase().includes("__shapeitup_wrapper__"),
+          );
+          const absInputs = wrapperKey
+            ? collectBundleInputsRecursive(metafileInputs, wrapperKey, resolveDir, normalizedPath)
+            : // Fallback to a flat walk if we can't locate the wrapper key
+              // (shouldn't happen with the synthetic entry above, but keep as
+              // a safety net so a future refactor doesn't silently lose
+              // invalidation coverage).
+              Object.keys(metafileInputs)
+                .filter((p) => !p.toLowerCase().includes("__shapeitup_wrapper__"))
+                .map((p) => (path.isAbsolute(p) ? p : path.resolve(resolveDir, p)))
+                .filter((abs) => abs.toLowerCase() !== document.fileName.toLowerCase()
+                  && abs.toLowerCase() !== normalizedPath.toLowerCase());
+          for (const abs of absInputs) {
             try {
               inputMtimes[abs] = fs.statSync(abs).mtimeMs;
             } catch {

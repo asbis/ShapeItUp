@@ -169,7 +169,20 @@ export function activate(context: vscode.ExtensionContext) {
         // getDefaultDirectory().
         const workspaceRoots =
           vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? [];
-        const payload = JSON.stringify({ timestamp: Date.now(), pid: process.pid, workspaceRoots });
+        // P11 fix: carry the extension version + viewer-ready flag so the MCP
+        // server can render `[shapeitup mcp vX · ext vY]` footers and surface
+        // the viewer state in get_render_status. Using the VSCode API's
+        // `packageJSON.version` avoids a disk read on every 2s tick.
+        const extensionVersion: string | undefined =
+          (context.extension?.packageJSON?.version as string | undefined) ?? undefined;
+        const viewerReady = !!viewerProvider.viewerReady;
+        const payload = JSON.stringify({
+          timestamp: Date.now(),
+          pid: process.pid,
+          workspaceRoots,
+          extensionVersion,
+          viewerReady,
+        });
         fs.writeFileSync(pidHbPath, payload);
         fs.writeFileSync(legacyHbPath, payload);
       } catch {}
@@ -442,6 +455,35 @@ export function activate(context: vscode.ExtensionContext) {
             await viewerProvider.awaitNextRender(8000);
           } catch (e: any) {
             outputChannel.appendLine(`[ai] render-preview: awaitNextRender failed — ${e?.message ?? e}`);
+            // P1 fix: if the reason awaitNextRender rejected is a real
+            // webview-worker error (not just a timeout on a slow machine),
+            // bail out with that error instead of falling through to the
+            // screenshot path. The old flow silently proceeded and captured
+            // whatever was on screen from the PREVIOUS render — a stale PNG
+            // masquerading as a success. We distinguish the two by whether
+            // the error-message handler set lastRenderError; a timeout alone
+            // does not.
+            const viewerErr = viewerProvider.takeLastRenderError();
+            if (viewerErr) {
+              clearInterval(heartbeat);
+              await writeResult(id, {
+                error: viewerErr.message,
+                errorStack: viewerErr.stack,
+                errorOperation: viewerErr.operation,
+                source: "webview-worker",
+              });
+              // Restore viewer UI state defensively so a subsequent successful
+              // render isn't presented to the user with leftover screenshot
+              // mode styling.
+              viewerProvider.sendViewerCommand("set-render-mode", { mode: "dark" });
+              viewerProvider.sendViewerCommand("toggle-dimensions", { show: false });
+              viewerProvider.sendViewerCommand("toggle-axes", { show: true, scaleToModel: false });
+              viewerProvider.sendViewerCommand("restore-part-visibility", {});
+              return;
+            }
+            // No worker error recorded — this was a plain timeout. Preserve
+            // the existing best-effort capture behavior (slow-but-succeeding
+            // renders on weak hardware still produce a usable PNG).
           }
         } catch (e: any) {
           outputChannel.appendLine(`[ai] render-preview: failed to load ${cmd.filePath}: ${e?.message ?? e}`);
@@ -528,12 +570,31 @@ export function activate(context: vscode.ExtensionContext) {
       const partWarnings = viewerProvider.drainPartWarnings();
 
       if (screenshotPath) {
-        await writeResult(id, { screenshotPath, partWarnings });
-        const displayPath =
-          wsRoot && screenshotPath.startsWith(wsRoot)
-            ? path.relative(wsRoot, screenshotPath).split(path.sep).join("/")
-            : screenshotPath;
-        outputChannel.appendLine(`[ai] Screenshot saved: ${displayPath}`);
+        // P1 edge-race guard: an error may have arrived between the successful
+        // render-success and the screenshot completing. Drain the consume-once
+        // slot before reporting the PNG — if one is present, the PNG is stale
+        // (reflecting the prior on-screen geometry, not the script we were
+        // asked to render) and MCP must see the error instead.
+        const viewerErr = viewerProvider.takeLastRenderError();
+        if (viewerErr) {
+          await writeResult(id, {
+            error: viewerErr.message,
+            errorStack: viewerErr.stack,
+            errorOperation: viewerErr.operation,
+            source: "webview-worker",
+            partWarnings,
+          });
+          outputChannel.appendLine(
+            `[ai] render-preview: dropping captured PNG at ${screenshotPath} — worker error arrived post-capture (${viewerErr.message})`,
+          );
+        } else {
+          await writeResult(id, { screenshotPath, partWarnings });
+          const displayPath =
+            wsRoot && screenshotPath.startsWith(wsRoot)
+              ? path.relative(wsRoot, screenshotPath).split(path.sep).join("/")
+              : screenshotPath;
+          outputChannel.appendLine(`[ai] Screenshot saved: ${displayPath}`);
+        }
       } else {
         // P3-9: final diagnostic line on screenshot failure. Paste-ready
         // for a bug report: file path + elapsed ms + heartbeat count make
@@ -762,6 +823,48 @@ async function showMcpInstallOptions(
     }
   }
   output.appendLine(`[mcp] User chose install target: ${(picked as any).id}`);
+
+  // Warm the npx cache so the first MCP connect from the chosen client
+  // doesn't have to download ~30 MB of replicad-opencascadejs inline —
+  // Claude Code's connect timeout can fire before that finishes, surfacing
+  // a spurious "failed" state even when the server is healthy.
+  warmNpxMcpCache(output);
+}
+
+/**
+ * Fire-and-forget prefetch of `@shapeitup/mcp-server` into the npx cache.
+ * Runs detached so VS Code doesn't wait on it and the output stays quiet on
+ * the happy path. We intentionally don't surface errors to the user — if the
+ * prefetch fails, the real `npx` invocation from Claude/Cursor/etc. will try
+ * again and the user sees the real error in their client.
+ */
+function warmNpxMcpCache(output: vscode.OutputChannel) {
+  try {
+    const { spawn } = require("child_process") as typeof import("child_process");
+    const isWin = process.platform === "win32";
+    // `npx --yes --package <pkg> -- node --version` forces npx to resolve and
+    // install the package (populating its cache) but runs `node --version`
+    // instead of the package's bin, so the command exits in milliseconds
+    // once the download finishes rather than starting a stdio MCP server we
+    // would then have to kill.
+    const child = spawn(
+      isWin ? "npx.cmd" : "npx",
+      ["--yes", "--package", "@shapeitup/mcp-server", "--", "node", "--version"],
+      {
+        detached: true,
+        stdio: "ignore",
+        shell: false,
+        windowsHide: true,
+      },
+    );
+    child.on("error", (err) => {
+      output.appendLine(`[mcp] npx prefetch failed to spawn: ${err.message}`);
+    });
+    child.unref();
+    output.appendLine("[mcp] Warming npx cache for @shapeitup/mcp-server in background.");
+  } catch (e: any) {
+    output.appendLine(`[mcp] npx prefetch skipped: ${e?.message ?? e}`);
+  }
 }
 
 /**

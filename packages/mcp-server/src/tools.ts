@@ -77,34 +77,40 @@ let lastWaitTimeoutReason: "dead" | "slow" | null = null;
 const _emittedWorkspaceRoots = new Set<string>();
 
 /**
- * Version tag appended to every response that routes through `formatStatusText`.
- * Read from `packages/extension/package.json` at MCP-server startup so agents
- * can tell at a glance which extension release they're talking to — hard bug
- * reports otherwise conflate "fixed on tip" with "old build still installed".
+ * P11 fix: MCP-server's OWN package.json version. When the server is installed
+ * via `npx -y @shapeitup/mcp-server`, only its own dist/ + package.json ship —
+ * the old probe for `packages/extension/package.json` always missed, which
+ * gave agents an always-wrong `[shapeitup vunknown]` footer. This is the ONE
+ * version that is always present: it's the package the user actually invoked.
  *
- * Probes a few candidate locations for the package.json because the MCP server
- * ships bundled (dist/ layout is flat) but during `tsc --noEmit` / dev mode we
- * run from source. If we can't find it, fall back to `unknown` rather than
- * throwing — a missing version is informational, not load-bearing.
+ * Note: this is just the MCP server's version. The extension's version is
+ * reported separately via the heartbeat (see getViewerStatus / getVersionTag)
+ * so the combined footer reflects both sides of the stack honestly.
  */
-const SHAPEITUP_VERSION: string = (() => {
+const MCP_SERVER_VERSION: string = (() => {
+  // Candidates in order of likelihood for each install shape:
+  //  1. Bundled dist (packages/mcp-server/dist/mcp-server.mjs → ../package.json)
+  //  2. Dev / tsc (packages/mcp-server/src/tools.ts → ../package.json)
+  //  3. Defensive fallback against process.cwd()
   const candidates: string[] = [];
   try {
-    // From compiled dist (packages/mcp-server/dist/*.js or bundled single file).
-    candidates.push(join(__dirname, "..", "..", "extension", "package.json"));
-    candidates.push(join(__dirname, "..", "..", "..", "extension", "package.json"));
-    // From source tree (packages/mcp-server/src/tools.ts) during dev / tsc.
-    candidates.push(join(__dirname, "..", "..", "..", "packages", "extension", "package.json"));
-    // Bundled alongside in globalStorage layouts (defensive).
-    candidates.push(resolve(process.cwd(), "packages", "extension", "package.json"));
+    candidates.push(join(__dirname, "..", "package.json"));
+    candidates.push(join(__dirname, "..", "..", "package.json"));
+    candidates.push(resolve(process.cwd(), "packages", "mcp-server", "package.json"));
   } catch {
-    // __dirname shouldn't throw but be defensive — fall through to "unknown".
+    // __dirname shouldn't throw but be defensive.
   }
   for (const p of candidates) {
     try {
       if (existsSync(p)) {
         const pkg = JSON.parse(readFileSync(p, "utf-8"));
-        if (pkg && typeof pkg.version === "string" && pkg.version.length > 0) {
+        if (
+          pkg &&
+          typeof pkg.name === "string" &&
+          pkg.name.includes("mcp-server") &&
+          typeof pkg.version === "string" &&
+          pkg.version.length > 0
+        ) {
           return pkg.version;
         }
       }
@@ -114,7 +120,141 @@ const SHAPEITUP_VERSION: string = (() => {
   }
   return "unknown";
 })();
-const SHAPEITUP_VERSION_TAG = `\n[shapeitup v${SHAPEITUP_VERSION}]`;
+
+/**
+ * P11 fix: snapshot of viewer connectivity derived from live heartbeats.
+ * Recomputed on each call (no module-level cache) so "disconnected" reflects
+ * the current state — a user who closes VS Code between calls gets an
+ * accurate footer on the next tool invocation rather than a cached "connected".
+ */
+export function getViewerStatus(): {
+  alive: boolean;
+  viewerReady: boolean;
+  extensionVersion?: string;
+} {
+  const all = readAllHeartbeats();
+  if (all.length === 0) {
+    return { alive: false, viewerReady: false };
+  }
+  const now = Date.now();
+  // Match isExtensionAlive()'s 15_000ms window so the two helpers agree on
+  // liveness — a mismatch would let `get_render_status` report "connected"
+  // while `render_preview` refuses because its check disagrees.
+  const fresh = all.filter((hb) => now - (hb.timestamp ?? 0) < 15_000);
+  const source = fresh.length > 0 ? fresh : all;
+  // Prefer a heartbeat that actually reports viewerReady=true — in multi-window
+  // setups the MCP-owning window is usually the one with an open viewer, not
+  // the backgrounded one that briefly lost focus.
+  const ready = source.find((hb) => hb.viewerReady === true);
+  const pick = ready ?? source[0];
+  const extensionVersion =
+    source.find((hb) => typeof hb.extensionVersion === "string" && hb.extensionVersion.length > 0)?.extensionVersion;
+  return {
+    alive: fresh.length > 0,
+    viewerReady: !!pick?.viewerReady,
+    extensionVersion,
+  };
+}
+
+/**
+ * P11 fix: build the version footer live on each call. Never emits the literal
+ * "unknown" — when the extension half of the stack is disconnected we say so
+ * explicitly so agents don't chase phantom version drift in bug reports.
+ *
+ * Formats:
+ *   happy path:      [shapeitup mcp v1.3.0 · ext v1.5.2]
+ *   extension down:  [shapeitup mcp v1.3.0 · extension-disconnected]
+ *   both unknown:    [shapeitup mcp vdev · extension-disconnected] — mcp
+ *                    "unknown" falls back to "dev" so the footer never
+ *                    contains the confusing literal word "unknown".
+ */
+export function getVersionTag(): string {
+  const status = getViewerStatus();
+  const mcpV = MCP_SERVER_VERSION !== "unknown" ? MCP_SERVER_VERSION : "dev";
+  const extSuffix = status.alive && status.extensionVersion
+    ? `\u00b7 ext v${status.extensionVersion}`
+    : "\u00b7 extension-disconnected";
+  return `\n[shapeitup mcp v${mcpV} ${extSuffix}]`;
+}
+
+/**
+ * P11 fix: human-readable viewer-status block appended to get_render_status.
+ * Three-state report: connected+ready, connected+loading, disconnected. The
+ * extension-version line only appears when we have one — on pre-P11 extension
+ * builds the heartbeat lacks it, and "Extension version: unknown" is worse
+ * than silent.
+ */
+export function formatViewerBlock(): string {
+  const s = getViewerStatus();
+  let line: string;
+  if (!s.alive) line = "disconnected";
+  else if (s.viewerReady) line = "connected (ready)";
+  else line = "connected (loading)";
+  const versionLine = s.extensionVersion
+    ? `\nExtension version: ${s.extensionVersion}`
+    : "";
+  return `\nViewer: ${line}${versionLine}`;
+}
+
+/**
+ * P1 fix: when a webview-worker error message contains references to Node-only
+ * globals (`require`, `__dirname`, `process.*`), append a one-line hint
+ * reminding the caller that `.shape.ts` files run in BOTH the Node MCP engine
+ * AND a Web Worker inside the viewer. ESM imports are the portable choice.
+ *
+ * Keeps the hint terse — full docs live in the skill; this is just enough
+ * context for an agent that just hit the error to self-correct.
+ */
+function formatWorkerErrorMessage(
+  message: string,
+  stack?: string,
+  operation?: string,
+): string {
+  const parts: string[] = [`Screenshot failed: ${message}`];
+  if (operation) parts.push(`Operation: ${operation}`);
+  if (stack) {
+    const trimmed = stack
+      .split("\n")
+      .slice(0, 4)
+      .map((l) => `  ${l.trim()}`)
+      .filter((l) => l.trim().length > 2)
+      .join("\n");
+    if (trimmed.length > 0) parts.push(`Stack:\n${trimmed}`);
+  }
+  if (/require is not defined|__dirname|process\./.test(message)) {
+    parts.push(
+      "CommonJS restriction: `.shape.ts` files run in both Node (MCP) and a Web Worker (viewer). `require`, `__dirname`, `process.*`, and Node-only APIs are not available in the viewer — use ESM `import` instead.",
+    );
+  }
+  return parts.join("\n");
+}
+
+/**
+ * P1 fix: read shapeitup-viewer-error.json (written by viewer-provider.ts on
+ * webview-worker error). Returns the payload when its timestamp is NEWER than
+ * shapeitup-status.json's timestamp — that's the signal that the webview
+ * picked up an error the engine never saw.
+ */
+function readViewerErrorIfNewer(globalStorage: string): { message: string; stack?: string; operation?: string; timestamp: number; fileName?: string } | null {
+  try {
+    const errPath = join(globalStorage, "shapeitup-viewer-error.json");
+    if (!existsSync(errPath)) return null;
+    const err = JSON.parse(readFileSync(errPath, "utf-8"));
+    if (typeof err?.message !== "string" || typeof err?.timestamp !== "number") return null;
+    const statusPath = join(globalStorage, "shapeitup-status.json");
+    let statusTs = 0;
+    try {
+      const s = JSON.parse(readFileSync(statusPath, "utf-8"));
+      const t = typeof s?.timestamp === "string" ? Date.parse(s.timestamp) : (typeof s?.timestamp === "number" ? s.timestamp : 0);
+      if (Number.isFinite(t)) statusTs = t;
+    } catch {}
+    if (err.timestamp > statusTs) return err;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 
 function nextCommandId(): string {
   return ID_PREFIX + (++commandCounter);
@@ -157,6 +297,18 @@ interface WindowHeartbeat {
   pid: number;
   timestamp: number;
   workspaceRoots: string[];
+  /**
+   * P11 fix: VSCode extension's package version (e.g. "1.5.2"). Optional so
+   * older extension builds that don't include it still parse cleanly — the
+   * consumer treats absence as "extension too old to report a version".
+   */
+  extensionVersion?: string;
+  /**
+   * P11 fix: whether the extension's webview is mounted AND its worker has
+   * finished WASM init. Optional for back-compat; absence is reported as
+   * "extension connected, viewer state unknown".
+   */
+  viewerReady?: boolean;
 }
 
 /**
@@ -188,6 +340,8 @@ function readAllHeartbeats(): WindowHeartbeat[] {
             pid: data.pid,
             timestamp: data.timestamp,
             workspaceRoots: data.workspaceRoots as string[],
+            extensionVersion: typeof data?.extensionVersion === "string" ? data.extensionVersion : undefined,
+            viewerReady: typeof data?.viewerReady === "boolean" ? data.viewerReady : undefined,
           });
         }
       } catch {}
@@ -588,6 +742,32 @@ function formatLastScreenshotLine(status: EngineStatus): string {
   return `\nLast screenshot: ${ls.path}${when}${mode}${cam}`;
 }
 
+/**
+ * Collapse consecutive duplicate strings into a single entry suffixed with
+ * `(×N)`. Order-preserving: the first occurrence of each distinct line keeps
+ * its position; the count is what varies. Used by the STEP/STL export
+ * printability block so that 48 parts all flagged for the same boolean-
+ * artefact reason emit one line, not 48 identical ones.
+ */
+function dedupLines(lines: string[]): string[] {
+  const out: string[] = [];
+  const counts = new Map<string, number>();
+  const firstIndex = new Map<string, number>();
+  for (const line of lines) {
+    if (!firstIndex.has(line)) {
+      firstIndex.set(line, out.length);
+      out.push(line);
+      counts.set(line, 1);
+    } else {
+      counts.set(line, (counts.get(line) ?? 1) + 1);
+    }
+  }
+  return out.map((line) => {
+    const n = counts.get(line) ?? 1;
+    return n > 1 ? `${line} (\u00d7${n})` : line;
+  });
+}
+
 function formatStatusText(status: EngineStatus, verbosity: "summary" | "full" = "summary"): string {
   const lastShot = formatLastScreenshotLine(status);
   if (!status.success) {
@@ -619,7 +799,7 @@ function formatStatusText(status: EngineStatus, verbosity: "summary" | "full" = 
     const resetNote = status.engineReset
       ? `\nEngine was re-initialized after a WASM exception. Next call will take ~500ms.`
       : "";
-    return `Render FAILED\nError: ${status.error}${hint}${operation}${stack}${resetNote}\nFile: ${status.fileName || "unknown"}\nTip: call get_preview to view the last successful render for visual comparison (the PNG is NOT overwritten on failure).${lastShot}\nTime: ${status.timestamp}${SHAPEITUP_VERSION_TAG}`;
+    return `Render FAILED\nError: ${status.error}${hint}${operation}${stack}${resetNote}\nFile: ${status.fileName || "unknown"}\nTip: call get_preview to view the last successful render for visual comparison (the PNG is NOT overwritten on failure).${lastShot}\nTime: ${status.timestamp}${getVersionTag()}`;
   }
   const parts = status.partNames?.length ? `\nParts: ${status.partNames.join(", ")}` : "";
   const paramEntries = status.currentParams ? Object.entries(status.currentParams) : [];
@@ -650,6 +830,22 @@ function formatStatusText(status: EngineStatus, verbosity: "summary" | "full" = 
         ? `\nGeometry errors (part validation failed):\n - ${status.warnings.join("\n - ")}\nNote: Volume/area/mass omitted for invalid parts.`
         : `\nGeometry warnings:\n - ${status.warnings.join("\n - ")}`)
     : "";
+  // P9: aggregate `patterns.cutAt` material-removal summary. Only rendered
+  // when the script actually called cutAt (undefined → omitted entirely).
+  // The engine promotes USER-EXPLICIT cutAt misses to thrown errors, so a
+  // `false` here almost always means a generator-produced placement set
+  // whose math landed outside the target — a warning, not a failure.
+  let cutAtSummary = "";
+  if (status.hasRemovedMaterial === true) {
+    const count = status.cutAtCallCount ?? 0;
+    cutAtSummary = `\nCut material removal: all succeeded${count ? ` (${count} call${count === 1 ? "" : "s"})` : ""}`;
+  } else if (status.hasRemovedMaterial === false) {
+    const failed = status.cutAtFailedCount ?? 0;
+    const total = status.cutAtCallCount ?? 0;
+    cutAtSummary = total > 0
+      ? `\nCut material removal: ${failed}/${total} call${total === 1 ? "" : "s"} removed no material`
+      : `\nCut material removal: one or more calls removed no material`;
+  }
   const properties = formatProperties(status.properties, verbosity);
   const bbox = status.boundingBox
     ? `\nBounding box: ${status.boundingBox.x} x ${status.boundingBox.y} x ${status.boundingBox.z} mm`
@@ -658,40 +854,28 @@ function formatStatusText(status: EngineStatus, verbosity: "summary" | "full" = 
     ? `\nMaterial: ${status.material.name ? status.material.name + ", " : ""}density ${status.material.density} g/cm³`
     : "";
 
-  // Geometry sanity: flag parts that extend meaningfully below z=0. When a
-  // mechanical design has a baseplate resting on the XY plane, a part whose
-  // minimum z sits more than 1mm below the origin is almost always a rotation
-  // direction mistake or a pivot-point typo — but it renders the same either
-  // way, so the visual inspection alone won't catch it. 1mm tolerance keeps
-  // ordinary -0.001 numerical dust from tripping the warning.
+  // Geometry sanity: flag a single part that extends meaningfully below z=0.
+  // When a mechanical design has a baseplate resting on the XY plane, a part
+  // whose minimum z sits more than 1mm below the origin is almost always a
+  // rotation-direction mistake or a pivot-point typo — but it renders the
+  // same either way, so visual inspection alone won't catch it. 1mm tolerance
+  // keeps ordinary -0.001 numerical dust from tripping the warning.
   //
-  // Assembly-convention exception: when a user's project uses a different
-  // reference (e.g. Z=0 at the TOP face of a knitting-machine bed), MOST
-  // parts legitimately sit below Z=0. Firing 12 warnings in that case is pure
-  // noise. Suppress the warning when half or more of the parts share the same
-  // fate — one-off mistakes still surface; systemic conventions don't.
+  // Multi-part assemblies are excluded entirely: in practice every
+  // non-trivial assembly uses SOME reference convention other than "every
+  // part sits above Z=0" (bedplates, centred axles, floor-anchored frames).
+  // The old 50%-systemic-convention heuristic still fired one-off warnings
+  // in mixed cases and was pure noise. If `main()` returns an array, trust
+  // the author's convention and skip the check.
   let belowZeroWarn = "";
   const partsList = status.properties?.parts;
-  if (Array.isArray(partsList) && partsList.length > 0) {
-    const belowCount = partsList.filter(
-      (p) => typeof p.boundingBox?.min?.[2] === "number" && p.boundingBox!.min[2] < -1,
-    ).length;
-    const isSystemicConvention =
-      partsList.length > 1 && belowCount >= Math.ceil(partsList.length / 2);
-    if (!isSystemicConvention) {
-      const offenders: string[] = [];
-      for (const p of partsList) {
-        const minZ = p.boundingBox?.min?.[2];
-        if (typeof minZ === "number" && minZ < -1) {
-          const depth = (-minZ).toFixed(1);
-          offenders.push(
-            `\u26a0 Geometry: part '${p.name}' extends ${depth} mm below z=0. If it should rest on a baseplate (z=0), check your rotation direction or pivot point.`,
-          );
-        }
-      }
-      if (offenders.length > 0) {
-        belowZeroWarn = "\n" + offenders.join("\n");
-      }
+  if (Array.isArray(partsList) && partsList.length === 1) {
+    const p = partsList[0];
+    const minZ = p.boundingBox?.min?.[2];
+    if (typeof minZ === "number" && minZ < -1) {
+      const depth = (-minZ).toFixed(1);
+      belowZeroWarn =
+        `\n\u26a0 Geometry: part '${p.name}' extends ${depth} mm below z=0. If it should rest on a baseplate (z=0), check your rotation direction or pivot point.`;
     }
   }
 
@@ -699,9 +883,9 @@ function formatStatusText(status: EngineStatus, verbosity: "summary" | "full" = 
   if (geomInvalid) {
     // Hoist the warnings block above stats so the structural problem is the
     // first thing the reader sees, not an otherwise-normal-looking summary.
-    return `${headline}\nFile: ${status.fileName || "unknown"}${warnings}\nStats: ${status.stats}${parts}${bbox}${material}${properties}${belowZeroWarn}${currentParams}${timings}${lastShot}\nTime: ${status.timestamp}${SHAPEITUP_VERSION_TAG}`;
+    return `${headline}\nFile: ${status.fileName || "unknown"}${warnings}\nStats: ${status.stats}${parts}${bbox}${material}${properties}${belowZeroWarn}${currentParams}${timings}${cutAtSummary}${lastShot}\nTime: ${status.timestamp}${getVersionTag()}`;
   }
-  return `${headline}\nFile: ${status.fileName || "unknown"}\nStats: ${status.stats}${parts}${bbox}${material}${properties}${belowZeroWarn}${currentParams}${timings}${warnings}${lastShot}\nTime: ${status.timestamp}${SHAPEITUP_VERSION_TAG}`;
+  return `${headline}\nFile: ${status.fileName || "unknown"}\nStats: ${status.stats}${parts}${bbox}${material}${properties}${belowZeroWarn}${currentParams}${timings}${warnings}${cutAtSummary}${lastShot}\nTime: ${status.timestamp}${getVersionTag()}`;
 }
 
 /**
@@ -1581,10 +1765,20 @@ async function executeWithPersistedParams(
    * underlying execute. Use this from any caller that downstream-derefs
    * `parts[i].shape` (live OCCT handle) — the cache layer scrubs those.
    */
-  opts?: { partStats?: "none" | "bbox" | "full"; force?: boolean },
+  opts?: {
+    partStats?: "none" | "bbox" | "full";
+    force?: boolean;
+    /**
+     * When true, forwarded to `executeShapeFile` to bypass the *bundle* cache
+     * (esbuild output). Distinct from `force`, which bypasses the *mesh*
+     * cache (tessellated OCCT output). Either may be set independently.
+     */
+    forceBundleRebuild?: boolean;
+  },
 ): ReturnType<typeof executeShapeFile> {
   const merged = mergeSidecarOverrides(absPath, callOverrides);
   const force = opts?.force === true;
+  const forceBundleRebuild = opts?.forceBundleRebuild === true;
   // partStats === "full" path needs OCCT-measured volumes that cached entries
   // (tessellated at the default "bbox" level) don't carry. Treat as a force.
   const needsFreshMeasurement = opts?.partStats === "full";
@@ -1595,7 +1789,13 @@ async function executeWithPersistedParams(
   // key that includes meshQuality, renderMode, cameraAngle, etc.
   const meshQuality = "default";
 
-  if (!force && !needsFreshMeasurement) {
+  // `forceBundleRebuild` must also bypass the mesh cache: a mesh-cache hit
+  // returns before `executeShapeFile` runs, which means the bundle cache is
+  // never consulted and no "Cache invalidated: force=true" warning is
+  // emitted. The whole point of forceBundleRebuild is to give MCP callers a
+  // way to guarantee esbuild re-ran, so serving a stale mesh here would
+  // silently defeat the flag.
+  if (!force && !needsFreshMeasurement && !forceBundleRebuild) {
     const head = readSourceForCacheKey(absPath);
     if (head) {
       const hit = lookupMeshCache(absPath, head.sourceHash, paramsKey, meshQuality);
@@ -1608,7 +1808,13 @@ async function executeWithPersistedParams(
     }
   }
 
-  const outcome = await executeShapeFile(absPath, GLOBAL_STORAGE, merged, opts);
+  // Only forward fields the engine actually reads. `force` is a mesh-cache
+  // concept local to this wrapper; `forceBundleRebuild` is the engine-side
+  // knob for the bundle cache.
+  const outcome = await executeShapeFile(absPath, GLOBAL_STORAGE, merged, {
+    partStats: opts?.partStats,
+    forceBundleRebuild,
+  });
 
   // Only cache successful outcomes. Re-read mtime/source AFTER execution so
   // the entry tracks what was actually rendered, not whatever the file looked
@@ -1643,9 +1849,27 @@ export type CollisionEntry = {
   a: string;
   b: string;
   volume: number;
-  region?: { min: [number, number, number]; max: [number, number, number] };
+  region?: {
+    min: [number, number, number];
+    max: [number, number, number];
+    /** Per-axis overlap extents (max - min), mm. */
+    depths: { x: number; y: number; z: number };
+  };
   center?: [number, number, number];
+  aabbVolA?: number;
+  aabbVolB?: number;
 };
+
+function misplacedHint(c: CollisionEntry): string {
+  const va = c.aabbVolA;
+  const vb = c.aabbVolB;
+  if (va === undefined || vb === undefined || va <= 0 || vb <= 0) return "";
+  const smaller = Math.min(va, vb);
+  const larger = Math.max(va, vb);
+  if (smaller / larger >= 0.5) return "";
+  const smallerName = va < vb ? c.a : c.b;
+  return ` (${smallerName} likely misplaced)`;
+}
 
 /** Render the per-pair collision block for check_collisions. */
 export function formatCollisionPairs(
@@ -1673,11 +1897,14 @@ export function formatCollisionPairs(
       if (reportFormat === "full") {
         const lines: string[] = [];
         for (const c of realC) {
-          lines.push(`  - ${c.a} \u2194 ${c.b}: ${fmt(c.volume)} mm\u00b3 overlap`);
+          lines.push(`  - ${c.a} \u2194 ${c.b}: ${fmt(c.volume)} mm\u00b3 overlap${misplacedHint(c)}`);
           if (c.region) {
             const r = c.region;
             lines.push(
               `    Region: x${fmtRange(r.min[0], r.max[0])} y${fmtRange(r.min[1], r.max[1])} z${fmtRange(r.min[2], r.max[2])} mm`,
+            );
+            lines.push(
+              `    Overlap depth: X=${fmt(r.depths.x)}mm, Y=${fmt(r.depths.y)}mm, Z=${fmt(r.depths.z)}mm`,
             );
           }
           if (c.center) {
@@ -1688,18 +1915,21 @@ export function formatCollisionPairs(
       } else {
         const lines: string[] = [];
         const [worst, ...rest] = realC;
-        lines.push(`  - ${worst.a} \u2194 ${worst.b}: ${fmt(worst.volume)} mm\u00b3 overlap`);
+        lines.push(`  - ${worst.a} \u2194 ${worst.b}: ${fmt(worst.volume)} mm\u00b3 overlap${misplacedHint(worst)}`);
         if (worst.region) {
           const r = worst.region;
           lines.push(
             `    Region: x${fmtRange(r.min[0], r.max[0])} y${fmtRange(r.min[1], r.max[1])} z${fmtRange(r.min[2], r.max[2])} mm`,
+          );
+          lines.push(
+            `    Overlap depth: X=${fmt(r.depths.x)}mm, Y=${fmt(r.depths.y)}mm, Z=${fmt(r.depths.z)}mm`,
           );
         }
         if (worst.center) {
           lines.push(`    Center: ${fmtPt(worst.center)} mm`);
         }
         for (const c of rest) {
-          lines.push(`  - ${c.a} vs ${c.b} \u2014 ${fmt(c.volume)} mm\u00b3`);
+          lines.push(`  - ${c.a} vs ${c.b} \u2014 ${fmt(c.volume)} mm\u00b3${misplacedHint(c)}`);
         }
         sections.push(`\nCollisions (sorted by volume desc):\n${lines.join("\n")}`);
       }
@@ -1832,7 +2062,26 @@ export function registerTools(server: McpServer) {
     "create_shape",
     "Create a new .shape.ts CAD script file and execute it. Fails if file already exists — use modify_shape to update existing files. Path resolution precedence: absolute `directory` used as-is; relative `directory` probed against each heartbeat-reported VSCode workspace root (first match wins), else `process.cwd()`; omitted `directory` defaults to the first active VSCode workspace root (or cwd if no extension is running). Refuses to create a file when the resolved path contains a duplicated segment (e.g. `examples/examples/...`) unless `allowPathDuplication: true` is passed.",
     {
-      name: z.string().describe("File name without extension (e.g., 'bracket')"),
+      name: z
+        .string()
+        .superRefine((n, ctx) => {
+          // Reject callers passing a full filename — we append '.shape.ts'
+          // ourselves and doubling produces e.g. `needle.shape.shape.ts`.
+          // Check the most-specific suffix first so the suggested stem is
+          // computed correctly regardless of which variant was passed.
+          const match =
+            /\.shape\.ts$/i.exec(n) ??
+            /\.shape$/i.exec(n) ??
+            /\.ts$/i.exec(n);
+          if (match) {
+            const stem = n.slice(0, match.index);
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: `Pass just the stem (e.g. 'needle'). I add '.shape.ts' automatically. Did you mean to pass '${stem}' instead of '${n}'?`,
+            });
+          }
+        })
+        .describe("File name without extension (e.g., 'bracket'). Do not include '.shape', '.ts', or '.shape.ts' — the tool appends '.shape.ts' automatically."),
       code: z.string().describe("TypeScript source code using Replicad API"),
       directory: z.string().optional().describe("Directory to create the file in. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first match wins), falling back to process.cwd(). When omitted, defaults to the active VSCode workspace root."),
       overwrite: z.boolean().optional().describe("Set to true to overwrite an existing file (default: false)"),
@@ -2019,8 +2268,9 @@ export function registerTools(server: McpServer) {
       filePath: z.string().describe("Path to the .shape.ts file to execute. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
       capture: z.boolean().optional().describe("If true, after opening, also capture a PNG screenshot (isometric, AI mode, default size) via the VSCode extension. Requires the extension. Capture failures are reported as warnings; the handler still reports the execution status as success."),
       verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats. 'summary' (default) caps at 10 parts. 'full' dumps every part."),
+      forceBundleRebuild: z.boolean().optional().describe("If true, bypasses the bundled-script cache and re-invokes esbuild. Use only when you suspect the cache is stale; the cache normally handles this correctly via mtime tracking."),
     },
-    safeHandler("open_shape", async ({ filePath, capture, verbosity }) => {
+    safeHandler("open_shape", async ({ filePath, capture, verbosity, forceBundleRebuild }) => {
       const absPath = resolveShapePath(filePath);
       if (!existsSync(absPath)) {
         return {
@@ -2029,7 +2279,11 @@ export function registerTools(server: McpServer) {
         };
       }
 
-      const { status } = await executeWithPersistedParams(absPath);
+      const { status } = await executeWithPersistedParams(
+        absPath,
+        undefined,
+        forceBundleRebuild ? { forceBundleRebuild: true } : undefined,
+      );
       notifyExtensionOfShape(absPath);
 
       let captureLine = "";
@@ -2061,7 +2315,29 @@ export function registerTools(server: McpServer) {
               if (!result) {
                 captureLine = "\nCapture: timed out after 60000ms (open_shape result still valid).";
               } else if (result.error) {
-                captureLine = `\nCapture: failed — ${result.error}`;
+                // P1 fix: carry stack/operation through to open_shape's
+                // capture line so the error matches what render_preview would
+                // report for the same underlying failure.
+                const sidecar = readViewerErrorIfNewer(GLOBAL_STORAGE);
+                const stack: string | undefined =
+                  typeof result.errorStack === "string" ? result.errorStack : sidecar?.stack;
+                const op: string | undefined =
+                  typeof result.errorOperation === "string" ? result.errorOperation : sidecar?.operation;
+                let detail = result.error as string;
+                if (op) detail += ` (operation: ${op})`;
+                if (/require is not defined|__dirname|process\./.test(result.error as string)) {
+                  detail += "\nCommonJS restriction: `.shape.ts` files run in both Node (MCP) and a Web Worker (viewer). `require`, `__dirname`, `process.*`, and Node-only APIs are not available in the viewer — use ESM `import` instead.";
+                }
+                if (stack) {
+                  const trimmed = stack
+                    .split("\n")
+                    .slice(0, 3)
+                    .map((l: string) => `  ${l.trim()}`)
+                    .filter((l: string) => l.trim().length > 2)
+                    .join("\n");
+                  if (trimmed.length > 0) detail += `\n${trimmed}`;
+                }
+                captureLine = `\nCapture: failed — ${detail}`;
               } else if (result.screenshotPath && existsSync(result.screenshotPath)) {
                 captureLine = `\nScreenshot: ${result.screenshotPath}`;
                 try {
@@ -2114,7 +2390,7 @@ export function registerTools(server: McpServer) {
       }
       if (code === undefined && params === undefined) {
         return {
-          content: [{ type: "text" as const, text: "modify_shape: provide `code` (to overwrite the file) or `params` (to re-run with overrides), or both." }],
+          content: [{ type: "text" as const, text: "modify_shape: provide `code` (to overwrite the file) or `params` (to re-run with overrides), or both. To execute an existing file without changes, use open_shape." }],
           isError: true,
         };
       }
@@ -2447,6 +2723,10 @@ export function registerTools(server: McpServer) {
       let printabilityBlock = "";
       const props = status.properties;
       if (props?.parts && props.parts.length > 0) {
+        // Threshold matches engine.ts aggregateProperties: sub-0.1 mm edges
+        // are rare enough to be worth surfacing, sub-0.4 was just flagging
+        // every boolean-cut artefact.
+        const MIN_FEATURE_WARN_MM = 0.1;
         const exported = partName
           ? props.parts.filter((p) => p.name === partName)
           : props.parts;
@@ -2454,32 +2734,36 @@ export function registerTools(server: McpServer) {
           (p) => p.printability && (p.printability.manifold === false || p.printability.issues.length > 0),
         );
         if (flagged.length > 0) {
-          const lines: string[] = ["", "\u26a0 Printability concerns before slicing:"];
+          const rawLines: string[] = [];
           let sawSmallFeature = false;
           for (const p of flagged) {
             const pr = p.printability!;
             const reasons: string[] = [];
             if (pr.manifold === false) reasons.push("non-manifold geometry");
-            if (pr.minFeatureSize_mm < 0.4) {
+            if (pr.minFeatureSize_mm < MIN_FEATURE_WARN_MM) {
               reasons.push(
-                `minFeature ${pr.minFeatureSize_mm.toFixed(2)} mm < 0.4 mm nozzle`,
+                `minFeature ${pr.minFeatureSize_mm.toFixed(2)} mm — likely boolean artefact, not a printability concern unless a real face is thin`,
               );
               sawSmallFeature = true;
             }
             if (reasons.length === 0 && pr.issues.length > 0) {
-              // e.g. attributed stdlib warning ("threads.tapInto at small ...")
-              // without a feature-size trigger.
               reasons.push(pr.issues[0]);
             }
-            lines.push(`  - ${p.name}: ${reasons.join("; ")}`);
+            rawLines.push(`  - ${p.name}: ${reasons.join("; ")}`);
             if (sawSmallFeature) {
-              lines.push(
-                `    (threads.tapInto at small metric size produces thin helical features)`,
-              );
-              sawSmallFeature = false; // only annotate once to avoid repetition
+              const attribution = pr.issues.length > 0
+                ? `(${pr.issues[0]})`
+                : `(source unknown \u2014 inspect faces near minimum feature)`;
+              rawLines.push(`    ${attribution}`);
+              sawSmallFeature = false;
             }
           }
-          if (flagged.some((p) => (p.printability?.minFeatureSize_mm ?? 1) < 0.4)) {
+          // Dedupe: when 48 parts hit the same boolean-artefact wording,
+          // collapse them to one line with a "(×N)" suffix so the field
+          // report stays readable. Order-preserving.
+          const deduped = dedupLines(rawLines);
+          const lines: string[] = ["", "\u26a0 Printability concerns before slicing:", ...deduped];
+          if (flagged.some((p) => (p.printability?.minFeatureSize_mm ?? 1) < MIN_FEATURE_WARN_MM)) {
             lines.push("");
             lines.push(
               "If Cura/PrusaSlicer skips features or reports manifold errors, consider",
@@ -3165,14 +3449,53 @@ export function registerTools(server: McpServer) {
     {
       filePath: z.string().optional().describe("Optional .shape.ts to execute first. Defaults to the last-executed shape."),
       cameraAngle: z
-        .union([
-          z.enum(["isometric", "iso", "top", "bottom", "front", "right", "back", "left"]),
-          z
-            .array(z.enum(["isometric", "iso", "top", "bottom", "front", "right", "back", "left"]))
-            .min(1)
-            .max(4),
-        ])
+        .any()
         .optional()
+        .superRefine((val, ctx) => {
+          if (val === undefined) return;
+          const presets = ["isometric", "iso", "top", "bottom", "front", "back", "left", "right"] as const;
+          const isPreset = (x: unknown): x is (typeof presets)[number] =>
+            typeof x === "string" && (presets as readonly string[]).includes(x);
+          const describe = (x: unknown): string => {
+            if (typeof x === "string") return JSON.stringify(x);
+            try {
+              return JSON.stringify(x);
+            } catch {
+              return String(x);
+            }
+          };
+          const expected = `Expected one of [${presets.join(", ")}] or an array of 1–4 of these.`;
+          if (typeof val === "string") {
+            if (!isPreset(val)) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: `${expected} Got ${describe(val)}.`,
+              });
+            }
+            return;
+          }
+          if (Array.isArray(val)) {
+            if (val.length < 1 || val.length > 4) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: `${expected} Got an array of length ${val.length}.`,
+              });
+              return;
+            }
+            const bad = val.filter((x) => !isPreset(x));
+            if (bad.length > 0) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: `${expected} Got ${describe(val)} (invalid entries: ${bad.map(describe).join(", ")}).`,
+              });
+            }
+            return;
+          }
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `${expected} Got ${describe(val)}.`,
+          });
+        })
         .describe("Camera angle preset (default: 'isometric'). Aliases: 'iso' → 'isometric'. Also accepts an array of 1–4 angles — each is captured separately and composited into one collage PNG (1×N strip for 2–3 angles, 2×2 grid for 4)."),
       grid: z
         .boolean()
@@ -3200,8 +3523,9 @@ export function registerTools(server: McpServer) {
         .describe("Tessellation-quality preset. `'final'` (default for <15-part assemblies) matches the pre-existing render quality. `'preview'` coarsens the mesh ~2.5× for faster first-render on large assemblies, at the cost of visibly chunkier facets — choose this for layout checks on 15+ part assemblies. If omitted, the extension auto-degrades to `'preview'` when the part count is >= 15 and uses `'final'` otherwise."),
       inline: z.boolean().optional().describe("Return the rendered PNG inline as base64 image content on top of the usual text + file path. Default true — agents see the image directly without an extra `get_preview` round trip. Skipped inline if the file exceeds 10 MB. Pass false to skip the base64 payload (saves ~30% response size) when you only need the path."),
       verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats in the status text. 'summary' (default) caps at 10 parts. 'full' dumps every part."),
+      forceBundleRebuild: z.boolean().optional().describe("If true, bypasses the bundled-script cache and re-invokes esbuild. Use only when you suspect the cache is stale; the cache normally handles this correctly via mtime tracking."),
     },
-    safeHandler("render_preview", async ({ filePath, cameraAngle, grid, showDimensions, showAxes, renderMode, width, height, timeoutMs, focusPart, hideParts, finder, partName, partIndex, meshQuality, inline, verbosity }) => {
+    safeHandler("render_preview", async ({ filePath, cameraAngle, grid, showDimensions, showAxes, renderMode, width, height, timeoutMs, focusPart, hideParts, finder, partName, partIndex, meshQuality, inline, verbosity, forceBundleRebuild }) => {
       // Fix #4: normalize "iso" alias → "isometric" so downstream code and the
       // extension IPC only ever see the canonical preset name.
       const normalizeAngle = (a: string): string => (a === "iso" ? "isometric" : a);
@@ -3556,7 +3880,11 @@ export function registerTools(server: McpServer) {
         // expression. Matches preview_finder: lets us produce clean error
         // messages ("no part named X", "finder failed to evaluate") *before*
         // burning a full extension render.
-        const { status: preStatus, parts } = await executeWithPersistedParams(source);
+        const { status: preStatus, parts } = await executeWithPersistedParams(
+          source,
+          undefined,
+          forceBundleRebuild ? { forceBundleRebuild: true } : undefined,
+        );
         if (!preStatus.success || !parts || parts.length === 0) {
           return {
             content: [{ type: "text" as const, text: `Cannot render finder preview — script failed to render.\n${formatStatusText(preStatus)}` }],
@@ -3708,8 +4036,19 @@ export function registerTools(server: McpServer) {
           };
         }
         if (result.error) {
+          // P1 fix: surface stack + operation from the webview worker when
+          // present, and add a CommonJS-restriction hint if the error mentions
+          // Node-only globals. Also check for a fresher viewer-error sidecar
+          // in case the command-file round trip dropped fields the webview
+          // wrote synchronously.
+          const sidecar = readViewerErrorIfNewer(GLOBAL_STORAGE);
+          const msg = formatWorkerErrorMessage(
+            result.error,
+            result.errorStack ?? sidecar?.stack,
+            result.errorOperation ?? sidecar?.operation,
+          );
           return {
-            content: [{ type: "text" as const, text: `Screenshot failed: ${result.error}` }],
+            content: [{ type: "text" as const, text: msg }],
             isError: true,
           };
         }
@@ -3987,20 +4326,24 @@ export function registerTools(server: McpServer) {
     {},
     safeHandler("get_render_status", async () => {
       const statusFile = join(GLOBAL_STORAGE, "shapeitup-status.json");
+      // P11 fix: show the viewer connectivity block even when no render has
+      // happened yet — agents that call get_render_status first need a way to
+      // tell whether the extension is available before attempting renders.
+      const viewerBlock = formatViewerBlock();
       if (!existsSync(statusFile)) {
         return {
-          content: [{ type: "text" as const, text: "No render status available. Call create_shape, open_shape, or modify_shape first." }],
+          content: [{ type: "text" as const, text: `No render status available. Call create_shape, open_shape, or modify_shape first.${viewerBlock}` }],
         };
       }
       try {
         const status: EngineStatus = JSON.parse(readFileSync(statusFile, "utf-8"));
         return {
-          content: [{ type: "text" as const, text: formatStatusText(status) }],
+          content: [{ type: "text" as const, text: `${formatStatusText(status)}${viewerBlock}` }],
           // Render failures are an expected state, not tool errors.
         };
       } catch {
         return {
-          content: [{ type: "text" as const, text: "Could not read render status." }],
+          content: [{ type: "text" as const, text: `Could not read render status.${viewerBlock}` }],
           isError: true,
         };
       }
@@ -4285,17 +4628,18 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "check_collisions",
-    "Detects pairwise intersections between named parts in a multi-part assembly. AABB prefilter skips obviously-disjoint pairs; remaining pairs are tested with Replicad's 3D intersect (which can fail on complex curved solids — those pairs are reported as 'intersect failed' rather than silently ignored). Tolerance filters out numerical-noise contacts (default 0.001 mm³); very large assemblies (100+ parts) will be slow because work grows as N². Pass `acceptedPairs` to suppress EXPECTED intersections (needles resting in grooves, bolt shafts in through-holes) — accepted pairs are rolled into a summary count so unexpected bugs surface faster. Collisions with volume at or below `pressFitThreshold` are listed under 'Nominal contact' (press fits, touching interfaces) instead of the main 'Collisions' block. The main block is sorted by overlap volume descending so the biggest (most likely bug) is the first line. Pass either `filePath` (existing shape) or `code` (inline snippet) — they are mutually exclusive. Pass `format: 'full'` for per-pair geometry; default summary keeps responses compact.",
+    "Detects pairwise intersections between named parts in a multi-part assembly. AABB prefilter skips obviously-disjoint pairs; remaining pairs are tested with Replicad's 3D intersect (which can fail on complex curved solids — those pairs are reported as 'intersect failed' rather than silently ignored). Tolerance filters out numerical-noise contacts (default 0.001 mm³); very large assemblies (100+ parts) will be slow because work grows as N². Pass `acceptedPairs` to suppress EXPECTED intersections (needles resting in grooves, bolt shafts in through-holes) — accepted pairs are rolled into a summary count so unexpected bugs surface faster. Collisions with volume at or below `pressFitThreshold` are listed under 'Nominal contact' (press fits, touching interfaces) instead of the main 'Collisions' block. The main block is sorted by overlap volume descending so the biggest (most likely bug) is the first line. Pass either `filePath` (existing shape) or `code` (inline snippet) — they are mutually exclusive. Pass `params` to override numeric parameters for this single check (handy for sweeping a cam angle without editing persisted params). Pass `format: 'full'` for per-pair geometry; default summary keeps responses compact.",
     {
       filePath: z.string().optional().describe("Path to the .shape.ts file to check for part collisions. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first existing match wins), else anchor to process.cwd(). Mutually exclusive with `code`."),
       code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning an array of parts. Written to a throwaway temp file, executed, and deleted afterwards. Use `workingDir` to make local `./` imports resolve. Mutually exclusive with `filePath`."),
       workingDir: z.string().optional().describe("Directory to write the temp snippet file in when `code` is provided. When set, relative imports (`./foo.shape`) resolve against this directory. Defaults to a private globalStorage path (isolated; relative imports won't work)."),
+      params: z.record(z.string(), z.number()).optional().describe("Numeric param overrides applied to the shape's `export const params` for this single check. Same shape as tune_params accepts. Does NOT persist — merged with tune_params values for this execution only, so you can collision-check an articulation angle (e.g. `{ cam_angle_deg: 180 }`) without editing the shape."),
       tolerance: z.number().optional().describe("Minimum intersection volume in mm³ to count as a collision. Defaults to 0.001 — filters out numerical-noise overlaps on touching-but-not-overlapping parts. Negative values are clamped to 0."),
       acceptedPairs: z.array(z.tuple([z.string(), z.string()])).optional().describe("Pairs of part names whose intersection is EXPECTED and should not be flagged — e.g. [['needle','bed'], ['bolt','plate']]. Accepted pairs are rolled into a single-line summary count (with volume range) instead of listed individually. Order is symmetric: ['a','b'] also covers ['b','a']. When a name appears on multiple parts, every such pair is accepted."),
       pressFitThreshold: z.number().optional().describe("Volume threshold (mm³) at or below which a collision is classified as 'nominal contact' (press fit / touching interface) and listed in a compact section instead of the main Collisions block. Default 0.5 mm³. Set to 0 to disable the tag (every non-accepted collision is treated as real)."),
       format: z.enum(["summary", "full", "ids"]).optional().describe("Report verbosity. summary (default): count + worst pair detail + per-pair {a,b,volume}. full: per-pair with region+center geometry. ids: minimal [a,b,vol] tuples."),
     },
-    safeHandler("check_collisions", async ({ filePath, code, workingDir, tolerance, acceptedPairs, pressFitThreshold, format }) => {
+    safeHandler("check_collisions", async ({ filePath, code, workingDir, params, tolerance, acceptedPairs, pressFitThreshold, format }) => {
       // Input validation: filePath and code are mutually exclusive, one required.
       if (filePath !== undefined && code !== undefined) {
         return {
@@ -4322,8 +4666,11 @@ export function registerTools(server: McpServer) {
       // surfaced via formatStatusText so the agent sees the engine's own
       // error hint (fillet too large, wire not closed, etc.). Force-bypass
       // the mesh cache: the per-pair intersect() below dereferences
-      // `parts[i].shape` which the cache layer scrubs.
-      const { status, parts } = await executeWithPersistedParams(absPath, undefined, { force: true });
+      // `parts[i].shape` which the cache layer scrubs. When the caller passes
+      // `params`, they're merged with persisted values for this one execution
+      // so e.g. `{ cam_angle_deg: 180 }` can sweep an articulation without
+      // touching tune_params.
+      const { status, parts } = await executeWithPersistedParams(absPath, params, { force: true });
       if (!status.success || !parts) {
         return {
           content: [{ type: "text" as const, text: `Cannot check collisions — script failed to render.\n${formatStatusText(status)}` }],
@@ -4409,9 +4756,18 @@ export function registerTools(server: McpServer) {
         rawA: string;
         rawB: string;
         volume: number;
-        region?: { min: [number, number, number]; max: [number, number, number] };
+        region?: {
+          min: [number, number, number];
+          max: [number, number, number];
+          depths: { x: number; y: number; z: number };
+        };
         center?: [number, number, number];
+        aabbVolA?: number;
+        aabbVolB?: number;
       }> = [];
+
+      const boxVolume = (b: Box): number =>
+        Math.max(0, b.maxX - b.minX) * Math.max(0, b.maxY - b.minY) * Math.max(0, b.maxZ - b.minZ);
       const failures: Array<{ a: string; b: string; error: string }> = [];
       const degenerateWarnings: string[] = [];
       let skippedByAABB = 0;
@@ -4488,7 +4844,7 @@ export function registerTools(server: McpServer) {
               // throw doesn't kill the whole collision — we just omit the
               // region field for that pair. We still emit the volume number
               // because that came from a separate OCCT call.
-              let region: { min: [number, number, number]; max: [number, number, number] } | undefined;
+              let region: { min: [number, number, number]; max: [number, number, number]; depths: { x: number; y: number; z: number } } | undefined;
               try {
                 const meshData: any = overlapShape.mesh?.({ tolerance: 0.1, angularTolerance: 0.3 });
                 const verts: ArrayLike<number> | undefined = meshData?.vertices;
@@ -4502,7 +4858,11 @@ export function registerTools(server: McpServer) {
                     if (z < mnz) mnz = z; if (z > mxz) mxz = z;
                   }
                   if (isFinite(mnx)) {
-                    region = { min: [mnx, mny, mnz], max: [mxx, mxy, mxz] };
+                    region = {
+                      min: [mnx, mny, mnz],
+                      max: [mxx, mxy, mxz],
+                      depths: { x: mxx - mnx, y: mxy - mny, z: mxz - mnz },
+                    };
                   }
                 }
               } catch {
@@ -4516,6 +4876,8 @@ export function registerTools(server: McpServer) {
                 volume,
                 ...(region ? { region } : {}),
                 ...(overlapCenter ? { center: overlapCenter } : {}),
+                aabbVolA: boxVolume(boxI),
+                aabbVolB: boxVolume(boxJ),
               });
             }
           } finally {

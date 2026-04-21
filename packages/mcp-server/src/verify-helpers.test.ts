@@ -141,6 +141,69 @@ describe("extractCollisions", () => {
     expect(result.failures[0].error).toContain("boom");
     expect(result.ok).toBe(false);
   });
+
+  it("populates per-axis depths on the collision region", () => {
+    // Mock an intersection mesh so extractCollisions reaches the region
+    // branch: cam↔lifter overlap spans [-6.71..6.71] x [5..9.5] y [0.5..7.5] z
+    // → depths { x:13.42, y:4.5, z:7.0 } (the feedback example).
+    // Use a plain number[] for the overlap mesh to avoid Float32Array
+    // precision noise — extractCollisions copies vertex components verbatim,
+    // and the test is about depth arithmetic, not representation.
+    const overlapMesh = {
+      vertices: [
+        -6.71, 5.0, 0.5,
+         6.71, 9.5, 7.5,
+        -6.71, 9.5, 0.5,
+      ],
+    };
+    const overlapShape = {
+      mesh: () => overlapMesh,
+      delete: () => { /* noop */ },
+    };
+    const a = mockPart("cam", { aabb: [-6.71, 5.0, 0.5, 6.71, 9.5, 7.5] });
+    a.shape.intersect = () => overlapShape;
+    const b = mockPart("lifter", { aabb: [-6.71, 5.0, 0.5, 6.71, 9.5, 7.5] });
+    const fakeReplicad = {
+      measureShapeVolumeProperties: () => ({
+        volume: 42.1,
+        centerOfMass: [0, 7.25, 4.0],
+        delete: () => { /* noop */ },
+      }),
+    };
+    const result = extractCollisions([a, b], { replicad: fakeReplicad });
+    expect(result.real.length).toBe(1);
+    const region = result.real[0].region;
+    expect(region).toBeDefined();
+    expect(region!.depths.x).toBeCloseTo(13.42, 2);
+    expect(region!.depths.y).toBeCloseTo(4.5, 2);
+    expect(region!.depths.z).toBeCloseTo(7.0, 2);
+    expect(region!.min).toEqual([-6.71, 5.0, 0.5]);
+    expect(region!.max).toEqual([6.71, 9.5, 7.5]);
+  });
+
+  it("formatCollisionReport includes an 'Overlap depth' line per real collision", () => {
+    const overlapMesh = {
+      vertices: [
+        0, 0, 0,
+        2, 3, 5,
+        0, 3, 0,
+      ],
+    };
+    const overlapShape = { mesh: () => overlapMesh, delete: () => { /* noop */ } };
+    const a = mockPart("block", { aabb: [0, 0, 0, 2, 3, 5] });
+    a.shape.intersect = () => overlapShape;
+    const b = mockPart("wedge", { aabb: [0, 0, 0, 2, 3, 5] });
+    const fakeReplicad = {
+      measureShapeVolumeProperties: () => ({
+        volume: 17.0,
+        centerOfMass: [1.0, 1.5, 2.5],
+        delete: () => { /* noop */ },
+      }),
+    };
+    const report = extractCollisions([a, b], { replicad: fakeReplicad });
+    const text = formatCollisionReport(report);
+    expect(text).toContain("Overlap depth: X=2.00mm, Y=3.00mm, Z=5.00mm");
+  });
 });
 
 describe("extractJoints", () => {

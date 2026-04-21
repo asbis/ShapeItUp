@@ -388,6 +388,9 @@ export function formatGeometryReport(
 export interface CollisionRegion {
   min: [number, number, number];
   max: [number, number, number];
+  /** Per-axis overlap extents (max - min) in mm. Saves callers the mental
+   *  arithmetic of subtracting the bbox corners to size clearance cuts. */
+  depths: { x: number; y: number; z: number };
 }
 
 export interface CollisionRecord {
@@ -595,7 +598,11 @@ export function extractCollisions(
                 if (z < mnz) mnz = z; if (z > mxz) mxz = z;
               }
               if (isFinite(mnx)) {
-                region = { min: [mnx, mny, mnz], max: [mxx, mxy, mxz] };
+                region = {
+                  min: [mnx, mny, mnz],
+                  max: [mxx, mxy, mxz],
+                  depths: { x: mxx - mnx, y: mxy - mny, z: mxz - mnz },
+                };
               }
             }
           } catch { /* region omission is non-fatal */ }
@@ -684,6 +691,9 @@ export function formatCollisionReport(report: CollisionReport): string {
           const r = c.region;
           lines.push(
             `    Region: x${fmtRange(r.min[0], r.max[0])} y${fmtRange(r.min[1], r.max[1])} z${fmtRange(r.min[2], r.max[2])} mm`,
+          );
+          lines.push(
+            `    Overlap depth: X=${fmtNum(r.depths.x)}mm, Y=${fmtNum(r.depths.y)}mm, Z=${fmtNum(r.depths.z)}mm`,
           );
         }
         if (c.center) {

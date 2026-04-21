@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { validateSyntaxPure, detectPathDoubling, detectPathDoublingInfo, extractSignatures, safeHandler, computePartsLine, computeEffectiveMeshQuality, formatCollisionPairs, formatSweepCollisions, type CollisionEntry, type SweepCollisionEntry } from "./tools.js";
+import { validateSyntaxPure, detectPathDoubling, detectPathDoublingInfo, extractSignatures, safeHandler, computePartsLine, computeEffectiveMeshQuality, formatCollisionPairs, formatSweepCollisions, registerTools, getVersionTag, getViewerStatus, formatViewerBlock, type CollisionEntry, type SweepCollisionEntry } from "./tools.js";
 
 // ---------------------------------------------------------------------------
 // Bug #6 — validate_syntax must trust .method() calls whose receiver was
@@ -628,7 +628,11 @@ function makeCollision(a: string, b: string, volume: number, withGeometry = fals
   if (withGeometry) {
     return {
       a, b, volume,
-      region: { min: [0, 0, 0], max: [5, 3, 2] },
+      region: {
+        min: [0, 0, 0],
+        max: [5, 3, 2],
+        depths: { x: 5, y: 3, z: 2 },
+      },
       center: [2.5, 1.5, 1.0],
     };
   }
@@ -717,6 +721,72 @@ describe("formatCollisionPairs — check_collisions format param", () => {
   it("ids format: empty collisions returns empty array", () => {
     const out = formatCollisionPairs([], [], [], 0.5, "ids", accounting);
     expect(JSON.parse(out)).toEqual([]);
+  });
+
+  it("renders per-axis overlap depths on the worst pair in summary mode", () => {
+    const withDepth: CollisionEntry = {
+      a: "cam",
+      b: "lifter",
+      volume: 42.1,
+      region: {
+        min: [-6.71, 5.0, 0.5],
+        max: [6.71, 9.5, 7.5],
+        depths: { x: 13.42, y: 4.5, z: 7.0 },
+      },
+      center: [0, 7.25, 4.0],
+    };
+    const out = formatCollisionPairs([withDepth], [], [], 0.5, "summary", accounting);
+    expect(out).toContain("Overlap depth: X=13.42mm, Y=4.50mm, Z=7.00mm");
+    // Depth line must sit between Region and Center for readability.
+    const lines = out.split("\n").map((l) => l.trim());
+    const regionIdx = lines.findIndex((l) => l.startsWith("Region:"));
+    const depthIdx = lines.findIndex((l) => l.startsWith("Overlap depth:"));
+    const centerIdx = lines.findIndex((l) => l.startsWith("Center:"));
+    expect(regionIdx).toBeGreaterThan(-1);
+    expect(depthIdx).toBeGreaterThan(regionIdx);
+    expect(centerIdx).toBeGreaterThan(depthIdx);
+  });
+
+  it("check_collisions schema exposes a params override field", () => {
+    // Capture every tool registration. registerTools is strict (asserts
+    // McpServer shape), so we satisfy just the `.tool()` surface it uses.
+    type Registered = { name: string; description: string; schema: Record<string, any>; handler: any };
+    const registered: Registered[] = [];
+    const fake = {
+      tool: (name: string, description: string, schema: Record<string, any>, handler: any) => {
+        registered.push({ name, description, schema, handler });
+      },
+    };
+    registerTools(fake as unknown as Parameters<typeof registerTools>[0]);
+
+    const tool = registered.find((t) => t.name === "check_collisions");
+    expect(tool).toBeDefined();
+    // `params` must exist on the check_collisions schema. verify_shape already
+    // has it; this is the regression guard for the parity fix.
+    expect(Object.keys(tool!.schema)).toContain("params");
+    // Description should mention the new field so agents see it from tool
+    // listings without drilling into the schema.
+    expect(tool!.description).toMatch(/params/i);
+  });
+
+  it("renders per-axis overlap depths for every pair in full mode", () => {
+    const pairs: CollisionEntry[] = [
+      {
+        a: "a", b: "b", volume: 10,
+        region: { min: [0, 0, 0], max: [2, 4, 6], depths: { x: 2, y: 4, z: 6 } },
+      },
+      {
+        a: "c", b: "d", volume: 5,
+        region: { min: [0, 0, 0], max: [1, 1, 1], depths: { x: 1, y: 1, z: 1 } },
+      },
+    ];
+    const out = formatCollisionPairs(pairs, [], [], 0.5, "full", accounting);
+    const depthLines = out.split("\n").filter((l) => l.trim().startsWith("Overlap depth:"));
+    expect(depthLines).toHaveLength(2);
+    expect(depthLines[0]).toContain("X=2.00mm");
+    expect(depthLines[0]).toContain("Y=4.00mm");
+    expect(depthLines[0]).toContain("Z=6.00mm");
+    expect(depthLines[1]).toContain("X=1.00mm");
   });
 });
 
@@ -812,5 +882,62 @@ describe("formatSweepCollisions — sweep_check format param", () => {
   it("full with no collisions: reports clear through all steps", () => {
     const out = formatSweepCollisions([], [0, 10, 20, 30, 40], "full");
     expect(out).toContain("\u2713 Clear through all 5 steps");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P11 — getVersionTag must never emit the literal word "unknown". When the
+// extension half of the stack is disconnected we say so explicitly. Whole-env
+// tests run against the real GLOBAL_STORAGE filesystem — in the test runner
+// there's no live VSCode extension, so "extension-disconnected" is the
+// expected shape. The MCP server's own version is always resolvable because
+// the test runs from the monorepo (package.json sits next to the source).
+// ---------------------------------------------------------------------------
+describe("getVersionTag — P11 version footer", () => {
+  it("never contains the literal word 'unknown'", () => {
+    const tag = getVersionTag();
+    expect(tag).not.toContain("vunknown");
+    // The whole word 'unknown' should not appear either — "disconnected"
+    // replaces it for the extension half.
+    expect(tag).not.toMatch(/\bunknown\b/);
+  });
+
+  it("begins with a newline + [shapeitup mcp v… prefix", () => {
+    const tag = getVersionTag();
+    expect(tag.startsWith("\n[shapeitup mcp v")).toBe(true);
+    expect(tag.endsWith("]")).toBe(true);
+  });
+
+  it("reports extension-disconnected when no heartbeat is present OR heartbeat lacks extensionVersion", () => {
+    // Two branches are valid in a test environment:
+    //   (a) No heartbeat at all (clean CI) → "extension-disconnected"
+    //   (b) Heartbeat exists but was written by an old extension build that
+    //       didn't include extensionVersion → also "extension-disconnected"
+    //       (getVersionTag requires BOTH alive and version).
+    // The contract is "never emit unknown" — we verify the actual happy-path
+    // literal only in a live-extension env, which this test runner isn't.
+    const status = getViewerStatus();
+    const tag = getVersionTag();
+    if (status.alive && status.extensionVersion) {
+      expect(tag).toContain(`ext v${status.extensionVersion}`);
+    } else {
+      expect(tag).toContain("extension-disconnected");
+    }
+  });
+});
+
+describe("formatViewerBlock — P11 get_render_status viewer reporting", () => {
+  it("reports one of the three states and always starts with \\nViewer:", () => {
+    const block = formatViewerBlock();
+    expect(block.startsWith("\nViewer: ")).toBe(true);
+    expect(block).toMatch(/disconnected|connected \(ready\)|connected \(loading\)/);
+  });
+
+  it("omits Extension version line when extension is disconnected", () => {
+    const status = getViewerStatus();
+    const block = formatViewerBlock();
+    if (!status.alive || !status.extensionVersion) {
+      expect(block).not.toContain("Extension version:");
+    }
   });
 });
