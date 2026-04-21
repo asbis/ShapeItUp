@@ -177,12 +177,18 @@ function copyExtensionTypings() {
   // shapeitup: emit .d.ts for every stdlib source file via tsc, then write a
   // tiny wrapper + package.json around them.
   const stdlibSrc = resolve(__dirname, "packages/core/src/stdlib");
+  const coreSrc = resolve(__dirname, "packages/core/src");
   const shapeitupDest = resolve(typingsDest, "shapeitup");
   const stdlibDestDir = resolve(shapeitupDest, "stdlib");
   if (existsSync(stdlibSrc)) {
     mkdirSync(stdlibDestDir, { recursive: true });
 
     const tmpTsconfig = resolve(__dirname, "packages/extension/.tsconfig.typings.tmp.json");
+    // rootDir is the whole core/src (not just stdlib) because stdlib files
+    // legitimately import from sibling helpers like instrumentation.ts —
+    // narrowing rootDir to stdlibSrc makes tsc complain TS6059. outDir
+    // mirrors that: stdlib .d.ts files land at shapeitupDest/stdlib/*.d.ts
+    // so the ./stdlib/index wrapper below still resolves.
     const tsconfig = {
       compilerOptions: {
         target: "ES2022",
@@ -195,8 +201,8 @@ function copyExtensionTypings() {
         noEmit: false,
         composite: false,
         incremental: false,
-        outDir: stdlibDestDir,
-        rootDir: stdlibSrc,
+        outDir: shapeitupDest,
+        rootDir: coreSrc,
         lib: ["ES2022", "DOM"],
       },
       include: [stdlibSrc.replace(/\\/g, "/") + "/**/*.ts"],
