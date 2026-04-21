@@ -1,10 +1,14 @@
 # Changelog
 
-## 1.5.0 (2026-04-21)
+## 1.6.0 (2026-04-21)
 
 Headless, standalone-ready MCP server. API-compatible for MCP clients; the
 extension-side IPC protocol changed, so linking against older extensions will
 not work (extension 1.7.0+ required).
+
+This version supersedes unreleased `1.5.x` internal tags — content unchanged,
+version bump only to avoid a collision with the `v1.5.0` / `v1.5.2` tags that
+had already been created on the remote.
 
 ### Changed
 - WebSocket subscriber bridge replaces the previous global-storage-directory
