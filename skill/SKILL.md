@@ -677,6 +677,7 @@ holes.clearance("M3", { depth?, fit?, axis? })            // alias of `through` 
 holes.counterbore("M3", { plateThickness, fit?, axis? })  // socket-head pocket + shaft
 holes.countersink("M4", { plateThickness, fit?, axis? })  // 90° flat-head flare + shaft
 holes.tapped("M3", { depth, axis? })                      // tap-drill sized
+holes.threaded("M3", { depth, axis? })                    // FDM: threaded hole — screw self-taps into tap-drill hole (preferred over modeled threads at M2–M5)
 holes.teardrop("M3", { depth, axis?: "+X" | "+Y" })       // FDM-printable horizontal hole (own +X/+Y axis set)
 holes.keyhole({ largeD, smallD, slot, depth, axis? })     // hang-on-screw mount
 holes.slot({ length, width, depth, axis? })               // elongated adjustment slot
@@ -1174,7 +1175,9 @@ See `examples/stdlib/linear-actuator-subassembled.shape.ts` for a side-by-side w
 
 ### threads — helical metric + trapezoidal
 
-Real helical threads via OCCT sweep. Mostly useful for STEP export to machine shops, large printable threads (M8+, jar lids, leadscrews), and visual fidelity in renders. Small threads (M2–M5) **don't survive FDM printing reliably** — use `inserts.pocket` + heat-set inserts instead.
+> ⚠️ **FDM WARNING**: Modeled helical threads at M2–M5 (pitch < 1 mm) are below typical FDM nozzle resolution. Slicers (Cura, PrusaSlicer, Bambu Studio) produce unsliceable or non-watertight STLs, and when they do slice, the printed threads shear on first install. For 3D printing, prefer `holes.threaded(size, { depth })` + let the screw self-tap into the tap-drill hole, OR `inserts.pocket` + a brass heat-set insert. Modeled threads are correct for STEP export to CNC/molding and for M6+ on FDM.
+
+Real helical threads via OCCT sweep. Mostly useful for STEP export to machine shops, large printable threads (M8+, jar lids, leadscrews), and visual fidelity in renders. Small threads (M2–M5) **don't survive FDM printing reliably** — use `holes.threaded` (self-tap) or `inserts.pocket` + heat-set inserts instead.
 
 **Compound vs. Mesh form — pick one deliberately.** `threads.metric` and `threads.leadscrew` return a *Compound* (root cylinder + un-fused per-turn loops). That's fast and appropriate for **multi-part STEP export** where the thread renders as its own named part. It is **not fuse-safe**: OCCT's B-Rep boolean cannot merge the per-turn loops with another solid and produces non-manifold seams — `head.fuse(threads.metric(...))` will fail BRepCheck. Any time you want to combine a thread with another solid, use the `*Mesh` variants below — they route the boolean through the Manifold kernel (O(n log n), sub-second on WASM).
 
@@ -1202,6 +1205,8 @@ threads.tapHole("M5", 8);                           // CUT-TOOL for a tapped hol
 plate.cut(threads.tapHole("M5", 8).translate(x, y, plateTop));
 
 // Modeled internal threads — real helical ridges, returns fuse-safe MeshShape:
+// ⚠️ FDM: M2–M5 modeled threads print poorly. For 3D printing, prefer
+//         holes.threaded("M4", { depth }) + let the screw self-tap.
 threads.tapInto(plate, "M5", 8, [x, y, plateTop]);                 // metric
 threads.tapIntoTrap(plate, "TR8x8", 16, [x, y, plateTop]);         // trapezoidal (leadscrew nuts)
 

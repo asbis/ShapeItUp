@@ -40,6 +40,66 @@ import {
   type MetricSize,
 } from "./standards";
 import { markNonFuseSafeThread } from "./threads-patch";
+import { pushRuntimeWarning } from "./warnings";
+
+// ── FDM-resolution advisory ────────────────────────────────────────────────
+// Modeled helical threads below ~M6 have pitch < 1 mm, which is at or below
+// typical FDM nozzle resolution (0.4 mm). Slicers produce unsliceable or
+// non-watertight STLs, and even when they slice, the printed threads shear.
+// We warn at the entry of every metric-sized thread builder in this module so
+// agents and users get redirected to `holes.threaded()` (self-tap) or to
+// M6+ sizes where modeled threads print cleanly. We intentionally DO NOT
+// dedupe these warnings — N calls emit N warnings so the warnings system
+// can decide presentation. STEP-for-CNC workflows are unaffected since the
+// warning is advisory, not an error.
+const FDM_RISKY_SIZES = new Set<MetricSize>(["M2", "M2.5", "M3", "M4", "M5"]);
+
+function warnFdmSmallThreadIfNeeded(fnName: string, size: MetricSize): void {
+  if (!FDM_RISKY_SIZES.has(size)) return;
+  const pitch = METRIC_COARSE_PITCH[size];
+  pushRuntimeWarning(
+    `${fnName}('${size}', ...): modeled threads at ${pitch} mm pitch are below typical FDM resolution. ` +
+      `For 3D printing, prefer holes.threaded('${size}', { depth }) (the screw self-taps into a tap-drill hole), ` +
+      `OR jump to M6+ where modeled threads survive. ` +
+      `This function is fine for STEP export to CNC/molding — just not direct FDM slicing.`,
+  );
+}
+
+/**
+ * Custom-diameter variant of the FDM advisory. `externalMesh`/`internalMesh`
+ * don't take a size designator — they take raw `{ diameter, pitch }` — so we
+ * can't key on MetricSize. Instead warn when the nominal diameter matches a
+ * standard metric nominal in the M2–M5 range AND the pitch is below 1 mm
+ * (roughly the FDM-resolution cutoff). Jar lids at 50 mm with a 2 mm pitch
+ * stay quiet; a 4 mm × 0.7 mm thread matches M4-coarse and gets redirected.
+ */
+function warnFdmCustomSmallThreadIfNeeded(
+  fnName: "threads.externalMesh" | "threads.internalMesh",
+  diameter: number,
+  pitch: number,
+): void {
+  // Match the diameter to a nominal M-size entry. We use a small tolerance
+  // because users sometimes pass diameter = 3.0 or 3.01; the pitch check
+  // below is the real safety net against false positives (a 3 mm drill
+  // hole with 2 mm pitch is not a thread we'd warn about).
+  const entries = Object.entries(METRIC_COARSE_PITCH) as Array<
+    [MetricSize, number]
+  >;
+  for (const [size, coarsePitch] of entries) {
+    if (!FDM_RISKY_SIZES.has(size)) continue;
+    const nominal = parseFloat(size.slice(1));
+    if (Math.abs(diameter - nominal) > 0.05) continue;
+    if (pitch >= 1.0) return; // large pitch on a small diameter — probably jar-lid-like, don't warn
+    pushRuntimeWarning(
+      `${fnName}({ diameter: ${diameter}, pitch: ${pitch}, ... }): modeled threads at ${pitch} mm pitch ` +
+        `(≈ ${size} coarse = ${coarsePitch} mm) are below typical FDM resolution. ` +
+        `For 3D printing, prefer holes.threaded('${size}', { depth }) (the screw self-taps into a tap-drill hole), ` +
+        `OR jump to M6+ where modeled threads survive. ` +
+        `This function is fine for STEP export to CNC/molding — just not direct FDM slicing.`,
+    );
+    return;
+  }
+}
 
 // ── Profiles ───────────────────────────────────────────────────────────────
 
@@ -381,6 +441,9 @@ export interface MetricThreadOpts {
 /**
  * Externally-threaded metric rod for standard M-sizes.
  *
+ * ⚠️ FDM WARNING: M2–M5 modeled threads print poorly (pitch < 1 mm). For
+ * 3D printing, use M6+ or pair with `holes.threaded()` on the mating part.
+ *
  *   threads.metric("M5", 20);                     // M5 × 20, coarse (0.8mm)
  *   threads.metric("M5", 20, { pitch: "fine" });  // M5 × 20, fine (0.5mm)
  *   threads.metric("M6", 30, { pitch: 1.5 });     // custom pitch
@@ -398,6 +461,7 @@ export function metric(
   opts: MetricThreadOpts = {},
 ): Shape3D {
   assertSupportedSize(size, METRIC_COARSE_PITCH, "metric-threads");
+  warnFdmSmallThreadIfNeeded("threads.metric", size);
   const pitch = resolveMetricPitch(size, opts.pitch);
   return external({
     diameter: asMetricDiameter(size),
@@ -413,6 +477,9 @@ export function metric(
  * signature as {@link metric}, but the minor-diameter cylinder and helical
  * ridges are fused inside the Manifold kernel. The returned mesh is
  * watertight and can be cleanly `.fuse()`d, `.cut()` from, etc.
+ *
+ * ⚠️ FDM WARNING: M2–M5 modeled threads print poorly (pitch < 1 mm). For
+ * 3D printing, use M6+ or pair with `holes.threaded()` on the mating part.
  *
  * Use this when you need `head.fuse(thread)` — e.g. building a bolt from a
  * custom head shape. The B-Rep {@link metric} form is **not** fuse-safe.
@@ -430,6 +497,7 @@ export function metricMesh(
   opts: MetricThreadOpts = {},
 ): MeshShape {
   assertSupportedSize(size, METRIC_COARSE_PITCH, "metric-threads");
+  warnFdmSmallThreadIfNeeded("threads.metricMesh", size);
   const pitch = resolveMetricPitch(size, opts.pitch);
   const profile = metricProfile(pitch);
   const starts = opts.starts ?? 1;
@@ -524,6 +592,9 @@ function validateCustomThreadOpts(
  * `MeshShape`. The non-ISO escape hatch for {@link metricMesh}: jar lids,
  * bottle threads, custom couplers, acme-ish leadscrews.
  *
+ * ⚠️ FDM WARNING: diameter ≤ 5 mm with pitch < 1 mm prints poorly. For
+ * 3D printing, use larger diameters/pitches or `holes.threaded()`.
+ *
  * Convention: Z ∈ [0, length] (positive-shape, same as {@link external}).
  *
  *   // Jar thread — 50mm outer diameter, 2.5mm pitch, 10mm tall:
@@ -536,6 +607,7 @@ function validateCustomThreadOpts(
  */
 export function externalMesh(opts: CustomThreadOpts): MeshShape {
   validateCustomThreadOpts("externalMesh", opts);
+  warnFdmCustomSmallThreadIfNeeded("threads.externalMesh", opts.diameter, opts.pitch);
   const profile = opts.profile ?? metricProfile(opts.pitch);
   const starts = opts.starts ?? 1;
   const majorR = opts.diameter / 2;
@@ -548,6 +620,9 @@ export function externalMesh(opts: CustomThreadOpts): MeshShape {
  * `MeshShape` of the helical ridges only (use together with your own bore
  * cylinder, or subtract from a plate then fuse). The non-ISO escape hatch for
  * {@link tapInto} / {@link tapIntoTrap}.
+ *
+ * ⚠️ FDM WARNING: diameter ≤ 5 mm with pitch < 1 mm prints poorly. For
+ * 3D printing, prefer `holes.threaded()` + self-tap.
  *
  * Convention: top at Z=0, body extends into -Z (cut-tool, same as
  * {@link internal}).
@@ -563,6 +638,7 @@ export function externalMesh(opts: CustomThreadOpts): MeshShape {
  */
 export function internalMesh(opts: CustomThreadOpts): MeshShape {
   validateCustomThreadOpts("internalMesh", opts);
+  warnFdmCustomSmallThreadIfNeeded("threads.internalMesh", opts.diameter, opts.pitch);
   const profile = opts.profile ?? metricProfile(opts.pitch);
   const starts = opts.starts ?? 1;
   const minorR = opts.diameter / 2;
@@ -900,7 +976,14 @@ function asMeshShape(
 }
 
 /**
- * Cut a modeled tapped hole into a plate. Returns a MeshShape — any
+ * Cut modeled helical threads into a plate.
+ *
+ * ⚠️ FDM WARNING: M2–M5 modeled threads print poorly (pitch < 1 mm is
+ * below typical FDM resolution). For 3D printing, prefer
+ * `holes.threaded()` + let the screw self-tap. This function is correct
+ * for STEP export to CNC/molding and for M6+ on FDM.
+ *
+ * Cuts a modeled tapped hole into a plate. Returns a MeshShape — any
  * subsequent `.fuse()` / `.cut()` must therefore be Manifold-compatible
  * (MeshShape-to-MeshShape). Chains cleanly for multi-hole plates: the
  * `plate` arg accepts either a Shape3D (first call) or a MeshShape (second
@@ -925,6 +1008,7 @@ export function tapInto(
   opts: MetricThreadOpts = {},
 ): MeshShape {
   assertSupportedSize(size, METRIC_COARSE_PITCH, "metric-threads");
+  warnFdmSmallThreadIfNeeded("threads.tapInto", size);
   const pitch = resolveMetricPitch(size, opts.pitch);
   const profile = metricProfile(pitch);
   const starts = opts.starts ?? 1;

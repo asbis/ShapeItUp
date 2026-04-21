@@ -487,6 +487,42 @@ export function tapped(
 }
 
 /**
+ * Creates a cut-tool for a threaded hole — a tap-drill-diameter cylinder.
+ * The screw self-taps into the printed plastic on first install.
+ *
+ * WHY NOT modeled threads? For M2–M5 on FDM, helical thread features are
+ * below nozzle resolution and slice poorly. A tap-drill hole + self-tap
+ * is stronger, smaller, and prints cleanly. For M6+ on FDM or for STEP
+ * export to CNC/molding, use `threads.tapInto` directly for modeled helical
+ * geometry.
+ *
+ * Internally delegates to {@link tapped} — this is a vocabulary-matching
+ * alias so agents reaching for "threaded holes" discover the self-tap
+ * pathway first. For explicit modeled helical threads (M6+ on FDM, or for
+ * STEP export), use `threads.tapInto` directly.
+ *
+ * @example
+ * const hole = holes.threaded("M4", { depth: 10 });
+ * const plate = base.cut(hole.translate(x, y, topZ));
+ *
+ * @param size Metric designator, e.g. `"M4"`.
+ * @param opts.depth Hole depth in mm.
+ * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the hole OPENS ON; the body penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
+ * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
+ * @returns Cut-tool Shape3D, top at Z=0.
+ */
+export function threaded(
+  size: MetricSize,
+  opts: {
+    depth: number;
+    axis?: HoleAxis;
+    drillDirection?: HoleAxis;
+  }
+): Shape3D {
+  return tapped(size, opts);
+}
+
+/**
  * Teardrop hole — a horizontal-axis hole that prints cleanly on FDM with no
  * supports. Cross-section is a circle fused with a triangular tip pointing in
  * the +Z direction, giving a 45° roof that FDM handles without drooping.
