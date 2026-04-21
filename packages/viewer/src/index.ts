@@ -377,29 +377,76 @@ function respawnWorker() {
   initWorker();
 }
 
-function initWorker() {
-  fetch(config.workerUrl)
-    .then((res) => res.text())
-    .then((code) => {
-      const blob = new Blob([code], { type: "application/javascript" });
-      const url = URL.createObjectURL(blob);
-      worker = new Worker(url);
-      worker.onmessage = (e) => handleWorkerMessage(e.data);
-      worker.onerror = (e) => {
-        postToExtension({ type: "error", message: `Worker crashed: ${e.message}` });
-        respawnWorker();
-      };
-      worker.postMessage({
-        type: "init",
-        wasmLoaderUrl: config.wasmLoaderUrl,
-        wasmUrl: config.wasmUrl,
-        manifoldLoaderUrl: config.manifoldLoaderUrl,
-        manifoldWasmUrl: config.manifoldWasmUrl,
-      });
-    })
-    .catch((err) => {
-      postToExtension({ type: "error", message: `Failed to load worker: ${err}` });
+/**
+ * Ask the extension host for cached WASM bytes (read once on activation by
+ * `getCachedWasmAssets`). Resolves with the assets, or with `undefined` if
+ * the extension didn't reply within `timeoutMs` — in which case the worker
+ * falls back to URL fetch (the pre-cache behavior).
+ *
+ * Wired separately from the regular `onMessage` handler because we want to
+ * scope the listener to a single request/response cycle without polluting
+ * the global map. Using `window.addEventListener("message", ...)` directly
+ * is fine here: the message-handler module just routes by type, it doesn't
+ * own the message channel.
+ */
+function requestWasmAssetsFromExtension(
+  timeoutMs = 2000,
+): Promise<{ occt?: { loaderJs: string; wasmBytes: Uint8Array }; manifold?: { loaderJs: string; wasmBytes: Uint8Array } } | undefined> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const onMsg = (event: MessageEvent) => {
+      const msg = event.data;
+      if (!msg || msg.type !== "wasm-assets") return;
+      settled = true;
+      window.removeEventListener("message", onMsg);
+      resolve({ occt: msg.occt, manifold: msg.manifold });
+    };
+    window.addEventListener("message", onMsg);
+    postToExtension({ type: "request-wasm-assets" });
+    setTimeout(() => {
+      if (settled) return;
+      window.removeEventListener("message", onMsg);
+      // Falls through to URL-fetch path inside the worker.
+      // eslint-disable-next-line no-console
+      console.warn("[shapeitup viewer] wasm-assets request timed out — using URL fallback");
+      resolve(undefined);
+    }, timeoutMs);
+  });
+}
+
+async function initWorker() {
+  try {
+    // Pull cached bytes from the extension host BEFORE creating the worker.
+    // The extension preloaded these on activation (see wasm-cache.ts). If
+    // the cache is cold (race on first activation, missing dist/ files),
+    // assets is undefined and the worker falls back to URL fetch.
+    const assets = await requestWasmAssetsFromExtension();
+
+    const code = await fetch(config.workerUrl).then((res) => res.text());
+    const blob = new Blob([code], { type: "application/javascript" });
+    const url = URL.createObjectURL(blob);
+    worker = new Worker(url);
+    worker.onmessage = (e) => handleWorkerMessage(e.data);
+    worker.onerror = (e) => {
+      postToExtension({ type: "error", message: `Worker crashed: ${e.message}` });
+      respawnWorker();
+    };
+    worker.postMessage({
+      type: "init",
+      // URL fallback (always populated — the worker prefers cached bytes
+      // when present and uses these only if the extension didn't ship any).
+      wasmLoaderUrl: config.wasmLoaderUrl,
+      wasmUrl: config.wasmUrl,
+      manifoldLoaderUrl: config.manifoldLoaderUrl,
+      manifoldWasmUrl: config.manifoldWasmUrl,
+      // Cached-bytes fast path. Either may be undefined (missing manifold
+      // is fine; missing occt makes the worker fall back to URL fetch).
+      occt: assets?.occt,
+      manifold: assets?.manifold,
     });
+  } catch (err) {
+    postToExtension({ type: "error", message: `Failed to load worker: ${err}` });
+  }
 }
 
 function handleWorkerMessage(msg: WorkerToWebview) {
