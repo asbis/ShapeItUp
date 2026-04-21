@@ -236,6 +236,13 @@ export interface ShapeProperties {
     /** Per-part material override (propagated from `PartInput.material`). */
     material?: { density: number; name?: string };
     /**
+     * Optional BOM group label (propagated from the stdlib `part()` factory's
+     * `group` option). When set, the BOM emitter collapses identical groups
+     * into a single row with summed qty. Undefined → fall back to geometric
+     * dedup on (material, volume, bbox).
+     */
+    group?: string;
+    /**
      * FDM-printability heuristics computed at render time from the
      * tessellated triangle mesh + BRepCheck's manifold flag. Lets downstream
      * tools (`get_render_status`, `export_shape`) warn the user before the
@@ -843,9 +850,16 @@ function aggregateProperties(
     if (!geometryValid) {
       issues.push("Non-manifold geometry — OCCT validation failed");
     }
-    if (Number.isFinite(minEdge) && minEdge < DEFAULT_NOZZLE_MM) {
+    // Boolean operations routinely leave sub-mm sliver edges at cut/fuse
+    // boundaries, so firing a printability warning for every part whose
+    // smallest edge merely dips below a nozzle width is pure noise. Use half
+    // a typical nozzle (~0.2 mm) as the cutoff — below that it probably IS a
+    // genuinely thin face, and the rewording admits the ambiguity instead of
+    // asserting "below nozzle" as a fact.
+    const MIN_EDGE_WARN_MM = DEFAULT_NOZZLE_MM / 2;
+    if (Number.isFinite(minEdge) && minEdge < MIN_EDGE_WARN_MM) {
       issues.push(
-        `Smallest feature ${minEdge.toFixed(2)} mm is below typical ${DEFAULT_NOZZLE_MM.toFixed(1)} mm FDM nozzle width`,
+        `Minimum edge fragment ${minEdge.toFixed(2)} mm — likely boolean artefact, not a printability concern unless a real face is thin`,
       );
     }
     // Attribute any drained runtime warning that names this part or calls out
@@ -879,6 +893,13 @@ function aggregateProperties(
       // walk a second data source. Absent when the script didn't declare them.
       ...(typeof p.qty === "number" ? { qty: p.qty } : {}),
       ...(p.material ? { material: p.material } : {}),
+      // Propagate the optional BOM group label when the stdlib `part()`
+      // factory attached one. TessellatedPart doesn't currently type this
+      // field, so read it off `p` via an untyped lookup — absent on every
+      // script that doesn't use `group`, so the output stays clean.
+      ...(typeof (p as any).group === "string" && (p as any).group.length > 0
+        ? { group: (p as any).group as string }
+        : {}),
       printability,
     };
   });
