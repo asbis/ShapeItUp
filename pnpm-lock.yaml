@@ -48,6 +48,9 @@ importers:
       esbuild-wasm:
         specifier: ^0.28.0
         version: 0.28.0
+      ws:
+        specifier: ^8.20.0
+        version: 8.20.0
     devDependencies:
       '@shapeitup/shared':
         specifier: workspace:*
@@ -55,6 +58,9 @@ importers:
       '@types/vscode':
         specifier: ^1.106.0
         version: 1.115.0
+      '@types/ws':
+        specifier: ^8.18.1
+        version: 8.18.1
 
   packages/mcp-server:
     dependencies:
@@ -70,6 +76,9 @@ importers:
       replicad-opencascadejs:
         specifier: ^0.23.0
         version: 0.23.0
+      ws:
+        specifier: ^8.20.0
+        version: 8.20.0
     devDependencies:
       '@modelcontextprotocol/sdk':
         specifier: ^1.0.0
@@ -80,6 +89,9 @@ importers:
       '@shapeitup/shared':
         specifier: workspace:*
         version: link:../shared
+      '@types/ws':
+        specifier: ^8.18.1
+        version: 8.18.1
       replicad:
         specifier: ^0.23.0
         version: 0.23.0
@@ -773,6 +785,9 @@ packages:
   '@types/webxr@0.5.24':
     resolution: {integrity: sha512-h8fgEd/DpoS9CBrjEQXR+dIDraopAEfu4wYVNY2tEPwk60stPWhvZMf4Foo5FakuQ7HFZoa8WceaWFervK2Ovg==}
 
+  '@types/ws@8.18.1':
+    resolution: {integrity: sha512-ThVF6DCVhA8kUGy+aazFQ4kXQ7E1Ty7A3ypFOe0IcJV8O/M511G99AW24irKrW56Wt44yG9+ij8FaqoBGkuBXg==}
+
   '@vitest/expect@2.1.9':
     resolution: {integrity: sha512-UJCIkTBenHeKT1TTlKMJWy1laZewsRIzYighyYiJKZreqtdxSos/S1t+ktRMQWu2CKqaarrkeszJx1cgC5tGZw==}
 
@@ -1440,6 +1455,18 @@ packages:
   wrappy@1.0.2:
     resolution: {integrity: sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ==}
 
+  ws@8.20.0:
+    resolution: {integrity: sha512-sAt8BhgNbzCtgGbt2OxmpuryO63ZoDk/sqaB/znQm94T4fCEsy/yV+7CdC1kJhOU9lboAEU7R3kquuycDoibVA==}
+    engines: {node: '>=10.0.0'}
+    peerDependencies:
+      bufferutil: ^4.0.1
+      utf-8-validate: '>=5.0.2'
+    peerDependenciesMeta:
+      bufferutil:
+        optional: true
+      utf-8-validate:
+        optional: true
+
   zod-to-json-schema@3.25.2:
     resolution: {integrity: sha512-O/PgfnpT1xKSDeQYSCfRI5Gy3hPf91mKVDuYLUHZJMiDFptvP41MSnWofm8dnCm0256ZNfZIM7DSzuSMAFnjHA==}
     peerDependencies:
@@ -1855,6 +1882,10 @@ snapshots:
   '@types/vscode@1.115.0': {}
 
   '@types/webxr@0.5.24': {}
+
+  '@types/ws@8.18.1':
+    dependencies:
+      '@types/node': 22.19.17
 
   '@vitest/expect@2.1.9':
     dependencies:
@@ -2615,6 +2646,8 @@ snapshots:
       stackback: 0.0.2
 
   wrappy@1.0.2: {}
+
+  ws@8.20.0: {}
 
   zod-to-json-schema@3.25.2(zod@4.3.6):
     dependencies:

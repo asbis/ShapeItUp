@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync, watch as fsWatch } from "fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync } from "fs";
 import { join, resolve, basename, dirname, isAbsolute, sep } from "path";
 import { homedir } from "os";
 import {
@@ -29,7 +29,9 @@ import {
   type GeometryFacesFilter,
   type GeometryEdgesFilter,
 } from "./verify-helpers.js";
-import { getDetectedAppsAsync } from "./app-detector.js";
+import { getDetectedAppsAsync, getDetectedApps } from "./app-detector.js";
+import { getSubscriberBus, defaultGlobalStorageDir } from "./subscriber-bus.js";
+import { openFileInApp } from "./app-launcher.js";
 
 /**
  * Shared globalStorage dir with the VSCode extension. Both processes write and
@@ -44,30 +46,17 @@ const GLOBAL_STORAGE = join(
     : ".config/Code/User/globalStorage/shapeitup.shapeitup-vscode"
 );
 
-// --- File-based IPC to the extension (optional, best-effort) ---
-// Only used for UI-sync commands: set_render_mode, toggle_dimensions,
-// open-in-app. If VSCode isn't running these report that honestly —
-// everything else works without VSCode. (list_installed_apps used to route
-// through here too; it was ported in-process so the standalone MCP server
-// can answer it without a running extension.)
+// --- Subscriber bus (WebSocket) -------------------------------------------
+// The MCP server advertises a WebSocket port via its own heartbeat file.
+// VSCode extension instances subscribe on activation and receive fire-and-
+// forget UI events (set-render-mode, toggle-dimensions, open-shape). A tool
+// call NEVER fails just because no extension is attached — a missing
+// subscriber is a silent, informational outcome.
 
-const ID_PREFIX = `${process.pid}-${Date.now().toString(36)}-`;
-let commandCounter = 0;
-
-// Extend-while-alive grace for waitForResult: if the nominal timeout expires
-// but the extension heartbeat is still fresh, grant ONE additional window of
-// this length before giving up. Matches the reality of cold OCCT renders —
-// the extension is still working, MCP just needs to be patient. Granted at
-// most once per waitForResult call, so a truly stuck render eventually fails.
-const WAIT_GRACE_MS = 30_000;
-
-// Set by waitForResult on the failing path so the caller can distinguish
-// "extension crashed / disappeared" from "extension is alive but render is
-// slower than the budget". Reset to null on every successful resolution.
-// Module-level rather than a return-shape change to keep the diff minimal
-// across the several callers (open-in-app, export_shape, preview_finder,
-// render_preview).
-let lastWaitTimeoutReason: "dead" | "slow" | null = null;
+// Shared bus singleton. When the MCP bootstrap calls `getSubscriberBus` with
+// the same globalStorage dir + server version, this module and the bootstrap
+// see the same instance. Version defaults to our own package.json version so
+// tools and the bootstrap stay in sync.
 
 // Workspace-resolution note throttle. When `create_shape` (and any future
 // handler with similar logic) falls back to the VSCode workspace because the
@@ -140,9 +129,9 @@ export function getViewerStatus(): {
     return { alive: false, viewerReady: false };
   }
   const now = Date.now();
-  // Match isExtensionAlive()'s 15_000ms window so the two helpers agree on
-  // liveness — a mismatch would let `get_render_status` report "connected"
-  // while `render_preview` refuses because its check disagrees.
+  // 15 s freshness window matches the extension heartbeat cadence with a
+  // generous margin so a momentary stall (Docker start, browser GC) doesn't
+  // flip the viewer status to disconnected mid-session.
   const fresh = all.filter((hb) => now - (hb.timestamp ?? 0) < 15_000);
   const source = fresh.length > 0 ? fresh : all;
   // Prefer a heartbeat that actually reports viewerReady=true — in multi-window
@@ -259,10 +248,6 @@ function readViewerErrorIfNewer(globalStorage: string): { message: string; stack
 }
 
 
-function nextCommandId(): string {
-  return ID_PREFIX + (++commandCounter);
-}
-
 /**
  * Headless-first rendering helper. Renders the supplied parts through the
  * bundled SVG+resvg pipeline — the same path every screenshot-producing
@@ -310,30 +295,27 @@ async function renderHeadlessPngFromParts(
   return { svgPath, pngPath, pngBuf, svgSummary: svgOut.summary, rasterError };
 }
 
-function sendExtensionCommand(command: string, params: Record<string, any> = {}): string | undefined {
-  try {
-    mkdirSync(GLOBAL_STORAGE, { recursive: true });
-    const cmdFile = join(GLOBAL_STORAGE, "mcp-command.json");
-    const _id = nextCommandId();
-    writeFileSync(cmdFile, JSON.stringify({ command, _id, ...params }));
-    return _id;
-  } catch {
-    return undefined;
-  }
+/**
+ * Lazy accessor for the WebSocket subscriber bus. Lives here (not at module
+ * top-level) so `getBus()` works whether this file is imported before or
+ * after `index.ts` starts the listener — the bus itself is a singleton keyed
+ * by (globalStorageDir, version) so both call sites see the same instance.
+ *
+ * Tools publish UI-sync events via this bus; the send is fire-and-forget and
+ * never blocks the tool handler. When no extension is connected, the publish
+ * returns `delivered: 0` and callers surface an informational message rather
+ * than failing the call.
+ */
+function getBus() {
+  return getSubscriberBus(defaultGlobalStorageDir(), MCP_SERVER_VERSION);
 }
 
-function readExtensionResult(): any {
-  try {
-    const resultFile = join(GLOBAL_STORAGE, "mcp-result.json");
-    if (existsSync(resultFile)) {
-      const data = readFileSync(resultFile, "utf-8");
-      return JSON.parse(data);
-    }
-  } catch {}
-  return null;
-}
-
-function readHeartbeat(): { timestamp?: number; workspaceRoots?: string[] } | null {
+/**
+ * Legacy single-file heartbeat (pre-per-pid extension builds). Still read as
+ * a fallback for workspace-root enumeration when no per-pid heartbeats exist
+ * — no discovery / IPC use past this point.
+ */
+function readLegacyHeartbeat(): { timestamp?: number; workspaceRoots?: string[] } | null {
   try {
     const hb = join(GLOBAL_STORAGE, "shapeitup-heartbeat.json");
     if (!existsSync(hb)) return null;
@@ -399,7 +381,7 @@ function readAllHeartbeats(): WindowHeartbeat[] {
   } catch {}
   if (out.length === 0) {
     // Back-compat: older extensions only wrote the legacy single-file heartbeat.
-    const legacy = readHeartbeat();
+    const legacy = readLegacyHeartbeat();
     if (legacy && typeof legacy.timestamp === "number" && Array.isArray(legacy.workspaceRoots)) {
       out.push({
         pid: -1,
@@ -411,54 +393,51 @@ function readAllHeartbeats(): WindowHeartbeat[] {
   return out;
 }
 
-function isExtensionAlive(): boolean {
-  // Aggregate across per-pid heartbeats — multi-window setups often have one
-  // stale window (minimized / background) alongside a fresh foreground one,
-  // and we want ANY live window to count as "extension alive". Raised from
-  // 5s to 15s because 5s fires false-negatives during momentary system stalls
-  // (Docker/VM starts, browser GC, macOS App Nap on backgrounded VS Code).
-  const all = readAllHeartbeats();
-  const now = Date.now();
-  if (all.length > 0) {
-    return all.some((hb) => now - (hb.timestamp ?? 0) < 15_000);
-  }
-  const hb = readHeartbeat();
-  if (!hb) return false;
-  return now - (hb.timestamp ?? 0) < 15_000;
-}
-
 /**
  * Returns the list of VSCode workspace roots reported by the most recent
  * heartbeat, or an empty array when no extension is running / heartbeat is
- * missing. Unlike `isExtensionAlive()`, this does NOT require the heartbeat to
- * be fresh — multi-window VSCode setups can have stale heartbeats from a
- * window that lost focus but still own files the agent is working on. We
- * treat *any* heartbeat-reported workspace as a candidate for path resolution;
- * liveness is a separate concern enforced elsewhere (render tools, etc.).
+ * missing. Does NOT require the heartbeat to be fresh — multi-window VSCode
+ * setups can have stale heartbeats from a window that lost focus but still
+ * own files the agent is working on. We treat *any* heartbeat-reported
+ * workspace as a candidate for path resolution.
  *
  * When per-pid heartbeats exist, aggregate workspace roots across ALL live
  * windows so path resolution can probe every workspace in the user's
  * multi-window setup (not just whichever window happened to write the legacy
- * single-file heartbeat last).
+ * single-file heartbeat last). Live WebSocket subscribers also contribute
+ * their workspace roots so the MCP server can resolve paths even before the
+ * extension has written its first heartbeat tick.
  */
 function getHeartbeatWorkspaceRoots(): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const add = (root: string) => {
+    const key = resolve(root).toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(root);
+    }
+  };
+  // Prefer live subscriber-reported roots — the extension advertises them
+  // explicitly on the hello message so they're always in sync with the
+  // currently-connected viewer.
+  try {
+    for (const root of getBus().getSubscriberWorkspaceRoots()) add(root);
+  } catch {
+    // Bus may not have started yet during module init / tests.
+  }
   const all = readAllHeartbeats();
   if (all.length > 0) {
-    const seen = new Set<string>();
-    const out: string[] = [];
     for (const hb of all) {
-      for (const root of hb.workspaceRoots) {
-        const key = resolve(root).toLowerCase();
-        if (!seen.has(key)) {
-          seen.add(key);
-          out.push(root);
-        }
-      }
+      for (const root of hb.workspaceRoots) add(root);
     }
-    return out;
+    if (out.length > 0) return out;
   }
-  const hb = readHeartbeat();
-  return Array.isArray(hb?.workspaceRoots) ? (hb!.workspaceRoots as string[]) : [];
+  const hb = readLegacyHeartbeat();
+  if (Array.isArray(hb?.workspaceRoots)) {
+    for (const root of hb!.workspaceRoots as string[]) add(root);
+  }
+  return out;
 }
 
 /**
@@ -539,20 +518,26 @@ async function withShapeFile<T>(
 }
 
 /**
- * Where should a `create_shape` / `list_shapes` call default to when the caller
- * doesn't pass a directory? `process.cwd()` is wrong: when VSCode or Claude
- * Code spawns the MCP stdio child, cwd is wherever node was launched from
- * (commonly the extension's install dir or the user's home), so files "leak"
- * outside the user's workspace. The VSCode extension writes its
- * workspaceRoots into the heartbeat — prefer the first one when fresh, and
- * fall back to cwd only if the extension isn't running at all.
+ * Where should a `create_shape` / `list_shapes` call default to when the
+ * caller doesn't pass a directory? `process.cwd()` is usually correct — when
+ * the MCP stdio child is spawned by a terminal client, cwd is the user's
+ * working dir. But when VSCode (or any GUI client) spawns the child, cwd is
+ * wherever the extension host was launched from, so files leak out of the
+ * user's workspace.
+ *
+ * When exactly ONE WebSocket subscriber is connected, its advertised
+ * workspace root is the unambiguous best default; multiple subscribers is
+ * ambiguous so we fall through to cwd. Heartbeat-reported roots still
+ * contribute as a tie-breaker when no subscriber has yet completed the
+ * hello handshake.
  */
 function getDefaultDirectory(): string {
-  const hb = readHeartbeat();
-  if (hb && Date.now() - (hb.timestamp ?? 0) < 5000) {
-    const root = hb.workspaceRoots?.[0];
-    if (root) return root;
-  }
+  try {
+    const subscriberRoots = getBus().getSubscriberWorkspaceRoots();
+    if (subscriberRoots.length === 1) return subscriberRoots[0];
+  } catch {}
+  const wsRoots = getHeartbeatWorkspaceRoots();
+  if (wsRoots.length === 1) return wsRoots[0];
   return process.cwd();
 }
 
@@ -592,107 +577,21 @@ function resolveShapePath(filePath: string): string {
   return resolve(process.cwd(), filePath);
 }
 
-async function waitForResult(commandId: string, timeoutMs: number): Promise<any> {
-  const start = Date.now();
-  let aliveChecks = 0;
-  let deadline = start + timeoutMs;
-  let graceGranted = false;
-  lastWaitTimeoutReason = null;
-
-  // T6.B: watch the parent directory for writes to mcp-result.json; race each
-  // watch event against a 250ms safety backstop so we don't stall when the OS
-  // fs.watch notification fires late or is suppressed (e.g. network drives).
-  // We watch the DIRECTORY rather than the file so fs.watch doesn't error on a
-  // not-yet-existing result file, and so we receive the event on every write
-  // (file-watches on Linux can miss subsequent writes after a rename).
-  const watchDir = GLOBAL_STORAGE;
-
-  /**
-   * Wait for EITHER a fs.watch change event on watchDir OR a 250ms timeout.
-   * Returns a promise that resolves when either fires.
-   */
-  function waitForWriteOrBackstop(): Promise<void> {
-    return new Promise<void>((resolve) => {
-      let settled = false;
-      const settle = () => {
-        if (!settled) {
-          settled = true;
-          try { watcher.close(); } catch {}
-          clearTimeout(timer);
-          resolve();
-        }
-      };
-      const timer = setTimeout(settle, 250);
-      let watcher: ReturnType<typeof fsWatch>;
-      try {
-        watcher = fsWatch(watchDir, (_event: string, filename: string | null) => {
-          if (filename === "mcp-result.json" || filename === null) settle();
-        });
-        watcher.on("error", settle);
-      } catch {
-        // fs.watch unavailable (e.g. Docker tmpfs) — fall through to backstop.
-        clearTimeout(timer);
-        setTimeout(resolve, 250);
-      }
-    });
-  }
-
-  while (true) {
-    if (Date.now() >= deadline) {
-      // Deadline reached. If the extension still looks alive AND we haven't
-      // already extended once, grant a single grace window — a cold OCCT
-      // render on complex geometry can legitimately overshoot the initial
-      // budget while the extension is still making progress.
-      if (!graceGranted && isExtensionAlive()) {
-        graceGranted = true;
-        deadline += WAIT_GRACE_MS;
-        continue;
-      }
-      // Give up. Record why so the caller can shape the user-facing message.
-      lastWaitTimeoutReason = isExtensionAlive() ? "slow" : "dead";
-      return null;
-    }
-    // Wait for a write event or the 250ms backstop — whichever comes first.
-    await waitForWriteOrBackstop();
-    const result = readExtensionResult();
-    if (result && result._id === commandId) {
-      lastWaitTimeoutReason = null;
-      return result;
-    }
-    // Cheap early exit: if the extension died mid-wait there's no point
-    // holding open the full timeout. Only relevant BEFORE grace is granted;
-    // once we've extended, we stop short-circuiting on liveness since the
-    // heartbeat writer itself could be briefly delayed on a slow machine.
-    if (!graceGranted && ++aliveChecks % 10 === 0 && !isExtensionAlive()) {
-      lastWaitTimeoutReason = "dead";
-      return null;
-    }
-  }
-}
-
-function extensionOfflineError(tool: string) {
-  return {
-    content: [{
-      type: "text" as const,
-      text: `${tool} requires the ShapeItUp VSCode extension to be running (it's a viewer-state command). Open VSCode with the extension installed, then retry.\n(No heartbeat at ${join(GLOBAL_STORAGE, "shapeitup-heartbeat.json")})`,
-    }],
-    isError: true,
-  };
-}
-
 /**
- * Best-effort: when an MCP operation changes the current shape, poke the
- * extension so its live viewer re-renders the same file. Fires and forgets —
- * if VSCode isn't running, nothing happens and MCP still succeeds.
+ * Best-effort: when an MCP operation changes the current shape, poke any
+ * attached viewer so its interactive display reflects the same file. The
+ * subscriber bus routes the event by targetWorkspaceRoot — multi-window
+ * setups only see the open-shape in the window that owns the file.
  *
- * The targetWorkspaceRoot hint routes the command to the single window whose
- * workspace owns the file — without it, multi-window setups silently process
- * the open-shape in every window that happens to read the command file.
+ * Fire-and-forget. Zero subscribers is a silent no-op; the tool call always
+ * succeeds.
  */
 function notifyExtensionOfShape(filePath: string): void {
-  if (isExtensionAlive()) {
+  try {
     const targetWorkspaceRoot = computeTargetWorkspaceRoot(filePath);
-    sendExtensionCommand("open-shape", { filePath, targetWorkspaceRoot });
+    getBus().publishEvent("open-shape", { filePath, targetWorkspaceRoot }, { targetWorkspaceRoot });
+  } catch {
+    // Never let a bus failure surface to the handler.
   }
 }
 
@@ -2912,18 +2811,25 @@ export function registerTools(server: McpServer) {
         }
       }
 
-      // open-in-app still needs the VSCode extension for app detection +
-      // launching. Best-effort — never fails the export itself.
+      // open-in-app launches the external app directly from the MCP server
+      // via app-launcher.ts (no extension dependency). Best-effort — never
+      // fails the export itself; the STEP/STL was already written.
       let openLine = "";
       if (openIn) {
-        if (!isExtensionAlive()) {
-          openLine = `\nOpen-in skipped: VSCode extension not running. Launch the file manually: ${savePath}`;
+        const app = getDetectedApps().find((a) => a.id === openIn);
+        if (!app) {
+          openLine = `\nOpen-in warning: ${openIn} is not installed or was not detected. Run list_installed_apps to see available apps.`;
         } else {
-          const cmdId = sendExtensionCommand("open-in-app", { appId: openIn, exportPath: savePath });
-          if (cmdId) {
-            const result = await waitForResult(cmdId, 15000);
-            if (result?.openedIn) openLine = `\nOpened in: ${result.openedIn}`;
-            else if (result?.error) openLine = `\nOpen-in warning: ${result.error}`;
+          const result = openFileInApp(savePath, app);
+          if (result.launched) {
+            openLine = `\nOpened in: ${app.name}`;
+            // Fire-and-forget decoration — extensions subscribed to the bus
+            // may surface a "Opened in Cura" toast. No-op when no subscriber.
+            try { getBus().publishEvent("app-opened", { appId: openIn, filePath: savePath }); } catch {}
+          } else if (result.urlScheme) {
+            openLine = `\nOpen-in: ${app.name} uses a URL scheme (${result.urlScheme}). Click the URL or open ${app.name} manually.`;
+          } else {
+            openLine = `\nOpen-in warning: ${result.error ?? "unknown launch failure"}`;
           }
         }
       }
@@ -3070,10 +2976,11 @@ export function registerTools(server: McpServer) {
       const files = findShapeFiles(dir, depth);
       // Always surface which directory was actually searched — when no
       // `directory` is passed, agents otherwise can't tell whether we used
-      // the workspace root (extension alive) or process.cwd() (fallback).
-      const source = usedDefault
-        ? isExtensionAlive() ? " (default: active VSCode workspace)" : " (default: cwd — extension not running)"
-        : "";
+      // a subscriber-reported workspace root or process.cwd() (fallback).
+      // We no longer condition on "is VSCode alive"; the bus either
+      // reported a unique workspace root (subscriber-scoped default) or we
+      // fell through to cwd.
+      const source = usedDefault ? " (default: cwd)" : "";
       const header = `Searched: ${dir}${source}\nFound: ${files.length} .shape.ts file${files.length === 1 ? "" : "s"}`;
       const body = files.length > 0 ? `\n\n${files.join("\n")}` : "";
       return {
@@ -4076,23 +3983,24 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "set_render_mode",
-    "Switch the interactive VSCode viewer between dark and AI mode. Requires VSCode extension — this is a UI-only setting.",
+    "Switch the interactive VSCode viewer between dark and AI mode. UI-only setting — when no VSCode viewer is attached the preference is recorded for the next viewer to pick up (the tool never fails on a missing viewer).",
     {
       mode: z.enum(["ai", "dark"]).describe("'ai' for high-contrast light mode, 'dark' for normal dark mode"),
     },
     safeHandler("set_render_mode", async ({ mode }) => {
-      if (!isExtensionAlive()) return extensionOfflineError("set_render_mode");
-      const ok = !!sendExtensionCommand("set-render-mode", { mode });
+      const { delivered } = getBus().publishEvent("set-render-mode", { mode });
+      const text = delivered > 0
+        ? `Render mode set to: ${mode}`
+        : `No viewer attached — render mode preference recorded for the next connection (mode=${mode}).`;
       return {
-        content: [{ type: "text" as const, text: ok ? `Render mode set to: ${mode}` : "Failed to send command" }],
-        isError: !ok,
+        content: [{ type: "text" as const, text }],
       };
     })
   );
 
   server.tool(
     "toggle_dimensions",
-    "Show or hide dimension measurements on the VSCode viewer. Requires VSCode extension — UI-only setting. Omit `show` to toggle the current state.",
+    "Show or hide dimension measurements on the VSCode viewer. UI-only setting — when no viewer is attached the preference is recorded for the next connection (the tool never fails on a missing viewer). Omit `show` to toggle the current state.",
     {
       show: z
         .union([z.boolean(), z.enum(["true", "false"])])
@@ -4100,14 +4008,15 @@ export function registerTools(server: McpServer) {
         .describe("true to show dimensions, false to hide. Omit to toggle the current state. Also accepts 'true'/'false' strings for clients that stringify booleans."),
     },
     safeHandler("toggle_dimensions", async ({ show }) => {
-      if (!isExtensionAlive()) return extensionOfflineError("toggle_dimensions");
       const normalized: boolean | undefined =
         typeof show === "string" ? show === "true" : show;
-      const ok = !!sendExtensionCommand("toggle-dimensions", { show: normalized });
+      const { delivered } = getBus().publishEvent("toggle-dimensions", { show: normalized });
       const stateLabel = normalized === undefined ? "toggled" : normalized ? "visible" : "hidden";
+      const text = delivered > 0
+        ? `Dimensions: ${stateLabel}`
+        : `No viewer attached — dimension preference recorded for the next connection (show=${stateLabel}).`;
       return {
-        content: [{ type: "text" as const, text: ok ? `Dimensions: ${stateLabel}` : "Failed to send command" }],
-        isError: !ok,
+        content: [{ type: "text" as const, text }],
       };
     })
   );

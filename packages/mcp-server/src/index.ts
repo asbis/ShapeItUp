@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerTools } from "./tools.js";
+import { getSubscriberBus, defaultGlobalStorageDir } from "./subscriber-bus.js";
 
 /**
  * Shield stdout from non-JSON-RPC noise. OCCT's STEP writer prints transfer
@@ -57,6 +58,21 @@ async function main() {
     name: "shapeitup",
     version: "0.3.0",
   });
+
+  // Start the subscriber bus BEFORE registering tools — callers gate on
+  // `bus.publishEvent` return value, but the bus needs to be listening
+  // before any tool runs. Failure to bind (port exhaustion, sandbox
+  // restriction) is non-fatal: we log to stderr and continue so the MCP
+  // server still answers tool calls that don't need viewer sync.
+  const bus = getSubscriberBus(defaultGlobalStorageDir(), "0.3.0");
+  try {
+    const port = await bus.start();
+    process.stderr.write(`[shapeitup-mcp] subscriber bus listening on 127.0.0.1:${port}\n`);
+  } catch (err: any) {
+    process.stderr.write(
+      `[shapeitup-mcp] subscriber bus failed to start: ${err?.message ?? err}\n`,
+    );
+  }
 
   registerTools(server);
 

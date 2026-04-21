@@ -1,10 +1,11 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import * as fs from "fs";
+import WebSocket from "ws";
 import { ViewerProvider } from "./viewer-provider";
 import { registerCommands } from "./commands";
 import { createFileWatcher } from "./file-watcher";
-import { getDetectedApps, getDetectedAppsAsync, warmAppCache, type AppId } from "./app-detector";
-import { exportAndOpen, findAppById, openFileInApp, resolveLaunchMode } from "./open-in-app";
+import { warmAppCache } from "./app-detector";
 import {
   installStub,
   workspaceHasReplicadDependency,
@@ -199,506 +200,187 @@ export function activate(context: vscode.ExtensionContext) {
     });
   }
 
-  // Watch for MCP command files (allows MCP server to trigger extension actions)
-  const commandFile = path.join(context.globalStorageUri.fsPath, "mcp-command.json");
-  const resultFile = path.join(context.globalStorageUri.fsPath, "mcp-result.json");
-  const claimDir = path.join(context.globalStorageUri.fsPath, "mcp-claims");
-  try {
-    require("fs").mkdirSync(claimDir, { recursive: true });
-  } catch {}
-  const seenCommandIds = new Set<string>();
-  const writeResult = async (id: string | undefined, payload: Record<string, any>) => {
+  // MCP subscriber bridge: connect to the MCP server's WebSocket listener
+  // (advertised via `mcp-server-heartbeat-<pid>.json` in the same
+  // globalStorage dir) and subscribe to fire-and-forget UI events. Routing
+  // across multiple VSCode windows is handled server-side via the
+  // `targetWorkspaceRoot` filter on `publishEvent` — this extension no
+  // longer needs to arbitrate a claim-lock race against peer windows.
+  installMcpSubscriber(context, viewerProvider, outputChannel);
+
+  outputChannel.appendLine("ShapeItUp activated");
+}
+
+/**
+ * WebSocket subscriber for the MCP server's event bus. Runs independently of
+ * the viewer so the viewer can still render user-driven previews even while
+ * the MCP server is disconnected (or not even running).
+ *
+ * Discovery: reads `mcp-server-heartbeat-<pid>.json` from globalStorage to
+ * find the MCP server's `127.0.0.1:<port>` listener. Reconnects with
+ * exponential backoff on close. When the heartbeat file is missing (MCP
+ * server not running), the loop pauses for 5 s between probes.
+ */
+function installMcpSubscriber(
+  context: vscode.ExtensionContext,
+  viewer: ViewerProvider,
+  output: vscode.OutputChannel,
+) {
+  const globalStorage = context.globalStorageUri.fsPath;
+  let ws: WebSocket | null = null;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let backoffMs = 2000;
+  const MAX_BACKOFF_MS = 30_000;
+  let disposed = false;
+
+  const readMcpHeartbeat = (): { port: number; pid: number } | null => {
     try {
-      await vscode.workspace.fs.writeFile(
-        vscode.Uri.file(resultFile),
-        Buffer.from(JSON.stringify({ _id: id, ...payload }), "utf-8")
-      );
-    } catch {}
-  };
-
-  // Cross-window arbitration: every VSCode window with the extension watches
-  // the same globalStorage command file. Without a claim, both windows race
-  // and the wrong one's viewer can screenshot stale geometry under the right
-  // filename (the cross-workspace render_preview bug). Whichever window first
-  // creates `<id>.lock` services the command; losers return silently.
-  //
-  // Two layers of gating:
-  //
-  // 1. EXPLICIT targetWorkspaceRoot (preferred, new). The MCP server reads all
-  //    per-pid heartbeats, picks the single workspace that owns cmd.filePath,
-  //    and embeds `targetWorkspaceRoot`. Windows whose workspace folders don't
-  //    include that root drop out IMMEDIATELY — no lock race, no side effects.
-  //    This eliminates the multi-window cross-talk bug where a non-owning
-  //    window's viewer would still process the command's side effects because
-  //    it happened to be priority 1 in the legacy arbitration.
-  //
-  // 2. FALLBACK priority-based arbitration (legacy, for older MCP clients that
-  //    don't supply targetWorkspaceRoot):
-  //      priority 0 — file is in this window's workspace (claim immediately)
-  //      priority 1 — no filePath OR no workspace folders (neutral)
-  //      priority 2 — has workspaces but file is outside all of them (skip)
-  const isWorkspaceMatch = (root: string): boolean => {
-    const normalized = path.resolve(root).toLowerCase();
-    const wsFolders = vscode.workspace.workspaceFolders ?? [];
-    return wsFolders.some((ws) => {
-      const wsRoot = path.resolve(ws.uri.fsPath).toLowerCase();
-      return normalized === wsRoot;
-    });
-  };
-
-  const arbitrate = async (id: string, cmd: any): Promise<boolean> => {
-    const fs = require("fs");
-    const wsFolders = vscode.workspace.workspaceFolders ?? [];
-
-    // Layer 1: explicit targetWorkspaceRoot from MCP.
-    //
-    // When set, this window is ONLY allowed to handle the command if one of
-    // its workspace folders matches the target. We still pass through the
-    // lock race so two windows whose workspace folders both match the target
-    // (pathological: same workspace opened twice) don't double-execute.
-    // Windows whose folders don't match return false immediately — no race,
-    // no viewer side effects.
-    if (typeof cmd?.targetWorkspaceRoot === "string" && cmd.targetWorkspaceRoot.length > 0) {
-      if (!isWorkspaceMatch(cmd.targetWorkspaceRoot)) {
-        return false;
+      if (!fs.existsSync(globalStorage)) return null;
+      const now = Date.now();
+      let freshest: { port: number; pid: number; timestamp: number } | null = null;
+      for (const name of fs.readdirSync(globalStorage)) {
+        if (!name.startsWith("mcp-server-heartbeat-") || !name.endsWith(".json")) continue;
+        try {
+          const raw = fs.readFileSync(path.join(globalStorage, name), "utf-8");
+          const hb = JSON.parse(raw);
+          if (
+            typeof hb?.pid === "number" &&
+            typeof hb?.port === "number" &&
+            typeof hb?.timestamp === "number" &&
+            now - hb.timestamp < 10_000
+          ) {
+            if (!freshest || hb.timestamp > freshest.timestamp) {
+              freshest = { port: hb.port, pid: hb.pid, timestamp: hb.timestamp };
+            }
+          }
+        } catch {}
       }
-      // Match — fall through to the lock race with priority 0 so we claim
-      // immediately (no delay, no fallback bidding from other windows).
-      const claimPath = path.join(claimDir, `${id}.lock`);
-      try {
-        fs.writeFileSync(claimPath, `${process.pid}\n0\n`, { flag: "wx" });
-        setTimeout(() => {
-          try { fs.unlinkSync(claimPath); } catch {}
-        }, 60_000);
-        return true;
-      } catch {
-        return false;
-      }
-    }
-
-    // Layer 2: legacy priority-based arbitration.
-    let priority = 1;
-    if (cmd?.filePath && typeof cmd.filePath === "string" && wsFolders.length > 0) {
-      const fp = path.resolve(cmd.filePath).toLowerCase();
-      const inWs = wsFolders.some((ws) => {
-        const root = path.resolve(ws.uri.fsPath).toLowerCase();
-        return fp === root || fp.startsWith(root + path.sep);
-      });
-      priority = inWs ? 0 : 2;
-    }
-    // Bug #1(c) fix: if this window has workspaces but none of them owns
-    // cmd.filePath, drop out of the race entirely instead of waiting and
-    // potentially winning the claim (which would silently render into the
-    // wrong workspace under a synthesized filename). A window that sees no
-    // cmd.filePath OR has no workspace folders still participates as a
-    // neutral bidder — that's the "lightweight MCP client" case.
-    if (priority === 2) {
-      return false;
-    }
-    if (priority > 0) {
-      await new Promise((r) => setTimeout(r, priority * 150));
-    }
-    const claimPath = path.join(claimDir, `${id}.lock`);
-    try {
-      fs.writeFileSync(claimPath, `${process.pid}\n${priority}\n`, { flag: "wx" });
-      // Best-effort GC so the claims dir doesn't grow without bound.
-      setTimeout(() => {
-        try { fs.unlinkSync(claimPath); } catch {}
-      }, 60_000);
-      return true;
+      return freshest ? { port: freshest.port, pid: freshest.pid } : null;
     } catch {
-      return false;
+      return null;
     }
   };
 
-  // Serialize command processing: concurrent render/screenshot/export calls
-  // race on webview state (pendingScreenshotResolve, render mode, camera) and
-  // cause one to hang forever. A FIFO queue prevents this.
-  let queue: Promise<void> = Promise.resolve();
-  const enqueue = (fn: () => Promise<void>) => {
-    queue = queue.then(fn, fn);
+  const scheduleReconnect = (delay: number) => {
+    if (disposed) return;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connect, delay);
   };
 
-  const commandWatcher = vscode.workspace.createFileSystemWatcher(
-    new vscode.RelativePattern(context.globalStorageUri, "mcp-command.json")
-  );
-  commandWatcher.onDidChange(async () => {
-    let cmd: any;
-    try {
-      const data = await vscode.workspace.fs.readFile(vscode.Uri.file(commandFile));
-      cmd = JSON.parse(Buffer.from(data).toString("utf-8"));
-    } catch {
+  const connect = () => {
+    if (disposed) return;
+    const hb = readMcpHeartbeat();
+    if (!hb) {
+      // No MCP server running. Poll at a slow cadence — this is the normal
+      // state when the user hasn't configured any MCP client.
+      scheduleReconnect(5000);
       return;
     }
 
-    // Dedup: file watcher double-fires on a single write. Use the _id written
-    // by the MCP server (prefixed with pid+time so it's unique across restarts).
-    const id: string | undefined = cmd?._id;
-    if (id) {
-      if (seenCommandIds.has(id)) return;
-      seenCommandIds.add(id);
-      // Bounded memory: only keep the last ~200 ids.
-      if (seenCommandIds.size > 200) {
-        const first = seenCommandIds.values().next().value;
-        if (first) seenCommandIds.delete(first);
-      }
-    }
+    const sock = new WebSocket(`ws://127.0.0.1:${hb.port}`);
+    ws = sock;
 
-    enqueue(async () => {
+    sock.on("open", () => {
+      backoffMs = 2000; // reset backoff on successful connect
+      const workspaceRoots =
+        vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? [];
       try {
-        if (id) {
-          const won = await arbitrate(id, cmd);
-          if (!won) {
-            // Another window owns this command — don't write a result, don't
-            // log loudly (this is the normal case in multi-window setups).
-            return;
-          }
-        }
-        await handleCommand(cmd, id);
-      } catch (e: any) {
-        outputChannel.appendLine(`[ai] command error: ${e?.message ?? e}`);
-        await writeResult(id, { error: String(e?.message ?? e) });
-      }
+        sock.send(JSON.stringify({ type: "hello", workspaceRoots }));
+      } catch {}
+      output.appendLine(
+        `[mcp-bus] Subscribed to MCP server pid=${hb.pid} port=${hb.port}; roots=[${workspaceRoots.join(", ")}]`,
+      );
     });
-  });
-  context.subscriptions.push(commandWatcher);
 
-  async function handleCommand(cmd: any, id: string | undefined) {
-    if (cmd.command === "open-shape") {
-      outputChannel.appendLine(`[ai] Opening ${cmd.filePath}`);
-      const doc = await vscode.workspace.openTextDocument(cmd.filePath);
-      lastPreviewedFile = doc.fileName;
-      await vscode.window.showTextDocument(doc, { preview: false });
-
-      // Make sure the preview panel is open before dispatching the script —
-      // agent workflows often run without any visible viewer, and executeScript
-      // silently no-ops if there's no webview to receive it.
-      await viewerProvider.ensureWebview();
-      viewerProvider.executeScript(doc);
-
-      const fs = require("fs");
-      const statusPath = path.join(context.globalStorageUri.fsPath, "shapeitup-status.json");
-      const startTime = Date.now();
-      try { fs.unlinkSync(statusPath); } catch {}
-
-      let renderDone = false;
-      while (Date.now() - startTime < 8000) {
-        await new Promise((r) => setTimeout(r, 100));
-        if (fs.existsSync(statusPath)) {
-          try {
-            const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
-            if (status.timestamp && new Date(status.timestamp).getTime() > startTime) {
-              await writeResult(id, { renderStatus: status });
-              renderDone = true;
-              break;
-            }
-          } catch {}
-        }
-      }
-      if (!renderDone) {
-        await writeResult(id, {
-          renderStatus: { success: false, error: "Render timed out after 8 seconds", fileName: cmd.filePath },
-        });
-      }
-    } else if (cmd.command === "render-preview") {
-      outputChannel.appendLine(`[ai] render-preview: file=${cmd.filePath || "<last>"} mode=${cmd.renderMode}, dims=${cmd.showDimensions}, axes=${!!cmd.showAxes}, camera=${cmd.cameraAngle || "isometric"}, size=${cmd.width || "auto"}x${cmd.height || "auto"}${cmd.meshQuality ? `, meshQuality=${cmd.meshQuality}` : ""}`);
-
-      // P3-9 render-timeout diagnostic heartbeat. The MCP-side timeout fires
-      // at 60s by default; past 30s we start heartbeating into the output
-      // channel so a user chasing a pathological render sees *something* —
-      // empty progress is the worst failure mode because there's nothing to
-      // paste into a bug report. Cleared on every exit path (success, error,
-      // unhandled throw); one heartbeat per 10s.
-      const renderStartedAt = Date.now();
-      const renderFile = cmd.filePath || "<last>";
-      let heartbeatCount = 0;
-      const heartbeat = setInterval(() => {
-        const elapsedMs = Date.now() - renderStartedAt;
-        if (elapsedMs < 30_000) return; // wait until pathological
-        heartbeatCount++;
-        outputChannel.appendLine(
-          `[ai] render-preview heartbeat: file=${renderFile} executionMs=${elapsedMs} ` +
-            `beat=${heartbeatCount} — render has not completed yet. If this persists past 60s the MCP ` +
-            `render_preview will time out; paste this line into the bug report.`
-        );
-      }, 10_000);
-
-      const ready = await viewerProvider.ensureWebview();
-      if (!ready) {
-        clearInterval(heartbeat);
-        await writeResult(id, { error: "Viewer webview could not be opened — the extension host may be unresponsive." });
+    sock.on("message", (data) => {
+      let msg: any;
+      try {
+        msg = JSON.parse(data.toString("utf-8"));
+      } catch {
         return;
       }
+      handleEvent(msg, sock, viewer, output);
+    });
 
-      // If MCP passed an explicit file path, make sure that's what's loaded in
-      // the viewer before capturing. The engine in the MCP process already
-      // renders in Node; we re-render here so the user's visible viewer shows
-      // the same shape they're about to screenshot.
-      //
-      // Bug C: replace the status-file polling loop with an in-process
-      // handshake. The old loop waited for `shapeitup-status.json.timestamp >
-      // startTime`, but that file was already written by the MCP engine
-      // BEFORE this handler even ran — the loop always timed out, then fell
-      // through to a 500ms sleep and captured whatever was on screen (often
-      // the PREVIOUS shape). Armed BEFORE executeScript dispatch so fast
-      // renders can't beat us to the render-success message.
-      if (cmd.filePath) {
-        try {
-          const doc = await vscode.workspace.openTextDocument(cmd.filePath);
-          lastPreviewedFile = doc.fileName;
-          // `cmd.params` (optional) is the ephemeral param override map set by
-          // tune_params so the viewer re-renders the same configuration the
-          // MCP engine just computed. Absent on normal render_preview calls.
-          viewerProvider.armPendingRender();
-          viewerProvider.executeScript(doc, cmd.params, cmd.meshQuality);
-          try {
-            await viewerProvider.awaitNextRender(8000);
-          } catch (e: any) {
-            outputChannel.appendLine(`[ai] render-preview: awaitNextRender failed — ${e?.message ?? e}`);
-            // P1 fix: if the reason awaitNextRender rejected is a real
-            // webview-worker error (not just a timeout on a slow machine),
-            // bail out with that error instead of falling through to the
-            // screenshot path. The old flow silently proceeded and captured
-            // whatever was on screen from the PREVIOUS render — a stale PNG
-            // masquerading as a success. We distinguish the two by whether
-            // the error-message handler set lastRenderError; a timeout alone
-            // does not.
-            const viewerErr = viewerProvider.takeLastRenderError();
-            if (viewerErr) {
-              clearInterval(heartbeat);
-              await writeResult(id, {
-                error: viewerErr.message,
-                errorStack: viewerErr.stack,
-                errorOperation: viewerErr.operation,
-                source: "webview-worker",
-              });
-              // Restore viewer UI state defensively so a subsequent successful
-              // render isn't presented to the user with leftover screenshot
-              // mode styling.
-              viewerProvider.sendViewerCommand("set-render-mode", { mode: "dark" });
-              viewerProvider.sendViewerCommand("toggle-dimensions", { show: false });
-              viewerProvider.sendViewerCommand("toggle-axes", { show: true, scaleToModel: false });
-              viewerProvider.sendViewerCommand("restore-part-visibility", {});
-              return;
-            }
-            // No worker error recorded — this was a plain timeout. Preserve
-            // the existing best-effort capture behavior (slow-but-succeeding
-            // renders on weak hardware still produce a usable PNG).
-          }
-        } catch (e: any) {
-          outputChannel.appendLine(`[ai] render-preview: failed to load ${cmd.filePath}: ${e?.message ?? e}`);
-        }
-      }
+    const onClose = () => {
+      if (ws === sock) ws = null;
+      const next = Math.min(backoffMs, MAX_BACKOFF_MS);
+      backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF_MS);
+      scheduleReconnect(next);
+    };
+    sock.on("close", onClose);
+    sock.on("error", (err) => {
+      output.appendLine(`[mcp-bus] socket error: ${(err as Error)?.message ?? err}`);
+      try { sock.close(); } catch {}
+    });
+  };
 
-      // Reset the per-part warning buffer before dispatching — any mismatches
-      // for focusPart/hideParts reported by the viewer during this screenshot
-      // call will land here and get surfaced to the MCP response.
-      viewerProvider.resetPartWarnings();
+  // Kick off the first connect attempt on the next tick so activation
+  // finishes quickly — otherwise a slow loopback bind could block the
+  // extension host for tens of ms.
+  setImmediate(connect);
 
-      // T6.A: arm BEFORE dispatching so the handshake catches even a fast response.
-      viewerProvider.armPendingScreenshot();
-      viewerProvider.sendViewerCommand("prepare-screenshot", {
-        renderMode: cmd.renderMode || "ai",
-        showDimensions: !!cmd.showDimensions,
-        showAxes: !!cmd.showAxes,
-        cameraAngle: cmd.cameraAngle || "isometric",
-        focusPart: cmd.focusPart,
-        hideParts: cmd.hideParts,
-      });
-      try {
-        await viewerProvider.awaitScreenshotReady(2000);
-      } catch {
-        // Timeout or superseded — proceed anyway (same behavior as the old sleep).
-      }
+  context.subscriptions.push({
+    dispose: () => {
+      disposed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      try { ws?.close(); } catch {}
+    },
+  });
+}
 
-      // Prefer a workspace-local dir so sandboxed agents can read the PNG with
-      // a relative path; fall back to globalStorage when no workspace is open.
-      // Note: avoid a dot-prefixed dir — AI agent tools (Claude Code / Gemini
-      // CLI Read) hide dotfiles by default, which would break the
-      // "render preview → read PNG → self-correct" loop.
-      //
-      // Bug #1/#12 fix: when MCP provides `cmd.outputPath`, honor it verbatim
-      // — the MCP side knows the exact shape being rendered and which
-      // workspace owns it, whereas this window's `workspaceFolders[0]` can
-      // disagree with the owning workspace in multi-window setups. The old
-      // synthesis path is preserved only as a fallback for legacy callers.
-      const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-      let outputDir: string | undefined;
-      let explicitOutputPath: string | undefined;
-      if (typeof cmd.outputPath === "string" && cmd.outputPath.length > 0) {
-        explicitOutputPath = cmd.outputPath;
-        outputDir = path.dirname(cmd.outputPath);
-        try {
-          const fs = require("fs");
-          fs.mkdirSync(outputDir, { recursive: true });
-          const gitignorePath = path.join(outputDir, ".gitignore");
-          if (!fs.existsSync(gitignorePath)) {
-            fs.writeFileSync(gitignorePath, "*\n");
-          }
-        } catch {}
-      } else if (wsRoot) {
-        outputDir = path.join(wsRoot, "shapeitup-previews");
-        try {
-          const fs = require("fs");
-          fs.mkdirSync(outputDir, { recursive: true });
-          const gitignorePath = path.join(outputDir, ".gitignore");
-          if (!fs.existsSync(gitignorePath)) {
-            fs.writeFileSync(gitignorePath, "*\n");
-          }
-        } catch {}
-      }
+async function handleEvent(
+  msg: any,
+  sock: WebSocket,
+  viewer: ViewerProvider,
+  output: vscode.OutputChannel,
+) {
+  if (!msg || typeof msg.event !== "string") return;
+  const { event, _id } = msg;
+  const reply = (ok: boolean, error?: string) => {
+    if (typeof _id !== "string") return;
+    try { sock.send(JSON.stringify({ _id, ok, ...(error ? { error } : {}) })); } catch {}
+  };
 
-      const screenshotPath = await viewerProvider.captureScreenshot(
-        outputDir,
-        cmd.cameraAngle,
-        cmd.width,
-        cmd.height,
-        explicitOutputPath
-      );
-
-      // Always restore user's dark mode + hide dimensions, even on failure.
-      // Axes default to visible in the interactive viewer, so restore them at
-      // default scale regardless of what the screenshot asked for.
-      viewerProvider.sendViewerCommand("set-render-mode", { mode: "dark" });
-      viewerProvider.sendViewerCommand("toggle-dimensions", { show: false });
-      viewerProvider.sendViewerCommand("toggle-axes", { show: true, scaleToModel: false });
-      // Unconditionally restore every part to visible — focusPart/hideParts
-      // are transient for the screenshot and must not leak into the
-      // interactive viewer's state.
-      viewerProvider.sendViewerCommand("restore-part-visibility", {});
-
-      const partWarnings = viewerProvider.drainPartWarnings();
-
-      if (screenshotPath) {
-        // P1 edge-race guard: an error may have arrived between the successful
-        // render-success and the screenshot completing. Drain the consume-once
-        // slot before reporting the PNG — if one is present, the PNG is stale
-        // (reflecting the prior on-screen geometry, not the script we were
-        // asked to render) and MCP must see the error instead.
-        const viewerErr = viewerProvider.takeLastRenderError();
-        if (viewerErr) {
-          await writeResult(id, {
-            error: viewerErr.message,
-            errorStack: viewerErr.stack,
-            errorOperation: viewerErr.operation,
-            source: "webview-worker",
-            partWarnings,
-          });
-          outputChannel.appendLine(
-            `[ai] render-preview: dropping captured PNG at ${screenshotPath} — worker error arrived post-capture (${viewerErr.message})`,
-          );
-        } else {
-          await writeResult(id, { screenshotPath, partWarnings });
-          const displayPath =
-            wsRoot && screenshotPath.startsWith(wsRoot)
-              ? path.relative(wsRoot, screenshotPath).split(path.sep).join("/")
-              : screenshotPath;
-          outputChannel.appendLine(`[ai] Screenshot saved: ${displayPath}`);
-        }
-      } else {
-        // P3-9: final diagnostic line on screenshot failure. Paste-ready
-        // for a bug report: file path + elapsed ms + heartbeat count make
-        // it easy to distinguish "worker deadlocked" from "renderer crashed".
-        const elapsedMs = Date.now() - renderStartedAt;
-        outputChannel.appendLine(
-          `[ai] render-preview timeout-diagnostic: file=${renderFile} executionMs=${elapsedMs} ` +
-            `heartbeats=${heartbeatCount} — capture returned no path. ` +
-            `Viewer webview may be closed, worker may have crashed, or OCCT is wedged.`
-        );
-        await writeResult(id, {
-          error: "Screenshot capture timed out — the viewer webview may be closed or the worker may have crashed.",
-          partWarnings,
-        });
-        outputChannel.appendLine("[ai] Screenshot failed (timeout)");
-      }
-      clearInterval(heartbeat);
-    } else if (cmd.command === "screenshot") {
-      const screenshotPath = await viewerProvider.captureScreenshot(cmd.outputDir);
-      if (screenshotPath) {
-        await writeResult(id, { screenshotPath });
-      } else {
-        await writeResult(id, { error: "Screenshot capture timed out" });
-      }
-    } else if (cmd.command === "export-shape") {
-      outputChannel.appendLine(`[ai] Export: ${cmd.format} → ${cmd.outputPath || "dialog"}${cmd.openIn ? ` (open in ${cmd.openIn})` : ""}`);
-
-      if (cmd.outputPath) {
-        const data = await viewerProvider.requestExport(cmd.format);
-        if (data) {
-          const fs = require("fs");
-          fs.writeFileSync(cmd.outputPath, Buffer.from(data));
-          outputChannel.appendLine(`[ai] Exported to ${cmd.outputPath}`);
-
-          // Optional: launch the exported file in the requested app.
-          if (cmd.openIn) {
-            const app = findAppById(cmd.openIn as AppId);
-            if (!app) {
-              await writeResult(id, {
-                exportPath: cmd.outputPath,
-                openInError: `${cmd.openIn} is not installed or was not detected. Run list_installed_apps to see available apps.`,
-              });
-            } else {
-              try {
-                // MCP path is non-interactive: use the stored preference or fall back to "reuse".
-                const mode = await resolveLaunchMode(app, context, false);
-                await openFileInApp(cmd.outputPath, app, outputChannel, mode);
-                await writeResult(id, { exportPath: cmd.outputPath, openedIn: app.name });
-              } catch (e: any) {
-                await writeResult(id, { exportPath: cmd.outputPath, openInError: e?.message ?? String(e) });
-              }
-            }
-          } else {
-            await writeResult(id, { exportPath: cmd.outputPath });
-          }
-        } else {
-          await writeResult(id, { error: "Export timed out — no shape loaded, or the worker did not reply." });
-        }
-      } else {
-        if (cmd.format === "step") {
-          vscode.commands.executeCommand("shapeitup.exportSTEP");
-        } else {
-          vscode.commands.executeCommand("shapeitup.exportSTL");
-        }
-        await writeResult(id, { error: "Interactive export requires a UI dialog — MCP clients should pass outputPath." });
-      }
-    } else if (cmd.command === "list-installed-apps") {
-      // Async path is important here: on a cold cache the Windows scan can
-      // take several seconds. With the 10s ceiling inside detectWindowsAsync
-      // we're guaranteed to return within the MCP timeout.
-      const detected = await getDetectedAppsAsync();
-      const apps = detected.map((a) => ({
-        id: a.id,
-        name: a.name,
-        preferredFormat: a.preferredFormat,
-      }));
-      await writeResult(id, { apps });
-    } else if (cmd.command === "open-in-app") {
-      const app = findAppById(cmd.appId as AppId);
-      if (!app) {
-        await writeResult(id, { error: `App not detected: ${cmd.appId}` });
-      } else {
-        try {
-          // This IPC command is only sent by the MCP server — don't prompt.
-          const exportPath = await exportAndOpen(viewerProvider, app, context, outputChannel, { interactive: false });
-          if (exportPath) {
-            await writeResult(id, { exportPath, openedIn: app.name });
-          } else {
-            await writeResult(id, { error: "Export failed — no shape loaded, or the worker did not reply." });
-          }
-        } catch (e: any) {
-          await writeResult(id, { error: e?.message ?? String(e) });
-        }
-      }
-    } else if (cmd.command === "set-render-mode") {
-      viewerProvider.sendViewerCommand("set-render-mode", { mode: cmd.mode });
-      await writeResult(id, { ok: true });
-    } else if (cmd.command === "toggle-dimensions") {
-      viewerProvider.sendViewerCommand("toggle-dimensions", { show: cmd.show });
-      await writeResult(id, { ok: true });
+  try {
+    if (event === "set-render-mode") {
+      viewer.sendViewerCommand("set-render-mode", { mode: msg.mode });
+      output.appendLine(`[mcp-bus] set-render-mode mode=${msg.mode}`);
+      reply(true);
+      return;
     }
+    if (event === "toggle-dimensions") {
+      viewer.sendViewerCommand("toggle-dimensions", { show: msg.show });
+      output.appendLine(`[mcp-bus] toggle-dimensions show=${msg.show}`);
+      reply(true);
+      return;
+    }
+    if (event === "open-shape") {
+      const filePath = msg.filePath;
+      if (typeof filePath !== "string") {
+        reply(false, "missing filePath");
+        return;
+      }
+      output.appendLine(`[mcp-bus] open-shape ${filePath}`);
+      const doc = await vscode.workspace.openTextDocument(filePath);
+      await vscode.window.showTextDocument(doc, { preview: false });
+      await viewer.ensureWebview();
+      viewer.executeScript(doc);
+      reply(true);
+      return;
+    }
+    if (event === "app-opened") {
+      output.appendLine(`[mcp-bus] app-opened app=${msg.appId} file=${msg.filePath}`);
+      reply(true);
+      return;
+    }
+    // Unknown events: reply with ok=false so publishAndAwait callers can
+    // detect version skew. Silent on fire-and-forget messages (no _id).
+    reply(false, `unknown event: ${event}`);
+  } catch (e: any) {
+    output.appendLine(`[mcp-bus] handler error for ${event}: ${e?.message ?? e}`);
+    reply(false, e?.message ?? String(e));
   }
-
-  outputChannel.appendLine("ShapeItUp activated");
 }
 
 export function deactivate() {}
