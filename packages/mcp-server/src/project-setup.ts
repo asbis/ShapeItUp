@@ -148,9 +148,18 @@ export function setupShapeProject(cwd: string): SetupResult {
   const absCwd = resolve(cwd);
   const result: SetupResult = { cwd: absCwd, created: [], skipped: [] };
 
+  // Auto-create the target directory when missing. The function only writes
+  // non-executable type stubs and a tsconfig beneath this path, so eagerly
+  // materializing the directory is safe and matches the "setup project"
+  // nominal semantics — users shouldn't have to `mkdir` before invoking it.
   if (!existsSync(absCwd)) {
-    result.note = `Directory does not exist: ${absCwd}`;
-    return result;
+    try {
+      mkdirSync(absCwd, { recursive: true });
+      result.created.push(absCwd);
+    } catch (e: any) {
+      result.note = `Could not create directory ${absCwd}: ${e?.message ?? String(e)}`;
+      return result;
+    }
   }
 
   const typingsDir = locateBundledTypings();

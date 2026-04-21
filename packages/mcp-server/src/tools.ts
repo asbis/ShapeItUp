@@ -612,21 +612,34 @@ function formatStatusText(status: EngineStatus, verbosity: "summary" | "full" = 
   // direction mistake or a pivot-point typo — but it renders the same either
   // way, so the visual inspection alone won't catch it. 1mm tolerance keeps
   // ordinary -0.001 numerical dust from tripping the warning.
+  //
+  // Assembly-convention exception: when a user's project uses a different
+  // reference (e.g. Z=0 at the TOP face of a knitting-machine bed), MOST
+  // parts legitimately sit below Z=0. Firing 12 warnings in that case is pure
+  // noise. Suppress the warning when half or more of the parts share the same
+  // fate — one-off mistakes still surface; systemic conventions don't.
   let belowZeroWarn = "";
   const partsList = status.properties?.parts;
   if (Array.isArray(partsList) && partsList.length > 0) {
-    const offenders: string[] = [];
-    for (const p of partsList) {
-      const minZ = p.boundingBox?.min?.[2];
-      if (typeof minZ === "number" && minZ < -1) {
-        const depth = (-minZ).toFixed(1);
-        offenders.push(
-          `\u26a0 Geometry: part '${p.name}' extends ${depth} mm below z=0. If it should rest on a baseplate (z=0), check your rotation direction or pivot point.`,
-        );
+    const belowCount = partsList.filter(
+      (p) => typeof p.boundingBox?.min?.[2] === "number" && p.boundingBox!.min[2] < -1,
+    ).length;
+    const isSystemicConvention =
+      partsList.length > 1 && belowCount >= Math.ceil(partsList.length / 2);
+    if (!isSystemicConvention) {
+      const offenders: string[] = [];
+      for (const p of partsList) {
+        const minZ = p.boundingBox?.min?.[2];
+        if (typeof minZ === "number" && minZ < -1) {
+          const depth = (-minZ).toFixed(1);
+          offenders.push(
+            `\u26a0 Geometry: part '${p.name}' extends ${depth} mm below z=0. If it should rest on a baseplate (z=0), check your rotation direction or pivot point.`,
+          );
+        }
       }
-    }
-    if (offenders.length > 0) {
-      belowZeroWarn = "\n" + offenders.join("\n");
+      if (offenders.length > 0) {
+        belowZeroWarn = "\n" + offenders.join("\n");
+      }
     }
   }
 
@@ -3617,12 +3630,12 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "preview_finder",
-    "Preview which edges/faces a Replicad EdgeFinder or FaceFinder matches on a shape — WITHOUT editing the user's script. Runs the given .shape.ts file (or an inline `code` snippet), applies the finder to the resulting shape, and reports how many entities matched plus their locations. `EdgeFinder` and `FaceFinder` are implicitly in scope — pass a plain TS finder expression (same DSL you'd use in a fillet/chamfer/shell call), e.g. `new EdgeFinder().inDirection(\"Z\")` or `new FaceFinder().inPlane(\"XY\", 10)`. Supports the full finder DSL: `.and`, `.or`, `.not`, `.inDirection`, `.inPlane`, `.ofLength`, `.containsPoint`, etc. If the VSCode extension is running, also renders the highlighted preview in the viewer (pink spheres at each match); otherwise just returns the text report. Pass either `filePath` (existing shape) or `code` (inline snippet) — they are mutually exclusive. Debugging a script that crashes BEFORE the finder target exists: pass a modified snippet via `code` with the failing op commented out or stubbed — the finder then runs against the shape at whatever earlier point you choose.",
+    "Preview which edges/faces a Replicad EdgeFinder or FaceFinder matches on a shape — WITHOUT editing the user's script. Runs the given .shape.ts file (or an inline `code` snippet), applies the finder to the resulting shape, and reports how many entities matched plus their locations. The `finder` argument is a STRING of TS source code (not a Finder object) — `EdgeFinder` and `FaceFinder` are already in scope inside that string. Example: `finder: 'new EdgeFinder().inDirection(\"Z\")'` or `finder: 'new FaceFinder().inPlane(\"XY\", 10)'`. Supports the full finder DSL: `.and`, `.or`, `.not`, `.inDirection`, `.inPlane`, `.ofLength`, `.containsPoint`, etc. If the VSCode extension is running, also renders the highlighted preview in the viewer (pink spheres at each match); otherwise just returns the text report. Pass either `filePath` (existing shape) or `code` (inline snippet) — they are mutually exclusive. Debugging a script that crashes BEFORE the finder target exists: pass a modified snippet via `code` with the failing op commented out or stubbed — the finder then runs against the shape at whatever earlier point you choose.",
     {
       filePath: z.string().optional().describe("Path to the .shape.ts file whose shape the finder should be applied to. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first existing match wins), else anchor to process.cwd(). Mutually exclusive with `code`."),
       code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning a Shape3D or array of parts. Written to a throwaway temp file, executed, and deleted afterwards. Use `workingDir` to make local `./` imports resolve. Mutually exclusive with `filePath`."),
       workingDir: z.string().optional().describe("Directory to write the temp snippet file in when `code` is provided. When set, relative imports (`./foo.shape`) resolve against this directory. Defaults to a private globalStorage path (isolated; relative imports won't work)."),
-      finder: z.string().describe("TS expression producing an EdgeFinder or FaceFinder, e.g. 'new EdgeFinder().inDirection(\"Z\").ofLength(l => l > 10)'"),
+      finder: z.string().describe("TS source-code STRING (not a Finder object) that evaluates to an EdgeFinder or FaceFinder. Example: `'new EdgeFinder().inDirection(\"Z\").ofLength(l => l > 10)'`. The EdgeFinder / FaceFinder constructors are already in scope inside the string — do not import them."),
       partIndex: z.number().int().nonnegative().optional().describe("If the script returns a multi-part assembly, which part's shape to apply the finder to (default: 0). Ignored when `partName` is also provided."),
       partName: z.string().optional().describe("For multi-part assemblies: apply the finder to the part whose name matches exactly (e.g., 'bolt'). Takes precedence over `partIndex` when both are provided."),
     },
@@ -3891,14 +3904,16 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "check_collisions",
-    "Detects pairwise intersections between named parts in a multi-part assembly. AABB prefilter skips obviously-disjoint pairs; remaining pairs are tested with Replicad's 3D intersect (which can fail on complex curved solids — those pairs are reported as 'intersect failed' rather than silently ignored). Tolerance filters out numerical-noise contacts (default 0.001 mm³); very large assemblies (100+ parts) will be slow because work grows as N². Pass either `filePath` (existing shape) or `code` (inline snippet) — they are mutually exclusive.",
+    "Detects pairwise intersections between named parts in a multi-part assembly. AABB prefilter skips obviously-disjoint pairs; remaining pairs are tested with Replicad's 3D intersect (which can fail on complex curved solids — those pairs are reported as 'intersect failed' rather than silently ignored). Tolerance filters out numerical-noise contacts (default 0.001 mm³); very large assemblies (100+ parts) will be slow because work grows as N². Pass `acceptedPairs` to suppress EXPECTED intersections (needles resting in grooves, bolt shafts in through-holes) — accepted pairs are rolled into a summary count so unexpected bugs surface faster. Collisions with volume at or below `pressFitThreshold` are listed under 'Nominal contact' (press fits, touching interfaces) instead of the main 'Collisions' block. The main block is sorted by overlap volume descending so the biggest (most likely bug) is the first line. Pass either `filePath` (existing shape) or `code` (inline snippet) — they are mutually exclusive.",
     {
       filePath: z.string().optional().describe("Path to the .shape.ts file to check for part collisions. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first existing match wins), else anchor to process.cwd(). Mutually exclusive with `code`."),
       code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning an array of parts. Written to a throwaway temp file, executed, and deleted afterwards. Use `workingDir` to make local `./` imports resolve. Mutually exclusive with `filePath`."),
       workingDir: z.string().optional().describe("Directory to write the temp snippet file in when `code` is provided. When set, relative imports (`./foo.shape`) resolve against this directory. Defaults to a private globalStorage path (isolated; relative imports won't work)."),
       tolerance: z.number().optional().describe("Minimum intersection volume in mm³ to count as a collision. Defaults to 0.001 — filters out numerical-noise overlaps on touching-but-not-overlapping parts. Negative values are clamped to 0."),
+      acceptedPairs: z.array(z.tuple([z.string(), z.string()])).optional().describe("Pairs of part names whose intersection is EXPECTED and should not be flagged — e.g. [['needle','bed'], ['bolt','plate']]. Accepted pairs are rolled into a single-line summary count (with volume range) instead of listed individually. Order is symmetric: ['a','b'] also covers ['b','a']. When a name appears on multiple parts, every such pair is accepted."),
+      pressFitThreshold: z.number().optional().describe("Volume threshold (mm³) at or below which a collision is classified as 'nominal contact' (press fit / touching interface) and listed in a compact section instead of the main Collisions block. Default 0.5 mm³. Set to 0 to disable the tag (every non-accepted collision is treated as real)."),
     },
-    safeHandler("check_collisions", async ({ filePath, code, workingDir, tolerance }) => {
+    safeHandler("check_collisions", async ({ filePath, code, workingDir, tolerance, acceptedPairs, pressFitThreshold }) => {
       // Input validation: filePath and code are mutually exclusive, one required.
       if (filePath !== undefined && code !== undefined) {
         return {
@@ -3939,6 +3954,27 @@ export function registerTools(server: McpServer) {
       }
 
       const tol = Math.max(0, typeof tolerance === "number" ? tolerance : 0.001);
+      // Press-fit threshold: below this volume a collision is expected to be a
+      // contact fit (bearing in seat, pin in hole) rather than a real overlap
+      // bug. Clamp to tol so it never falls below the "real collision" floor.
+      const pressFit = Math.max(
+        tol,
+        typeof pressFitThreshold === "number" ? pressFitThreshold : 0.5,
+      );
+      // Build the accepted-pairs lookup with symmetric keys. The user passes
+      // raw part names (the same names their `part({ name: "..." })` calls
+      // used); we match against `parts[i].name`, not the indexed label that
+      // duplicate-name disambiguation would produce — otherwise users of
+      // `patterns.spread` (where 20 needles all carry name="needle") would
+      // have to list 20 tuples instead of one.
+      const pairKey = (a: string, b: string): string =>
+        a < b ? `${a}|${b}` : `${b}|${a}`;
+      const acceptedSet = new Set<string>();
+      for (const pair of acceptedPairs ?? []) {
+        if (Array.isArray(pair) && pair.length === 2) {
+          acceptedSet.add(pairKey(pair[0], pair[1]));
+        }
+      }
 
       // Step 2: compute per-part AABBs from the tessellated vertex arrays.
       // Same math as engine.boundingBoxFromVertices but we keep the raw
@@ -3985,6 +4021,9 @@ export function registerTools(server: McpServer) {
       const collisions: Array<{
         a: string;
         b: string;
+        /** Raw part names (not labels) for acceptedPairs matching. */
+        rawA: string;
+        rawB: string;
         volume: number;
         region?: { min: [number, number, number]; max: [number, number, number] };
         center?: [number, number, number];
@@ -4088,6 +4127,8 @@ export function registerTools(server: McpServer) {
               collisions.push({
                 a: labelFor(i),
                 b: labelFor(j),
+                rawA: parts[i].name,
+                rawB: parts[j].name,
                 volume,
                 ...(region ? { region } : {}),
                 ...(overlapCenter ? { center: overlapCenter } : {}),
@@ -4101,7 +4142,25 @@ export function registerTools(server: McpServer) {
         }
       }
 
-      // Step 5: format the summary.
+      // Step 5: triage collisions into three buckets BEFORE formatting, so the
+      // accounting header can report "N real / M nominal / K accepted" instead
+      // of a single flat count. Sorting each bucket by volume descending puts
+      // the worst offender at the top of its block.
+      const acceptedC = collisions.filter((c) =>
+        acceptedSet.has(pairKey(c.rawA, c.rawB)),
+      );
+      const unacceptedC = collisions.filter(
+        (c) => !acceptedSet.has(pairKey(c.rawA, c.rawB)),
+      );
+      const realC = unacceptedC
+        .filter((c) => c.volume > pressFit)
+        .sort((a, b) => b.volume - a.volume);
+      const pressFitC = unacceptedC
+        .filter((c) => c.volume <= pressFit)
+        .sort((a, b) => b.volume - a.volume);
+      acceptedC.sort((a, b) => b.volume - a.volume);
+
+      // Step 6: format the summary.
       const fmt = (n: number) => (Math.abs(n) >= 1000 ? n.toFixed(0) : n.toFixed(2));
       const pairWord = (n: number) => `${n} pair${n === 1 ? "" : "s"}`;
 
@@ -4121,17 +4180,17 @@ export function registerTools(server: McpServer) {
       //     readers don't have to add the two bullets themselves.
       //   - skippedByAABB === 0: fall through to the original tested-line path,
       //     unchanged (we only touch the phrasing that sounded evasive).
+      // "All clear" means no REAL collisions (accepted + press-fit don't count
+      // against the user). Keeps the accounting headline trustworthy when the
+      // user has declared expected overlaps.
+      const noRealTrouble = realC.length === 0 && failures.length === 0;
       if (skippedByAABB > 0 && skippedByAABB === totalPairs) {
         accounting.push(`  - No overlap possible \u2014 all ${pairWord(totalPairs)} AABB-disjoint.`);
       } else if (skippedByAABB > 0 && tested > 0) {
-        const allClear = collisions.length === 0 && failures.length === 0
-          ? " \u2014 all tested pairs clear"
-          : "";
+        const allClear = noRealTrouble ? " \u2014 all tested pairs clear" : "";
         accounting.push(`  - ${pairWord(skippedByAABB)} AABB-disjoint (skipped); ${pairWord(tested)} tested${allClear}.`);
       } else if (skippedByAABB === 0 && tested > 0) {
-        const testedSuffix = collisions.length === 0 && failures.length === 0
-          ? " \u2014 all clear"
-          : "";
+        const testedSuffix = noRealTrouble ? " \u2014 all clear" : "";
         accounting.push(`  - ${pairWord(tested)} tested for 3D intersection${testedSuffix}.`);
       }
 
@@ -4141,20 +4200,44 @@ export function registerTools(server: McpServer) {
         const fmtPt = (p: [number, number, number]) =>
           `(${fmt(p[0])}, ${fmt(p[1])}, ${fmt(p[2])})`;
         const fmtRange = (lo: number, hi: number) => `[${fmt(lo)}, ${fmt(hi)}]`;
-        const lines: string[] = [];
-        for (const c of collisions) {
-          lines.push(`  - ${c.a} \u2194 ${c.b}: ${fmt(c.volume)} mm\u00b3 overlap`);
-          if (c.region) {
-            const r = c.region;
-            lines.push(
-              `    Region: x${fmtRange(r.min[0], r.max[0])} y${fmtRange(r.min[1], r.max[1])} z${fmtRange(r.min[2], r.max[2])} mm`,
-            );
+
+        if (realC.length > 0) {
+          const lines: string[] = [];
+          for (const c of realC) {
+            lines.push(`  - ${c.a} \u2194 ${c.b}: ${fmt(c.volume)} mm\u00b3 overlap`);
+            if (c.region) {
+              const r = c.region;
+              lines.push(
+                `    Region: x${fmtRange(r.min[0], r.max[0])} y${fmtRange(r.min[1], r.max[1])} z${fmtRange(r.min[2], r.max[2])} mm`,
+              );
+            }
+            if (c.center) {
+              lines.push(`    Center: ${fmtPt(c.center)} mm`);
+            }
           }
-          if (c.center) {
-            lines.push(`    Center: ${fmtPt(c.center)} mm`);
-          }
+          sections.push(`\nCollisions (sorted by volume desc):\n${lines.join("\n")}`);
         }
-        sections.push(`\nCollisions:\n${lines.join("\n")}`);
+
+        if (pressFitC.length > 0) {
+          // Compact format — one line per pair. No region/center; press-fit
+          // overlaps are expected so the reader doesn't need their geometry.
+          const lines = pressFitC.map(
+            (c) => `  - ${c.a} \u2194 ${c.b}: ${fmt(c.volume)} mm\u00b3`,
+          );
+          sections.push(
+            `\nNominal contact (volume \u2264 ${fmt(pressFit)} mm\u00b3 \u2014 press fits, touching interfaces):\n${lines.join("\n")}`,
+          );
+        }
+
+        if (acceptedC.length > 0) {
+          // Summary only — the user already told us these are expected.
+          const volumes = acceptedC.map((c) => c.volume);
+          const minV = Math.min(...volumes);
+          const maxV = Math.max(...volumes);
+          sections.push(
+            `\nAccepted (pre-declared expected): ${acceptedC.length} pair${acceptedC.length === 1 ? "" : "s"}, volume ${fmt(minV)}\u2013${fmt(maxV)} mm\u00b3.`,
+          );
+        }
       }
 
       if (failures.length > 0) {
@@ -4169,7 +4252,15 @@ export function registerTools(server: McpServer) {
       // All-clear footer when nothing collided, nothing failed, and at least
       // one pair was actually tested (otherwise the AABB prefilter skipped
       // everything and "no collisions detected" would be misleading).
-      if (collisions.length === 0 && failures.length === 0 && skippedByAABB < totalPairs) {
+      // Accepted and press-fit overlaps are NOT trouble — they get their own
+      // sections above but don't invalidate the "no real collisions" state.
+      if (
+        realC.length === 0 &&
+        failures.length === 0 &&
+        skippedByAABB < totalPairs &&
+        pressFitC.length === 0 &&
+        acceptedC.length === 0
+      ) {
         sections.push(`\nNo collisions detected.`);
       }
 

@@ -15,7 +15,7 @@ import { screws, bolts, washers, inserts, seatedOnPlate } from "./fasteners";
 import { fromBack, shape3d, placeOn, extrudeCentered } from "./placement";
 import { Part, joint, part, faceAt, shaftAt, boreAt } from "./parts";
 import { mate, assemble, subassembly, stackOnZ, entries, symmetricPair, debugJoints, highlightJoints } from "./assembly";
-import { cylinder } from "./cylinder";
+import { cylinder, rod } from "./cylinder";
 import * as motors from "./motors";
 import * as couplers from "./couplers";
 import * as threads from "./threads";
@@ -93,6 +93,7 @@ export {
   debugJoints,
   highlightJoints,
   cylinder,
+  rod,
   motors,
   couplers,
   threads,
@@ -135,6 +136,7 @@ export const shapeitupStdlib = {
   debugJoints,
   highlightJoints,
   cylinder,
+  rod,
   motors,
   couplers,
   threads,

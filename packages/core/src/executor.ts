@@ -260,35 +260,13 @@ export function executeScript(
 
   const code = rewriteImports(jsForRewrite);
 
-  // Multi-file .shape.ts bundles collision detection.
-  //
-  // When a user's entry `.shape.ts` imports other `.shape.ts` modules that each
-  // define `export default function main(...)` and `export const params`,
-  // esbuild inlines them all. To avoid local-variable collisions it renames
-  // the non-entry bindings to `main2`, `params2`, etc. The entry file's
-  // bindings keep the bare names `main` and `params`.
-  //
-  // Before the footer-injection fix the ambient `typeof main !== "undefined"`
-  // lookup inside the wrapper could bind to the LAST declared `main` in the
-  // bundle (depending on esbuild's output shape) rather than the entry's.
-  // Two symptoms:
-  //   - the wrong shape rendered, but "Render SUCCESS" still reported,
-  //   - `result.params` came from an imported module's declaration.
-  //
-  // With the `__SHAPEITUP_ENTRY_MAIN__` / `__SHAPEITUP_ENTRY_PARAMS__` globals
-  // (set by the esbuild footer in both the extension host and the MCP engine
-  // at bundle time) we now prefer the canonical entry bindings. This regex
-  // scan surfaces an advisory warning when the bundle shows signs of having
-  // merged multiple `main`/`params` declarations so the user can switch the
-  // imported modules to named factories.
-  if (/\b(?:var|let|const|function)\s+(?:main\d+|params\d+)\b/.test(code)) {
-    pushRuntimeWarning(
-      "Multi-file bundle detected multiple `main` symbols — using entry " +
-        "file's `main`. For library `.shape.ts` modules, export named " +
-        "factories (e.g. `export function makePart(...)`) instead of " +
-        "`export default main`.",
-    );
-  }
+  // Multi-file .shape.ts bundles: the `__SHAPEITUP_ENTRY_MAIN__` /
+  // `__SHAPEITUP_ENTRY_PARAMS__` globals (set by the esbuild footer in both
+  // the extension host and the MCP engine at bundle time) resolve the entry's
+  // `main`/`params` regardless of how esbuild renames the imported modules'
+  // bindings. No runtime warning is needed — the previous advisory scan fired
+  // on the skill-docs-recommended "export default main alongside named
+  // factory" pattern, i.e. it punished correct usage.
 
   const wrapped = `
     return (function(__replicad__, __shapeitup__, __paramOverrides__) {

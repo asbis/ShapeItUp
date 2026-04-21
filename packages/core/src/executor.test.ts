@@ -1001,10 +1001,12 @@ describe("executeScript — multi-file entry disambiguation", () => {
     expect(params.map((p) => p.name)).toEqual(["width"]);
   });
 
-  it("emits a runtime warning when the bundle contains `main2` / `params2` symbols", () => {
-    // This is the collision smell — esbuild only renames to `nameN` when two
-    // modules declared the same name. The warning tells the user to switch
-    // library modules to named factories.
+  it("does NOT emit a noisy warning when esbuild renames imported `main` / `params` to `main2` / `params2`", () => {
+    // The old advisory scan fired on this shape, but the __SHAPEITUP_ENTRY_MAIN__
+    // canonical markers already resolve the entry's `main` correctly — the
+    // warning only punished the skill-docs-recommended pattern of exporting
+    // `default main` alongside a named factory. The scan has been removed;
+    // this test pins that decision so it doesn't regress.
     const g = globalThis as any;
     g.__SHAPEITUP_ENTRY_MAIN__ = () => "ok";
     const js = `
@@ -1015,12 +1017,10 @@ describe("executeScript — multi-file entry disambiguation", () => {
     `;
     executeScript(js, {}, {});
     const warnings = drainRuntimeWarnings();
-    expect(warnings.length).toBeGreaterThanOrEqual(1);
     const multiFileWarn = warnings.find((w) =>
       /Multi-file bundle detected multiple `main` symbols/.test(w),
     );
-    expect(multiFileWarn).toBeDefined();
-    expect(multiFileWarn!).toMatch(/named factories/i);
+    expect(multiFileWarn).toBeUndefined();
   });
 
   it("does NOT emit the collision warning for single-file scripts", () => {

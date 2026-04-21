@@ -61,3 +61,13 @@ export function cylinder(opts: CylinderOpts): Shape3D {
   }
   return makeCylinder(radius, opts.length, base, direction);
 }
+
+/**
+ * Alias for `cylinder()` — engineers describing motion hardware often reach
+ * for "rod" or "shaft" before "cylinder". Identical options and return type;
+ * pick whichever reads better at the call site.
+ *
+ *   rod({ from: [0, 0, 0], to: [100, 0, 0], diameter: 8 })  // NOT a separate signature — use cylinder with top/bottom + length
+ *   rod({ bottom: [0, 0, 0], length: 100, diameter: 8, direction: "+X" })
+ */
+export const rod = cylinder;

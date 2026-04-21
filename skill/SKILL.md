@@ -1028,6 +1028,8 @@ cylinder({ top: [0, 0, 0], length: 10, diameter: 3 })            // top at origi
 cylinder({ bottom: [0,0,0], length: 50, diameter: 8, direction: "+Y" })  // along +Y
 ```
 
+`rod` is an alias for `cylinder` — identical options and return type. Pick whichever reads better at the call site (e.g. `rod({ bottom, length, diameter, direction })` for a linear rail, `cylinder` for a part bore).
+
 See `examples/stdlib/leadscrew-assembly.shape.ts` for a full NEMA17 → coupler → leadscrew demo.
 
 ### Insertion mates — when a part nests INSIDE another

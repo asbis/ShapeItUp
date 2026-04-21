@@ -44,7 +44,7 @@ import {
   assertPositiveFinite,
   assertSupportedSize,
 } from "./standards";
-import { pushRuntimeWarning } from "./warnings";
+import { pushRuntimeWarning, claimAmbiguousRawWarning } from "./warnings";
 
 /**
  * Raw diameters that equal a nominal metric size (M3, M4, M5, M6, M8, M10, M12).
@@ -67,7 +67,9 @@ function warnAmbiguousRawDiameter(
   // Explicit `{ raw: true }` is the intent-declaring escape hatch — the user
   // has asserted they want the literal diameter, so silently skip the advisory.
   if (raw === true) return;
+  if (!Number.isInteger(size)) return; // non-integer diameters (e.g. 8.2) disambiguate intent
   if (!AMBIGUOUS_RAW_DIAMETERS.has(size)) return;
+  if (!claimAmbiguousRawWarning(size)) return; // at most once per run per size
   const key = `M${size}` as MetricSize;
   const spec = SOCKET_HEAD[key];
   if (!spec) return;
@@ -727,8 +729,14 @@ export function slot(opts: {
   assertPositiveFinite("holes.slot", "opts.width", width);
   assertPositiveFinite("holes.slot", "opts.depth", depth);
   if (length < width) {
+    const travelExample = Math.max(3, Math.round(width));
     throw new Error(
-      `holes.slot: length (${length}) must be >= width (${width}).`
+      `holes.slot: length (${length}) must be >= width (${width}). ` +
+        `\`length\` is the TIP-TO-TIP overall length (including the rounded ends), ` +
+        `not the extra travel beyond the round ends. ` +
+        `For an M${Math.round(width - 0.4)}-ish bolt with ${travelExample}mm of travel, ` +
+        `use length=${width + travelExample}, width=${width} ` +
+        `(length = bolt_clearance_diameter + desired_travel).`
     );
   }
   const r = width / 2;

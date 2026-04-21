@@ -32,6 +32,25 @@ export function resetRuntimeWarnings(): void {
   resetNonXYPlaneHint();
   resetExtrudePlaneHint();
   resetPendingExtrudeHints();
+  resetAmbiguousRawSeen();
+}
+
+// Per-execute latch for the "raw diameter matches a metric nominal" advisory
+// (holes.ts). When a user writes `holes.through(8, ...)` twenty times in one
+// file we want exactly ONE warning, not twenty — the first is a useful nudge,
+// the rest is noise that trains users to ignore warnings wholesale.
+const ambiguousRawSeen = new Set<number>();
+
+/** Returns true the FIRST time a given size is raised this run; false thereafter. */
+export function claimAmbiguousRawWarning(size: number): boolean {
+  if (ambiguousRawSeen.has(size)) return false;
+  ambiguousRawSeen.add(size);
+  return true;
+}
+
+/** Reset the ambiguous-raw-diameter latch. Called from resetRuntimeWarnings(). */
+export function resetAmbiguousRawSeen(): void {
+  ambiguousRawSeen.clear();
 }
 
 // One-shot latch for the "sketchOnPlane is not XY — pen axis mapping may

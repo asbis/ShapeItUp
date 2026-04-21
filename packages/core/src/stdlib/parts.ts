@@ -33,9 +33,28 @@ export function normalizeAxis(a: Axis): Vec3 {
   if (a === "-Y") return [0, -1, 0];
   if (a === "+Z") return [0, 0, 1];
   if (a === "-Z") return [0, 0, -1];
+  if (!Array.isArray(a) || a.length !== 3) {
+    throw new Error(
+      `Axis must be a string shorthand ("+X"/"-X"/"+Y"/"-Y"/"+Z"/"-Z") or a 3-element vector [x, y, z]. ` +
+        `Received: ${JSON.stringify(a)}.`
+    );
+  }
   const [x, y, z] = a;
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+    throw new Error(
+      `Axis vector components must all be finite numbers. Received: [${x}, ${y}, ${z}]. ` +
+        `Did you mean a string shorthand like "+Z"?`
+    );
+  }
   const mag = Math.sqrt(x * x + y * y + z * z);
-  if (mag === 0) throw new Error("Axis vector cannot be zero");
+  if (mag === 0) {
+    throw new Error(
+      `Axis vector cannot be [0, 0, 0] — the direction is undefined. ` +
+        `Use a string shorthand like "+Z" / "-X", or pass a non-zero vector. ` +
+        `(Common cause: computing an axis from two identical points, or calling .rotate()/.translate() on a Part ` +
+        `with an unset axis variable.)`
+    );
+  }
   return [x / mag, y / mag, z / mag];
 }
 

@@ -500,9 +500,19 @@ export async function executeShapeFile(
     // Surface other warnings (non-fatal) in the status so the user sees them.
     // Combine esbuild warnings with any preflight warnings (e.g. importing
     // `params` from a sibling .shape.ts — supported but fragile).
+    //
+    // Filter out "Import 'X' will always be undefined" warnings for the
+    // optional names the synthetic wrapper re-exports (`config`, `material`,
+    // `params`). These fire on every file that doesn't declare one of them —
+    // which is most of them — and the re-export pattern is deliberate (back-
+    // compat with the executor's ambient `typeof foo !== "undefined"` lookup).
+    const OPTIONAL_REEXPORT_NAMES = /Import "(config|material|params)" will always be undefined/;
+    const filteredEsbuildWarnings = result.warnings.filter(
+      (w) => !OPTIONAL_REEXPORT_NAMES.test(w.text),
+    );
     const combinedWarnings = [
       ...preflightResult.warnings,
-      ...result.warnings.map((w) => w.text),
+      ...filteredEsbuildWarnings.map((w) => w.text),
     ];
     if (combinedWarnings.length > 0) {
       status.warnings = combinedWarnings;
