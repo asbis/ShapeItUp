@@ -451,36 +451,6 @@ export function computeTargetWorkspaceRoot(filePath: string): string | undefined
 }
 
 /**
- * Verifies that a resolved shape path belongs to a workspace currently owned by
- * some live extension host. Returns null if ownership is fine, or an MCP error
- * response if the shape is in a workspace that no live host owns.
- *
- * This is the single source of truth — both render_preview and preview_finder
- * must call it for EVERY invocation, not only the explicit-filePath branch.
- * Uses readAllHeartbeats() so a multi-window setup is handled correctly: if
- * *any* live window owns the file we're fine. When there are no live windows
- * reporting workspace roots, we assume a single-window setup and defer to the
- * extension's own arbitration.
- */
-function assertWorkspaceOwned(source: string): { content: Array<{ type: "text"; text: string }>; isError: true } | null {
-  const wsRoots = getHeartbeatWorkspaceRoots();
-  if (wsRoots.length === 0) return null; // No heartbeat — assume single-window setup, extension will arbitrate
-  const sourceAbs = resolve(source).toLowerCase();
-  const inAnyWs = wsRoots.some((r) => {
-    const rAbs = resolve(r).toLowerCase();
-    return sourceAbs === rAbs || sourceAbs.startsWith(rAbs + sep.toLowerCase());
-  });
-  if (inAnyWs) return null;
-  return {
-    content: [{
-      type: "text" as const,
-      text: `Shape is in a workspace not owned by any live ShapeItUp window. Open the correct workspace in VSCode, or close the other window.\n\nShape is at ${source}\nLive workspace roots: ${wsRoots.join(", ") || "(none)"}`,
-    }],
-    isError: true,
-  };
-}
-
-/**
  * Runs `op` with a resolved file path. If `code` is provided, writes it to a
  * temp .shape.ts in `workingDir` (or a private globalStorage path when
  * unspecified), runs `op` with that path, and always cleans up the temp file.
@@ -3819,20 +3789,6 @@ export function registerTools(server: McpServer) {
         return { content: [textBlock], isError: false };
       }
 
-      // Bug #10: hard pre-flight check for cross-workspace renders. If the
-      // shape lives outside EVERY heartbeat-reported VSCode workspace, the
-      // bundler will later fail with the misleading "Could not resolve
-      // 'shapeitup'" — the real cause is that no open window owns this
-      // folder, so nothing can serve the render. Refuse up front with an
-      // actionable message instead of letting the bundler error bubble up.
-      // Note: preview_shape deliberately skips this check — its snippets live
-      // in an isolated globalStorage dir and have no user-visible workspace
-      // context, so a hard refusal would break every snippet render.
-      {
-        const wsErr = assertWorkspaceOwned(source);
-        if (wsErr) return wsErr;
-      }
-
       // When no explicit filePath was passed, the default `source` came from
       // engine.getLastFileName() — which is the process-wide "last executed
       // shape", regardless of which window currently owns focus. In a
@@ -4561,17 +4517,6 @@ export function registerTools(server: McpServer) {
           content: [{ type: "text" as const, text: `File not found: ${absPath}` }],
           isError: true,
         };
-      }
-
-      // Bug #10 / Issue #2: workspace-ownership check FIRST — before running the
-      // engine or building any text report. If this check fires on call #2
-      // after call #1 succeeded (because the heartbeat flipped to a different
-      // window in between), we want both calls to refuse identically instead
-      // of returning a match count + a stale PNG reference. Skip for inline
-      // `code` snippets since they live in the isolated globalStorage dir.
-      if (filePath !== undefined) {
-        const wsErr = assertWorkspaceOwned(absPath);
-        if (wsErr) return wsErr;
       }
 
       // Step 1: execute the user's script to get the live OCCT parts. Force-
