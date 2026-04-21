@@ -76,9 +76,6 @@ importers:
       replicad-opencascadejs:
         specifier: ^0.23.0
         version: 0.23.0
-      ws:
-        specifier: ^8.20.0
-        version: 8.20.0
     devDependencies:
       '@modelcontextprotocol/sdk':
         specifier: ^1.0.0
@@ -95,6 +92,9 @@ importers:
       replicad:
         specifier: ^0.23.0
         version: 0.23.0
+      ws:
+        specifier: ^8.20.0
+        version: 8.20.0
       zod:
         specifier: ^4.3.6
         version: 4.3.6
