@@ -15,7 +15,12 @@
     "onlyBuiltDependencies": [
       "esbuild",
       "@esbuild/win32-x64"
-    ]
+    ],
+    "peerDependencyRules": {
+      "allowedVersions": {
+        "manifold-3d>esbuild-wasm": "^0.28.0"
+      }
+    }
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
