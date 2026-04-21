@@ -147,23 +147,24 @@ export type PartStatsLevel = "none" | "bbox" | "full";
 /**
  * Per-quality multipliers applied to the auto-computed tolerance. `final`
  * is the baseline (1× — behaviour unchanged from before the quality knob
- * existed). `preview` multiplies by 2.5× — enough to cut triangle counts
- * by roughly an order of magnitude on complex shapes (meshing cost scales
- * inversely with tolerance²), while still looking reasonable on-screen for
- * assemblies with a lot of threaded / lofted geometry. Also loosens the
- * angular tolerance so helical surfaces don't pin runtime.
+ * existed). `preview` multiplies by 4.5× — tolerance² scaling means this
+ * is roughly 3–4× faster than the previous 2.5× factor (meshing cost
+ * scales inversely with tolerance²: (4.5/2.5)² ≈ 3.2×). Angular tolerance
+ * is also widened so helical surfaces (threads) don't pin the tessellator
+ * at preview quality.
  */
 const QUALITY_FACTOR: Record<MeshQuality, { linear: number; angular: number }> = {
   final: { linear: 1, angular: 0.1 },
-  preview: { linear: 2.5, angular: 0.25 },
+  preview: { linear: 4.5, angular: 0.4 },
 };
 
 export interface TessellateOptions {
   /**
    * Mesh quality preset. `"final"` (default) preserves the pre-existing
-   * tolerance behaviour. `"preview"` scales the tolerance ~2.5× (roughly
-   * 10× faster tessellation on complex geometry, at the cost of visibly
-   * coarser facets). Auto-degrading to preview for large assemblies is the
+   * tolerance behaviour. `"preview"` scales the tolerance ~4.5× (roughly
+   * 3–4× faster tessellation than "final" on complex geometry, at the cost
+   * of visibly coarser facets — triangle count scales inversely with
+   * tolerance²). Auto-degrading to preview for large assemblies is the
    * caller's policy decision — tessellatePart itself is neutral.
    */
   meshQuality?: MeshQuality;
@@ -184,8 +185,11 @@ export function tessellatePart(part: PartInput, opts: TessellateOptions = {}): T
   const factor = QUALITY_FACTOR[quality] ?? QUALITY_FACTOR.final;
   // Apply the preset's linear multiplier to the auto-computed tolerance.
   // Clamp upper bound so pathologically-large shapes on `preview` don't
-  // produce nearly-zero-triangle meshes that break the viewer.
-  const tolerance = Math.min(2.5, chooseTolerance(part.shape) * factor.linear);
+  // produce nearly-zero-triangle meshes that break the viewer. The cap is
+  // 5.0 mm — raised from 2.5 so the new preview linear factor of 4.5 can
+  // fully take effect on large shapes (chooseTolerance caps at 1.0 mm
+  // internally, so 1.0 * 4.5 = 4.5 would otherwise be pinned at 2.5).
+  const tolerance = Math.min(5.0, chooseTolerance(part.shape) * factor.linear);
   // angularTolerance (radians) caps the angle between consecutive facet normals.
   // 0.1 rad ≈ 5.7° matches replicad's default and is tight enough that helical
   // surfaces (threads) tessellate smoothly. 0.3 rad — OCCT's coarse end —

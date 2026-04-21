@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { validateSyntaxPure, detectPathDoubling, detectPathDoublingInfo, extractSignatures, safeHandler, computePartsLine } from "./tools.js";
+import { validateSyntaxPure, detectPathDoubling, detectPathDoublingInfo, extractSignatures, safeHandler, computePartsLine, computeEffectiveMeshQuality } from "./tools.js";
 
 // ---------------------------------------------------------------------------
 // Bug #6 — validate_syntax must trust .method() calls whose receiver was
@@ -94,6 +94,190 @@ describe("validateSyntaxPure — stdlib whitelisting", () => {
     const { text, isError } = validateSyntaxPure(code);
     expect(isError).toBe(true);
     expect(text).toMatch(/^Syntax error:/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pitfall detector — hand-rolled boolean loops
+// Covers all four new patterns plus regression-guards for the existing
+// `for` loop detection and false-positive suppression.
+// ---------------------------------------------------------------------------
+
+describe("validateSyntaxPure — boolean-loop pitfall detector", () => {
+  // Helper: build a minimal valid script body around a given snippet.
+  const wrap = (body: string) =>
+    [
+      `import { makeBox } from "replicad";`,
+      `export default function main() {`,
+      body,
+      `}`,
+    ].join("\n");
+
+  // --- Existing for-loop detection (regression guard) ---
+  it("flags for-loop with .cut (existing detection — no regression)", () => {
+    const code = wrap([
+      `  let s = makeBox(10,10,10);`,
+      `  for (let i=0; i<5; i++) { s = s.cut(makeBox(1,1,1)); }`,
+      `  return s;`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/slow pattern/);
+    expect(text).toMatch(/`for` loop/);
+    expect(text).toMatch(/patterns\.cutAt/);
+  });
+
+  it("flags for-loop with .fuse (existing detection)", () => {
+    const code = wrap([
+      `  let s = makeBox(10,10,10);`,
+      `  for (let i=0; i<5; i++) { s = s.fuse(makeBox(1,1,1)); }`,
+      `  return s;`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/slow pattern/);
+    expect(text).toMatch(/patterns\.cutAt/);
+  });
+
+  // --- NEW: for-loop with .intersect ---
+  it("flags for-loop with .intersect", () => {
+    const code = wrap([
+      `  let s = makeBox(10,10,10);`,
+      `  for (const p of pts) { s = s.intersect(p); }`,
+      `  return s;`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/slow pattern/);
+    expect(text).toMatch(/`for` loop/);
+  });
+
+  // --- NEW: while loop ---
+  it("flags while-loop with .cut", () => {
+    const code = wrap([
+      `  let s = makeBox(10,10,10);`,
+      `  while (pts.length > 0) { s = s.cut(pts.pop()); }`,
+      `  return s;`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/slow pattern/);
+    expect(text).toMatch(/`while` loop/);
+    expect(text).toMatch(/patterns\.cutAt/);
+  });
+
+  it("flags while-loop with .fuse", () => {
+    const code = wrap([
+      `  let s = makeBox(10,10,10);`,
+      `  while (pts.length) { s = s.fuse(pts.shift()); }`,
+      `  return s;`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/slow pattern/);
+    expect(text).toMatch(/`while` loop/);
+  });
+
+  // --- NEW: .forEach ---
+  it("flags .forEach with .cut", () => {
+    const code = wrap([
+      `  let s = makeBox(10,10,10);`,
+      `  pts.forEach(p => { s = s.cut(p); });`,
+      `  return s;`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/slow pattern/);
+    expect(text).toMatch(/`\.forEach` loop/);
+    expect(text).toMatch(/patterns\.cutAt/);
+  });
+
+  it("flags .forEach with .fuse (inline arrow, no braces)", () => {
+    const code = wrap([
+      `  let s = makeBox(10,10,10);`,
+      `  pts.forEach(p => s = s.fuse(p));`,
+      `  return s;`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/slow pattern/);
+    expect(text).toMatch(/`\.forEach` loop/);
+  });
+
+  it("flags .forEach with .intersect", () => {
+    const code = wrap([
+      `  let s = makeBox(10,10,10);`,
+      `  pts.forEach(p => s = s.intersect(p));`,
+      `  return s;`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/slow pattern/);
+    expect(text).toMatch(/`\.forEach` loop/);
+  });
+
+  // --- NEW: .reduce ---
+  it("flags .reduce with .cut", () => {
+    const code = wrap([
+      `  const s = pts.reduce((acc, p) => acc.cut(p), makeBox(10,10,10));`,
+      `  return s;`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/slow pattern/);
+    expect(text).toMatch(/`\.reduce` accumulator/);
+    expect(text).toMatch(/patterns\.cutAt/);
+  });
+
+  it("flags .reduce with .fuse", () => {
+    const code = wrap([
+      `  const s = pts.reduce((acc, p) => acc.fuse(p), makeBox(10,10,10));`,
+      `  return s;`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/slow pattern/);
+    expect(text).toMatch(/`\.reduce` accumulator/);
+  });
+
+  it("flags .reduce with .intersect", () => {
+    const code = wrap([
+      `  const s = pts.reduce((acc, p) => acc.intersect(p), makeBox(10,10,10));`,
+      `  return s;`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/slow pattern/);
+    expect(text).toMatch(/`\.reduce` accumulator/);
+  });
+
+  // --- Negative cases: must NOT trigger ---
+  it("does NOT flag a for-loop without .cut/.fuse/.intersect in the body", () => {
+    const code = wrap([
+      `  let total = 0;`,
+      `  for (let i=0; i<5; i++) { total += i; }`,
+      `  return makeBox(total, 10, 10);`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/slow pattern/);
+  });
+
+  it("does NOT flag a standalone .cut call outside any loop", () => {
+    const code = wrap([
+      `  const a = makeBox(10,10,10);`,
+      `  const b = makeBox(5,5,5);`,
+      `  return a.cut(b);`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/slow pattern/);
+  });
+
+  it("does NOT flag .forEach without a boolean method in the callback", () => {
+    const code = wrap([
+      `  const results: unknown[] = [];`,
+      `  pts.forEach(p => results.push(p));`,
+      `  return makeBox(10,10,10);`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/slow pattern/);
+  });
+
+  it("does NOT flag .reduce without a boolean method in the accumulator", () => {
+    const code = wrap([
+      `  const total = pts.reduce((acc, p) => acc + p.x, 0);`,
+      `  return makeBox(total, 10, 10);`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/slow pattern/);
   });
 });
 
@@ -390,5 +574,48 @@ describe("computePartsLine — Bug #5 focusPart unification", () => {
       "focused — other parts hidden in screenshot",
     );
     expect(line).toBe("\nParts: lid (focused — other parts hidden in screenshot)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// computeEffectiveMeshQuality — AI render mode auto-upgrade
+//
+// When renderMode is "ai" (or unset, which defaults to "ai") and the caller
+// did NOT explicitly pass meshQuality, the effective quality must be "final"
+// so the AI agent analyses accurate geometry. Explicit caller overrides
+// (including "preview") are always respected.
+// ---------------------------------------------------------------------------
+
+describe("computeEffectiveMeshQuality — AI render mode auto-upgrade", () => {
+  it("auto-upgrades to 'final' when renderMode=ai and meshQuality is not set", () => {
+    expect(computeEffectiveMeshQuality("ai", undefined)).toBe("final");
+  });
+
+  it("auto-upgrades to 'final' when renderMode is undefined (default 'ai') and meshQuality is not set", () => {
+    // renderMode absent == "ai" in the handler (renderMode || "ai").
+    expect(computeEffectiveMeshQuality(undefined, undefined)).toBe("final");
+  });
+
+  it("respects explicit meshQuality:'preview' even with renderMode=ai", () => {
+    // Caller opted in knowingly — do NOT override.
+    expect(computeEffectiveMeshQuality("ai", "preview")).toBe("preview");
+  });
+
+  it("respects explicit meshQuality:'final' with renderMode=ai (no-op upgrade)", () => {
+    expect(computeEffectiveMeshQuality("ai", "final")).toBe("final");
+  });
+
+  it("does NOT auto-upgrade when renderMode='dark' and meshQuality is not set", () => {
+    // Dark mode is for human review, not AI analysis — respect the absence
+    // of meshQuality (passes through as undefined → extension auto-degrades).
+    expect(computeEffectiveMeshQuality("dark", undefined)).toBeUndefined();
+  });
+
+  it("respects explicit meshQuality:'preview' with renderMode=dark", () => {
+    expect(computeEffectiveMeshQuality("dark", "preview")).toBe("preview");
+  });
+
+  it("respects explicit meshQuality:'final' with renderMode=dark", () => {
+    expect(computeEffectiveMeshQuality("dark", "final")).toBe("final");
   });
 });

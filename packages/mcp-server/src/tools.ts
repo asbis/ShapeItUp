@@ -946,6 +946,30 @@ export function checkBezierDegeneracy(code: string): string | null {
 }
 
 /**
+ * Compute the effective meshQuality to use for a render_preview call.
+ *
+ * Rule: when renderMode is "ai" (or absent — which defaults to "ai") AND
+ * the caller did NOT explicitly supply meshQuality, force "final" so the AI
+ * agent always analyses accurate geometry rather than a coarsely-faceted
+ * preview mesh.
+ *
+ * When the caller explicitly passes meshQuality (even "preview") their
+ * choice is respected — they opted in knowingly.
+ *
+ * Extracted so unit tests can verify the policy without spinning up the
+ * full MCP server.
+ */
+export function computeEffectiveMeshQuality(
+  renderMode: string | undefined,
+  meshQuality: "preview" | "final" | undefined
+): "preview" | "final" | undefined {
+  if ((renderMode === "ai" || renderMode === undefined) && meshQuality === undefined) {
+    return "final";
+  }
+  return meshQuality;
+}
+
+/**
  * Pure syntax + pitfall validator. Extracted from the `validate_syntax` /
  * `validate_script` MCP tools so unit tests can call it directly without
  * spinning up an MCP server. Returns the same text the tools emit, plus a
@@ -1184,12 +1208,21 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
       semanticWarnings.push(bezierWarning);
     }
 
-    // 6. .fuse(/.cut( inside a for-loop body — classic "slow pattern".
-    //    Walk the raw code, track brace depth from the `for (...)` header
-    //    to the matching `}`, and flag fuse/cut within.
+    // 6. Hand-rolled boolean loops — classic "slow pattern" that crosses the
+    //    WASM boundary N times instead of once. Detects five variants:
+    //    (a) for(...){...shape.cut/fuse/intersect...}
+    //    (b) while(...){...shape.cut/fuse/intersect...}
+    //    (c) arr.forEach(p => shape = shape.cut/fuse/intersect(p))
+    //    (d) arr.reduce((acc, p) => acc.cut/fuse/intersect(p), shape)
+    //    All recommend patterns.cutAt, which batches at the WASM boundary.
+    const boolInLoopBody = /\.\s*(fuse|cut|intersect)\s*\(/;
+
+    // (a) for-loop with brace-walk to extract body
+    let loopBoolSuggested = false;
+    let loopBoolKind = "";
+
     const forPattern = /\bfor\s*\([^)]*\)\s*\{/g;
     let forMatch: RegExpExecArray | null;
-    let loopBoolSuggested = false;
     while ((forMatch = forPattern.exec(code)) !== null) {
       let depth = 1;
       let i = forMatch.index + forMatch[0].length;
@@ -1201,14 +1234,63 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
         i++;
       }
       const body = code.slice(start, i);
-      if (/\.\s*(fuse|cut)\s*\(/.test(body)) {
+      if (boolInLoopBody.test(body)) {
         loopBoolSuggested = true;
+        loopBoolKind = "for";
         break;
       }
     }
+
+    // (b) while-loop — same brace-walk approach
+    if (!loopBoolSuggested) {
+      const whilePattern = /\bwhile\s*\([^)]*\)\s*\{/g;
+      let whileMatch: RegExpExecArray | null;
+      while ((whileMatch = whilePattern.exec(code)) !== null) {
+        let depth = 1;
+        let i = whileMatch.index + whileMatch[0].length;
+        const start = i;
+        while (i < code.length && depth > 0) {
+          const ch = code[i];
+          if (ch === "{") depth++;
+          else if (ch === "}") depth--;
+          i++;
+        }
+        const body = code.slice(start, i);
+        if (boolInLoopBody.test(body)) {
+          loopBoolSuggested = true;
+          loopBoolKind = "while";
+          break;
+        }
+      }
+    }
+
+    // (c) .forEach(... => ...cut/fuse/intersect...)
+    // Matches: arr.forEach(p => shape = shape.cut(p)) and arrow-body variants.
+    if (!loopBoolSuggested) {
+      const forEachBoolPattern = /\.forEach\s*\(\s*\w+\s*=>[^)]*\.\s*(fuse|cut|intersect)\s*\(/;
+      if (forEachBoolPattern.test(code)) {
+        loopBoolSuggested = true;
+        loopBoolKind = "forEach";
+      }
+    }
+
+    // (d) .reduce((acc, p) => acc.cut/fuse/intersect(p), ...)
+    if (!loopBoolSuggested) {
+      const reduceBoolPattern = /\.reduce\s*\(\s*\([^)]*\)\s*=>[^,)]*\.\s*(fuse|cut|intersect)\s*\(/;
+      if (reduceBoolPattern.test(code)) {
+        loopBoolSuggested = true;
+        loopBoolKind = "reduce";
+      }
+    }
+
     if (loopBoolSuggested) {
+      const construct = loopBoolKind === "forEach"
+        ? "`.forEach` loop"
+        : loopBoolKind === "reduce"
+          ? "`.reduce` accumulator"
+          : `\`${loopBoolKind}\` loop`;
       semanticWarnings.push(
-        "Multiple 3D `fuse`/`cut` inside a loop is slow — consider combining in 2D first (with `drawing.fuse()` / `drawing.cut()`) then a single `.extrude()` at the end. See the `booleans` category in get_api_reference."
+        `slow pattern: hand-rolled ${construct} with \`.cut\`/\`.fuse\`/\`.intersect\` calls is 2–5× slower than \`patterns.cutAt(shape, () => makeTool(), placements)\` — it batches at the WASM boundary. See the \`patterns\` category in get_api_reference.`
       );
     }
 
@@ -2216,7 +2298,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "validate_syntax",
-    "Validate TypeScript syntax and detect 6 common CAD pitfalls (sketch mischain, missing sketchOnPlane, unclosed pen, non-uniform scale, oversized fillet, booleans in loop). Does NOT verify imports, types, or runtime behavior — for that, call create_shape or modify_shape.",
+    "Validate TypeScript syntax and detect common CAD pitfalls (sketch mischain, missing sketchOnPlane, unclosed pen, non-uniform scale, oversized fillet, hand-rolled boolean loops including for/while/forEach/reduce with .cut/.fuse/.intersect, fillet-after-boolean). Does NOT verify imports, types, or runtime behavior — for that, call create_shape or modify_shape.",
     validateSyntaxSchema,
     safeHandler("validate_syntax", validateSyntaxImpl)
   );
@@ -2845,6 +2927,20 @@ export function registerTools(server: McpServer) {
       } else if (Array.isArray(cameraAngle)) {
         cameraAngle = cameraAngle.map(normalizeAngle) as typeof cameraAngle;
       }
+
+      // AI render mode quality guard: faceted preview meshes mislead an AI
+      // agent doing visual analysis of the screenshot. When renderMode is
+      // "ai" (the default) and the caller did NOT explicitly set meshQuality,
+      // force "final" so the AI always sees accurate geometry.
+      // If the caller explicitly passes meshQuality (including "preview") we
+      // respect their choice — they know what they want.
+      const effectiveMeshQuality = computeEffectiveMeshQuality(renderMode, meshQuality);
+      if (effectiveMeshQuality !== meshQuality) {
+        console.error(
+          `[render] auto-upgrade meshQuality preview→final because renderMode=${renderMode ?? "ai"} (default)`
+        );
+      }
+
       // Resolve which file to render: explicit > engine's last-executed > status file.
       const explicitFilePath = filePath !== undefined && filePath !== null;
       let source: string | undefined = filePath ? resolveShapePath(filePath) : getLastFileName();
@@ -3037,7 +3133,7 @@ export function registerTools(server: McpServer) {
               height: perH,
               focusPart,
               hideParts,
-              meshQuality,
+              meshQuality: effectiveMeshQuality,
             });
             if (!cmdId) {
               return { content: [{ type: "text" as const, text: "Failed to send command to extension" }], isError: true };
@@ -3300,9 +3396,9 @@ export function registerTools(server: McpServer) {
           height: height || 960,
           focusPart,
           hideParts,
-          // P3-10: forward the user's quality preference (undefined → the
-          // core auto-degrades based on part count).
-          meshQuality,
+          // P3-10: forward the effective quality (auto-upgraded to "final" for
+          // ai render mode when the caller didn't explicitly set meshQuality).
+          meshQuality: effectiveMeshQuality,
         });
         if (!cmdId) {
           return { content: [{ type: "text" as const, text: "Failed to send command to extension" }], isError: true };

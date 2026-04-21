@@ -58,12 +58,12 @@ describe("tessellatePart — meshQuality option", () => {
     expect(shape.lastMeshOpts!.angularTolerance).toBe(0.1);
   });
 
-  it("'preview' multiplies the auto-tolerance by 2.5x and loosens angular tolerance", () => {
+  it("'preview' multiplies the auto-tolerance by 4.5x and loosens angular tolerance", () => {
     const shape = makeMockShape(100);
     tess(shape, "preview");
-    // 0.0866 * 2.5 ≈ 0.2165 mm
-    expect(shape.lastMeshOpts!.tolerance).toBeCloseTo(0.2165, 3);
-    expect(shape.lastMeshOpts!.angularTolerance).toBe(0.25);
+    // 0.0866 * 4.5 ≈ 0.3897 mm (well under the 5.0 cap)
+    expect(shape.lastMeshOpts!.tolerance).toBeCloseTo(0.3897, 3);
+    expect(shape.lastMeshOpts!.angularTolerance).toBe(0.4);
   });
 
   it("'preview' tolerance is strictly greater than 'final' for the same shape", () => {
@@ -74,17 +74,28 @@ describe("tessellatePart — meshQuality option", () => {
     expect(sPreview.lastMeshOpts!.tolerance).toBeGreaterThan(
       sFinal.lastMeshOpts!.tolerance,
     );
-    // Ratio is exactly 2.5 barring the upper clamp (which doesn't fire here).
+    // Ratio is exactly 4.5 barring the upper clamp (which doesn't fire here).
     expect(
       sPreview.lastMeshOpts!.tolerance / sFinal.lastMeshOpts!.tolerance,
-    ).toBeCloseTo(2.5, 5);
+    ).toBeCloseTo(4.5, 5);
   });
 
-  it("preview tolerance is clamped to 2.5 mm for pathologically large shapes", () => {
-    // A 10 m cube (10000 mm) — diag * 0.0005 * 2.5 would blow past the cap.
+  it("preview tolerance is clamped to 5.0 mm for pathologically large shapes", () => {
+    // chooseTolerance caps at 1.0 mm internally; * 4.5 = 4.5 < outer cap 5.0.
+    // We verify the outer cap is 5.0 (not the old 2.5) and that large shapes
+    // land below it.
     const shape = makeMockShape(10000);
     tess(shape, "preview");
-    // Auto-tolerance clamps chooseTolerance at 1.0 internally; * 2.5 = 2.5.
-    expect(shape.lastMeshOpts!.tolerance).toBeLessThanOrEqual(2.5);
+    expect(shape.lastMeshOpts!.tolerance).toBeLessThanOrEqual(5.0);
+  });
+
+  it("preview tolerance exceeds the old 2.5 mm ceiling for large shapes", () => {
+    // With the new 4.5x factor, large shapes produce tolerances in the
+    // 4.0–5.0 mm range — strictly higher than the previous 2.5 mm ceiling.
+    // chooseTolerance(10000mm cube) = 1.0 mm (internal cap); * 4.5 = 4.5 mm.
+    const shape = makeMockShape(10000);
+    tess(shape, "preview");
+    expect(shape.lastMeshOpts!.tolerance).toBeGreaterThan(2.5);
+    expect(shape.lastMeshOpts!.tolerance).toBeCloseTo(4.5, 3);
   });
 });
