@@ -2750,6 +2750,12 @@ export function registerTools(server: McpServer) {
           type BomPartEntry = {
             name: string;
             qty: number;
+            /**
+             * When >1 identical rows were merged, list every member name so
+             * downstream tools (slicer handoff, part-picker UI) can still
+             * address individual instances. Omitted on singletons.
+             */
+            instances?: string[];
             material?: { density: number; name?: string };
             volume_mm3?: number;
             mass_g?: number;
@@ -2783,7 +2789,8 @@ export function registerTools(server: McpServer) {
             ? propsParts.filter((p) => p.name === partName)
             : propsParts;
 
-          const bomParts: BomPartEntry[] = filtered.map((p, idx) => {
+          // First pass: build per-part rows exactly as before.
+          const perPartRows: BomPartEntry[] = filtered.map((p, idx) => {
             const origIdx = partName
               ? propsParts.findIndex((q) => q.name === p.name)
               : idx;
@@ -2813,6 +2820,53 @@ export function registerTools(server: McpServer) {
             if (bb) entry.boundingBox = bb;
             return entry;
           });
+
+          // Second pass: collapse geometrically-identical rows into a single
+          // BOM entry with summed qty. Key preference: explicit `group` label
+          // (set via the `part({ group: ... })` stdlib factory) wins; else
+          // we fall back to a geometric signature on (material, volume,
+          // bounding-box extent) rounded to 2 dp so float noise doesn't
+          // fragment what should be one row. Callers that need per-instance
+          // addressability still get the `instances[]` list when merged.
+          const round2 = (n: number): number => Math.round(n * 100) / 100;
+          const bomParts: BomPartEntry[] = [];
+          const keyIndex = new Map<string, number>();
+          for (let i = 0; i < perPartRows.length; i++) {
+            const row = perPartRows[i];
+            const src = filtered[i] as { group?: string };
+            const explicitGroup = typeof src.group === "string" && src.group.length > 0
+              ? src.group
+              : undefined;
+            let key: string;
+            if (explicitGroup) {
+              key = `g:${explicitGroup}`;
+            } else {
+              const matKey = row.material
+                ? `${row.material.name ?? ""}:${row.material.density}`
+                : "";
+              const volKey = typeof row.volume_mm3 === "number" ? round2(row.volume_mm3) : "";
+              const bb = row.boundingBox;
+              const bbKey = bb
+                ? [round2(bb.max[0] - bb.min[0]), round2(bb.max[1] - bb.min[1]), round2(bb.max[2] - bb.min[2])].join(",")
+                : "";
+              key = `f:${matKey}|${volKey}|${bbKey}`;
+            }
+            const existingIdx = keyIndex.get(key);
+            if (existingIdx === undefined) {
+              keyIndex.set(key, bomParts.length);
+              bomParts.push({ ...row });
+            } else {
+              const tgt = bomParts[existingIdx];
+              tgt.qty += row.qty;
+              if (!tgt.instances) {
+                // First merge: seed with the original (first-kept) name, then
+                // append this row's name.
+                tgt.instances = [tgt.name, row.name];
+              } else {
+                tgt.instances.push(row.name);
+              }
+            }
+          }
 
           const totalMass = bomParts.reduce(
             (s, e) => s + (typeof e.mass_g === "number" ? e.mass_g * (e.qty ?? 1) : 0),
@@ -3917,8 +3971,23 @@ export function registerTools(server: McpServer) {
           else { cols = n; rows = 1; } // fallback for 1 (shouldn't happen — single-angle path owns n=1)
 
           const labelH = 28; // px of space below each tile for the angle label
-          const totalW = perW * cols;
-          const totalH = (perH + labelH) * rows;
+          const tileGap = 24; // px gutter between adjacent tiles (both axes)
+          const legendH = 32; // px band below the tile grid for the shared legend
+          // Tile strip width: `cols` tiles plus `cols - 1` gutters. For cols=1
+          // the second term is zero, so a single-tile collage matches perW exactly.
+          const totalW = perW * cols + tileGap * Math.max(0, cols - 1);
+          // Tile strip height: `rows` of image+label plus `rows - 1` gutters.
+          const tilesH = (perH + labelH) * rows + tileGap * Math.max(0, rows - 1);
+          // Total height adds the legend band below the tiles.
+          const totalH = tilesH + legendH;
+
+          // Approximate max chars per label that comfortably fit inside one
+          // tile's width given the 18 px sans-serif. 8 px/char is generous for
+          // a proportional font but keeps the math cheap and the edge case
+          // (huge angle names on narrow tiles) safely truncated.
+          const maxLabelChars = Math.max(4, Math.floor((perW - 12) / 8));
+          const truncateLabel = (s: string): string =>
+            s.length <= maxLabelChars ? s : s.slice(0, Math.max(1, maxLabelChars - 1)) + "…";
 
           // Build an SVG that references each captured PNG as base64. Fonts
           // are suppressed in svg-to-png.ts (font: { loadSystemFonts: false }),
@@ -3930,15 +3999,26 @@ export function registerTools(server: McpServer) {
           for (let i = 0; i < n; i++) {
             const col = i % cols;
             const row = Math.floor(i / cols);
-            const x = col * perW;
-            const y = row * (perH + labelH);
+            const x = col * (perW + tileGap);
+            const y = row * (perH + labelH + tileGap);
             const b64 = readFileSync(capturedPaths[i]).toString("base64");
             svg += `<image x="${x}" y="${y}" width="${perW}" height="${perH}" xlink:href="data:image/png;base64,${b64}"/>\n`;
-            const label = angleList[i];
+            const label = truncateLabel(angleList[i]);
             const labelX = x + perW / 2;
             const labelY = y + perH + labelH * 0.7;
-            svg += `<text x="${labelX}" y="${labelY}" text-anchor="middle" font-family="sans-serif" font-size="18" fill="#222">${label}</text>\n`;
+            // Clip the label to the tile width so an over-long name can't
+            // spill into the neighbouring tile — truncation above gives the
+            // common case; textLength is the belt-and-braces guard.
+            svg += `<text x="${labelX}" y="${labelY}" text-anchor="middle" font-family="sans-serif" font-size="18" fill="#222" textLength="${perW - 12}" lengthAdjust="spacingAndGlyphs">${label}</text>\n`;
           }
+          // Legend band: a single strip below the tile grid summarizing the
+          // full set of angles rendered. Keeps per-tile labels uncluttered
+          // when we had to truncate, and gives the viewer one place to see
+          // every angle name in full.
+          const legendY = tilesH + legendH * 0.65;
+          const legendText = angleList.join("  |  ");
+          svg += `<rect x="0" y="${tilesH}" width="${totalW}" height="${legendH}" fill="#f5f5f5"/>\n`;
+          svg += `<text x="${totalW / 2}" y="${legendY}" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#444">${legendText}</text>\n`;
           svg += `</svg>\n`;
 
           const collagePath = join(previewsDir, `shapeitup-preview-${userBase}-collage.png`);

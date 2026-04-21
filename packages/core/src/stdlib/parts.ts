@@ -200,6 +200,12 @@ export function composeTransforms(first: Transform, second: Transform): Transfor
 export interface PartOptions {
   name?: string;
   color?: string;
+  /**
+   * Optional BOM group label — identical `group` values collapse into a
+   * single BOM row with summed `qty`, regardless of geometry. Leave unset
+   * to fall back to geometric dedup (material + volume + bbox).
+   */
+  group?: string;
   /** @internal Used by `assemble()` to return positioned parts without rebuilding shapes. */
   joints?: Record<string, JointSpec>;
   /** @internal Accumulated world transform. */
@@ -230,6 +236,7 @@ export class Part {
   readonly shape: Shape3D;
   readonly name?: string;
   readonly color?: string;
+  readonly group?: string;
   private readonly _localJoints: Record<string, JointSpec>;
   private readonly _xform: Transform;
   private readonly _children: ReadonlyArray<Part>;
@@ -238,6 +245,7 @@ export class Part {
     this.shape = shape;
     this.name = opts.name;
     this.color = opts.color;
+    this.group = opts.group;
     this._localJoints = opts.joints ?? {};
     this._xform = opts.xform ?? IDENTITY;
     this._children = opts.children ?? [];
@@ -444,11 +452,12 @@ export class Part {
    * use `toEntries()` instead if you want each child rendered as its own
    * part in the viewer (typical case).
    */
-  toEntry(): { shape: Shape3D; name?: string; color?: string } {
+  toEntry(): { shape: Shape3D; name?: string; color?: string; group?: string } {
     return {
       shape: this.worldShape(),
       name: this.name,
       color: this.color,
+      ...(this.group !== undefined ? { group: this.group } : {}),
     };
   }
 
@@ -466,19 +475,21 @@ export class Part {
    *   Each child keeps its own name and color (fall back to the
    *   subassembly's color if a child has none).
    */
-  toEntries(): Array<{ shape: Shape3D; name?: string; color?: string }> {
+  toEntries(): Array<{ shape: Shape3D; name?: string; color?: string; group?: string }> {
     if (this._children.length === 0) {
       return [this.toEntry()];
     }
     const outerXform = this._xform;
     const inheritColor = this.color;
-    const out: Array<{ shape: Shape3D; name?: string; color?: string }> = [];
+    const inheritGroup = this.group;
+    const out: Array<{ shape: Shape3D; name?: string; color?: string; group?: string }> = [];
     for (const child of this._children) {
       // Child's `_xform` is its position within THIS subassembly (local frame).
       // Compose with the subassembly's outer xform to get the child's world pose.
       const composed = new Part(child.shape, {
         name: child.name,
         color: child.color ?? inheritColor,
+        group: child.group ?? inheritGroup,
         joints: child._localJoints,
         xform: composeTransforms(child._xform, outerXform),
         children: child._children,
@@ -502,6 +513,14 @@ export function joint(position: Point3, opts: JointOpts): JointSpec {
   };
 }
 
+/**
+ * Alias for `joint` — positions a joint at an arbitrary 3D point.
+ * Prefer `jointAt([x, y, z], opts)` when the joint isn't on the Z-axis face
+ * (e.g. joints on vertical walls, corner pivots). For Z-plane joints you can
+ * still use the `faceAt` / `shaftAt` / `boreAt` sugar.
+ */
+export const jointAt = joint;
+
 // ── Declarative factory + joint shortcuts ───────────────────────────────────
 //
 // The `part({...})` factory collapses `new Part(...).addJoint().addJoint()`
@@ -522,6 +541,12 @@ export interface PartFactoryOpts {
   shape: Shape3D;
   name?: string;
   color?: string;
+  /**
+   * Optional BOM group label. Parts that share a `group` value collapse into
+   * a single BOM row with summed `qty`, regardless of geometric differences.
+   * Omit to fall back to geometric dedup (material + volume + bbox).
+   */
+  group?: string;
   joints?: Record<string, InlineJointSpec>;
 }
 
@@ -543,7 +568,7 @@ export interface PartFactoryOpts {
  * fluent `.addJoint()` chain form (e.g., conditionally adding joints).
  */
 export function part(opts: PartFactoryOpts): Part {
-  let p = new Part(opts.shape, { name: opts.name, color: opts.color });
+  let p = new Part(opts.shape, { name: opts.name, color: opts.color, group: opts.group });
   if (opts.joints) {
     for (const [name, j] of Object.entries(opts.joints)) {
       p = p.addJoint(name, j.at, {

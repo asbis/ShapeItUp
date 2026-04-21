@@ -511,6 +511,13 @@ export interface ShapeProperties {
     /** Per-part material override (propagated from `PartInput.material`). */
     material?: { density: number; name?: string };
     /**
+     * Optional BOM group label (propagated from the stdlib `part()` factory's
+     * `group` option). When set, the BOM emitter collapses identical groups
+     * into a single row with summed qty. Undefined → fall back to geometric
+     * dedup on (material, volume, bbox).
+     */
+    group?: string;
+    /**
      * FDM-printability heuristics computed at render time from the
      * tessellated triangle mesh + BRepCheck's manifold flag. Lets downstream
      * tools (`get_render_status`, `export_shape`) warn the user before the
@@ -1632,6 +1639,13 @@ function aggregateProperties(
       // walk a second data source. Absent when the script didn't declare them.
       ...(typeof p.qty === "number" ? { qty: p.qty } : {}),
       ...(p.material ? { material: p.material } : {}),
+      // Propagate the optional BOM group label from stdlib `part()` when
+      // attached. TessellatedPart doesn't currently type `group`, so read
+      // it off `p` via an untyped lookup — absent on every script that
+      // doesn't use `group`, so the output stays clean.
+      ...(typeof (p as any).group === "string" && (p as any).group.length > 0
+        ? { group: (p as any).group as string }
+        : {}),
     };
 
     if (skipAnalysis) {
@@ -1649,13 +1663,16 @@ function aggregateProperties(
     }
     // Boolean operations routinely leave sub-mm sliver edges at cut/fuse
     // boundaries — firing a printability warning on every part that ever
-    // called .cut() was pure noise (48 identical lines on the
-    // knitting-printer review). Narrow the threshold to 1/4 of a typical
-    // nozzle: below 0.1 mm is far enough past boolean-artefact territory
-    // that it probably IS a genuinely thin face, and the rewording admits
-    // the ambiguity instead of asserting "below nozzle" as a fact.
-    const MIN_EDGE_WARN_MM = DEFAULT_NOZZLE_MM / 4;
-    if (Number.isFinite(minEdge) && minEdge < MIN_EDGE_WARN_MM) {
+    // called .cut() was pure noise (48 identical lines on the knitting-
+    // printer review, still firing on 0.06–0.10 mm slivers in the
+    // external CAD review). Narrow the threshold further and gate on
+    // non-manifold geometry: on a manifold, watertight shape a sub-nozzle
+    // sliver is almost always a boolean artefact (cosmetic, sliceable),
+    // not a real thin face. Real thin-wall problems show up as both a
+    // tiny minEdge AND a non-manifold validation failure, which the
+    // explicit "Non-manifold geometry" issue above already covers.
+    const MIN_EDGE_WARN_MM = DEFAULT_NOZZLE_MM / 8;
+    if (Number.isFinite(minEdge) && minEdge < MIN_EDGE_WARN_MM && !geometryValid) {
       issues.push(
         `Minimum edge fragment ${minEdge.toFixed(2)} mm — likely boolean artefact, not a printability concern unless a real face is thin`,
       );
