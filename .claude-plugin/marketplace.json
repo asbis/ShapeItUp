@@ -1,0 +1,39 @@
+{
+  "name": "shapeitup",
+  "owner": {
+    "name": "Asbjorn Rorvik",
+    "email": "rorvik.asbjorn@gmail.com"
+  },
+  "metadata": {
+    "description": "Scripted CAD for AI agents — write TypeScript + Replicad, get STEP/STL. Headless MCP server for geometry tools; optional VS Code extension for live 3D preview.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "shapeitup",
+      "description": "CAD scripting toolkit: create/modify .shape.ts files, validate geometry, check collisions, export STEP/STL via Replicad + OpenCascade. Runs headless; live 3D preview available if the ShapeItUp VS Code extension is installed.",
+      "version": "1.3.0",
+      "author": {
+        "name": "Asbjorn Rorvik",
+        "email": "rorvik.asbjorn@gmail.com"
+      },
+      "homepage": "https://github.com/asbis/ShapeItUp",
+      "repository": "https://github.com/asbis/ShapeItUp",
+      "license": "MIT",
+      "keywords": ["cad", "3d", "replicad", "opencascade", "step", "stl", "parametric", "mechanical-engineering"],
+      "category": "productivity",
+      "source": {
+        "source": "github",
+        "repo": "asbis/ShapeItUp"
+      },
+      "strict": false,
+      "skills": ["./skills"],
+      "mcpServers": {
+        "shapeitup": {
+          "command": "npx",
+          "args": ["-y", "@shapeitup/mcp-server"]
+        }
+      }
+    }
+  ]
+}
