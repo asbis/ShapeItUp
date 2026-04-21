@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { validateSyntaxPure, detectPathDoubling, detectPathDoublingInfo, extractSignatures, safeHandler, computePartsLine, computeEffectiveMeshQuality, formatCollisionPairs, type CollisionEntry } from "./tools.js";
+import { validateSyntaxPure, detectPathDoubling, detectPathDoublingInfo, extractSignatures, safeHandler, computePartsLine, computeEffectiveMeshQuality, formatCollisionPairs, formatSweepCollisions, type CollisionEntry, type SweepCollisionEntry } from "./tools.js";
 
 // ---------------------------------------------------------------------------
 // Bug #6 — validate_syntax must trust .method() calls whose receiver was
@@ -717,5 +717,100 @@ describe("formatCollisionPairs — check_collisions format param", () => {
   it("ids format: empty collisions returns empty array", () => {
     const out = formatCollisionPairs([], [], [], 0.5, "ids", accounting);
     expect(JSON.parse(out)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatSweepCollisions — unit tests for sweep_check format param
+// ---------------------------------------------------------------------------
+
+/** Build sweep collision fixtures. */
+function makeSweepCollisions(stepVolumes: Array<[number, number, string, string]>): SweepCollisionEntry[] {
+  return stepVolumes.map(([step, volume, pairA, pairB]) => ({
+    step,
+    angle: step * 10,
+    pairA,
+    pairB,
+    volume,
+  }));
+}
+
+describe("formatSweepCollisions — sweep_check format param", () => {
+  // 5 collisions across 3 steps: step 0 (1 pair), step 2 (2 pairs), step 4 (2 pairs)
+  const collisions = makeSweepCollisions([
+    [0, 3.0, "arm", "wall"],
+    [2, 8.5, "arm", "wall"],
+    [2, 6.2, "arm", "floor"],
+    [4, 5.0, "arm", "wall"],
+    [4, 4.1, "arm", "ceiling"],
+  ]);
+  // angles array: step index → angle in degrees (0,10,20,30,40)
+  const angles = [0, 10, 20, 30, 40];
+
+  it("default (no format → summary): emits per-step counts, not per-pair lines", () => {
+    const out = formatSweepCollisions(collisions, angles, "summary");
+    // Should show count per step.
+    expect(out).toMatch(/Step 0.*1 collision/);
+    expect(out).toMatch(/Step 2.*2 collision/);
+    expect(out).toMatch(/Step 4.*2 collision/);
+    // Must NOT list individual pair lines for each collision.
+    const pairLines = out.split("\n").filter((l) => l.includes(" \u2194 ") && !l.includes("Worst"));
+    // Only worst step detail — worst is step 2 (volume 8.5+6.2=14.7), its pairs are listed.
+    // But they're indented under "Worst step:" not as top-level ✗ lines.
+    expect(pairLines.length).toBeLessThanOrEqual(2);
+  });
+
+  it("default summary: includes worst step with pair detail", () => {
+    const out = formatSweepCollisions(collisions, angles, "summary");
+    // Worst step = step 2 (14.7 total vol vs step 4's 9.1 and step 0's 3.0).
+    expect(out).toContain("Worst step: 2");
+    expect(out).toContain("arm \u2194 wall");
+    expect(out).toContain("arm \u2194 floor");
+  });
+
+  it("format=full: emits one \u2717 line per collision pair", () => {
+    const out = formatSweepCollisions(collisions, angles, "full");
+    // Each collision gets its own ✗ line.
+    const crossLines = out.split("\n").filter((l) => l.includes("\u2717"));
+    expect(crossLines).toHaveLength(5);
+    // Must contain per-pair detail.
+    expect(out).toContain("arm \u2194 wall");
+  });
+
+  it("summary is shorter than full when there are 5+ collisions", () => {
+    const summaryOut = formatSweepCollisions(collisions, angles, "summary");
+    const fullOut = formatSweepCollisions(collisions, angles, "full");
+    expect(summaryOut.length).toBeLessThan(fullOut.length);
+  });
+
+  it("format=ids: returns [step, pairs] tuples as JSON, no prose", () => {
+    const out = formatSweepCollisions(collisions, angles, "ids");
+    expect(() => JSON.parse(out)).not.toThrow();
+    const tuples = JSON.parse(out) as Array<[number, Array<[string, string, number]>]>;
+    expect(Array.isArray(tuples)).toBe(true);
+    // 3 unique steps.
+    expect(tuples).toHaveLength(3);
+    // Step 2 has 2 pairs.
+    const step2 = tuples.find(([s]) => s === 2);
+    expect(step2).toBeDefined();
+    expect(step2![1]).toHaveLength(2);
+    // No prose in ids output.
+    expect(out).not.toContain("Sweep check");
+    expect(out).not.toContain("Clear");
+  });
+
+  it("ids: empty collisions returns empty array", () => {
+    const out = formatSweepCollisions([], [0, 10, 20], "ids");
+    expect(JSON.parse(out)).toEqual([]);
+  });
+
+  it("summary with no collisions: reports clear through all steps", () => {
+    const out = formatSweepCollisions([], [0, 10, 20, 30, 40], "summary");
+    expect(out).toContain("\u2713 Clear through all 5 steps");
+  });
+
+  it("full with no collisions: reports clear through all steps", () => {
+    const out = formatSweepCollisions([], [0, 10, 20, 30, 40], "full");
+    expect(out).toContain("\u2713 Clear through all 5 steps");
   });
 });

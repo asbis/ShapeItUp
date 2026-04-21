@@ -1617,6 +1617,86 @@ export function formatCollisionPairs(
   return sections.join("\n");
 }
 
+export type SweepCollisionEntry = {
+  step: number;
+  angle: number;
+  pairA: string;
+  pairB: string;
+  volume: number;
+};
+
+/** Render the per-step collision block for sweep_check. */
+export function formatSweepCollisions(
+  collisions: SweepCollisionEntry[],
+  angles: number[],
+  sweepFormat: CollisionReportFormat,
+): string {
+  const fmt = (x: number) => (Math.abs(x) >= 1000 ? x.toFixed(0) : x.toFixed(2));
+  const fmtAngle = (a: number) => (Math.abs(a) >= 100 ? a.toFixed(1) : a.toFixed(2));
+  const n = angles.length;
+
+  if (sweepFormat === "ids") {
+    const byStep = new Map<number, Array<[string, string, number]>>();
+    for (const c of collisions) {
+      const entry = byStep.get(c.step) ?? [];
+      entry.push([c.pairA, c.pairB, parseFloat(fmt(c.volume))]);
+      byStep.set(c.step, entry);
+    }
+    const tuples = Array.from(byStep.entries()).map(([step, pairs]) => [step, pairs]);
+    return JSON.stringify(tuples);
+  }
+
+  const sections: string[] = [];
+  const colidingSteps = new Set(collisions.map((c) => c.step));
+  const firstCollide = n > 0
+    ? Array.from({ length: n }, (_, i) => i).find((i) => colidingSteps.has(i))
+    : undefined;
+
+  if (firstCollide === undefined) {
+    sections.push(`  \u2713 Clear through all ${n} steps (angles ${fmtAngle(angles[0])}\u00b0 \u2026 ${fmtAngle(angles[n - 1])}\u00b0)`);
+  } else if (firstCollide > 0) {
+    sections.push(
+      `  \u2713 Clear through steps 0\u2013${firstCollide - 1} (angles ${fmtAngle(angles[0])}\u00b0 \u2026 ${fmtAngle(angles[firstCollide - 1])}\u00b0)`,
+    );
+  }
+
+  if (sweepFormat === "full") {
+    for (const c of collisions) {
+      sections.push(
+        `  \u2717 Step ${c.step} (angle ${fmtAngle(c.angle)}\u00b0): ${c.pairA} \u2194 ${c.pairB} ${fmt(c.volume)} mm\u00b3`,
+      );
+    }
+  } else {
+    // summary: per-step counts + worst step detail
+    if (collisions.length > 0) {
+      const stepCounts = new Map<number, number>();
+      const stepVolumes = new Map<number, number>();
+      for (const c of collisions) {
+        stepCounts.set(c.step, (stepCounts.get(c.step) ?? 0) + 1);
+        stepVolumes.set(c.step, (stepVolumes.get(c.step) ?? 0) + c.volume);
+      }
+      const sortedSteps = Array.from(stepCounts.keys()).sort((a, b) => a - b);
+      for (const s of sortedSteps) {
+        const cnt = stepCounts.get(s)!;
+        sections.push(
+          `  \u2717 Step ${s} (${fmtAngle(angles[s])}\u00b0): ${cnt} collision${cnt === 1 ? "" : "s"}`,
+        );
+      }
+      let worstStep = sortedSteps[0];
+      for (const s of sortedSteps) {
+        if ((stepVolumes.get(s) ?? 0) > (stepVolumes.get(worstStep) ?? 0)) worstStep = s;
+      }
+      const worstPairs = collisions.filter((c) => c.step === worstStep);
+      sections.push(`\n  Worst step: ${worstStep} (${fmtAngle(angles[worstStep])}\u00b0)`);
+      for (const c of worstPairs) {
+        sections.push(`    ${c.pairA} \u2194 ${c.pairB}: ${fmt(c.volume)} mm\u00b3`);
+      }
+    }
+  }
+
+  return sections.join("\n");
+}
+
 export function registerTools(server: McpServer) {
   server.tool(
     "setup_shape_project",
@@ -4550,7 +4630,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "sweep_check",
-    "Rotate a single named part through a range of angles around a pivot+axis and report any collisions it would make with the other parts at each step. Useful for articulated mechanisms (hinges, arms, linkages) where static collision checks miss motion conflicts. The moving part is cloned at every step so the original assembly is never mutated. Also reports the swept-volume AABB — the union of the moving part's axis-aligned bounds across every step — so you can size clearance envelopes. Pass either `filePath` or `code` (mutually exclusive, same rules as check_collisions).",
+    "Rotate a single named part through a range of angles around a pivot+axis and report any collisions it would make with the other parts at each step. Useful for articulated mechanisms (hinges, arms, linkages) where static collision checks miss motion conflicts. The moving part is cloned at every step so the original assembly is never mutated. Also reports the swept-volume AABB — the union of the moving part's axis-aligned bounds across every step — so you can size clearance envelopes. Pass either `filePath` or `code` (mutually exclusive, same rules as check_collisions). Pass `format: 'full'` for per-pair geometry; default summary keeps responses compact.",
     {
       filePath: z.string().optional().describe("Path to the .shape.ts file to sweep. Absolute passes through; relative probes workspace roots. Mutually exclusive with `code`."),
       code: z.string().optional().describe("Inline .shape.ts source — written to a temp file, executed, then deleted. Use `workingDir` for relative-import resolution. Mutually exclusive with `filePath`."),
@@ -4561,8 +4641,9 @@ export function registerTools(server: McpServer) {
       range: z.array(z.number()).length(2).describe("[startDeg, endDeg] sweep range in degrees. Direction matters — [0, 90] sweeps positive, [0, -90] sweeps negative."),
       steps: z.number().int().positive().describe("Number of angle samples (inclusive endpoints). 8-24 is typical; more samples = finer resolution but linear slowdown."),
       tolerance: z.number().optional().describe("Minimum intersection volume in mm³ to count as a collision. Defaults to 0.001 — filters out numerical-noise touches. Negative values clamp to 0."),
+      format: z.enum(["summary", "full", "ids"]).optional().describe("Report verbosity. summary (default): per-step counts only + worst step detail. full: per-step per-pair dump. ids: [step, [[a,b,vol],...]] tuples."),
     },
-    safeHandler("sweep_check", async ({ filePath, code, workingDir, moving, pivot, axis, range, steps, tolerance }) => {
+    safeHandler("sweep_check", async ({ filePath, code, workingDir, moving, pivot, axis, range, steps, tolerance, format }) => {
       if (filePath !== undefined && code !== undefined) {
         return {
           content: [{ type: "text" as const, text: "sweep_check: pass either `filePath` OR `code`, not both." }],
@@ -4726,34 +4807,21 @@ export function registerTools(server: McpServer) {
         }
 
         // ---- Formatting -------------------------------------------------
-        const sections: string[] = [];
+        const sweepFormat: CollisionReportFormat = format ?? "summary";
         const rangeHdr = `[${fmtAngle(startDeg)}\u00b0, ${fmtAngle(endDeg)}\u00b0]`;
-        sections.push(
-          `Sweep check: '${moving}' rotating ${rangeHdr} in ${n} steps around [${fmt(pivot[0])},${fmt(pivot[1])},${fmt(pivot[2])}] axis [${fmt(axis[0])},${fmt(axis[1])},${fmt(axis[2])}]`,
-        );
 
-        // Collapse the contiguous-clear prefix/infix into a single "Clear
-        // through steps a–b" line so long clean sweeps don't spam 24 lines.
-        const colidingSteps = new Set(collisions.map((c) => c.step));
-        const firstCollide = n > 0
-          ? Array.from({ length: n }, (_, i) => i).find((i) => colidingSteps.has(i))
-          : undefined;
-        if (firstCollide === undefined) {
-          // Entirely clear sweep.
-          sections.push(`  \u2713 Clear through all ${n} steps (angles ${fmtAngle(angles[0])}\u00b0 \u2026 ${fmtAngle(angles[n - 1])}\u00b0)`);
-        } else if (firstCollide > 0) {
-          sections.push(
-            `  \u2713 Clear through steps 0\u2013${firstCollide - 1} (angles ${fmtAngle(angles[0])}\u00b0 \u2026 ${fmtAngle(angles[firstCollide - 1])}\u00b0)`,
-          );
+        // ids format: delegate entirely to the pure helper, no header prose.
+        if (sweepFormat === "ids") {
+          return {
+            content: [{ type: "text" as const, text: formatSweepCollisions(collisions, angles, "ids") }],
+          };
         }
 
-        // Per-collision lines — every step with at least one collision gets
-        // one line per offending pair. Preserve sweep order.
-        for (const c of collisions) {
-          sections.push(
-            `  \u2717 Step ${c.step} (angle ${fmtAngle(c.angle)}\u00b0): ${c.pairA} \u2194 ${c.pairB} ${fmt(c.volume)} mm\u00b3`,
-          );
-        }
+        // summary / full: header + pure formatting helper + envelope trailer.
+        const headerLine = `Sweep check: '${moving}' rotating ${rangeHdr} in ${n} steps around [${fmt(pivot[0])},${fmt(pivot[1])},${fmt(pivot[2])}] axis [${fmt(axis[0])},${fmt(axis[1])},${fmt(axis[2])}]`;
+        const collisionBlock = formatSweepCollisions(collisions, angles, sweepFormat);
+        const sections: string[] = [headerLine];
+        if (collisionBlock) sections.push(collisionBlock);
 
         if (failures.length > 0) {
           sections.push(`\nProbe failures (recorded, not counted as collisions):`);
