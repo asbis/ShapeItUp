@@ -37,6 +37,7 @@ This skill gives you breadth: what to call, when, how. For depth (full signature
 Start with `create_shape` (or `modify_shape`) — the status from that call tells you whether the render succeeded and returns every stat you need. Branch based on what came back:
 
 - Render succeeded
+  - Already rendered and only tuning a number (no code change) → `modify_shape({ filePath, params: {...} })` — params-only call re-runs with new values without rewriting the file. Reach for this BEFORE considering a fresh `create_shape` / full `modify_shape({ code })`.
   - Need visual check → `render_preview` (returns PNG path; Read the file to see it)
   - Need dims/volume/mass only → use the stats already in the `create_shape`/`modify_shape` response (or `get_render_status`). No screenshot needed.
   - Exploring a parameter range (target volume, fit tolerance, bbox) → `tune_params` (ephemeral overrides, doesn't touch the file) until happy, then `modify_shape` with the winning value
@@ -65,7 +66,7 @@ All 20 tools. Dense reference — use this table to find the right tool fast.
 |------|---------|----------|
 | `setup_shape_project` | Bootstrap a folder with `.shape.ts` type stubs + tsconfig. **You usually don't need to call this — `create_shape` auto-bootstraps on first write.** Call explicitly only when editor import errors persist in a brand-new folder. Never runs `npm install` — replicad/OCCT are bundled inside the MCP server itself. | `directory` |
 | `create_shape` | Create new `.shape.ts` and execute (auto-bootstraps types on first write) | `name`, `code`, `directory?`, `overwrite?` |
-| `modify_shape` | Overwrite existing `.shape.ts` and execute | `filePath`, `code` |
+| `modify_shape` | Overwrite existing `.shape.ts` and execute. **Params-only form** (`{ filePath, params }` with no `code`) re-renders with new param values without rewriting the file — preferred for "tune one number" on an already-rendered shape. | `filePath`, `code?`, `params?` |
 | `read_shape` | Read file contents | `filePath` |
 | `open_shape` | Execute an existing file, bring up in viewer | `filePath` |
 | `delete_shape` | Delete a `.shape.ts` file | `filePath` |
@@ -88,7 +89,21 @@ All 20 tools. Dense reference — use this table to find the right tool fast.
 
 ## Plane orientation (read this first)
 
-The single most common first-time mistake in this library — wrong extrude direction. Memorize:
+### Prefer the axis-explicit stdlib primitives
+
+**Before reaching for `drawRectangle(w, h).sketchOnPlane(plane).extrude(d)`**, check whether one of these does the job. They take a world axis directly and remove every plane-orientation footgun below.
+
+| Instead of | Use |
+|------------|-----|
+| `makeCylinder(r, h, loc, dir)` or `drawCircle(r).sketchOnPlane(...).extrude(h)` | `cylinder({ bottom, length, diameter, direction: "+Y" })` — base/top explicit, axis named |
+| `makeBox([x0,y0,z0], [x1,y1,z1])` | `box({ from: [x0,y0,z0], to: [x1,y1,z1] })` — validates `to > from` on every axis |
+| `drawRectangle(w, h).sketchOnPlane("XZ").extrude(d)` (surprise-direction) | `prism({ profile: drawRectangle(w, h), along: "+Y", length: d })` — lands in the half-space you named |
+
+`box` / `prism` / `cylinder` all live in `shapeitup` — use them whenever the geometry is axis-aligned. Reach for raw `sketchOnPlane(...).extrude(...)` only for non-rectangular / revolved / lofted profiles.
+
+### If you really need sketchOnPlane, memorize the extrude direction
+
+Replicad's native extrude grows in a different world direction per plane — the #1 first-time mistake:
 
 ```
 XY → extrudes +Z (up)
@@ -97,6 +112,8 @@ YZ → extrudes +X
 ```
 
 No exceptions, no flags, no "it depends". To flip direction, use the reverse-named plane (`YX` → -Z, `ZX` → +Y, `ZY` → -X) or pass a negative extrude depth (`.extrude(-L)`). `sketchOnPlane("XZ", [0, 0, 20])`'s origin offset is in WORLD coordinates, so the `[0, 0, 20]` raises along world Z, NOT along the XZ plane's local axis.
+
+Or skip all that and use `prism({ along: "+Y", length: 20 })` — same shape, no sign puzzle.
 
 ### Pen axis mapping (`draw().hLine` / `.vLine`, `Sketcher`)
 
@@ -172,6 +189,15 @@ return [
 ```
 
 Each part gets its own color in the viewer and becomes a named component in STEP files. Per-part stats (volume, surface area, CoM, bbox, mass) are returned by `get_render_status`.
+
+Mark mockup / reference parts with `analyze: false` to suppress printability and minFeature warnings for geometry you won't fabricate (motors, pre-bought tubes, collision-check stand-ins):
+
+```typescript
+return [
+  { shape: housing,     name: "housing",    color: "#8899aa" },
+  { shape: servoMockup, name: "servo",      color: "#333", analyze: false },
+];
+```
 
 ---
 
@@ -466,6 +492,8 @@ export default function main() {
 
 ## Multi-File & Assemblies
 
+**Rule of thumb: each `.shape.ts` file's `default export main()` is treated as the render entrypoint only for the file you're currently opening. To compose parts from another `.shape.ts`, always export and import a NAMED factory (e.g., `export function makeSolenoidBankParts(...)`), not the default.**
+
 ### Importing between shape files
 
 `main()` is only invoked when a file is the top-level shape — it's NOT imported. Export named factory functions for reuse. If you see `No matching export in "x.shape.ts" for import "makeX"`, you're trying to import something that's only reachable via `main()`'s return value.
@@ -505,6 +533,36 @@ export default function main() {
   return [makeBolt(8, 20).translate(10, 0, 0), makeBolt(8, 20).translate(-10, 0, 0)];
 }
 ```
+
+### `composeAssembly` — parametric multi-file assemblies
+
+When two files each export their own parametric `main()` + `params` (e.g. a pinch-valve's `body.shape.ts` and `cam.shape.ts`), `composeAssembly` merges both `params` dicts into one and dispatches slider overrides to the right child. No hand-typed params, no overlap ambiguity — duplicate keys throw at load time, naming both sides.
+
+```typescript
+// body.shape.ts
+export const params = { bodyWidth: 80, bodyBore: 12 };
+export default function main(p = params) { /* ... */ }
+
+// cam.shape.ts
+export const params = { camRadius: 10, camOffset: 2 };
+export default function main(p = params) { /* ... */ }
+
+// assembly.shape.ts
+import { composeAssembly } from "shapeitup";
+import * as body from "./body.shape";
+import * as cam  from "./cam.shape";
+const assembly = composeAssembly({
+  parts: [
+    { main: body.default, params: body.params },
+    { main: cam.default,  params: cam.params,
+      transform: (p) => ({ ...p, shape: p.shape.translate(0, 0, 20), name: "cam" }) },
+  ],
+});
+export const params = assembly.params;
+export default assembly.main;
+```
+
+The `transform` hook clones the shape before running (Replicad's translate/rotate consume the input), so it's safe to pose children without breaking caching. Each child still returns `Shape3D` or `{ shape, name, color, ... }`; composeAssembly flattens both into the top-level array.
 
 ### `main()` return types
 
@@ -660,10 +718,16 @@ Mechanical / 3D-printing helpers layered on top of Replicad. **Use these instead
 import { holes, screws, bolts, washers, inserts, bearings, extrusions, printHints } from "shapeitup";
 ```
 
-**Cut-tool orientation convention** — every hole/seat/pocket helper returns a Shape3D with axis +Z, top at Z=0, extending into -Z. Translate it to the target location, then `.cut()`:
+**Cut-tool orientation convention** — every hole/seat/pocket helper returns a Shape3D with axis +Z, top at Z=0, extending into -Z. The ergonomic shortcut is to hand the tool factory to `patterns.cutTop` (infers plate-top Z from the plate's bbox, wraps the translate + cut into one call):
 
 ```typescript
-plate.cut(holes.counterbore("M3", { plateThickness: 4 }).translate(10, 10, 4))
+plate = patterns.cutTop(plate, () => holes.counterbore("M3", { plateThickness: t }), [10, 10])
+```
+
+Low-level fallback (when `patterns.cutTop` can't be used — e.g. the plate's bbox isn't readable): build + translate + cut by hand.
+
+```typescript
+plate.cut(holes.counterbore("M3", { plateThickness: t }).translate(10, 10, t))
 // Note: Z = plate_thickness, so the pocket's top aligns with the plate's top face.
 ```
 
@@ -684,6 +748,31 @@ const plate = shape3d(drawRectangle(60, 40).sketchOnPlane("XY").extrude(5));
 plate.cut(hole);  // OK
 ```
 
+### Axis-aware cut tools (prefer over manual `.rotate(90, ...)`)
+
+Every cut-tool helper below takes an optional `axis: "+X" | "-X" | "+Y" | "-Y" | "+Z" | "-Z"` naming the face the hole **opens on** (the body penetrates in the opposite direction). Reach for `axis:` before rotating a `+Z` tool by hand — the rotation math is already correct.
+
+**"Opens on" axis mnemonic** — for each axis, the drill enters from that side and the hole body extends in the opposite direction:
+
+| axis | drill enters from | body penetrates toward |
+|------|-------------------|------------------------|
+| `"+Z"` | top (+Z) face | −Z |
+| `"-Z"` | bottom (−Z) face | +Z |
+| `"+X"` | +X face | −X |
+| `"-X"` | −X face | +X |
+| `"+Y"` | +Y face | −Y |
+| `"-Y"` | −Y face | +Y |
+
+- `holes.through` / `holes.clearance` / `holes.counterbore` / `holes.countersink` / `holes.tapped` / `holes.threaded` — all 6 axes
+- `holes.throughAt` / `holes.tappedAt` / `holes.counterboreAt` — **preferred single-call form** (`(plate, size, { at: [x,y,z], ... })`) — auto-handles plate-top translation and warns when `at[2]` drifts off the top face
+- `holes.teardrop` — horizontal only (`+X` / `+Y` — intended for FDM-printable sideways holes)
+- `holes.keyhole` / `holes.slot` — all 6 axes
+- `inserts.pocket("M3", { axis })` — heat-set insert pocket
+- `motors.nema17_mountPlate({ thickness, axis })` / `nema23_mountPlate` / `nema14_mountPlate` — full 4-hole pattern + shaft bore + optional boss (see below)
+- `cylinder({ direction: "+Y" })` / `rod({...})` — positive cylinder, same axis union
+
+For 3D-shape positioning (not cuts): `box({ from, to })`, `prism({ profile, along, length })` — see the Plane-orientation cheat sheet above.
+
 ### holes — cut tools
 
 ```typescript
@@ -696,6 +785,47 @@ holes.threaded("M3", { depth, axis? })                    // FDM: threaded hole 
 holes.teardrop("M3", { depth, axis?: "+X" | "+Y" })       // FDM-printable horizontal hole (own +X/+Y axis set)
 holes.keyhole({ largeD, smallD, slot, depth, axis? })     // hang-on-screw mount
 holes.slot({ length, width, depth, axis? })               // elongated adjustment slot
+
+// Preferred single-call wrappers — translate + cut in one line, with a
+// top-face Z sanity check that emits a runtime warning when `at[2]` isn't
+// near the plate's top bbox face (the #1 silent "cut removed nothing" cause).
+holes.throughAt(plate, "M3", { at: [x, y, topZ], depth?, fit?, axis? })
+holes.tappedAt(plate, "M3",  { at: [x, y, topZ], depth, axis? })
+holes.counterboreAt(plate, "M3", { at: [x, y, topZ], plateThickness, fit?, axis? })
+```
+
+### Patterns — placements on any plane
+
+```typescript
+patterns.grid(3, 4, 10)                  // 3×4, centered on origin — no `centered` flag needed
+patterns.linear(5, [10, 0, 0])           // origin-anchored: (0..4)*step
+patterns.linear(5, [10, 0, 0], { centered: true })  // symmetric about origin: [-20, -10, 0, 10, 20]
+patterns.polar(6, 25)                    // 6 on a 25 mm circle (XY plane by default)
+
+// Remap any XY-plane pattern onto YZ or XZ — for vent grids on side walls etc.
+patterns.onPlane(patterns.grid(5, 3, 6, 6), "YZ")
+// grid cells were (x, y, 0); after onPlane("YZ") they become (0, x, y).
+```
+
+`grid` is already centered. `linear` now takes `{ centered: true }` for the same behaviour when you want a run straddling the origin.
+
+### Motors — assembly Part vs. mount-plate cut tool
+
+```typescript
+// Full motor body with shaft + mount-face joints — use when you want the
+// motor visible in the assembly or need to mate a coupler to its shaftTip.
+const m = motors.nema17();
+mate(m.joints.mountFace, bracket.joints.motorSeat);
+
+// Just cut the 4-hole bolt pattern + shaft bore + optional boss recess
+// through a plate — use when the motor itself is out of scope.
+bracket = bracket.cut(
+  motors.nema17_mountPlate({ thickness: 5, boss: true })
+);
+// Sideways mount — axis: "+Y" opens the cut on the +Y face, body into -Y:
+wall = wall.cut(
+  motors.nema17_mountPlate({ thickness: 6, axis: "+Y", center: [0, 6, 20] })
+);
 ```
 
 Full parameter tables for every stdlib namespace are available via `get_api_reference({ category: "stdlib" })`. One-line index of namespaces:
@@ -716,5 +846,6 @@ Full parameter tables for every stdlib namespace are available via `get_api_refe
 - `motors` / `couplers` — NEMA14/17/23 motor + flexible coupler Part builders with joints
 - `threads` — helical metric + trapezoidal threads (`metric`, `metricMesh`, `tapInto`, `leadscrew`, …)
 - `cylinder` / `rod` — orientation-explicit cylinder with named top/bottom anchor
+- `box` — corner-to-corner axis-aligned block; `prism` — drawing extruded along a named axis (preferred over `sketchOnPlane().extrude()` for axis-aligned parts)
 - `shape3d` / `fromBack` / `seatedOnPlate` / `debugJoints` / `highlightJoints` — utilities
 

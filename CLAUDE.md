@@ -113,8 +113,22 @@ Registered globally in `~/.claude/settings.json`. Provides 9 tools:
 
 - **GitHub**: https://github.com/asbis/ShapeItUp
 - **VS Marketplace**: Published as `shapeitup.shapeitup-vscode`
-- **Auto-deploy**: GitHub Actions workflow triggers on release creation. Uses `VSCE_PAT` secret.
-- **To release**: bump version in `packages/extension/package.json`, commit, push, then `gh release create v0.x.x`
+- **npm**: `@shapeitup/mcp-server` — consumed by marketplace users via `npx -y @shapeitup/mcp-server` (the canonical install shape for Claude Code / Cursor / Desktop / Gemini).
+- **Auto-deploy**: `.github/workflows/publish.yml` triggers on GitHub release creation. It builds, then (a) `pnpm --filter @shapeitup/mcp-server publish` to npm, and (b) `vsce publish` to the Marketplace. Uses `NPM_TOKEN` and `VSCE_PAT` secrets.
+- **To release**: bump `packages/extension/package.json` version, commit, push, then `gh release create v0.x.x`.
+
+### Any change under `packages/mcp-server/` MUST bump its own version
+
+The release workflow publishes `@shapeitup/mcp-server` on every GitHub release, but **npm rejects republishing an existing version and the workflow step has `continue-on-error: true`** — so forgetting to bump `packages/mcp-server/package.json` causes a *silent* skip. Marketplace users stay on the old npm version while getting a freshly-published VSIX → drift between the bundled extension and the server they load via `npx`.
+
+Checklist when touching anything under `packages/mcp-server/src/` or its deps (`packages/core/`, etc. that get bundled in):
+
+1. Bump `packages/extension/package.json` version (drives the release tag).
+2. Bump `packages/mcp-server/package.json` version in the same commit.
+3. Both versions should usually move in lockstep to keep diagnostics sane.
+4. After the release lands, verify `npm view @shapeitup/mcp-server version` matches.
+
+A mismatch is the exact failure mode that bit us in v1.1.0 → v1.5.2: the extension bundled fine but `~/.claude.json` entries pointing at `npx -y @shapeitup/mcp-server` resolved to a stale published version.
 
 ## Known Issues / Gotchas
 
