@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync, renameSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync, renameSync, watch as fsWatch } from "fs";
 import { join, resolve, basename, dirname, isAbsolute, sep } from "path";
 import { homedir } from "os";
 import {
@@ -412,6 +412,45 @@ async function waitForResult(commandId: string, timeoutMs: number): Promise<any>
   let deadline = start + timeoutMs;
   let graceGranted = false;
   lastWaitTimeoutReason = null;
+
+  // T6.B: watch the parent directory for writes to mcp-result.json; race each
+  // watch event against a 250ms safety backstop so we don't stall when the OS
+  // fs.watch notification fires late or is suppressed (e.g. network drives).
+  // We watch the DIRECTORY rather than the file so fs.watch doesn't error on a
+  // not-yet-existing result file, and so we receive the event on every write
+  // (file-watches on Linux can miss subsequent writes after a rename).
+  const watchDir = GLOBAL_STORAGE;
+
+  /**
+   * Wait for EITHER a fs.watch change event on watchDir OR a 250ms timeout.
+   * Returns a promise that resolves when either fires.
+   */
+  function waitForWriteOrBackstop(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const settle = () => {
+        if (!settled) {
+          settled = true;
+          try { watcher.close(); } catch {}
+          clearTimeout(timer);
+          resolve();
+        }
+      };
+      const timer = setTimeout(settle, 250);
+      let watcher: ReturnType<typeof fsWatch>;
+      try {
+        watcher = fsWatch(watchDir, (_event: string, filename: string | null) => {
+          if (filename === "mcp-result.json" || filename === null) settle();
+        });
+        watcher.on("error", settle);
+      } catch {
+        // fs.watch unavailable (e.g. Docker tmpfs) — fall through to backstop.
+        clearTimeout(timer);
+        setTimeout(resolve, 250);
+      }
+    });
+  }
+
   while (true) {
     if (Date.now() >= deadline) {
       // Deadline reached. If the extension still looks alive AND we haven't
@@ -427,7 +466,8 @@ async function waitForResult(commandId: string, timeoutMs: number): Promise<any>
       lastWaitTimeoutReason = isExtensionAlive() ? "slow" : "dead";
       return null;
     }
-    await new Promise((r) => setTimeout(r, 100));
+    // Wait for a write event or the 250ms backstop — whichever comes first.
+    await waitForWriteOrBackstop();
     const result = readExtensionResult();
     if (result && result._id === commandId) {
       lastWaitTimeoutReason = null;
