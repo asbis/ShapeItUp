@@ -222,8 +222,22 @@ export function registerMcpClientsView(context: vscode.ExtensionContext) {
  * when the existing entry actually points at a non-existent path so we never
  * clobber a hand-tuned setup.
  */
+/**
+ * Match args[0] values that point inside a versioned shapeitup extension
+ * folder (`.vscode/extensions/shapeitup.shapeitup-vscode-<version>/…`). Those
+ * paths are inherently version-coupled: even if the folder still exists on
+ * disk, the bundle is from a previous release and can't be trusted (e.g.
+ * 1.1.0's mcp-server.mjs had a bare `import "esbuild"` that fails at runtime).
+ */
+function isVersionedExtensionPath(arg: string): boolean {
+  return /[\\/]\.vscode[\\/]extensions[\\/]shapeitup\.shapeitup-vscode-[^\\/]+[\\/]/i.test(arg);
+}
+
 async function migrateStaleMcpEntriesIfNeeded(context: vscode.ExtensionContext) {
-  const KEY = "shapeitup.migrateStale.v1";
+  // v2 bumps the gate so users who already dismissed v1 (when the detector
+  // only caught deleted paths) get re-prompted for the broken-but-present
+  // case.
+  const KEY = "shapeitup.migrateStale.v2";
   if (context.globalState.get(KEY)) return;
 
   const home = os.homedir();
@@ -251,11 +265,18 @@ async function migrateStaleMcpEntriesIfNeeded(context: vscode.ExtensionContext) 
     const cfg = readJson(c.file);
     const entry = cfg?.mcpServers?.shapeitup;
     if (!entry) continue;
-    // Stale iff the entry uses `command: node` with an args[0] file path that
-    // no longer exists. An `npx -y @shapeitup/mcp-server` entry (the new
-    // canonical shape) is left alone.
+    // Stale iff the entry uses `command: node` with an args[0] that is
+    // either (a) a path that no longer exists, or (b) points inside a
+    // versioned shapeitup extension folder — those bundles are frozen to a
+    // specific release and may be present-but-broken after an upgrade. An
+    // `npx -y @shapeitup/mcp-server` entry (the new canonical shape) is left
+    // alone.
     const arg = Array.isArray(entry.args) ? entry.args[0] : undefined;
-    if (entry.command === "node" && typeof arg === "string" && !fs.existsSync(arg)) {
+    if (
+      entry.command === "node" &&
+      typeof arg === "string" &&
+      (!fs.existsSync(arg) || isVersionedExtensionPath(arg))
+    ) {
       stale.push({ label: c.label, file: c.file, currentArg: arg });
     }
   }
@@ -267,7 +288,7 @@ async function migrateStaleMcpEntriesIfNeeded(context: vscode.ExtensionContext) 
 
   const choice = await vscode.window.showWarningMessage(
     `ShapeItUp found ${stale.length} broken MCP entr${stale.length === 1 ? "y" : "ies"} ` +
-      `pointing at an old extension path that no longer exists. ` +
+      `pointing at a versioned extension bundle. ` +
       `Migrate to the npm-based install (npx -y @shapeitup/mcp-server)?`,
     "Migrate",
     "Show details",
