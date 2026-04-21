@@ -84,6 +84,17 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // MCP clients close stdin when they disconnect. The StdioServerTransport
+  // handles protocol-level teardown, but the subscriber-bus WebSocket
+  // listener keeps the event loop alive on its own. Shut the bus down on
+  // stdin EOF so the process exits cleanly instead of needing a
+  // SIGTERM/timeout kill — important for short-lived smoke tests and for
+  // agent harnesses that spawn and tear down the server many times.
+  process.stdin.once("end", () => {
+    try { bus.stop(); } catch { /* already torn down */ }
+    process.exit(0);
+  });
 }
 
 main().catch((err) => {
