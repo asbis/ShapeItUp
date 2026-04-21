@@ -790,11 +790,13 @@ async function uninstallMcpServer(output: vscode.OutputChannel) {
     return;
   }
 
-  const items = [
-    ...found.map((t) => ({ label: t.label, target: t, kind: "json" as const })),
-    ...(hasGemini ? [{ label: `Gemini CLI (${geminiExt})`, target: geminiExt, kind: "dir" as const }] : []),
-    ...(hasSkill ? [{ label: `Claude Code skill (${skill})`, target: skill, kind: "dir" as const }] : []),
-  ];
+  type UninstallItem =
+    | { label: string; mode: "json"; target: typeof targets[number] }
+    | { label: string; mode: "dir"; target: string };
+  const items: UninstallItem[] = [];
+  for (const t of found) items.push({ label: t.label, target: t, mode: "json" });
+  if (hasGemini) items.push({ label: `Gemini CLI (${geminiExt})`, target: geminiExt, mode: "dir" });
+  if (hasSkill) items.push({ label: `Claude Code skill (${skill})`, target: skill, mode: "dir" });
   const picks = await vscode.window.showQuickPick(items, {
     canPickMany: true,
     placeHolder: "Select ShapeItUp entries to remove",
@@ -810,7 +812,7 @@ async function uninstallMcpServer(output: vscode.OutputChannel) {
 
   for (const p of picks) {
     try {
-      if (p.kind === "json") {
+      if (p.mode === "json") {
         const t = p.target as typeof targets[number];
         const c = JSON.parse(fs.readFileSync(t.file, "utf-8"));
         if (c?.mcpServers?.shapeitup) {

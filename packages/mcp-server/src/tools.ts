@@ -4920,6 +4920,9 @@ function formatProperties(
         }
       }
     }
+    if (capped) {
+      lines.push(`  … and ${allParts.length - SUMMARY_PARTS_CAP} more parts (use get_render_status for full list)`);
+    }
   } else if (props.parts && props.parts.length === 1) {
     // Single-part renders skip the per-part stats row above (those are
     // redundant with the assembly-wide volume/area/mass), but we still want
@@ -4933,9 +4936,6 @@ function formatProperties(
       for (const issue of pr.issues) {
         lines.push(`    \u26a0 ${issue}`);
       }
-    }
-    if (capped) {
-      lines.push(`  … and ${allParts.length - SUMMARY_PARTS_CAP} more parts (use get_render_status for full list)`);
     }
   }
   return lines.length ? `\nGeometric properties:\n${lines.join("\n")}` : "";
