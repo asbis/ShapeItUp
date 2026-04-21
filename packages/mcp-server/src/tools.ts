@@ -21,6 +21,14 @@ import {
 import { autoBootstrapIfNeeded, setupShapeProject } from "./project-setup.js";
 import { renderPartsToSvg } from "./svg-renderer.js";
 import { svgToPng } from "./svg-to-png.js";
+import {
+  extractGeometry,
+  extractCollisions,
+  extractJoints,
+  type GeometryFormat,
+  type GeometryFacesFilter,
+  type GeometryEdgesFilter,
+} from "./verify-helpers.js";
 
 /**
  * Shared globalStorage dir with the VSCode extension. Both processes write and
@@ -4728,6 +4736,155 @@ export function registerTools(server: McpServer) {
           text: `${summary}\nWarnings (${warnings.length}):\n${warnings.map((w) => `  - ${w}`).join("\n")}`,
         }],
       };
+    })
+  );
+
+  server.tool(
+    "verify_shape",
+    "Single-call inspection bundle: executes the shape ONCE and runs any combination of geometry, collision, and joint checks against that single execution. Faster than calling describe_geometry → check_collisions → validate_joints separately (each of those re-executes the shape). Returns a structured JSON report with one section per requested check plus a top-level `ok` flag and `summary`. Pick `checks` to scope the work; per-check options are prefixed (geometryFormat, collisionTolerance, jointTolerance, etc.). Use the individual tools for one-off queries; use this when verifying an assembly comprehensively.",
+    {
+      filePath: z.string().optional().describe("Path to the .shape.ts file. Mutually exclusive with `code`."),
+      code: z.string().optional().describe("Inline .shape.ts source — written to a temp file, executed, then deleted. Use `workingDir` for relative-import resolution. Mutually exclusive with `filePath`."),
+      workingDir: z.string().optional().describe("Directory to host the inline snippet when `code` is provided. Defaults to a private globalStorage path."),
+      params: z.record(z.string(), z.number()).optional().describe("Numeric param overrides applied to the shape's `export const params`. Same shape as tune_params accepts."),
+      checks: z.array(z.enum(["geometry", "collisions", "joints"])).optional().describe("Which checks to run. Defaults to all three. Order doesn't matter; each runs against the same single execution."),
+      // Geometry per-check options
+      geometryFormat: z.enum(["summary", "full"]).optional().describe("Geometry report verbosity. summary (default): face/edge counts + bounding box. full: per-face / per-edge records (capped by geometryLimit)."),
+      geometryFaces: z.enum(["all", "planar", "curved"]).optional().describe("Geometry face filter. Defaults to 'all'."),
+      geometryEdges: z.enum(["all", "outer", "none"]).optional().describe("Geometry edge filter. Defaults to 'none' (faces-only is the common case)."),
+      geometryLimit: z.number().int().positive().optional().describe("Hard cap on face/edge records in geometryFormat='full'. Default 50."),
+      geometryPartName: z.string().optional().describe("Restrict the geometry check to a single named part. Undefined = every part."),
+      // Collision per-check options
+      collisionTolerance: z.number().optional().describe("Min intersection volume in mm³ to count as a collision. Default 0.001."),
+      collisionAcceptedPairs: z.array(z.tuple([z.string(), z.string()])).optional().describe("Pairs of part names whose intersection is EXPECTED (e.g. needles in grooves). Symmetric. Accepted pairs are reported separately and do NOT flip ok=false."),
+      collisionPressFitThreshold: z.number().optional().describe("Volume threshold (mm³) below which a collision is reported as 'press fit' (touching interface) instead of a real collision. Default 0.5."),
+      // Joint per-check options
+      jointTolerance: z.number().optional().describe("Max joint-to-surface distance in mm before a warning fires. Default 0.1."),
+    },
+    safeHandler("verify_shape", async (args) => {
+      const {
+        filePath, code, workingDir, params,
+        checks, geometryFormat, geometryFaces, geometryEdges, geometryLimit, geometryPartName,
+        collisionTolerance, collisionAcceptedPairs, collisionPressFitThreshold,
+        jointTolerance,
+      } = args;
+
+      if (filePath !== undefined && code !== undefined) {
+        return {
+          content: [{ type: "text" as const, text: "verify_shape: pass either `filePath` OR `code`, not both." }],
+          isError: true,
+        };
+      }
+      if (filePath === undefined && code === undefined) {
+        return {
+          content: [{ type: "text" as const, text: "verify_shape: provide either `filePath` (existing shape) or `code` (inline snippet)." }],
+          isError: true,
+        };
+      }
+
+      const requested = (checks && checks.length > 0)
+        ? Array.from(new Set(checks))
+        : ["geometry", "collisions", "joints"] as const;
+      const want = (k: "geometry" | "collisions" | "joints") =>
+        (requested as readonly string[]).includes(k);
+
+      return withShapeFile({ filePath, code, workingDir }, async (absPath) => {
+        if (!existsSync(absPath)) {
+          return {
+            content: [{ type: "text" as const, text: `File not found: ${absPath}` }],
+            isError: true,
+          };
+        }
+
+        const t0 = Date.now();
+        // force:true — collisions need .shape.intersect(), geometry needs .shape.faces;
+        // both deref live OCCT handles which the cache layer scrubs.
+        const { status, parts } = await executeWithPersistedParams(absPath, params, { force: true });
+        const executionMs = Date.now() - t0;
+
+        if (!status.success || !parts) {
+          const errReport = {
+            ok: false,
+            summary: { parts: 0, executionMs, totalMs: Date.now() - t0, issues: 1 },
+            error: status.error ?? "shape execution failed",
+            statusText: formatStatusText(status),
+          };
+          return {
+            content: [{ type: "text" as const, text: `verify_shape: execution failed.\n${JSON.stringify(errReport, null, 2)}` }],
+            isError: true,
+          };
+        }
+
+        const core = await getCore();
+        const replicad: any = core.replicad();
+
+        const report: any = {
+          ok: true,
+          summary: { parts: parts.length, executionMs, totalMs: 0, issues: 0 },
+        };
+
+        if (want("geometry")) {
+          const result = extractGeometry(parts, {
+            partName: geometryPartName,
+            format: geometryFormat as GeometryFormat | undefined,
+            faces: geometryFaces as GeometryFacesFilter | undefined,
+            edges: geometryEdges as GeometryEdgesFilter | undefined,
+            limit: geometryLimit,
+            replicad,
+          });
+          if (!result.ok) {
+            report.geometry = { status: "error", error: result.error };
+            report.ok = false;
+            report.summary.issues++;
+          } else {
+            report.geometry = { status: "ok", report: result.report };
+          }
+        }
+
+        if (want("collisions")) {
+          const collisionReport = extractCollisions(parts, {
+            tolerance: collisionTolerance,
+            acceptedPairs: collisionAcceptedPairs,
+            pressFitThreshold: collisionPressFitThreshold,
+            replicad,
+          });
+          report.collisions = {
+            status: collisionReport.skipped
+              ? "skipped"
+              : collisionReport.real.length > 0 || collisionReport.failures.length > 0
+                ? "warning"
+                : "ok",
+            report: collisionReport,
+          };
+          if (collisionReport.real.length > 0 || collisionReport.failures.length > 0) {
+            report.ok = false;
+            report.summary.issues += collisionReport.real.length + collisionReport.failures.length;
+          }
+        }
+
+        if (want("joints")) {
+          const jointReport = extractJoints(parts, { tolerance: jointTolerance });
+          report.joints = {
+            status: !jointReport.introspectable
+              ? "skipped"
+              : jointReport.warnings.length > 0
+                ? "warning"
+                : "ok",
+            report: jointReport,
+          };
+          if (jointReport.introspectable && jointReport.warnings.length > 0) {
+            report.ok = false;
+            report.summary.issues += jointReport.warnings.length;
+          }
+        }
+
+        report.summary.totalMs = Date.now() - t0;
+        const header = `verify_shape: ${report.ok ? "OK" : `${report.summary.issues} issue${report.summary.issues === 1 ? "" : "s"}`} (${parts.length} parts, ${report.summary.totalMs}ms total, ${executionMs}ms execution).`;
+
+        return {
+          content: [{ type: "text" as const, text: `${header}\n${JSON.stringify(report, null, 2)}` }],
+        };
+      });
     })
   );
 
