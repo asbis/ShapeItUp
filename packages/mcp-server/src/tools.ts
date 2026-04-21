@@ -1974,8 +1974,63 @@ export function registerTools(server: McpServer) {
         contentsLine = "";
       }
 
+      // Printability hand-off summary: before the slicer sees this STL/STEP,
+      // surface any per-part concerns the engine already computed during
+      // rendering (Task 1). Silent on clean exports — the normal response
+      // stays unchanged when every part is manifold and above the nozzle
+      // threshold. Only considers parts that actually made it into this
+      // export (honours `partName` filtering) so a single-part export of a
+      // clean part doesn't get warned about a different assembly member.
+      let printabilityBlock = "";
+      const props = status.properties;
+      if (props?.parts && props.parts.length > 0) {
+        const exported = partName
+          ? props.parts.filter((p) => p.name === partName)
+          : props.parts;
+        const flagged = exported.filter(
+          (p) => p.printability && (p.printability.manifold === false || p.printability.issues.length > 0),
+        );
+        if (flagged.length > 0) {
+          const lines: string[] = ["", "\u26a0 Printability concerns before slicing:"];
+          let sawSmallFeature = false;
+          for (const p of flagged) {
+            const pr = p.printability!;
+            const reasons: string[] = [];
+            if (pr.manifold === false) reasons.push("non-manifold geometry");
+            if (pr.minFeatureSize_mm < 0.4) {
+              reasons.push(
+                `minFeature ${pr.minFeatureSize_mm.toFixed(2)} mm < 0.4 mm nozzle`,
+              );
+              sawSmallFeature = true;
+            }
+            if (reasons.length === 0 && pr.issues.length > 0) {
+              // e.g. attributed stdlib warning ("threads.tapInto at small ...")
+              // without a feature-size trigger.
+              reasons.push(pr.issues[0]);
+            }
+            lines.push(`  - ${p.name}: ${reasons.join("; ")}`);
+            if (sawSmallFeature) {
+              lines.push(
+                `    (threads.tapInto at small metric size produces thin helical features)`,
+              );
+              sawSmallFeature = false; // only annotate once to avoid repetition
+            }
+          }
+          if (flagged.some((p) => (p.printability?.minFeatureSize_mm ?? 1) < 0.4)) {
+            lines.push("");
+            lines.push(
+              "If Cura/PrusaSlicer skips features or reports manifold errors, consider",
+            );
+            lines.push(
+              "holes.threaded(size, {depth}) instead of threads.tapInto for M2–M5 sizes.",
+            );
+          }
+          printabilityBlock = "\n" + lines.join("\n");
+        }
+      }
+
       return {
-        content: [{ type: "text" as const, text: `Exported to: ${savePath}\nFormat: ${format.toUpperCase()}\nSize: ${sizeStr}\nSource: ${source}${contentsLine}${bomLine}${openLine}${multiPartWarning}` }],
+        content: [{ type: "text" as const, text: `Exported to: ${savePath}\nFormat: ${format.toUpperCase()}\nSize: ${sizeStr}\nSource: ${source}${contentsLine}${bomLine}${openLine}${multiPartWarning}${printabilityBlock}` }],
       };
     })
   );
@@ -4634,6 +4689,32 @@ function formatProperties(props: ShapeProperties | undefined): string {
       if (p.centerOfMass) bits.push(`CoM=${fmtPt(p.centerOfMass)}`);
       if (p.boundingBox) bits.push(`bbox=${fmt(p.boundingBox.x)}x${fmt(p.boundingBox.y)}x${fmt(p.boundingBox.z)}`);
       if (bits.length) lines.push(`  - ${p.name}: ${bits.join(", ")}`);
+      // Printability: only surface the section when there's actually a
+      // concern — clean parts (manifold + feature ≥ nozzle) stay silent so
+      // the happy-path output isn't cluttered.
+      const pr = p.printability;
+      if (pr && (pr.manifold === false || pr.issues.length > 0)) {
+        lines.push(
+          `    printability: manifold=${pr.manifold}, minFeature=${pr.minFeatureSize_mm.toFixed(2)} mm`,
+        );
+        for (const issue of pr.issues) {
+          lines.push(`      \u26a0 ${issue}`);
+        }
+      }
+    }
+  } else if (props.parts && props.parts.length === 1) {
+    // Single-part renders skip the per-part stats row above (those are
+    // redundant with the assembly-wide volume/area/mass), but we still want
+    // to surface printability for the one part when it has concerns.
+    const p = props.parts[0];
+    const pr = p.printability;
+    if (pr && (pr.manifold === false || pr.issues.length > 0)) {
+      lines.push(
+        `  printability: manifold=${pr.manifold}, minFeature=${pr.minFeatureSize_mm.toFixed(2)} mm`,
+      );
+      for (const issue of pr.issues) {
+        lines.push(`    \u26a0 ${issue}`);
+      }
     }
   }
   return lines.length ? `\nGeometric properties:\n${lines.join("\n")}` : "";
