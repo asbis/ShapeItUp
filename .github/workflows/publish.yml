@@ -92,14 +92,18 @@ jobs:
           echo "$OUT"
           echo "--- end output ---"
 
-          if [ $RC -ne 0 ]; then
-            echo "mcp-server exited with code $RC" >&2
-            exit $RC
+          # The server keeps its WebSocket listener open after responding to a
+          # single initialize, so `timeout 10` will kill it (rc=124) even on a
+          # successful response. Accept that: the only thing that matters for
+          # the smoke test is that the server produced a valid initialize
+          # response before being killed. Any other non-zero rc with no valid
+          # response means a real failure.
+          if echo "$OUT" | grep -q '"serverInfo"' && echo "$OUT" | grep -q '"protocolVersion"'; then
+            echo "Smoke test OK: serverInfo + protocolVersion found (server rc=$RC; 124=graceful-timeout-kill is expected)."
+          else
+            echo "Smoke test FAILED: missing serverInfo/protocolVersion in response (rc=$RC)" >&2
+            exit 1
           fi
-
-          echo "$OUT" | grep -q '"serverInfo"'
-          echo "$OUT" | grep -q '"protocolVersion"'
-          echo "Smoke test OK: serverInfo + protocolVersion found."
 
           popd >/dev/null
           rm -rf "$TMPDIR"
