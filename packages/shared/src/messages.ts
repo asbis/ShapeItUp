@@ -14,6 +14,23 @@ import type { ExportFormat } from "./types.js";
  */
 export const BUNDLE_EXTERNALS = ["replicad", "shapeitup"] as const;
 
+/**
+ * Bundled WASM assets sent from the extension host to the webview so the
+ * worker can skip its 1.2MB loader fetch + .wasm fetch on every (re)spawn.
+ *
+ * Both fields are raw bytes the worker uses verbatim:
+ *   - `loaderJs`   — Emscripten loader JS text (eval'd via `new Function()`).
+ *   - `wasmBytes`  — Raw WASM binary (passed to Emscripten as `wasmBinary`).
+ *
+ * The extension reads these once on activation (see wasm-cache.ts) and serves
+ * them in response to `request-wasm-assets`. Manifold is optional — older
+ * VSIX builds may not ship it.
+ */
+export interface WasmAssetBundle {
+  loaderJs: string;
+  wasmBytes: Uint8Array;
+}
+
 // Extension Host → Webview
 export type ExtToWebview =
   | {
@@ -31,7 +48,15 @@ export type ExtToWebview =
   | { type: "request-export"; format: ExportFormat }
   | { type: "request-screenshot"; width?: number; height?: number }
   | { type: "viewer-command"; command: string; [key: string]: any }
-  | { type: "set-theme"; background: string };
+  | { type: "set-theme"; background: string }
+  // Reply to a webview-side `request-wasm-assets`. Both occt and manifold may
+  // be omitted if the extension cache is cold or the asset file is missing —
+  // the worker falls back to URL fetch in that case.
+  | {
+      type: "wasm-assets";
+      occt?: WasmAssetBundle;
+      manifold?: WasmAssetBundle;
+    };
 
 /**
  * Parameters for the MCP `render-preview` IPC command written to
@@ -68,11 +93,27 @@ export type WebviewToExt =
   | { type: "status"; message: string }
   | { type: "toolbar-export"; format: ExportFormat }
   | { type: "param-changed"; params: Record<string, number> }
-  | { type: "ready" };
+  | { type: "ready" }
+  // Webview asks the extension for the cached OCCT (+ optional Manifold) bytes
+  // on worker init. The extension replies with a `wasm-assets` message
+  // (ExtToWebview). Sent once per worker (re)spawn.
+  | { type: "request-wasm-assets" };
 
 // Webview → Worker
 export type WebviewToWorker =
-  | { type: "init"; wasmUrl: string }
+  | {
+      type: "init";
+      // URL-fallback fields (used when the extension didn't ship cached bytes).
+      wasmLoaderUrl?: string;
+      wasmUrl?: string;
+      manifoldLoaderUrl?: string;
+      manifoldWasmUrl?: string;
+      // Cached-bytes fast path. When present, the worker eval's `loaderJs`
+      // directly and passes `wasmBytes` to the Emscripten module factory as
+      // `wasmBinary` — skipping the cold fetch + parse on every (re)spawn.
+      occt?: WasmAssetBundle;
+      manifold?: WasmAssetBundle;
+    }
   | {
       type: "execute";
       js: string;
