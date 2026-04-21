@@ -3,248 +3,125 @@
 </p>
 
 <p align="center">
-  <strong>Scripted CAD for VS Code</strong> — write TypeScript, see 3D, export to STEP/STL.
+  <strong>Scripted CAD for AI agents and humans</strong> — write TypeScript, get CAD.
 </p>
 
 <p align="center">
   <a href="https://github.com/asbis/ShapeItUp/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://www.npmjs.com/package/@shapeitup/mcp-server"><img src="https://img.shields.io/npm/v/@shapeitup/mcp-server.svg" alt="npm: @shapeitup/mcp-server"></a>
 </p>
 
 ---
 
-ShapeItUp is a VS Code extension that turns TypeScript files into 3D CAD models using the [Replicad](https://replicad.xyz) library (OpenCascade WASM). It includes an MCP server so AI assistants like Claude Code can create, modify, and visually verify CAD models.
+ShapeItUp is an MCP server that turns [Replicad](https://replicad.xyz) / OpenCascade into AI-agent-grade CAD tooling. It writes, renders, verifies, and exports parametric 3D models from TypeScript `.shape.ts` files, headlessly — from the terminal, from Claude Code / Cursor / Claude Desktop, or from CI. A [VSCode extension](#vscode-extension-optional) is available as an optional interactive viewer for humans who want to watch the renders happen live.
 
-## Features
-
-- **Script-based CAD** -- write `.shape.ts` files using TypeScript + Replicad API
-- **Live 3D preview** -- auto-renders when you save or switch files
-- **Parameter sliders** -- export a `params` object and get interactive sliders
-- **Multi-file assemblies** -- import parts from other files, render with per-part colors
-- **STEP + STL export** -- manufacturing-ready output from toolbar buttons
-- **Section view** -- clip plane to inspect internal geometry
-- **Click-to-measure** -- click two points to measure distance
-- **Dimension overlay** -- bounding box X/Y/Z measurements
-- **AI integration** -- MCP server with tools for Claude Code to create and verify shapes
-
-## Quick Start
-
-### Install from source
+## Install for Claude Code
 
 ```bash
-git clone https://github.com/asbis/ShapeItUp.git
-cd ShapeItUp
-pnpm install
-pnpm build
+claude mcp add shapeitup -- npx -y @shapeitup/mcp-server
 ```
 
-Then press **F5** in VS Code to launch the Extension Development Host.
+That's it. `claude mcp add` registers the server in your Claude Code config so agent sessions pick it up automatically. See the [Claude Code MCP docs](https://docs.claude.com/en/docs/claude-code/mcp) for scoping options (`-s user` for all projects, `-s project` for just this repo).
 
-### Your first shape
+## Install for Cursor / Claude Desktop / other MCP clients
 
-Create a file called `my-part.shape.ts`:
-
-```typescript
-import { drawRectangle, sketchCircle } from "replicad";
-
-export default function main() {
-  const box = drawRectangle(60, 40).sketchOnPlane("XY").extrude(20);
-  const hole = sketchCircle(8).extrude(20);
-  return box.cut(hole).fillet(2);
-}
-```
-
-The 3D preview appears automatically in the side panel.
-
-### With parameter sliders
-
-```typescript
-import { drawRoundedRectangle } from "replicad";
-
-export const params = {
-  width: 80,
-  height: 50,
-  depth: 30,
-  wall: 2,
-};
-
-export default function main({ width, height, depth, wall }: typeof params) {
-  const outer = drawRoundedRectangle(width, height, 5).sketchOnPlane("XY").extrude(depth);
-  const inner = drawRoundedRectangle(width - wall*2, height - wall*2, 3)
-    .sketchOnPlane("XY", [0, 0, wall]).extrude(depth);
-  return outer.cut(inner);
-}
-```
-
-Sliders appear in the side panel -- drag them to adjust dimensions live.
-
-### Multi-file assemblies
-
-```typescript
-// bolt.shape.ts
-import { sketchCircle, drawPolysides } from "replicad";
-
-export function makeBolt(diameter = 8, length = 30) {
-  const head = drawPolysides(diameter * 0.9, 6).sketchOnPlane("XY").extrude(5);
-  const shaft = sketchCircle(diameter / 2).extrude(length).translateZ(-length);
-  return head.fuse(shaft);
-}
-
-export default function main() { return makeBolt(); }
-```
-
-```typescript
-// assembly.shape.ts
-import { makeBolt } from "./bolt.shape";
-import { makePlate } from "./plate.shape";
-
-export default function main() {
-  return [
-    { shape: makePlate(), name: "plate", color: "#8899aa" },
-    { shape: makeBolt().translate(20, 10, 5), name: "bolt", color: "#aa8855" },
-  ];
-}
-```
-
-## Viewer Controls
-
-| Button | Action |
-|--------|--------|
-| **Fit** | Reset camera to fit model |
-| **Edges** | Toggle edge line display |
-| **Wire** | Toggle wireframe mode |
-| **Dims** | Show bounding box dimensions |
-| **Section** | Cross-section clip plane |
-| **Measure** | Click two points to measure distance |
-| **STEP** | Export as STEP file |
-| **STL** | Export as STL file |
-
-**Navigation:** Left-click drag = orbit, Right-click drag = pan, Scroll = zoom
-
-**ViewCube:** Quick preset views (Top, Front, Right, Isometric)
-
-**Parts panel:** Click the hamburger menu to toggle. Click any part to show/hide it.
-
-## AI Integration (Claude Code)
-
-ShapeItUp includes an MCP server that gives Claude Code tools to create and verify CAD models.
-
-### Setup
-
-Add to your `~/.claude/settings.json`:
+The generic MCP-config snippet:
 
 ```json
 {
   "mcpServers": {
     "shapeitup": {
-      "command": "node",
-      "args": ["/path/to/ShapeItUp/packages/mcp-server/dist/index.js"]
+      "command": "npx",
+      "args": ["-y", "@shapeitup/mcp-server"]
     }
   }
 }
 ```
 
-Copy the skill file for API reference:
+Where to put it:
 
-```bash
-cp skill/SKILL.md ~/.claude/commands/shapeitup.md
+- **Cursor** — `~/.cursor/mcp.json`, or Settings → MCP → *Add new server* to drop it in through the UI.
+- **Claude Desktop** — `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows. Restart the app after editing.
+- **Any stdio MCP client** — hand it `npx -y @shapeitup/mcp-server` as the server command.
+
+Node 20+ required. No native build step; everything ships as WASM.
+
+## What you get
+
+A CAD toolkit agents can drive end to end:
+
+- **Authoring** — `create_shape`, `modify_shape`, `read_shape`, `list_shapes`, `setup_shape_project`
+- **Rendering** — `render_preview`, `preview_shape`, `get_preview` (SVG-first, resvg-backed PNGs)
+- **Verification** — `verify_shape`, `check_collisions`, `sweep_check`, `describe_geometry`, `validate_joints`
+- **Iteration** — `tune_params` (slider overrides), `set_render_mode`, `toggle_dimensions`
+- **Export** — `export_shape` (STEP / STL / OBJ / 3MF)
+- **stdlib** — `holes`, `screws` / `bolts` / `washers` / `inserts`, `bearings`, `extrusions`, `patterns`, `threads`, `joints` + `assemble`, `printHints`, and more — all importable from `"shapeitup"` inside any `.shape.ts`
+
+Full tool list: 25 MCP tools covering the create → preview → verify → tune → export loop.
+
+## Quick example
+
+Prompt to the agent: *"I want a mounting bracket, 60×40×4 mm, four M3 through-holes in the corners."* The agent calls `create_shape` and writes:
+
+```typescript
+// bracket.shape.ts
+import { drawRoundedRectangle } from "replicad";
+import { holes } from "shapeitup";
+
+export const params = { width: 60, depth: 40, thickness: 4, holeInset: 6 };
+
+export default function main({ width, depth, thickness, holeInset }: typeof params) {
+  const plate = drawRoundedRectangle(width, depth, 3)
+    .sketchOnPlane("XY")
+    .extrude(thickness);
+
+  return holes.through(plate, "M3", [
+    [-width/2 + holeInset, -depth/2 + holeInset, 0],
+    [ width/2 - holeInset, -depth/2 + holeInset, 0],
+    [-width/2 + holeInset,  depth/2 - holeInset, 0],
+    [ width/2 - holeInset,  depth/2 - holeInset, 0],
+  ]);
+}
 ```
 
-### MCP Tools
+Then it calls `render_preview` and gets back a PNG it can inspect, plus bounding-box + volume metadata to sanity-check against the spec. If the user wants the holes bigger, the agent calls `tune_params` — no file rewrite needed.
 
-| Tool | Description |
-|------|-------------|
-| `create_shape` | Create a new `.shape.ts` file |
-| `modify_shape` | Update an existing shape file |
-| `read_shape` | Read shape file contents |
-| `list_shapes` | Find all `.shape.ts` files |
-| `validate_script` | Check TypeScript syntax |
-| `render_preview` | Capture screenshot with dimensions (AI self-review) |
-| `set_render_mode` | Switch between dark and high-contrast AI mode |
-| `toggle_dimensions` | Show/hide dimension overlay |
-| `get_api_reference` | Get Replicad API docs by category |
+## Running in CI / containers
 
-### Prompting Guide
+`npx -y @shapeitup/mcp-server` works anywhere Node 20 runs — Docker, GitHub Actions, GitLab CI. Renders go through `@resvg/resvg-wasm`; no GPU, no headless Chromium, no native graphics stack required. A cold boot on a stock Node image typically takes ~3 s for the first render (OCCT WASM compile) and < 200 ms thereafter.
 
-The `/shapeitup` skill loads the full Replicad API reference. Use it when asking Claude to create shapes.
+## VSCode extension (optional)
 
-**Good prompts:**
+There is a VSCode extension that subscribes to the MCP server's event bus and shows a live Three.js viewer in the side panel — useful when you want to watch an agent work, or to drive ShapeItUp interactively. Install it from the VS Code marketplace (search for "ShapeItUp") or build from source (see [Development](#development)).
 
-```
-/shapeitup
-Create an enclosure for a Raspberry Pi 4. It should be 90x65x30mm with 2mm walls,
-rounded corners, 4 screw holes in the corners, and cutouts for USB-C, micro HDMI,
-and the GPIO header.
-```
-
-```
-/shapeitup
-Make a parametric L-bracket. I need parameters for width, height, thickness,
-and hole diameter. Add 3 mounting holes.
-```
-
-```
-Create a bolt.shape.ts with a hex head bolt generator function,
-then create assembly.shape.ts that uses 4 bolts on a mounting plate.
-```
-
-**Tips for better results:**
-- Specify dimensions in millimeters
-- Mention wall thickness for enclosures
-- Ask for `export const params = {...}` to get sliders
-- Ask Claude to use `render_preview` to verify its work
-- For assemblies, ask for named colored parts
-
-## Architecture
-
-```
-Extension Host (Node.js)     Webview (Browser)           Web Worker (Browser)
-+-------------------+        +------------------+        +------------------+
-| File watcher      | -----> | Three.js viewer  | -----> | OCCT WASM        |
-| esbuild bundler   |        | Orbit controls   |        | Replicad         |
-| Export to disk    | <----- | Edge rendering   | <----- | Script execution |
-| MCP bridge        |        | Params sliders   |        | Tessellation     |
-+-------------------+        +------------------+        +------------------+
-```
-
-- **Replicad** -- TypeScript CAD library wrapping OpenCascade (OCCT) compiled to WASM
-- **Three.js** -- 3D rendering in a VS Code webview
-- **esbuild** -- bundles `.shape.ts` files with local imports resolved
-- **MCP SDK** -- stdio-based MCP server for AI tool integration
-
-## File Formats
-
-| Format | Use Case |
-|--------|----------|
-| **STEP** (.step) | CNC machining, injection molding -- exact B-Rep geometry |
-| **STL** (.stl) | 3D printing -- triangle mesh |
-
-## Requirements
-
-- **VS Code** 1.95+
-- **Node.js** 18+ (for building)
-- **pnpm** (for package management)
+The extension is entirely optional: the MCP server is headless on its own, does not require VSCode to be running, and produces the same renders whether or not a viewer is attached.
 
 ## Development
 
 ```bash
+git clone https://github.com/asbis/ShapeItUp.git
+cd ShapeItUp
 pnpm install
-pnpm dev          # watch mode -- rebuilds on changes
-# Press F5 to launch Extension Development Host
+pnpm build          # builds extension, viewer, worker, and mcp-server
+pnpm dev            # watch mode
+pnpm lint           # tsc -b across packages
 ```
 
-## Project Structure
+Then press **F5** in VS Code to launch the Extension Development Host if you want to iterate on the viewer.
+
+Project layout:
 
 ```
-ShapeItUp/
-  packages/
-    extension/    -- VS Code extension host
-    viewer/       -- Three.js 3D viewer (webview)
-    worker/       -- OCCT WASM + Replicad (web worker)
-    mcp-server/   -- Claude Code MCP server
-    shared/       -- Shared types and messages
-  examples/       -- Example .shape.ts files
-  skill/          -- Claude Code skill (API reference)
+packages/
+  mcp-server/   -- standalone MCP server (this is the npm package)
+  core/         -- Replicad wrappers, stdlib, execution engine (bundled into mcp-server)
+  shared/       -- cross-package types (bundled into mcp-server)
+  extension/    -- VSCode extension (optional viewer)
+  viewer/       -- Three.js viewer surface for the extension
+  worker/       -- OCCT WASM web-worker for the extension viewer
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines.
 
 ## License
 
