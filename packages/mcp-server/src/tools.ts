@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync, renameSync, watch as fsWatch } from "fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync, watch as fsWatch } from "fs";
 import { join, resolve, basename, dirname, isAbsolute, sep } from "path";
 import { homedir } from "os";
 import {
@@ -261,6 +261,53 @@ function readViewerErrorIfNewer(globalStorage: string): { message: string; stack
 
 function nextCommandId(): string {
   return ID_PREFIX + (++commandCounter);
+}
+
+/**
+ * Headless-first rendering helper. Renders the supplied parts through the
+ * bundled SVG+resvg pipeline — the same path every screenshot-producing
+ * MCP tool now takes (render_preview, preview_finder, preview_shape,
+ * tune_params, open_shape(capture:true)). Optionally overlays finder-match
+ * centroids as pink highlight dots.
+ *
+ * Writes both the raw SVG and the rasterized PNG under
+ * `{previewsDir}/{basename}.svg` / `.png`. Returns absolute paths plus the
+ * raw PNG bytes (so callers can decide whether to inline the bytes or just
+ * reference the path). A rasterization failure is non-fatal — the SVG is
+ * still produced and `pngBuf` comes back `null` with `rasterError` set.
+ */
+async function renderHeadlessPngFromParts(
+  parts: import("@shapeitup/core").ExecutedPart[],
+  opts: {
+    previewsDir: string;
+    basename: string;
+    width?: number;
+    highlights?: Array<{ x: number; y: number; z: number }>;
+    title?: string;
+  },
+): Promise<{
+  svgPath: string;
+  pngPath: string;
+  pngBuf: Buffer | null;
+  svgSummary: string;
+  rasterError: string | null;
+}> {
+  const { previewsDir, basename: base, width, highlights, title } = opts;
+  mkdirSync(previewsDir, { recursive: true });
+  const svgOut = renderPartsToSvg(parts, { highlights, title });
+  const svgPath = join(previewsDir, `${base}.svg`);
+  const pngPath = join(previewsDir, `${base}.png`);
+  writeFileSync(svgPath, svgOut.svg, "utf-8");
+
+  let pngBuf: Buffer | null = null;
+  let rasterError: string | null = null;
+  try {
+    pngBuf = await svgToPng(svgOut.svg, width ?? 1280);
+    writeFileSync(pngPath, pngBuf);
+  } catch (e: any) {
+    rasterError = e?.message ?? String(e);
+  }
+  return { svgPath, pngPath, pngBuf, svgSummary: svgOut.summary, rasterError };
 }
 
 function sendExtensionCommand(command: string, params: Record<string, any> = {}): string | undefined {
@@ -2415,10 +2462,10 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "open_shape",
-    "Execute an existing .shape.ts file and (if VSCode is open) also bring it up in the viewer. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd(). Pass `capture: true` to also take a screenshot (same path render_preview uses); a capture failure does not fail the whole call — it's reported as a warning line.",
+    "Execute an existing .shape.ts file; when the ShapeItUp VSCode extension is open it will also reflect the file in its interactive viewer. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd(). Pass `capture: true` to also render a screenshot through the bundled SVG pipeline (runs standalone — no extension needed). A capture failure does not fail the whole call — it's reported as a warning line.",
     {
       filePath: z.string().describe("Path to the .shape.ts file to execute. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
-      capture: z.boolean().optional().describe("If true, after opening, also capture a PNG screenshot (isometric, AI mode, default size) via the VSCode extension. Requires the extension. Capture failures are reported as warnings; the handler still reports the execution status as success."),
+      capture: z.boolean().optional().describe("If true, after opening, also render a PNG screenshot through the bundled headless SVG pipeline. Runs standalone; the VSCode extension, when open, will continue to show the same file in its interactive viewer. Capture failures are reported as warnings; the handler still reports the execution status as success."),
       verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats. 'summary' (default) caps at 10 parts. 'full' dumps every part."),
       forceBundleRebuild: z.boolean().optional().describe("If true, bypasses the bundled-script cache and re-invokes esbuild. Use only when you suspect the cache is stale; the cache normally handles this correctly via mtime tracking."),
     },
@@ -2431,82 +2478,58 @@ export function registerTools(server: McpServer) {
         };
       }
 
-      const { status } = await executeWithPersistedParams(
+      const { status, parts } = await executeWithPersistedParams(
         absPath,
         undefined,
         forceBundleRebuild ? { forceBundleRebuild: true } : undefined,
       );
+      // Keep the non-capture UI sync — extension reflects the file in its
+      // interactive viewer when it's running. This remains best-effort IPC.
       notifyExtensionOfShape(absPath);
 
       let captureLine = "";
       let captureImage: { type: "image"; data: string; mimeType: string } | null = null;
       if (capture === true && status.success) {
         try {
-          if (!isExtensionAlive()) {
-            captureLine = "\nCapture: skipped — VSCode extension is not running.";
+          const freshParts = (parts && parts.length > 0) ? parts : getLastParts();
+          if (freshParts.length === 0) {
+            captureLine = "\nCapture: skipped — no tessellated parts available.";
           } else {
             const previewsDir = join(dirname(absPath), "shapeitup-previews");
             const userBase = basename(absPath).replace(/\.shape\.ts$/, "");
-            const outPath = join(previewsDir, `shapeitup-preview-${userBase}-isometric.png`);
-            try { mkdirSync(previewsDir, { recursive: true }); } catch {}
-            const cmdId = sendExtensionCommand("render-preview", {
-              filePath: absPath,
-              outputPath: outPath,
-              targetWorkspaceRoot: computeTargetWorkspaceRoot(absPath),
-              renderMode: "ai",
-              showDimensions: true,
-              showAxes: true,
-              cameraAngle: "isometric",
+            const baseName = `shapeitup-preview-${userBase}-isometric`;
+            const rendered = await renderHeadlessPngFromParts(freshParts, {
+              previewsDir,
+              basename: baseName,
               width: 1280,
-              height: 960,
+              title: `open_shape — ${userBase}`,
             });
-            if (!cmdId) {
-              captureLine = "\nCapture: failed to send command to extension.";
-            } else {
-              const result = await waitForResult(cmdId, 60_000);
-              if (!result) {
-                captureLine = "\nCapture: timed out after 60000ms (open_shape result still valid).";
-              } else if (result.error) {
-                // P1 fix: carry stack/operation through to open_shape's
-                // capture line so the error matches what render_preview would
-                // report for the same underlying failure.
-                const sidecar = readViewerErrorIfNewer(GLOBAL_STORAGE);
-                const stack: string | undefined =
-                  typeof result.errorStack === "string" ? result.errorStack : sidecar?.stack;
-                const op: string | undefined =
-                  typeof result.errorOperation === "string" ? result.errorOperation : sidecar?.operation;
-                let detail = result.error as string;
-                if (op) detail += ` (operation: ${op})`;
-                if (/require is not defined|__dirname|process\./.test(result.error as string)) {
-                  detail += "\nCommonJS restriction: `.shape.ts` files run in both Node (MCP) and a Web Worker (viewer). `require`, `__dirname`, `process.*`, and Node-only APIs are not available in the viewer — use ESM `import` instead.";
-                }
-                if (stack) {
-                  const trimmed = stack
-                    .split("\n")
-                    .slice(0, 3)
-                    .map((l: string) => `  ${l.trim()}`)
-                    .filter((l: string) => l.trim().length > 2)
-                    .join("\n");
-                  if (trimmed.length > 0) detail += `\n${trimmed}`;
-                }
-                captureLine = `\nCapture: failed — ${detail}`;
-              } else if (result.screenshotPath && existsSync(result.screenshotPath)) {
-                captureLine = `\nScreenshot: ${result.screenshotPath}`;
-                try {
-                  const st = statSync(result.screenshotPath);
-                  if (st.size <= 10 * 1024 * 1024) {
-                    captureImage = {
-                      type: "image",
-                      data: readFileSync(result.screenshotPath).toString("base64"),
-                      mimeType: "image/png",
-                    };
-                  }
-                } catch {
-                  // inline read failed — path is still reported
-                }
-              } else {
-                captureLine = "\nCapture: extension did not report a screenshot path.";
+            if (rendered.pngBuf) {
+              captureLine = `\nScreenshot: ${rendered.pngPath}`;
+              try {
+                appendScreenshotMetadata(
+                  {
+                    timestamp: Date.now(),
+                    path: rendered.pngPath,
+                    renderMode: "ai",
+                    cameraAngle: "isometric",
+                    fileName: basename(absPath),
+                    sourceFile: absPath,
+                  },
+                  GLOBAL_STORAGE,
+                );
+              } catch {
+                // best effort
               }
+              if (rendered.pngBuf.length <= 10 * 1024 * 1024) {
+                captureImage = {
+                  type: "image",
+                  data: rendered.pngBuf.toString("base64"),
+                  mimeType: "image/png",
+                };
+              }
+            } else {
+              captureLine = `\nCapture: SVG written to ${rendered.svgPath}, PNG rasterization failed (${rendered.rasterError ?? "unknown"}).`;
             }
           }
         } catch (e: any) {
@@ -3089,13 +3112,13 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "preview_shape",
-    "Execute a .shape.ts snippet WITHOUT writing it to the user's workspace — ideal for trying boolean-chain variations, sketch tweaks, or debugging steps while iterating. The snippet must have an `export default` main() returning a Shape3D or an array of parts (same contract as create_shape). The code is written to a throwaway temp file, executed through the same engine as create_shape, and deleted afterwards. By default the temp file lives in an isolated globalStorage path — local `./` imports cannot resolve from there. Pass `workingDir` (usually `.` or the workspace root) to have the temp file written there instead, which enables relative imports like `./bolt.shape` to resolve against your workspace. Set captureScreenshot:true to also render a PNG (requires the VSCode extension).",
+    "Execute a .shape.ts snippet WITHOUT writing it to the user's workspace — ideal for trying boolean-chain variations, sketch tweaks, or debugging steps while iterating. The snippet must have an `export default` main() returning a Shape3D or an array of parts (same contract as create_shape). The code is written to a throwaway temp file, executed through the same engine as create_shape, and deleted afterwards. By default the temp file lives in an isolated globalStorage path — local `./` imports cannot resolve from there. Pass `workingDir` (usually `.` or the workspace root) to have the temp file written there instead, which enables relative imports like `./bolt.shape` to resolve against your workspace. Set captureScreenshot:true to also render a PNG through the bundled headless SVG pipeline (runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the render in its interactive viewer).",
     {
       code: z.string().describe("Full .shape.ts source — must include an `export default` main() function returning a Shape3D or array of parts. Pair with `workingDir` to enable local `./` imports."),
       workingDir: z.string().optional().describe("Directory to write the temp snippet file in. When set, relative imports (`./foo.shape`) resolve against this directory. Defaults to a private globalStorage path (isolated; relative imports won't work). Pass the workspace root — usually `.` or an absolute path — to make `./foo.shape` imports from your assembly work."),
-      captureScreenshot: z.boolean().optional().describe("If true, also capture a PNG screenshot via the VSCode extension. Default: false. Requires the extension to be running."),
-      focusPart: z.string().optional().describe("For multi-part assemblies only: name of a single part to display exclusively in the screenshot — all other parts are hidden. No-op on single-part shapes. Takes precedence over hideParts when both are supplied. The interactive viewer's part visibility is restored after the screenshot."),
-      hideParts: z.array(z.string()).optional().describe("For multi-part assemblies only: list of part names to hide in the screenshot. Other parts remain visible. Ignored if focusPart is also set. The interactive viewer's part visibility is restored after the screenshot."),
+      captureScreenshot: z.boolean().optional().describe("If true, also render a PNG screenshot through the bundled headless SVG pipeline. Default: false. Runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the render in its interactive viewer."),
+      focusPart: z.string().optional().describe("For multi-part assemblies only: name of a single part to display exclusively in the screenshot — all other parts are hidden. No-op on single-part shapes. Takes precedence over hideParts when both are supplied."),
+      hideParts: z.array(z.string()).optional().describe("For multi-part assemblies only: list of part names to hide in the screenshot. Other parts remain visible. Ignored if focusPart is also set."),
     },
     safeHandler("preview_shape", async ({ code, workingDir, captureScreenshot, focusPart, hideParts }) => {
       // Cheap pre-flight: reject obvious non-starters before touching the engine.
@@ -3211,82 +3234,57 @@ export function registerTools(server: McpServer) {
         // Same path as create_shape — consistent status output + hints for free.
         const { status } = await executeShapeFile(tempPath, GLOBAL_STORAGE);
 
-        // Screenshot branch: only when requested AND engine run succeeded AND the
-        // extension is alive. The temp file MUST survive long enough for the
-        // viewer to read it back, so we defer the unlink into the finally below.
+        // Screenshot branch: only when requested AND engine run succeeded.
+        // Routes entirely through the bundled headless SVG pipeline — no
+        // dependency on the VSCode extension. focusPart / hideParts are
+        // honored by filtering the parts list before rendering.
         if (wantScreenshot && status.success) {
-          if (!isExtensionAlive()) {
-            screenshotWarning = "\n(Screenshot skipped: VSCode extension is not running.)";
+          const allParts = getLastParts();
+          if (allParts.length === 0) {
+            screenshotWarning = "\n(Screenshot skipped: no tessellated parts available.)";
           } else {
-            // Bug #2: pin the previews dir to the tempfile's OWN dirname —
-            // same canonical rule as render_preview and tune_params. Previously
-            // this used readHeartbeat().workspaceRoots[0], which in
-            // multi-window VSCode setups could point at a workspace that
-            // doesn't own the snippet, landing the PNG in the wrong place.
-            // Anchoring to dirname(tempPath) makes output a pure function of
-            // the input: when `workingDir` was passed the PNG lands next to
-            // the user's workspace; when it wasn't, the PNG lands alongside
-            // the isolated globalStorage snippet (still readable via the
-            // returned absolute path).
-            const previewsDir = join(dirname(tempPath), "shapeitup-previews");
-            // Deterministic snippet-based filename derived from the tempfile
-            // basename (strip .shape.ts) so concurrent preview_shape calls
-            // don't collide and each PNG is traceable to its snippet.
-            const snippetBase = basename(tempPath).replace(/\.shape\.ts$/, "");
-            const expectedOutputPath = join(previewsDir, `shapeitup-preview-${snippetBase}.png`);
+            // Apply focus/hide filters. Multi-part only — on a single-part
+            // script these are silently ignored (matches the documented spec
+            // and computePartsLine's logic).
+            let renderParts = allParts;
+            if (allParts.length > 1) {
+              if (focusPart) {
+                const focused = allParts.filter((p) => p.name === focusPart);
+                if (focused.length > 0) renderParts = focused;
+              } else if (hideParts && hideParts.length > 0) {
+                const hidden = new Set(hideParts);
+                const kept = allParts.filter((p) => !hidden.has(p.name));
+                if (kept.length > 0) renderParts = kept;
+              }
+            }
 
-            const cmdId = sendExtensionCommand("render-preview", {
-              filePath: tempPath,
-              outputPath: expectedOutputPath,
-              targetWorkspaceRoot: computeTargetWorkspaceRoot(tempPath),
-              renderMode: "ai",
-              showDimensions: true,
-              cameraAngle: "isometric",
-              width: 1280,
-              height: 960,
-              focusPart,
-              hideParts,
-            });
-            if (!cmdId) {
-              screenshotWarning = "\n(Screenshot skipped: failed to send command to extension.)";
-            } else {
-              // Reviewer feedback: 60s timed out on a cold-cache enclosure
-              // snippet where a proper render just needed a couple more seconds.
-              // 120s matches the worker's own defensive ceiling for heavy
-              // OCCT shells/offsets; callers can still override via timeoutMs
-              // on the extension side. Only the inline-screenshot path gets
-              // the bump — the text-only status path stays fast.
-              const timeoutMs = 120_000;
-              const result = await waitForResult(cmdId, timeoutMs);
-              if (!result) {
-                const reason = lastWaitTimeoutReason === "slow"
-                  ? `Screenshot exceeded ${timeoutMs / 1000}s. Large enclosures can take longer on cold caches. Options: save the snippet to a file (cached across calls), lower the mesh quality via \`export const config = { meshQuality: 'preview' }\`, or pass a larger \`timeoutMs\`.`
-                  : "extension stopped responding.";
-                screenshotWarning = `\n(Screenshot skipped: ${reason})`;
-              } else if (result.error) {
-                screenshotWarning = `\n(Screenshot skipped: ${result.error})`;
-              } else if (result.screenshotPath) {
-                // Fix B (Bug #5): single-source-of-truth rule — derive from
-                // status.partNames. See computePartsLine for rationale.
-                const partsLine = computePartsLine(
-                  focusPart,
-                  hideParts,
-                  status.partNames ?? [],
-                  "focused",
-                );
-                const partWarnLine = Array.isArray(result.partWarnings) && result.partWarnings.length > 0
-                  ? `\nPart warnings: ${result.partWarnings.join("; ")}`
-                  : "";
-                screenshotLine = `\nScreenshot: ${result.screenshotPath}${partsLine}${partWarnLine}`;
-                // Fix #6: record the screenshot on the status file so
-                // `get_render_status` can surface it. Snippet renders use
-                // the tempPath as fileName — it's the only sensible label,
-                // even though the snippet won't survive the tool call.
+            // Pin the previews dir to the tempfile's OWN dirname — same
+            // canonical rule the prior extension path used. Anchoring to
+            // dirname(tempPath) makes output a pure function of the input.
+            const previewsDir = join(dirname(tempPath), "shapeitup-previews");
+            const snippetBase = basename(tempPath).replace(/\.shape\.ts$/, "");
+            const baseName = `shapeitup-preview-${snippetBase}`;
+
+            try {
+              const rendered = await renderHeadlessPngFromParts(renderParts, {
+                previewsDir,
+                basename: baseName,
+                width: 1280,
+                title: `preview_shape — ${snippetBase}`,
+              });
+              const partsLine = computePartsLine(
+                focusPart,
+                hideParts,
+                status.partNames ?? [],
+                "focused",
+              );
+              if (rendered.pngBuf) {
+                screenshotLine = `\nScreenshot: ${rendered.pngPath}${partsLine}`;
                 try {
                   appendScreenshotMetadata(
                     {
                       timestamp: Date.now(),
-                      path: result.screenshotPath,
+                      path: rendered.pngPath,
                       renderMode: "ai",
                       cameraAngle: "isometric",
                       fileName: basename(tempPath),
@@ -3297,7 +3295,11 @@ export function registerTools(server: McpServer) {
                 } catch {
                   // Best effort.
                 }
+              } else {
+                screenshotWarning = `\n(Screenshot: SVG at ${rendered.svgPath}; PNG rasterization failed — ${rendered.rasterError ?? "unknown"}.)`;
               }
+            } catch (e: any) {
+              screenshotWarning = `\n(Screenshot skipped: ${e?.message ?? e})`;
             }
           }
         }
@@ -3322,11 +3324,11 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "tune_params",
-    "Re-execute an existing .shape.ts with ephemeral `params` overrides WITHOUT modifying the file — the file on disk is untouched. Returns the same stats as get_render_status (volume, surface area, bounding box, timings, warnings) so agents can binary-search a design constraint (target volume, bounding box, mass, fit tolerance) before committing the winning value with modify_shape. Pass `captureScreenshot: true` to also render a PNG of the tuned configuration via the VSCode extension. Pass `persist: true` to also write the override map to a `.shapeitup-params.json` sidecar next to the file so every later execution (render_preview, open_shape, export_shape, etc.) picks them up automatically; clear with `clear_params`.",
+    "Re-execute an existing .shape.ts with ephemeral `params` overrides WITHOUT modifying the file — the file on disk is untouched. Returns the same stats as get_render_status (volume, surface area, bounding box, timings, warnings) so agents can binary-search a design constraint (target volume, bounding box, mass, fit tolerance) before committing the winning value with modify_shape. Pass `captureScreenshot: true` to also render a PNG of the tuned configuration through the bundled headless SVG pipeline (runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the render in its interactive viewer). Pass `persist: true` to also write the override map to a `.shapeitup-params.json` sidecar next to the file so every later execution (render_preview, open_shape, export_shape, etc.) picks them up automatically; clear with `clear_params`.",
     {
       filePath: z.string().describe("Path to the .shape.ts file. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
       params: z.record(z.string(), z.number()).describe("Map of param name → override value. Only listed params are overridden; others fall back to the file's declared defaults. Values must be numbers."),
-      captureScreenshot: z.boolean().optional().describe("If true, also capture a PNG screenshot of the tuned configuration via the VSCode extension. Default: false. Requires the extension to be running."),
+      captureScreenshot: z.boolean().optional().describe("If true, also render a PNG screenshot of the tuned configuration through the bundled headless SVG pipeline. Default: false. Runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the render in its interactive viewer."),
       inline: z.boolean().optional().describe("When used with captureScreenshot, also return the PNG as an inline image content block (base64) so the agent can see it without a second get_preview call. Skipped silently if the PNG exceeds 10 MB. Default: false."),
       persist: z.boolean().optional().describe("If true AND the render succeeds, write the override map to `.shapeitup-params.json` next to the file so subsequent render_preview/open_shape/export_shape/etc. calls pick them up automatically. Default: false (stateless, legacy behavior). Precedence: script defaults < sidecar < call-time params. Clear with `clear_params`."),
     },
@@ -3358,7 +3360,7 @@ export function registerTools(server: McpServer) {
       // second param via plain `tune_params` calls: the first param stays
       // pinned in the sidecar, the second stays ephemeral, and the render
       // reflects both.
-      const { status } = await executeWithPersistedParams(absPath, params);
+      const { status, parts } = await executeWithPersistedParams(absPath, params);
 
       // Warn about keys that aren't declared in the script's `params` object.
       // The engine silently accepts unknown keys (they just don't do anything);
@@ -3420,57 +3422,35 @@ export function registerTools(server: McpServer) {
         responseText += "\n(Persist skipped: render failed; sidecar unchanged.)";
       }
 
-      // Optional screenshot branch — only meaningful on a successful render
-      // AND when the extension is running. Mirrors the preview_shape pattern
-      // (warning, not isError, when the screenshot can't be produced).
+      // Optional screenshot branch — only meaningful on a successful render.
+      // Routes through the bundled headless SVG pipeline; no extension needed.
       let capturedScreenshotPath: string | undefined;
       if (captureScreenshot === true && status.success) {
-        if (!isExtensionAlive()) {
-          responseText += "\n(Screenshot skipped: VSCode extension is not running.)";
+        // Pin output path to dirname(absPath)/shapeitup-previews — same
+        // canonical rule as render_preview, so tune_params and render_preview
+        // write to the same place for the same shape.
+        const previewsDir = join(dirname(absPath), "shapeitup-previews");
+        const tuneBase = basename(absPath).replace(/\.shape\.ts$/, "");
+        const baseName = `shapeitup-preview-${tuneBase}-tuned-isometric`;
+        const renderParts = (parts && parts.length > 0) ? parts : getLastParts();
+        if (renderParts.length === 0) {
+          responseText += "\n(Screenshot skipped: no tessellated parts available.)";
         } else {
-          // Pin output path to dirname(absPath)/shapeitup-previews — same
-          // canonical rule as render_preview, so tune_params and render_preview
-          // write to the same place for the same shape regardless of which
-          // VSCode window is active.
-          const previewsDir = join(dirname(absPath), "shapeitup-previews");
-          const tuneBase = basename(absPath).replace(/\.shape\.ts$/, "");
-          const tuneOutputPath = join(previewsDir, `shapeitup-preview-${tuneBase}-tuned-isometric.png`);
-          const cmdId = sendExtensionCommand("render-preview", {
-            filePath: absPath,
-            outputPath: tuneOutputPath,
-            targetWorkspaceRoot: computeTargetWorkspaceRoot(absPath),
-            renderMode: "ai",
-            showDimensions: true,
-            cameraAngle: "isometric",
-            width: 1280,
-            height: 960,
-            // Forwarded to the extension host, which threads it through
-            // executeScript → viewer → worker so the PNG matches the tuned
-            // configuration we just stat'd, not the file's defaults.
-            params,
-          });
-          if (!cmdId) {
-            responseText += "\n(Screenshot skipped: failed to send command to extension.)";
-          } else {
-            const result = await waitForResult(cmdId, 60_000);
-            if (!result) {
-              const reason = lastWaitTimeoutReason === "slow"
-                ? "extension is alive but render exceeded 60s"
-                : "extension stopped responding";
-              responseText += `\n(Screenshot skipped: ${reason}.)`;
-            } else if (result.error) {
-              responseText += `\n(Screenshot skipped: ${result.error})`;
-            } else if (result.screenshotPath) {
-              responseText += `\nScreenshot: ${result.screenshotPath}`;
-              capturedScreenshotPath = result.screenshotPath;
-              // Fix #6: record the tune_params screenshot. Matches
-              // render_preview / preview_shape so get_render_status always
-              // reflects the most recent PNG regardless of which tool made it.
+          try {
+            const rendered = await renderHeadlessPngFromParts(renderParts, {
+              previewsDir,
+              basename: baseName,
+              width: 1280,
+              title: `tune_params — ${tuneBase}`,
+            });
+            if (rendered.pngBuf) {
+              responseText += `\nScreenshot: ${rendered.pngPath}`;
+              capturedScreenshotPath = rendered.pngPath;
               try {
                 appendScreenshotMetadata(
                   {
                     timestamp: Date.now(),
-                    path: result.screenshotPath,
+                    path: rendered.pngPath,
                     renderMode: "ai",
                     cameraAngle: "isometric",
                     fileName: basename(absPath),
@@ -3481,7 +3461,11 @@ export function registerTools(server: McpServer) {
               } catch {
                 // Best effort.
               }
+            } else {
+              responseText += `\n(Screenshot: SVG at ${rendered.svgPath}; PNG rasterization failed — ${rendered.rasterError ?? "unknown"}.)`;
             }
+          } catch (e: any) {
+            responseText += `\n(Screenshot skipped: ${e?.message ?? e})`;
           }
         }
       }
@@ -3653,7 +3637,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "render_preview",
-    "Capture a PNG screenshot of the current shape. Requires VSCode + the ShapeItUp extension to be running (the extension renders via its webview, which works regardless of window size — the canvas is temporarily resized to the requested resolution). Preview PNGs are written to `{workspace}/shapeitup-previews/` — Read the returned absolute path to view the image. For headless verification without VSCode, use get_render_status which returns volume, surface area, center of mass, and bounding box. Pass `finder` to paint pink highlight spheres on the matched edges/faces in the screenshot (for just a text match count with no PNG, use `preview_finder`). Pass `meshQuality: 'preview'` to speed up first-render on large assemblies at the cost of coarser facets; defaults to auto-degrade (preview for 15+ parts, final otherwise). Pass `cameraAngle` as an array (e.g. ['isometric', 'front', 'right']) or `grid: true` to composite multiple angles into a single labelled collage PNG.",
+    "Render a PNG screenshot of the current shape through the bundled headless SVG pipeline — a 4-pane (top/front/right/iso) shaded view produced from the in-memory tessellation. Runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the same shape in its interactive viewer. PNGs are written to `{workspace}/shapeitup-previews/` — Read the returned absolute path to view the image. Pass `finder` to overlay pink dots at matched edges/faces (for a text-only match count, use `preview_finder`). Pass `meshQuality: 'preview'` to coarsen tessellation on large assemblies; defaults to auto-degrade (preview for 15+ parts, final otherwise). Multi-angle / grid is handled inline by the 4-pane SVG — `cameraAngle` arrays and `grid: true` are accepted for backward compat but collapse to a single render.",
     {
       filePath: z.string().optional().describe("Optional .shape.ts to execute first. Defaults to the last-executed shape."),
       cameraAngle: z
@@ -3772,370 +3756,92 @@ export function registerTools(server: McpServer) {
         };
       }
 
-      if (!isExtensionAlive()) {
-        // Headless fallback: render a 4-view SVG wireframe from the
-        // OCCT-tessellated edges we already have. Not as pretty as the
-        // Three.js viewer, but lets agents verify silhouette and proportions
-        // without any running VS Code window.
-        const parts = getLastParts();
-        if (parts.length === 0) {
-          return {
-            content: [{
-              type: "text" as const,
-              text:
-                `render_preview: no tessellated parts available and VS Code extension isn't running. ` +
-                `Run create_shape / modify_shape / open_shape first so the engine has geometry to render.`,
-            }],
-            isError: true,
-          };
-        }
+      // Headless-first: the MCP server always renders through the bundled
+      // SVG + resvg pipeline. The ShapeItUp VSCode extension, when open,
+      // continues to reflect the same shape in its interactive viewer — it
+      // just isn't on the critical path for screenshot production.
 
-        const svgOut = renderPartsToSvg(parts);
-        const ts = Date.now();
-        const previewsDir = join(GLOBAL_STORAGE, "shapeitup-previews");
-        const svgPath = join(previewsDir, `headless-${ts}.svg`);
-        const pngPath = join(previewsDir, `headless-${ts}.png`);
-        try {
-          mkdirSync(previewsDir, { recursive: true });
-          writeFileSync(svgPath, svgOut.svg, "utf-8");
-        } catch (e: any) {
-          return {
-            content: [{ type: "text" as const, text: `Failed to write headless SVG preview: ${e.message}` }],
-            isError: true,
-          };
-        }
-
-        const liveRoots = getHeartbeatWorkspaceRoots();
-        const rootHint = liveRoots.length > 0
-          ? `\nFor the richer Three.js preview, focus a VS Code window with one of these workspaces open: ${liveRoots.join(", ")}`
-          : "\nFor the richer Three.js preview, open the .shape.ts file in VS Code with the ShapeItUp extension.";
-
-        // Rasterize the SVG → PNG so the agent gets a visible image in the
-        // response, not just a file path. Resvg-wasm pays a ~4 MB first-call
-        // init; after that each render is fast.
-        let pngBuf: Buffer | null = null;
-        let rasterError: string | null = null;
-        try {
-          pngBuf = await svgToPng(svgOut.svg, width ?? 800);
-          writeFileSync(pngPath, pngBuf);
-        } catch (e: any) {
-          rasterError = e?.message ?? String(e);
-        }
-
-        const textBlock = {
-          type: "text" as const,
-          text:
-            `Headless wireframe preview (VS Code extension not running).\n` +
-            `${svgOut.summary}\n` +
-            (pngBuf ? `PNG: ${pngPath}\nSVG: ${svgPath}` : `SVG: ${svgPath}\n(PNG rasterization failed: ${rasterError ?? "unknown"} — read the SVG directly.)`) +
-            rootHint,
+      // Execute the shape to get fresh tessellated parts. A finder pass needs
+      // live OCCT shape refs so we bypass the mesh cache (force: true). Plain
+      // renders reuse cached geometry when available.
+      const needsLiveShape = finder !== undefined && finder.trim().length > 0;
+      const { status: preStatus, parts: executedParts } = await executeWithPersistedParams(
+        source,
+        undefined,
+        {
+          force: needsLiveShape,
+          forceBundleRebuild: forceBundleRebuild ? true : undefined,
+        },
+      );
+      if (!preStatus.success || !executedParts || executedParts.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: `Cannot render preview — script failed.\n${formatStatusText(preStatus)}` }],
+          isError: true,
         };
-
-        if (pngBuf && pngBuf.length < 10 * 1024 * 1024) {
-          return {
-            content: [
-              textBlock,
-              {
-                type: "image" as const,
-                data: pngBuf.toString("base64"),
-                mimeType: "image/png",
-              },
-            ],
-            isError: false,
-          };
-        }
-
-        return { content: [textBlock], isError: false };
       }
 
-      // When no explicit filePath was passed, the default `source` came from
-      // engine.getLastFileName() — which is the process-wide "last executed
-      // shape", regardless of which window currently owns focus. In a
-      // multi-window VSCode setup, that file may belong to a workspace that is
-      // not the one the extension host will route this render to. Catching
-      // that silently would produce "success" responses pointing at a PNG
-      // captured by the wrong viewer. Refuse when the ambiguity is detectable
-      // and tell the caller to pass filePath.
-      if (!explicitFilePath) {
-        const hbs = readAllHeartbeats();
-        // Count live windows whose workspace roots actually contain `source`.
-        const resolvedSource = resolve(source).toLowerCase();
-        const ownedBy = hbs.filter((hb) =>
-          hb.workspaceRoots.some((r) => {
-            const rAbs = resolve(r).toLowerCase();
-            return resolvedSource === rAbs || resolvedSource.startsWith(rAbs + sep.toLowerCase());
-          }),
-        );
-        // Multi-window setup AND no window owns this file → the last-executed
-        // shape lives in a workspace that no current window can render.
-        if (hbs.length > 1 && ownedBy.length === 0) {
-          return {
-            content: [{
-              type: "text" as const,
-              text: `No default shape for this workspace — last-executed shape (${source}) lives in a workspace no live ShapeItUp window owns. Pass an explicit \`filePath\` or open the correct workspace.\n\nLive windows: ${hbs.map((h) => h.workspaceRoots.join(",")).join(" | ")}`,
-            }],
-            isError: true,
-          };
+      // Normalize cameraAngle for the text summary. Multi-angle / grid is
+      // accepted for backward compat but collapses to a single 4-pane SVG
+      // render — the SVG itself already shows top/front/right/iso, which
+      // subsumes the old multi-angle collage use case.
+      const singleAngle: string =
+        typeof cameraAngle === "string"
+          ? cameraAngle
+          : Array.isArray(cameraAngle)
+            ? cameraAngle[0] ?? "isometric"
+            : grid === true
+              ? "grid"
+              : "isometric";
+
+      // Apply focus/hide filters. Multi-part only (single-part scripts
+      // silently ignore — matches computePartsLine's invariant).
+      let renderParts = executedParts;
+      if (executedParts.length > 1) {
+        if (focusPart) {
+          const focused = executedParts.filter((p) => p.name === focusPart);
+          if (focused.length > 0) renderParts = focused;
+        } else if (hideParts && hideParts.length > 0) {
+          const hidden = new Set(hideParts);
+          const kept = executedParts.filter((p) => !hidden.has(p.name));
+          if (kept.length > 0) renderParts = kept;
         }
       }
 
-      // --- Multi-angle collage branch -----------------------------------------
-      // When the caller supplies an array of angles (or `grid: true`) we
-      // capture each angle via the existing single-angle IPC, then composite
-      // the intermediate PNGs into one labelled collage through resvg (same
-      // path the headless fallback uses). Intermediate PNGs are deleted after
-      // compositing so callers are left with a single file.
-      //
-      // Deliberately incompatible with `finder` — a finder collage would need
-      // N wrapper files and its own stamping logic, and nobody's asked. Fail
-      // loud if both are supplied.
-      const gridDefault: Array<"isometric" | "front" | "right" | "top"> = [
-        "isometric",
-        "front",
-        "right",
-        "top",
-      ];
-      let angleList: string[] | undefined;
-      if (Array.isArray(cameraAngle)) {
-        angleList = cameraAngle;
-      } else if (grid === true && cameraAngle === undefined) {
-        angleList = gridDefault.slice();
-      }
-      if (angleList && angleList.length > 1) {
-        if (finder !== undefined && finder.trim().length > 0) {
-          return {
-            content: [{
-              type: "text" as const,
-              text: "render_preview: multi-angle (array cameraAngle or grid:true) is not compatible with `finder`. Pass a single cameraAngle when using finder, or drop finder to build a collage.",
-            }],
-            isError: true,
-          };
-        }
-
-        const perW = width || 1280;
-        const perH = height || 960;
-        const previewsDir = join(dirname(source), "shapeitup-previews");
-        const userBase = basename(source).replace(/\.shape\.ts$/, "");
-        const capturedPaths: string[] = [];
-        const effectiveTimeout = timeoutMs ?? 60_000;
-
-        try {
-          for (const angle of angleList) {
-            const outPath = join(previewsDir, `shapeitup-preview-${userBase}-collage-${angle}.png`);
-            const cmdId = sendExtensionCommand("render-preview", {
-              filePath: source,
-              outputPath: outPath,
-              targetWorkspaceRoot: computeTargetWorkspaceRoot(source),
-              renderMode: renderMode || "ai",
-              showDimensions: showDimensions !== false,
-              showAxes: showAxes !== false,
-              cameraAngle: angle,
-              width: perW,
-              height: perH,
-              focusPart,
-              hideParts,
-              meshQuality: effectiveMeshQuality,
-            });
-            if (!cmdId) {
-              return { content: [{ type: "text" as const, text: "Failed to send command to extension" }], isError: true };
-            }
-            const result = await waitForResult(cmdId, effectiveTimeout);
-            if (!result) {
-              return {
-                content: [{ type: "text" as const, text: `render_preview (multi-angle): timed out on angle '${angle}' after ${effectiveTimeout}ms.` }],
-                isError: true,
-              };
-            }
-            if (result.error) {
-              return {
-                content: [{ type: "text" as const, text: `Screenshot failed for angle '${angle}': ${result.error}` }],
-                isError: true,
-              };
-            }
-            const capturedPath = result.screenshotPath;
-            if (!capturedPath || typeof capturedPath !== "string" || !existsSync(capturedPath)) {
-              return {
-                content: [{ type: "text" as const, text: `render_preview (multi-angle): extension did not write a PNG for angle '${angle}' (expected at ${outPath}).` }],
-                isError: true,
-              };
-            }
-            capturedPaths.push(capturedPath);
-          }
-
-          // Layout: 2 → 1×2 strip, 3 → 1×3 strip, 4 → 2×2 grid.
-          const n = capturedPaths.length;
-          let cols: number, rows: number;
-          if (n === 2) { cols = 2; rows = 1; }
-          else if (n === 3) { cols = 3; rows = 1; }
-          else if (n === 4) { cols = 2; rows = 2; }
-          else { cols = n; rows = 1; } // fallback for 1 (shouldn't happen — single-angle path owns n=1)
-
-          const labelH = 28; // px of space below each tile for the angle label
-          const tileGap = 24; // px gutter between adjacent tiles (both axes)
-          const legendH = 32; // px band below the tile grid for the shared legend
-          // Tile strip width: `cols` tiles plus `cols - 1` gutters. For cols=1
-          // the second term is zero, so a single-tile collage matches perW exactly.
-          const totalW = perW * cols + tileGap * Math.max(0, cols - 1);
-          // Tile strip height: `rows` of image+label plus `rows - 1` gutters.
-          const tilesH = (perH + labelH) * rows + tileGap * Math.max(0, rows - 1);
-          // Total height adds the legend band below the tiles.
-          const totalH = tilesH + legendH;
-
-          // Approximate max chars per label that comfortably fit inside one
-          // tile's width given the 18 px sans-serif. 8 px/char is generous for
-          // a proportional font but keeps the math cheap and the edge case
-          // (huge angle names on narrow tiles) safely truncated.
-          const maxLabelChars = Math.max(4, Math.floor((perW - 12) / 8));
-          const truncateLabel = (s: string): string =>
-            s.length <= maxLabelChars ? s : s.slice(0, Math.max(1, maxLabelChars - 1)) + "…";
-
-          // Build an SVG that references each captured PNG as base64. Fonts
-          // are suppressed in svg-to-png.ts (font: { loadSystemFonts: false }),
-          // so we use SVG's default font which renders as the platform generic
-          // sans. Good enough for a small label — these aren't for print.
-          let svg = `<?xml version="1.0" encoding="UTF-8"?>\n`;
-          svg += `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="${totalW}" height="${totalH}" viewBox="0 0 ${totalW} ${totalH}">\n`;
-          svg += `<rect width="${totalW}" height="${totalH}" fill="white"/>\n`;
-          for (let i = 0; i < n; i++) {
-            const col = i % cols;
-            const row = Math.floor(i / cols);
-            const x = col * (perW + tileGap);
-            const y = row * (perH + labelH + tileGap);
-            const b64 = readFileSync(capturedPaths[i]).toString("base64");
-            svg += `<image x="${x}" y="${y}" width="${perW}" height="${perH}" xlink:href="data:image/png;base64,${b64}"/>\n`;
-            const label = truncateLabel(angleList[i]);
-            const labelX = x + perW / 2;
-            const labelY = y + perH + labelH * 0.7;
-            // Clip the label to the tile width so an over-long name can't
-            // spill into the neighbouring tile — truncation above gives the
-            // common case; textLength is the belt-and-braces guard.
-            svg += `<text x="${labelX}" y="${labelY}" text-anchor="middle" font-family="sans-serif" font-size="18" fill="#222" textLength="${perW - 12}" lengthAdjust="spacingAndGlyphs">${label}</text>\n`;
-          }
-          // Legend band: a single strip below the tile grid summarizing the
-          // full set of angles rendered. Keeps per-tile labels uncluttered
-          // when we had to truncate, and gives the viewer one place to see
-          // every angle name in full.
-          const legendY = tilesH + legendH * 0.65;
-          const legendText = angleList.join("  |  ");
-          svg += `<rect x="0" y="${tilesH}" width="${totalW}" height="${legendH}" fill="#f5f5f5"/>\n`;
-          svg += `<text x="${totalW / 2}" y="${legendY}" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#444">${legendText}</text>\n`;
-          svg += `</svg>\n`;
-
-          const collagePath = join(previewsDir, `shapeitup-preview-${userBase}-collage.png`);
-          let collageBytes: Buffer;
-          try {
-            collageBytes = await svgToPng(svg, totalW);
-          } catch (e: any) {
-            return {
-              content: [{ type: "text" as const, text: `Collage rasterization failed: ${e?.message ?? e}. Intermediate PNGs: ${capturedPaths.join(", ")}` }],
-              isError: true,
-            };
-          }
-          try { mkdirSync(previewsDir, { recursive: true }); } catch {}
-          writeFileSync(collagePath, collageBytes);
-
-          // Clean up intermediates — the caller wanted a collage, not N files.
-          for (const p of capturedPaths) {
-            try { unlinkSync(p); } catch { /* best effort */ }
-          }
-
-          // Intentionally skip status-file writes here. The single-angle
-          // branch currently doesn't append screenshot metadata to
-          // shapeitup-status.json (there is no shared helper in this file),
-          // so the collage branch follows suit — staying consistent beats
-          // introducing a one-off observability write.
-
-          const textBlock = {
-            type: "text" as const,
-            text: `Collage saved to: ${collagePath}\nLayout: ${cols}x${rows} (${angleList.join(", ")})\nRender mode: ${renderMode || "ai"}, Per-tile: ${perW}x${perH}, Total: ${totalW}x${totalH}\nFile: ${source}\nUse the Read tool to view this image.`,
-          };
-          if (inline !== false) {
-            if (collageBytes.length > 10 * 1024 * 1024) {
-              return {
-                content: [
-                  textBlock,
-                  { type: "text" as const, text: `\n(collage is ${(collageBytes.length / 1024 / 1024).toFixed(1)} MB, exceeding the 10 MB inline limit. Use the Read tool on the saved path.)` },
-                ],
-              };
-            }
-            return {
-              content: [
-                textBlock,
-                { type: "image" as const, data: collageBytes.toString("base64"), mimeType: "image/png" },
-              ],
-            };
-          }
-          return { content: [textBlock] };
-        } catch (e: any) {
-          // Best-effort cleanup on unexpected failures so we don't leak
-          // half-rendered per-angle PNGs into the user's workspace.
-          for (const p of capturedPaths) {
-            try { unlinkSync(p); } catch {}
-          }
-          return {
-            content: [{ type: "text" as const, text: `render_preview (multi-angle): unexpected failure: ${e?.message ?? e}` }],
-            isError: true,
-          };
-        }
-      }
-
-      // Past this point, cameraAngle is either undefined or a single string.
-      // Narrow the variable so the rest of the handler (which was written
-      // before the union type) doesn't choke on the array branch.
-      const singleAngle: string | undefined = Array.isArray(cameraAngle) ? cameraAngle[0] : cameraAngle;
-
-      // --- Optional finder branch ---------------------------------------------
-      // When `finder` is set, we don't ship the user's file to the extension as
-      // usual; we generate a wrapper .shape.ts next to it that applies
-      // highlightFinder() to the chosen part and render THAT. The wrapper is
-      // cleaned up in a finally so we never leave droppings if the render
-      // crashes. `buildFinderWrapperScript` is the shared helper also used by
-      // preview_finder — keeping the wrapper contract in one place.
-      let wrapperPath: string | undefined;
+      // --- Optional finder overlay ------------------------------------------
+      // Evaluate the finder in-process against the chosen target part and
+      // collect centroid positions so the SVG can mark them as pink dots.
+      // Runs entirely without the extension — same code path whether or not
+      // a viewer is open.
+      let finderHighlights: Array<{ x: number; y: number; z: number }> | undefined;
       let finderAppliedLine = "";
       let finderPartWarning: string | undefined;
-      let renderFileArg = source;
-      if (finder !== undefined && finder.trim().length > 0) {
-        // Run the script once to resolve the target part + validate the finder
-        // expression. Matches preview_finder: lets us produce clean error
-        // messages ("no part named X", "finder failed to evaluate") *before*
-        // burning a full extension render.
-        const { status: preStatus, parts } = await executeWithPersistedParams(
-          source,
-          undefined,
-          forceBundleRebuild ? { forceBundleRebuild: true } : undefined,
-        );
-        if (!preStatus.success || !parts || parts.length === 0) {
-          return {
-            content: [{ type: "text" as const, text: `Cannot render finder preview — script failed to render.\n${formatStatusText(preStatus)}` }],
-            isError: true,
-          };
-        }
+      let finderMatchCount = 0;
 
+      if (needsLiveShape) {
+        // Resolve target part index on the UNFILTERED executedParts list so
+        // partName/partIndex semantics match preview_finder.
         let resolvedIdx: number;
         if (partName !== undefined) {
-          if (parts.length === 1) {
-            // Spec: single-part script + partName/partIndex passed → warn and
-            // proceed (finder applies to the sole part).
-            finderPartWarning = `partName='${partName}' ignored: script returned a single part ('${parts[0].name}'). Finder applied to it.`;
+          if (executedParts.length === 1) {
+            finderPartWarning = `partName='${partName}' ignored: script returned a single part ('${executedParts[0].name}'). Finder applied to it.`;
             resolvedIdx = 0;
           } else {
-            const byName = parts.findIndex((p) => p.name === partName);
+            const byName = executedParts.findIndex((p) => p.name === partName);
             if (byName < 0) {
               return {
-                content: [{ type: "text" as const, text: `No part named "${partName}" in ${basename(source)}. Available parts: ${parts.map((p) => p.name).join(", ") || "(none)"}` }],
+                content: [{ type: "text" as const, text: `No part named "${partName}" in ${basename(source)}. Available parts: ${executedParts.map((p) => p.name).join(", ") || "(none)"}` }],
                 isError: true,
               };
             }
             resolvedIdx = byName;
           }
         } else if (partIndex !== undefined) {
-          if (parts.length === 1 && partIndex !== 0) {
-            finderPartWarning = `partIndex=${partIndex} ignored: script returned a single part ('${parts[0].name}'). Finder applied to it.`;
+          if (executedParts.length === 1 && partIndex !== 0) {
+            finderPartWarning = `partIndex=${partIndex} ignored: script returned a single part ('${executedParts[0].name}'). Finder applied to it.`;
             resolvedIdx = 0;
-          } else if (partIndex >= parts.length) {
+          } else if (partIndex >= executedParts.length) {
             return {
-              content: [{ type: "text" as const, text: `partIndex ${partIndex} out of range — script returned ${parts.length} part${parts.length === 1 ? "" : "s"} (${parts.map((p) => p.name).join(", ")}).` }],
+              content: [{ type: "text" as const, text: `partIndex ${partIndex} out of range — script returned ${executedParts.length} part${executedParts.length === 1 ? "" : "s"} (${executedParts.map((p) => p.name).join(", ")}).` }],
               isError: true,
             };
           } else {
@@ -4145,10 +3851,10 @@ export function registerTools(server: McpServer) {
           resolvedIdx = 0;
         }
 
-        // Pre-evaluate the finder expression with EdgeFinder/FaceFinder in
-        // scope. Catches typos + undefined-method errors up-front so the MCP
-        // response carries a clear message instead of a generic "script
-        // failed" from the worker. Same sandbox pattern as preview_finder.
+        if (executedParts.length > 1) {
+          finderAppliedLine = `\nFinder applied to part ${resolvedIdx}: ${executedParts[resolvedIdx].name}`;
+        }
+
         try {
           const core = await getCore();
           const replicad: any = core.replicad();
@@ -4162,198 +3868,91 @@ export function registerTools(server: McpServer) {
               isError: true,
             };
           }
+          const target = executedParts[resolvedIdx];
+          const matches: any[] = finderObj.find(target.shape) || [];
+          finderMatchCount = matches.length;
+          finderHighlights = [];
+          for (const m of matches) {
+            let pt: any;
+            try {
+              if (typeof m.pointAt === "function") pt = m.pointAt(0.5);
+              else if (m.center) pt = m.center;
+            } catch {}
+            const px = pt?.x ?? (Array.isArray(pt) ? pt[0] : undefined);
+            const py = pt?.y ?? (Array.isArray(pt) ? pt[1] : undefined);
+            const pz = pt?.z ?? (Array.isArray(pt) ? pt[2] : undefined);
+            if (typeof px === "number" && typeof py === "number" && typeof pz === "number") {
+              finderHighlights.push({ x: px, y: py, z: pz });
+            }
+            try { m.delete?.(); } catch {}
+          }
         } catch (e: any) {
           return {
             content: [{ type: "text" as const, text: `Finder expression failed to evaluate: ${e?.message ?? e}\nExpression: ${finder}` }],
             isError: true,
           };
         }
-
-        // Emit the "(applied to part N: <name>)" line for multi-part assemblies
-        // — matches the spec's guidance for the default-partIndex case.
-        if (parts.length > 1) {
-          finderAppliedLine = `\nFinder applied to part ${resolvedIdx}: ${parts[resolvedIdx].name}`;
-        }
-
-        const stamp = Date.now().toString(36);
-        const dir = dirname(source);
-        wrapperPath = join(dir, `.shapeitup-finder-preview-${stamp}.shape.ts`);
-        try {
-          const wrapperSource = buildFinderWrapperScript(source, finder, { index: resolvedIdx });
-          writeFileSync(wrapperPath, wrapperSource, "utf-8");
-        } catch (e: any) {
-          // Couldn't even stage the wrapper — no cleanup needed since
-          // writeFileSync didn't succeed.
-          wrapperPath = undefined;
-          return {
-            content: [{ type: "text" as const, text: `Failed to stage finder wrapper file: ${e?.message ?? e}` }],
-            isError: true,
-          };
-        }
-        renderFileArg = wrapperPath;
       }
 
-      // Bug #1/#12 fix: MCP computes the exact PNG path here and hands it to
-      // the extension, instead of letting captureScreenshot() synthesize one
-      // from `this.lastExecutedFile` (which can be stale because executeScript
-      // is fired without await). The PNG is pinned to the USER-visible
-      // basename of `source`, placed in a shapeitup-previews/ sibling of the
-      // shape file itself. Anchoring to dirname(source) — rather than the
-      // heartbeat's workspace root — makes path resolution a pure function of
-      // the input, immune to the active-window/heartbeat drift that caused
-      // back-to-back calls to land in different directories.
+      // Canonical output path — anchored to dirname(source) so results are a
+      // pure function of the input and match the existing render_preview
+      // layout (`{shape-dir}/shapeitup-previews/shapeitup-preview-<name>-<angle>.png`).
       const previewsDir = join(dirname(source), "shapeitup-previews");
       const userBase = basename(source).replace(/\.shape\.ts$/, "");
-      const angleForName = singleAngle || "isometric";
-      const expectedOutputPath = join(previewsDir, `shapeitup-preview-${userBase}-${angleForName}.png`);
+      const angleForName = singleAngle;
+      const finderTag = needsLiveShape ? "-finder" : "";
+      const baseName = `shapeitup-preview-${userBase}${finderTag}-${angleForName}`;
+      const titleSuffix = needsLiveShape ? ` + finder (${finderMatchCount} match${finderMatchCount === 1 ? "" : "es"})` : "";
 
+      let rendered;
       try {
-        const cmdId = sendExtensionCommand("render-preview", {
-          filePath: renderFileArg,
-          outputPath: expectedOutputPath,
-          // Target the window whose workspace owns the SOURCE file (not the
-          // possibly-synthetic wrapperPath). The wrapper is staged next to
-          // source, so its owning workspace is identical; resolving off the
-          // user-visible source path keeps the hint stable even when
-          // preview_finder rewrites renderFileArg to a sibling wrapper.
-          targetWorkspaceRoot: computeTargetWorkspaceRoot(source),
-          renderMode: renderMode || "ai",
-          showDimensions: showDimensions !== false,
-          // Default flipped to ON — iso views on complex parts are otherwise
-          // ambiguous. Only suppress when the caller explicitly passes false.
-          showAxes: showAxes !== false,
-          cameraAngle: singleAngle || "isometric",
-          width: width || 1280,
-          height: height || 960,
-          focusPart,
-          hideParts,
-          // P3-10: forward the effective quality (auto-upgraded to "final" for
-          // ai render mode when the caller didn't explicitly set meshQuality).
-          meshQuality: effectiveMeshQuality,
+        rendered = await renderHeadlessPngFromParts(renderParts, {
+          previewsDir,
+          basename: baseName,
+          width: width ?? 1280,
+          highlights: finderHighlights,
+          title: `render_preview — ${userBase}${titleSuffix}`,
         });
-        if (!cmdId) {
-          return { content: [{ type: "text" as const, text: "Failed to send command to extension" }], isError: true };
-        }
+      } catch (e: any) {
+        return {
+          content: [{ type: "text" as const, text: `render_preview: headless render failed — ${e?.message ?? e}` }],
+          isError: true,
+        };
+      }
 
-        // The viewer does: execute script → render at requested size → capture.
-        // 60s default covers cold OCCT init + render on complex geometry. Callers
-        // can raise this via the tool's `timeoutMs` argument; waitForResult will
-        // also extend once more (WAIT_GRACE_MS) if the extension is still alive
-        // at the deadline, so truly-slow-but-responsive renders don't spuriously
-        // fail.
-        const effectiveTimeout = timeoutMs ?? 60_000;
-        const result = await waitForResult(cmdId, effectiveTimeout);
-        if (!result) {
-          // Distinguish the two failure modes. `lastWaitTimeoutReason` is set by
-          // waitForResult on the failing path.
-          const totalWaitMs = effectiveTimeout + (lastWaitTimeoutReason === "slow" ? WAIT_GRACE_MS : 0);
-          const msg = lastWaitTimeoutReason === "slow"
-            ? `render_preview timed out after ${totalWaitMs}ms. The extension is still responsive but the render is taking longer than ${totalWaitMs}ms — consider passing a larger \`timeoutMs\`.`
-            : `render_preview timed out after ${effectiveTimeout}ms. The extension appears to have crashed or was closed.`;
-          return {
-            content: [{ type: "text" as const, text: msg }],
-            isError: true,
-          };
-        }
-        if (result.error) {
-          // P1 fix: surface stack + operation from the webview worker when
-          // present, and add a CommonJS-restriction hint if the error mentions
-          // Node-only globals. Also check for a fresher viewer-error sidecar
-          // in case the command-file round trip dropped fields the webview
-          // wrote synchronously.
-          const sidecar = readViewerErrorIfNewer(GLOBAL_STORAGE);
-          const msg = formatWorkerErrorMessage(
-            result.error,
-            result.errorStack ?? sidecar?.stack,
-            result.errorOperation ?? sidecar?.operation,
-          );
-          return {
-            content: [{ type: "text" as const, text: msg }],
-            isError: true,
-          };
-        }
+      const screenshotPath = rendered.pngBuf ? rendered.pngPath : rendered.svgPath;
 
-        // Bug #1/#12 verification: the extension must report where it actually
-        // wrote the PNG, and that path must exist on disk. Previously the
-        // response echoed a synthesized path that could point at a stale
-        // cross-workspace file — now we require a real, existing path.
-        if (!result.screenshotPath || typeof result.screenshotPath !== "string") {
-          return {
-            content: [{ type: "text" as const, text: `render_preview: extension did not return a screenshotPath. Expected PNG at ${expectedOutputPath}.` }],
-            isError: true,
-          };
+      // Pull latest engine status so we can surface stats + authoritative
+      // partNames, same as before.
+      let statusText = "";
+      let renderedPartNames: string[] = [];
+      try {
+        const status: EngineStatus = JSON.parse(readFileSync(join(GLOBAL_STORAGE, "shapeitup-status.json"), "utf-8"));
+        if (status.success) {
+          statusText = `\nStats: ${status.stats}${formatProperties(status.properties, verbosity ?? "summary")}`;
         }
-        if (!existsSync(result.screenshotPath)) {
-          return {
-            content: [{
-              type: "text" as const,
-              text: `render_preview: extension reported screenshotPath=${result.screenshotPath}, but that file does not exist. Expected path was ${expectedOutputPath}. The extension may be running an older bundle that ignores the MCP-supplied outputPath — reload VSCode and retry.`,
-            }],
-            isError: true,
-          };
-        }
+        if (Array.isArray(status.partNames)) renderedPartNames = status.partNames;
+      } catch {}
 
-        // Pull the latest render status so the response includes geometric props
-        // AND the authoritative partNames list from the just-completed render.
-        // Fix B (Bug #5): route the "Parts: …" line through computePartsLine
-        // so the "(focused)" claim only prints when the engine's rendered
-        // partNames actually contain the requested focus — otherwise the
-        // viewer's "focusPart ignored" warning would contradict it.
-        let statusText = "";
-        let renderedPartNames: string[] = [];
-        try {
-          const status: EngineStatus = JSON.parse(readFileSync(join(GLOBAL_STORAGE, "shapeitup-status.json"), "utf-8"));
-          if (status.success) {
-            statusText = `\nStats: ${status.stats}${formatProperties(status.properties, verbosity ?? "summary")}`;
-          }
-          if (Array.isArray(status.partNames)) renderedPartNames = status.partNames;
-        } catch {}
+      const partsLine = computePartsLine(
+        focusPart,
+        hideParts,
+        renderedPartNames,
+        "focused — other parts hidden in screenshot",
+      );
+      const finderWarnLine = finderPartWarning ? `\nWarning: ${finderPartWarning}` : "";
+      const finderLine = needsLiveShape
+        ? `\nFinder: ${finder}${finderAppliedLine}\nFinder matches: ${finderMatchCount}${finderWarnLine}`
+        : "";
 
-        const partsLine = computePartsLine(
-          focusPart,
-          hideParts,
-          renderedPartNames,
-          "focused — other parts hidden in screenshot",
-        );
-        const partWarnLine = Array.isArray(result.partWarnings) && result.partWarnings.length > 0
-          ? `\nPart warnings: ${result.partWarnings.join("; ")}`
-          : "";
-        const finderWarnLine = finderPartWarning ? `\nWarning: ${finderPartWarning}` : "";
-
-        // For finder-wrapper renders, the extension names the PNG after the
-        // wrapper (leading-dot ugly name). Rename it in place so the returned
-        // path uses the user's shape basename — the screenshot still lives in
-        // `{workspace}/shapeitup-previews/`, just with a human-readable name.
-        // Best-effort: if rename fails, fall back to the raw extension path.
-        let screenshotPath: string = result.screenshotPath;
-        if (wrapperPath && screenshotPath && existsSync(screenshotPath)) {
-          try {
-            const userBase = basename(source).replace(/\.shape\.ts$/, "");
-            const angle = singleAngle || "isometric";
-            const renamedPath = join(dirname(screenshotPath), `shapeitup-preview-${userBase}-finder-${angle}.png`);
-            if (renamedPath !== screenshotPath) {
-              renameSync(screenshotPath, renamedPath);
-              screenshotPath = renamedPath;
-            }
-          } catch {
-            // keep raw screenshotPath
-          }
-        }
-
-        // Fix #6: append screenshot metadata to shapeitup-status.json. The
-        // VSCode extension deliberately does NOT write the status file on
-        // render (it would clobber the engine's authoritative record), so
-        // without this hop, `get_render_status` can never surface the fact
-        // that a PNG was just produced. Additive only — other fields (stats,
-        // warnings, geometryValid, etc.) are untouched, and subsequent
-        // failed renders preserve this field (see engine.ts:writeStatusFile).
+      if (rendered.pngBuf) {
         try {
           appendScreenshotMetadata(
             {
               timestamp: Date.now(),
-              path: screenshotPath,
+              path: rendered.pngPath,
               renderMode: renderMode || "ai",
-              cameraAngle: singleAngle || "isometric",
+              cameraAngle: singleAngle,
               fileName: basename(source),
               sourceFile: source,
             },
@@ -4362,64 +3961,37 @@ export function registerTools(server: McpServer) {
         } catch {
           // Best effort — never block the response on observability.
         }
-
-        const finderLine = finder !== undefined && finder.trim().length > 0
-          ? `\nFinder: ${finder}${finderAppliedLine}${finderWarnLine}`
-          : "";
-
-        const textBlock = {
-          type: "text" as const,
-          text: `Screenshot saved to: ${screenshotPath}\nRender mode: ${renderMode || "ai"}, Camera: ${singleAngle || "isometric"}, Axes: ${showAxes !== false ? "ON" : "OFF"}, Size: ${width || 1280}x${height || 960}\nFile: ${source}${partsLine}${partWarnLine}${finderLine}${statusText}\nUse the Read tool to view this image. Or call the \`get_preview\` MCP tool to receive the PNG data inline without needing filesystem access.`,
-        };
-
-        // Bug #8: when inline is requested, read the PNG off disk and append
-        // it as an image content block so the caller gets bytes + path in a
-        // single round trip. Mirrors get_preview's 10 MB size guard to avoid
-        // blowing past MCP response limits.
-        // Default to inlining the PNG so agents see the image without an
-        // extra get_preview round trip. Pass `inline: false` to opt out.
-        if (inline !== false) {
-          try {
-            const st = statSync(screenshotPath);
-            if (st.size > 10 * 1024 * 1024) {
-              return {
-                content: [
-                  textBlock,
-                  {
-                    type: "text" as const,
-                    text: `\n(inline=true requested but PNG is ${(st.size / 1024 / 1024).toFixed(1)} MB, exceeding the 10 MB inline limit. Reduce width/height or use the Read tool on the saved path.)`,
-                  },
-                ],
-              };
-            }
-            const data = readFileSync(screenshotPath).toString("base64");
-            return {
-              content: [
-                textBlock,
-                { type: "image" as const, data, mimeType: "image/png" },
-              ],
-            };
-          } catch (e: any) {
-            return {
-              content: [
-                textBlock,
-                {
-                  type: "text" as const,
-                  text: `\n(inline=true requested but failed to read PNG at ${screenshotPath}: ${e?.message ?? e}. Use the Read tool on the saved path instead.)`,
-                },
-              ],
-            };
-          }
-        }
-
-        return {
-          content: [textBlock],
-        };
-      } finally {
-        if (wrapperPath) {
-          try { unlinkSync(wrapperPath); } catch {}
-        }
       }
+
+      const rasterNote = rendered.pngBuf
+        ? ""
+        : `\n(PNG rasterization failed: ${rendered.rasterError ?? "unknown"} — read the SVG at ${rendered.svgPath} directly.)`;
+
+      const textBlock = {
+        type: "text" as const,
+        text: `Screenshot saved to: ${screenshotPath}\nRender mode: ${renderMode || "ai"}, Camera: 4-pane (top/front/right/iso), Size: ${width ?? 1280}px\nFile: ${source}${partsLine}${finderLine}${statusText}${rasterNote}\nUse the Read tool to view this image.`,
+      };
+
+      // Inline by default — mirrors the old behaviour so existing agent
+      // workflows keep seeing the bytes in-band. `inline: false` opts out.
+      if (inline !== false && rendered.pngBuf) {
+        if (rendered.pngBuf.length > 10 * 1024 * 1024) {
+          return {
+            content: [
+              textBlock,
+              { type: "text" as const, text: `\n(inline=true requested but PNG is ${(rendered.pngBuf.length / 1024 / 1024).toFixed(1)} MB, exceeding the 10 MB inline limit. Reduce width or use the Read tool on the saved path.)` },
+            ],
+          };
+        }
+        return {
+          content: [
+            textBlock,
+            { type: "image" as const, data: rendered.pngBuf.toString("base64"), mimeType: "image/png" },
+          ],
+        };
+      }
+
+      return { content: [textBlock] };
     })
   );
 
@@ -4572,7 +4144,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "preview_finder",
-    "Preview which edges/faces a Replicad EdgeFinder or FaceFinder matches on a shape — WITHOUT editing the user's script. Runs the given .shape.ts file (or an inline `code` snippet), applies the finder to the resulting shape, and reports how many entities matched plus their locations. The `finder` argument is a STRING of TS source code (not a Finder object) — `EdgeFinder` and `FaceFinder` are already in scope inside that string. Example: `finder: 'new EdgeFinder().inDirection(\"Z\")'` or `finder: 'new FaceFinder().inPlane(\"XY\", 10)'`. Supports the full finder DSL: `.and`, `.or`, `.not`, `.inDirection`, `.inPlane`, `.ofLength`, `.containsPoint`, etc. If the VSCode extension is running, also renders the highlighted preview in the viewer (pink spheres at each match); otherwise just returns the text report. Pass either `filePath` (existing shape) or `code` (inline snippet) — they are mutually exclusive. Debugging a script that crashes BEFORE the finder target exists: pass a modified snippet via `code` with the failing op commented out or stubbed — the finder then runs against the shape at whatever earlier point you choose.",
+    "Preview which edges/faces a Replicad EdgeFinder or FaceFinder matches on a shape — WITHOUT editing the user's script. Runs the given .shape.ts file (or an inline `code` snippet), applies the finder to the resulting shape, and reports how many entities matched plus their locations. The `finder` argument is a STRING of TS source code (not a Finder object) — `EdgeFinder` and `FaceFinder` are already in scope inside that string. Example: `finder: 'new EdgeFinder().inDirection(\"Z\")'` or `finder: 'new FaceFinder().inPlane(\"XY\", 10)'`. Supports the full finder DSL: `.and`, `.or`, `.not`, `.inDirection`, `.inPlane`, `.ofLength`, `.containsPoint`, etc. Also produces a highlighted screenshot through the bundled headless SVG pipeline (pink dots at each match centroid) — runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the render in its interactive viewer. Pass either `filePath` (existing shape) or `code` (inline snippet) — they are mutually exclusive. Debugging a script that crashes BEFORE the finder target exists: pass a modified snippet via `code` with the failing op commented out or stubbed — the finder then runs against the shape at whatever earlier point you choose.",
     {
       filePath: z.string().optional().describe("Path to the .shape.ts file whose shape the finder should be applied to. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first existing match wins), else anchor to process.cwd(). Mutually exclusive with `code`."),
       code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning a Shape3D or array of parts. Written to a throwaway temp file, executed, and deleted afterwards. Use `workingDir` to make local `./` imports resolve. Mutually exclusive with `filePath`."),
@@ -4684,20 +4256,39 @@ export function registerTools(server: McpServer) {
       }
 
       // Step 3: build the text description — count + per-match location hints.
-      const header = `Finder matched ${matches.length} ${entityKind}${matches.length === 1 ? "" : "s"} on part '${target.name}' of ${basename(absPath)}.`;
-      const locationLines: string[] = [];
-      const maxListed = 10;
-      const fmt = (n: number) => (Math.abs(n) >= 1000 ? n.toFixed(0) : n.toFixed(2));
-      for (let i = 0; i < Math.min(matches.length, maxListed); i++) {
+      // First pass: collect every match's centroid so the SVG overlay can mark
+      // ALL matches, not just the first ten we list in the text report.
+      const finderHighlights: Array<{ x: number; y: number; z: number }> = [];
+      const matchCentroids: Array<{ x: number; y: number; z: number } | null> = [];
+      for (let i = 0; i < matches.length; i++) {
         const m = matches[i];
         let pt: any;
         try {
           if (typeof m.pointAt === "function") pt = m.pointAt(0.5);
           else if (m.center) pt = m.center;
         } catch {}
-        const px = pt?.x ?? (Array.isArray(pt) ? pt[0] : undefined);
-        const py = pt?.y ?? (Array.isArray(pt) ? pt[1] : undefined);
-        const pz = pt?.z ?? (Array.isArray(pt) ? pt[2] : undefined);
+        const cx = pt?.x ?? (Array.isArray(pt) ? pt[0] : undefined);
+        const cy = pt?.y ?? (Array.isArray(pt) ? pt[1] : undefined);
+        const cz = pt?.z ?? (Array.isArray(pt) ? pt[2] : undefined);
+        if (typeof cx === "number" && typeof cy === "number" && typeof cz === "number") {
+          const p = { x: cx, y: cy, z: cz };
+          matchCentroids.push(p);
+          finderHighlights.push(p);
+        } else {
+          matchCentroids.push(null);
+        }
+      }
+
+      const header = `Finder matched ${matches.length} ${entityKind}${matches.length === 1 ? "" : "s"} on part '${target.name}' of ${basename(absPath)}.`;
+      const locationLines: string[] = [];
+      const maxListed = 10;
+      const fmt = (n: number) => (Math.abs(n) >= 1000 ? n.toFixed(0) : n.toFixed(2));
+      for (let i = 0; i < Math.min(matches.length, maxListed); i++) {
+        const m = matches[i];
+        const cc = matchCentroids[i];
+        const px = cc?.x;
+        const py = cc?.y;
+        const pz = cc?.z;
         const loc = (typeof px === "number" && typeof py === "number" && typeof pz === "number")
           ? `at (${fmt(px)}, ${fmt(py)}, ${fmt(pz)})`
           : "(location unavailable)";
@@ -4751,6 +4342,12 @@ export function registerTools(server: McpServer) {
       }
       if (matches.length > maxListed) {
         locationLines.push(`  ... ${matches.length - maxListed} more`);
+        // Clean up the match objects we didn't consume in the text loop so
+        // OCCT handles aren't leaked. The text loop above only deletes the
+        // first `maxListed` entries.
+        for (let i = maxListed; i < matches.length; i++) {
+          try { matches[i].delete?.(); } catch {}
+        }
       }
 
       if (matches.length === 0) {
@@ -4783,53 +4380,42 @@ export function registerTools(server: McpServer) {
 
       let text = `${header}\n${locationLines.join("\n")}`;
 
-      // Step 4: optional highlighted preview in the VSCode viewer. Write a
-      // synthetic wrapper .shape.ts next to the user's file (so local imports
-      // resolve through esbuild's bundler), render-preview it, then clean up.
-      // Note: the workspace-ownership check ran up-front (before we executed
-      // the script), so if we got here the workspace is owned — both first
-      // and second calls behave identically. Issue #2 fix.
-      if (isExtensionAlive()) {
-        const stamp = Date.now().toString(36);
+      // Step 4: headless highlighted preview via the bundled SVG pipeline.
+      // Runs standalone regardless of whether the VSCode extension is open.
+      // Pink dots mark every match centroid on top of the shaded 4-pane view.
+      let imageContent: { type: "image"; data: string; mimeType: string } | null = null;
+      try {
         const dir = dirname(absPath);
-        const previewPath = join(dir, `.shapeitup-finder-preview-${stamp}.shape.ts`);
-        const wrapperSource = buildFinderWrapperScript(absPath, finder, { index: idx });
-        // Pin the output PNG to the USER's shape basename, not the wrapper —
-        // without an explicit outputPath the extension would synthesize a name
-        // from `this.lastExecutedFile` (which is the wrapper), producing
-        // `shapeitup-preview-.shapeitup-finder-preview-<stamp>-isometric.png`.
         const previewsDir = join(dir, "shapeitup-previews");
         const userBase = basename(absPath).replace(/\.shape\.ts$/, "");
-        const finderOutputPath = join(previewsDir, `shapeitup-preview-${userBase}-finder-isometric.png`);
-        try {
-          writeFileSync(previewPath, wrapperSource, "utf-8");
-          const cmdId = sendExtensionCommand("render-preview", {
-            filePath: previewPath,
-            outputPath: finderOutputPath,
-            targetWorkspaceRoot: computeTargetWorkspaceRoot(previewPath),
-            renderMode: "ai",
-            showDimensions: false,
-            cameraAngle: "isometric",
-            width: 1280,
-            height: 960,
-          });
-          if (cmdId) {
-            const result = await waitForResult(cmdId, 30000);
-            if (result?.screenshotPath) {
-              text += `\n\nHighlighted preview: ${result.screenshotPath}\nUse the Read tool to view this image.`;
-            } else if (result?.error) {
-              text += `\n\n(Highlighted preview unavailable: ${result.error})`;
-            }
+        const baseName = `shapeitup-preview-${userBase}-finder-isometric`;
+        const rendered = await renderHeadlessPngFromParts(parts, {
+          previewsDir,
+          basename: baseName,
+          width: 1280,
+          highlights: finderHighlights,
+          title: `preview_finder — ${userBase} (${finderHighlights.length} match${finderHighlights.length === 1 ? "" : "es"})`,
+        });
+        if (rendered.pngBuf) {
+          text += `\n\nHighlighted preview: ${rendered.pngPath}\nUse the Read tool to view this image.`;
+          if (rendered.pngBuf.length <= 10 * 1024 * 1024) {
+            imageContent = {
+              type: "image",
+              data: rendered.pngBuf.toString("base64"),
+              mimeType: "image/png",
+            };
           }
-        } catch (e: any) {
-          text += `\n\n(Highlighted preview skipped: ${e?.message ?? e})`;
-        } finally {
-          try { unlinkSync(previewPath); } catch {}
+        } else {
+          text += `\n\n(Highlighted preview: SVG at ${rendered.svgPath}; PNG rasterization failed — ${rendered.rasterError ?? "unknown"}.)`;
         }
+      } catch (e: any) {
+        text += `\n\n(Highlighted preview skipped: ${e?.message ?? e})`;
       }
 
+      const contentArr: any[] = [{ type: "text" as const, text }];
+      if (imageContent) contentArr.push(imageContent);
       return {
-        content: [{ type: "text" as const, text }],
+        content: contentArr,
       };
       }); // close withShapeFile callback
     })
