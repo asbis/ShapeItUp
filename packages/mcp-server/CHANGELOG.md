@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.6.2 (2026-04-21)
+
+Patch: MCP tool schemas sanitized for strict clients (Gemini CLI).
+
+### Fixed
+- Gemini CLI now accepts the tool catalog. ShapeItUp's schemas previously
+  emitted `$schema`, `propertyNames`, and object-valued `additionalProperties`
+  (from `z.record(...)` params), all of which fail Gemini's OpenAPI-3.0-subset
+  validator and caused "400 INVALID_ARGUMENT" on every request regardless of
+  whether a tool was being called. A new sanitizer strips those fields
+  universally; runtime validation is unchanged. Safe for all MCP clients —
+  Claude Code, Cursor, and Claude Desktop continue to accept the simpler form.
+- `check_collisions` and `preview_finder` descriptions trimmed under 900
+  chars (previously 1229 / 1207) to fit Gemini's per-function 1024-char limit.
+- Defense-in-depth: description truncation at emit-time caps any future tool
+  description at 999 chars + ellipsis.
+
 ## 1.6.1 (2026-04-21)
 
 Patch release. Shipped alongside extension `1.7.0` to unblock the VSIX

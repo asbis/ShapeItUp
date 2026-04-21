@@ -1,6 +1,6 @@
 {
   "name": "@shapeitup/mcp-server",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "ShapeItUp MCP server — scripted CAD tools (Replicad/OpenCascade) for Claude Code, Cursor, Claude Desktop, and other MCP clients.",
   "type": "module",
   "bin": {

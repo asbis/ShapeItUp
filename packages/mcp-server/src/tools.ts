@@ -32,6 +32,7 @@ import {
 import { getDetectedAppsAsync, getDetectedApps } from "./app-detector.js";
 import { getSubscriberBus, defaultGlobalStorageDir } from "./subscriber-bus.js";
 import { openFileInApp } from "./app-launcher.js";
+import { sanitizeToolListResponse } from "./schema-sanitizer.js";
 
 /**
  * Shared globalStorage dir with the VSCode extension. Both processes write and
@@ -4053,7 +4054,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "preview_finder",
-    "Preview which edges/faces a Replicad EdgeFinder or FaceFinder matches on a shape — WITHOUT editing the user's script. Runs the given .shape.ts file (or an inline `code` snippet), applies the finder to the resulting shape, and reports how many entities matched plus their locations. The `finder` argument is a STRING of TS source code (not a Finder object) — `EdgeFinder` and `FaceFinder` are already in scope inside that string. Example: `finder: 'new EdgeFinder().inDirection(\"Z\")'` or `finder: 'new FaceFinder().inPlane(\"XY\", 10)'`. Supports the full finder DSL: `.and`, `.or`, `.not`, `.inDirection`, `.inPlane`, `.ofLength`, `.containsPoint`, etc. Also produces a highlighted screenshot through the bundled headless SVG pipeline (pink dots at each match centroid) — runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the render in its interactive viewer. Pass either `filePath` (existing shape) or `code` (inline snippet) — they are mutually exclusive. Debugging a script that crashes BEFORE the finder target exists: pass a modified snippet via `code` with the failing op commented out or stubbed — the finder then runs against the shape at whatever earlier point you choose.",
+    "Preview which edges/faces a Replicad EdgeFinder or FaceFinder matches on a shape — WITHOUT editing the user's script. Runs the given `filePath` (or inline `code` snippet), applies the finder, and reports match count plus locations. The `finder` argument is a STRING of TS source code (not a Finder object); `EdgeFinder` and `FaceFinder` are already in scope. Supports the full DSL: `.and`, `.or`, `.not`, `.inDirection`, `.inPlane`, `.ofLength`, `.containsPoint`, etc. Produces a highlighted screenshot (pink dots at each match centroid) via the bundled SVG pipeline; runs standalone and the VSCode extension reflects the render when open. Pass either `filePath` OR `code` — mutually exclusive. To debug a script that crashes before the finder target exists, pass a modified snippet via `code`. See `get_api_reference('finders')` for examples.",
     {
       filePath: z.string().optional().describe("Path to the .shape.ts file whose shape the finder should be applied to. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first existing match wins), else anchor to process.cwd(). Mutually exclusive with `code`."),
       code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning a Shape3D or array of parts. Written to a throwaway temp file, executed, and deleted afterwards. Use `workingDir` to make local `./` imports resolve. Mutually exclusive with `filePath`."),
@@ -4332,7 +4333,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "check_collisions",
-    "Detects pairwise intersections between named parts in a multi-part assembly. AABB prefilter skips obviously-disjoint pairs; remaining pairs are tested with Replicad's 3D intersect (which can fail on complex curved solids — those pairs are reported as 'intersect failed' rather than silently ignored). Tolerance filters out numerical-noise contacts (default 0.001 mm³); very large assemblies (100+ parts) will be slow because work grows as N². Pass `acceptedPairs` to suppress EXPECTED intersections (needles resting in grooves, bolt shafts in through-holes) — accepted pairs are rolled into a summary count so unexpected bugs surface faster. Collisions with volume at or below `pressFitThreshold` are listed under 'Nominal contact' (press fits, touching interfaces) instead of the main 'Collisions' block. The main block is sorted by overlap volume descending so the biggest (most likely bug) is the first line. Pass either `filePath` (existing shape) or `code` (inline snippet) — they are mutually exclusive. Pass `params` to override numeric parameters for this single check (handy for sweeping a cam angle without editing persisted params). Pass `format: 'full'` for per-pair geometry; default summary keeps responses compact.",
+    "Detects pairwise intersections between named parts in a multi-part assembly. AABB prefilter skips obviously-disjoint pairs; the rest run Replicad's 3D intersect (failures are surfaced as 'intersect failed' rather than ignored). `tolerance` filters numerical-noise contacts (default 0.001 mm³); 100+ parts scale as N². Pass `acceptedPairs` to suppress EXPECTED intersections (needles in grooves, bolts in through-holes) — accepted pairs collapse into a summary count so real bugs surface first. Volumes at or below `pressFitThreshold` list under 'Nominal contact'. Main block sorts by volume descending. Pass either `filePath` OR `code` — mutually exclusive. `params` overrides numeric parameters for this single check without persisting. `format: 'full'` adds per-pair geometry. See `get_api_reference('verification')` for examples.",
     {
       filePath: z.string().optional().describe("Path to the .shape.ts file to check for part collisions. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first existing match wins), else anchor to process.cwd(). Mutually exclusive with `code`."),
       code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning an array of parts. Written to a throwaway temp file, executed, and deleted afterwards. Use `workingDir` to make local `./` imports resolve. Mutually exclusive with `filePath`."),
@@ -5539,6 +5540,59 @@ export function registerTools(server: McpServer) {
       });
     })
   );
+
+  // --- Gemini CLI compatibility shim ---------------------------------------
+  // The MCP SDK registers its `tools/list` handler inline at first
+  // server.tool() call; that handler uses zod-to-json-schema's defaults, which
+  // emit `$schema`, `propertyNames`, and object-valued `additionalProperties`.
+  // Gemini CLI rejects the whole tool catalog (HTTP 400 INVALID_ARGUMENT) when
+  // any of those appear — even on a plain greeting. We wrap the existing
+  // handler with a sanitizer pass that strips those fields before they hit
+  // the wire. Runtime zod validation is untouched (the same tools still
+  // enforce value types on inbound calls). Safe for every other client.
+  installGeminiSchemaShim(server);
+}
+
+/**
+ * Wrap the MCP SDK's tools/list handler so every emitted schema is stripped
+ * of fields that trip Gemini's OpenAPI-3.0-subset validator. See
+ * `schema-sanitizer.ts` for the exact transformations.
+ *
+ * We grab the underlying low-level `Server.prototype._requestHandlers` Map
+ * entry the SDK installs at `server.tool()` time and replace it with a
+ * wrapper that calls the original and passes the response through
+ * `sanitizeToolListResponse`. This is a narrow, private-API hook; if a
+ * future SDK version restructures `_requestHandlers`, the install becomes
+ * a silent no-op (the sanitizer was never the validation boundary), and
+ * the integration test in `schema-sanitizer.test.ts` catches the drift.
+ */
+function installGeminiSchemaShim(server: McpServer): void {
+  // The SDK's high-level McpServer exposes the low-level Server via the
+  // public `.server` property (documented in the SDK source).
+  const lowLevel: any = (server as any).server;
+  const handlers: Map<string, (req: unknown, extra: unknown) => unknown> | undefined =
+    lowLevel?._requestHandlers;
+  if (!handlers || typeof handlers.get !== "function") {
+    // Either the SDK internals moved, OR the caller passed a duck-typed
+    // fake server (our own unit tests do this to probe tool registration).
+    // Silent in either case — the real server path is covered by the
+    // `tools/list emission is Gemini-safe` integration test which uses a
+    // real MCP SDK instance.
+    return;
+  }
+  const METHOD = "tools/list";
+  const original = handlers.get(METHOD);
+  if (typeof original !== "function") {
+    // handlers map exists but no tools/list — must mean no server.tool()
+    // calls ran (the SDK lazily registers the handler on first tool()).
+    // Also silent: this can only happen on a mis-wired caller, and the
+    // integration test above catches that regression.
+    return;
+  }
+  handlers.set(METHOD, async (request: unknown, extra: unknown) => {
+    const result = await Promise.resolve(original(request, extra));
+    return sanitizeToolListResponse(result);
+  });
 }
 
 // Fix #1: large assemblies (Asbjørn's 86-part build) blow the MCP token cap
