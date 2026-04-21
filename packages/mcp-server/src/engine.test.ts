@@ -7,6 +7,12 @@ import {
   checkBundleCache,
   extractLocalImportSpecifiers,
   clearBundleCache,
+  canonicalParamsKey,
+  clearMeshCache,
+  getMeshCacheSize,
+  lookupMeshCache,
+  populateMeshCache,
+  readSourceForCacheKey,
   type EngineStatus,
   type BundleCacheEntry,
 } from "./engine.js";
@@ -866,5 +872,263 @@ describe("executeShapeFile — multifile params import (regression for issue #3)
       }
     },
     30_000,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Mesh-result cache.
+//
+// The cache hashes (absPath, source-content, sorted-params, meshQuality) and
+// stores ExecuteOutcome WITHOUT live OCCT shape handles. These tests exercise
+// the helper surface directly so they don't pay the multi-second OCCT cost on
+// every assertion — the integration with executeWithPersistedParams is
+// covered separately at a single happy-path level by inspection in the build,
+// and would re-run the engine under WASM otherwise.
+// ---------------------------------------------------------------------------
+
+describe("mesh-result cache", () => {
+  // Each test runs against a fresh tempdir so they can hammer mtimes without
+  // racing the others. clearMeshCache() at the top of each test scopes the
+  // shared module-level Map so prior cases don't bleed in (and vice versa).
+
+  const makeFile = (content: string): { dir: string; absPath: string } => {
+    const dir = mkdtempSync(join(tmpdir(), "siu-mesh-cache-"));
+    const absPath = join(dir, "x.shape.ts");
+    writeFileSync(absPath, content, "utf-8");
+    return { dir, absPath };
+  };
+
+  const fakeOutcome = (success = true) => ({
+    status: {
+      success,
+      timestamp: new Date().toISOString(),
+    } as EngineStatus,
+    parts: success
+      ? [
+          {
+            // Live OCCT handle stand-in — must NOT be retained by the cache.
+            shape: { __wasm_handle__: 0xdeadbeef },
+            name: "p",
+            color: null,
+            vertices: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]),
+            normals: new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1]),
+            triangles: new Uint32Array([0, 1, 2]),
+            edgeVertices: new Float32Array([0, 0, 0, 1, 0, 0]),
+          } as any,
+        ]
+      : undefined,
+  });
+
+  it("populates on success and serves the same outcome on lookup", () => {
+    clearMeshCache();
+    const { dir, absPath } = makeFile("export default function main() {}");
+    try {
+      const head = readSourceForCacheKey(absPath)!;
+      const paramsKey = canonicalParamsKey({ width: 10 });
+      const outcome = fakeOutcome();
+      populateMeshCache(absPath, head.sourceHash, head.mtimeMs, paramsKey, "default", outcome);
+      expect(getMeshCacheSize()).toBe(1);
+      const hit = lookupMeshCache(absPath, head.sourceHash, paramsKey, "default");
+      expect(hit).toBeDefined();
+      expect(hit!.result.status.success).toBe(true);
+      expect(hit!.hitCount).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("STRIPS live OCCT shape handles from cached parts (WASM safety)", () => {
+    clearMeshCache();
+    const { dir, absPath } = makeFile("export default function main() {}");
+    try {
+      const head = readSourceForCacheKey(absPath)!;
+      const outcome = fakeOutcome();
+      // Sanity: pre-cache outcome carries the handle.
+      expect(outcome.parts![0].shape).toBeDefined();
+      populateMeshCache(absPath, head.sourceHash, head.mtimeMs, "{}", "default", outcome);
+      const hit = lookupMeshCache(absPath, head.sourceHash, "{}", "default");
+      expect(hit).toBeDefined();
+      expect(hit!.result.parts).toBeDefined();
+      // Cache entry must NOT carry the WASM pointer — that's the corruption
+      // vector the brief spent paragraphs warning about.
+      expect((hit!.result.parts![0] as any).shape).toBeUndefined();
+      // Mesh arrays survive intact (they're JS-owned typed arrays).
+      expect(hit!.result.parts![0].vertices.length).toBe(9);
+      expect(hit!.result.parts![0].triangles.length).toBe(3);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does NOT cache failed outcomes (fresh retry on next call)", () => {
+    clearMeshCache();
+    const { dir, absPath } = makeFile("export default function main() {}");
+    try {
+      const head = readSourceForCacheKey(absPath)!;
+      populateMeshCache(absPath, head.sourceHash, head.mtimeMs, "{}", "default", fakeOutcome(false));
+      expect(getMeshCacheSize()).toBe(0);
+      expect(lookupMeshCache(absPath, head.sourceHash, "{}", "default")).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("misses on different params (no false hit)", () => {
+    clearMeshCache();
+    const { dir, absPath } = makeFile("export default function main() {}");
+    try {
+      const head = readSourceForCacheKey(absPath)!;
+      populateMeshCache(absPath, head.sourceHash, head.mtimeMs, canonicalParamsKey({ w: 10 }), "default", fakeOutcome());
+      expect(lookupMeshCache(absPath, head.sourceHash, canonicalParamsKey({ w: 20 }), "default")).toBeUndefined();
+      // ...but the original key is still good — populate didn't overwrite.
+      expect(lookupMeshCache(absPath, head.sourceHash, canonicalParamsKey({ w: 10 }), "default")).toBeDefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("misses on different meshQuality bucket", () => {
+    clearMeshCache();
+    const { dir, absPath } = makeFile("export default function main() {}");
+    try {
+      const head = readSourceForCacheKey(absPath)!;
+      populateMeshCache(absPath, head.sourceHash, head.mtimeMs, "{}", "default", fakeOutcome());
+      expect(lookupMeshCache(absPath, head.sourceHash, "{}", "preview")).toBeUndefined();
+      expect(lookupMeshCache(absPath, head.sourceHash, "{}", "default")).toBeDefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("file content edit busts the entry (sourceHash drives the key)", () => {
+    clearMeshCache();
+    const { dir, absPath } = makeFile("export default function main() { return 1; }");
+    try {
+      const before = readSourceForCacheKey(absPath)!;
+      populateMeshCache(absPath, before.sourceHash, before.mtimeMs, "{}", "default", fakeOutcome());
+      // Edit the file. Bumping the mtime to "now+1s" is belt-and-suspenders —
+      // the sourceHash already differs because we wrote different bytes.
+      writeFileSync(absPath, "export default function main() { return 2; }", "utf-8");
+      const future = (Date.now() + 1000) / 1000;
+      utimesSync(absPath, future, future);
+      const after = readSourceForCacheKey(absPath)!;
+      expect(after.sourceHash).not.toBe(before.sourceHash);
+      // The new key has no entry — this is the invalidation path.
+      expect(lookupMeshCache(absPath, after.sourceHash, "{}", "default")).toBeUndefined();
+      // The OLD key still has its entry (the cache is content-addressed; a
+      // round-trip back to the original content would still hit).
+      expect(lookupMeshCache(absPath, before.sourceHash, "{}", "default")).toBeDefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("clearMeshCache drops every entry", () => {
+    clearMeshCache();
+    const { dir, absPath } = makeFile("export default function main() {}");
+    try {
+      const head = readSourceForCacheKey(absPath)!;
+      populateMeshCache(absPath, head.sourceHash, head.mtimeMs, "{}", "default", fakeOutcome());
+      expect(getMeshCacheSize()).toBe(1);
+      clearMeshCache();
+      expect(getMeshCacheSize()).toBe(0);
+      expect(lookupMeshCache(absPath, head.sourceHash, "{}", "default")).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("hitCount and lastUsed update on every lookup", () => {
+    clearMeshCache();
+    const { dir, absPath } = makeFile("export default function main() {}");
+    try {
+      const head = readSourceForCacheKey(absPath)!;
+      populateMeshCache(absPath, head.sourceHash, head.mtimeMs, "{}", "default", fakeOutcome());
+      const t0 = lookupMeshCache(absPath, head.sourceHash, "{}", "default")!;
+      expect(t0.hitCount).toBe(1);
+      const firstStamp = t0.lastUsed;
+      // Tiny wait so the second Date.now() can be strictly greater on systems
+      // with millisecond-resolution clocks. 5 ms is well above the floor.
+      const start = Date.now();
+      while (Date.now() - start < 5) { /* spin */ }
+      const t1 = lookupMeshCache(absPath, head.sourceHash, "{}", "default")!;
+      expect(t1.hitCount).toBe(2);
+      expect(t1.lastUsed).toBeGreaterThanOrEqual(firstStamp);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("canonicalParamsKey is order-independent (sorted-keys contract)", () => {
+    expect(canonicalParamsKey({ a: 1, b: 2, c: 3 })).toBe(
+      canonicalParamsKey({ c: 3, a: 1, b: 2 }),
+    );
+    expect(canonicalParamsKey(undefined)).toBe("{}");
+    expect(canonicalParamsKey({})).toBe("{}");
+    // Different values produce different keys.
+    expect(canonicalParamsKey({ a: 1 })).not.toBe(canonicalParamsKey({ a: 2 }));
+  });
+
+  it("readSourceForCacheKey returns undefined for missing files", () => {
+    expect(readSourceForCacheKey(join(tmpdir(), "siu-mesh-cache-does-not-exist.shape.ts"))).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mesh cache + executeShapeFile integration. The previous block exercises the
+// helper surface in isolation; this one drives a real OCCT execution end-to-
+// end so the contract that `executeWithPersistedParams` relies on is pinned:
+// after a successful execute, populating the cache with that outcome must
+// produce a hit on the same key in a follow-up call.
+// ---------------------------------------------------------------------------
+describe("mesh cache + executeShapeFile (real OCCT)", () => {
+  it(
+    "stores a successful execute outcome and serves the same status on lookup",
+    async () => {
+      clearMeshCache();
+      const workdir = mkdtempSync(join(tmpdir(), "siu-mesh-cache-real-"));
+      const storage = mkdtempSync(join(tmpdir(), "siu-mesh-cache-storage-"));
+      try {
+        const absPath = join(workdir, "tiny.shape.ts");
+        writeFileSync(
+          absPath,
+          [
+            'import { drawCircle } from "replicad";',
+            "export default function main() {",
+            '  return drawCircle(5).sketchOnPlane("XY").extrude(1);',
+            "}",
+            "",
+          ].join("\n"),
+          "utf-8",
+        );
+
+        // First execution: must succeed and produce live parts.
+        const first = await executeShapeFile(absPath, storage);
+        expect(first.status.success).toBe(true);
+        expect(first.parts && first.parts.length).toBeGreaterThan(0);
+
+        // Stamp it into the cache exactly the way executeWithPersistedParams
+        // does (sourceHash + mtimeMs read from disk after the execute).
+        const head = readSourceForCacheKey(absPath)!;
+        const paramsKey = canonicalParamsKey(undefined);
+        populateMeshCache(absPath, head.sourceHash, head.mtimeMs, paramsKey, "default", first);
+
+        // Lookup: same key returns the cached outcome (without live shapes).
+        const hit = lookupMeshCache(absPath, head.sourceHash, paramsKey, "default");
+        expect(hit).toBeDefined();
+        expect(hit!.result.status.success).toBe(true);
+        expect(hit!.result.status.partCount).toBe(first.status.partCount);
+        // The shape handle was scrubbed even though the original outcome had one.
+        expect(hit!.result.parts && hit!.result.parts.length).toBe(first.parts!.length);
+        expect((hit!.result.parts![0] as any).shape).toBeUndefined();
+        // Mesh arrays still present and non-empty.
+        expect(hit!.result.parts![0].vertices.length).toBeGreaterThan(0);
+        expect(hit!.result.parts![0].triangles.length).toBeGreaterThan(0);
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    60_000,
   );
 });
