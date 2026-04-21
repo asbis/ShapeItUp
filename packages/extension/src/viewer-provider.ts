@@ -103,6 +103,12 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
   private pendingRenderReject?: (err: Error) => void;
   private pendingRenderPromise?: Promise<void>;
 
+  // T6.A: handshake for prepare-screenshot → screenshot-ready round-trip.
+  // Arm BEFORE dispatching prepare-screenshot; await replaces the 500ms sleep.
+  private pendingScreenshotReadyResolve?: () => void;
+  private pendingScreenshotReadyReject?: (err: Error) => void;
+  private pendingScreenshotReadyPromise?: Promise<void>;
+
   constructor(context: vscode.ExtensionContext, output: vscode.OutputChannel) {
     this.context = context;
     this.output = output;
@@ -582,6 +588,17 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           this.pendingScreenshotResolve = undefined;
         }
         break;
+      case "screenshot-ready":
+        // T6.A: viewer signals that prepare-screenshot has finished rendering
+        // both frames. Resolve the handshake so armPendingScreenshot /
+        // awaitScreenshotReady callers can proceed immediately.
+        if (this.pendingScreenshotReadyResolve) {
+          this.pendingScreenshotReadyResolve();
+          this.pendingScreenshotReadyResolve = undefined;
+          this.pendingScreenshotReadyReject = undefined;
+          this.pendingScreenshotReadyPromise = undefined;
+        }
+        break;
       case "part-warning":
         // Non-fatal: a focusPart/hideParts name didn't match any loaded part.
         // Log it and buffer it so the active render-preview call can surface it
@@ -694,6 +711,45 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     this.pendingRenderResolve = undefined;
     this.pendingRenderReject = undefined;
     this.pendingRenderPromise = undefined;
+  }
+
+  /**
+   * T6.A: arm a pending screenshot-ready promise BEFORE dispatching
+   * prepare-screenshot. Mirrors armPendingRender — arm first so the
+   * handshake catches even a synchronous/fast viewer response.
+   */
+  armPendingScreenshot(): void {
+    if (this.pendingScreenshotReadyReject) {
+      this.pendingScreenshotReadyReject(new Error("screenshot superseded"));
+    }
+    this.pendingScreenshotReadyPromise = new Promise<void>((resolve, reject) => {
+      this.pendingScreenshotReadyResolve = resolve;
+      this.pendingScreenshotReadyReject = reject;
+    });
+    this.pendingScreenshotReadyPromise.catch(() => {});
+  }
+
+  /**
+   * T6.A: wait for the viewer's `screenshot-ready` postMessage. Rejects on
+   * timeout (caller proceeds with today's graceful-degradation behavior).
+   */
+  async awaitScreenshotReady(timeoutMs: number): Promise<void> {
+    if (!this.pendingScreenshotReadyPromise) return;
+    const p = this.pendingScreenshotReadyPromise;
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pendingScreenshotReadyReject) {
+          this.pendingScreenshotReadyReject(
+            new Error(`awaitScreenshotReady: timed out after ${timeoutMs}ms`)
+          );
+        }
+        reject(new Error(`awaitScreenshotReady: timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      p.then(
+        () => { clearTimeout(timer); resolve(); },
+        (err) => { clearTimeout(timer); reject(err); }
+      );
+    });
   }
 
   /** Drain the buffered per-part visibility warnings. */

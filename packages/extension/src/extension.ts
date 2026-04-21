@@ -453,6 +453,8 @@ export function activate(context: vscode.ExtensionContext) {
       // call will land here and get surfaced to the MCP response.
       viewerProvider.resetPartWarnings();
 
+      // T6.A: arm BEFORE dispatching so the handshake catches even a fast response.
+      viewerProvider.armPendingScreenshot();
       viewerProvider.sendViewerCommand("prepare-screenshot", {
         renderMode: cmd.renderMode || "ai",
         showDimensions: !!cmd.showDimensions,
@@ -461,8 +463,11 @@ export function activate(context: vscode.ExtensionContext) {
         focusPart: cmd.focusPart,
         hideParts: cmd.hideParts,
       });
-
-      await new Promise((r) => setTimeout(r, 500));
+      try {
+        await viewerProvider.awaitScreenshotReady(2000);
+      } catch {
+        // Timeout or superseded — proceed anyway (same behavior as the old sleep).
+      }
 
       // Prefer a workspace-local dir so sandboxed agents can read the PNG with
       // a relative path; fall back to globalStorage when no workspace is open.

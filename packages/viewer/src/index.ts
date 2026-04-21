@@ -922,6 +922,9 @@ onMessage("viewer-command", (msg) => {
       renderer.clear();
       renderer.render(scene, camera);
       renderGnomon(container.clientWidth, container.clientHeight);
+      // T6.A: signal extension that prepare-screenshot has completed so it can
+      // proceed without the unconditional 500ms sleep.
+      postToExtension({ type: "screenshot-ready" });
       break;
     }
   }
