@@ -941,3 +941,191 @@ describe("formatViewerBlock — P11 get_render_status viewer reporting", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Pitfall detector — negative fillet/chamfer radii
+// OCCT rejects negative radii with a low-level exception; the old code
+// silently skipped them via `r <= 0`. We now warn explicitly and cite the
+// method that will throw, so the user doesn't have to decipher the OCCT
+// trace.
+// ---------------------------------------------------------------------------
+
+describe("validateSyntaxPure — negative fillet/chamfer radii", () => {
+  const wrap = (body: string) =>
+    [
+      `import { makeBox } from "replicad";`,
+      `export default function main() {`,
+      body,
+      `}`,
+    ].join("\n");
+
+  it("flags a negative fillet radius", () => {
+    const code = wrap([
+      `  const b = makeBox(20, 20, 20);`,
+      `  return b.fillet(-2);`,
+    ].join("\n"));
+    const { text, isError } = validateSyntaxPure(code);
+    expect(isError).toBe(false);
+    expect(text).toMatch(/radius must be positive/);
+    expect(text).toContain(".fillet(-2)");
+  });
+
+  it("flags a negative chamfer radius", () => {
+    const code = wrap([
+      `  const b = makeBox(20, 20, 20);`,
+      `  return b.chamfer(-0.5);`,
+    ].join("\n"));
+    const { text, isError } = validateSyntaxPure(code);
+    expect(isError).toBe(false);
+    expect(text).toMatch(/radius must be positive/);
+    expect(text).toContain(".chamfer(-0.5)");
+  });
+
+  it("does NOT flag a zero radius (no-op, not a bug)", () => {
+    const code = wrap([
+      `  const b = makeBox(20, 20, 20);`,
+      `  return b.fillet(0);`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/radius must be positive/);
+  });
+
+  it("does NOT flag a normal positive radius", () => {
+    const code = wrap([
+      `  const b = makeBox(20, 20, 20);`,
+      `  return b.fillet(2);`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/radius must be positive/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pitfall detector — patterns.cutAt must receive a factory function
+// The stdlib throws a TypeError (see packages/core/src/stdlib/patterns.ts
+// cutAt) when the second argument is not a function, because Replicad's
+// translate/rotate consume OCCT handles. Mirror that at validate time.
+// ---------------------------------------------------------------------------
+
+describe("validateSyntaxPure — patterns.cutAt factory guard", () => {
+  it("flags patterns.cutAt called with a bare Shape argument", () => {
+    const code = [
+      `import { patterns, holes } from "shapeitup";`,
+      `import { makeBox } from "replicad";`,
+      `export default function main() {`,
+      `  const plate = makeBox(40, 40, 4);`,
+      `  const tool = holes.through("M4");`,
+      `  return patterns.cutAt(plate, tool, []);`,
+      `}`,
+    ].join("\n");
+    const { text, isError } = validateSyntaxPure(code);
+    expect(isError).toBe(false);
+    expect(text).toMatch(/patterns\.cutAt/);
+    expect(text).toMatch(/must be a factory function/);
+  });
+
+  it("flags lib.patterns.cutAt (namespace import) with a bare Shape", () => {
+    const code = [
+      `import * as lib from "shapeitup";`,
+      `import { makeBox } from "replicad";`,
+      `export default function main() {`,
+      `  const plate = makeBox(40, 40, 4);`,
+      `  const tool = lib.holes.through("M4");`,
+      `  return lib.patterns.cutAt(plate, tool, []);`,
+      `}`,
+    ].join("\n");
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/must be a factory function/);
+  });
+
+  it("does NOT flag patterns.cutAt with an arrow-function factory", () => {
+    const code = [
+      `import { patterns, holes } from "shapeitup";`,
+      `import { makeBox } from "replicad";`,
+      `export default function main() {`,
+      `  const plate = makeBox(40, 40, 4);`,
+      `  return patterns.cutAt(plate, () => holes.through("M4"), []);`,
+      `}`,
+    ].join("\n");
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/must be a factory function/);
+  });
+
+  it("does NOT flag patterns.cutAt with a function-expression factory", () => {
+    const code = [
+      `import { patterns, holes } from "shapeitup";`,
+      `import { makeBox } from "replicad";`,
+      `export default function main() {`,
+      `  const plate = makeBox(40, 40, 4);`,
+      `  return patterns.cutAt(plate, function () { return holes.through("M4"); }, []);`,
+      `}`,
+    ].join("\n");
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/must be a factory function/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pitfall detector — shape reuse after a boolean op
+// Replicad's cut/fuse/intersect invalidate the receiver's OCCT handle;
+// translate/rotate consume theirs too, so `x.cut(x.translate(...))` crashes
+// with a deleted-handle fault. Warn on the plain-Identifier case.
+// ---------------------------------------------------------------------------
+
+describe("validateSyntaxPure — shape reuse after boolean", () => {
+  const wrap = (body: string) =>
+    [
+      `import { makeBox } from "replicad";`,
+      `export default function main() {`,
+      body,
+      `}`,
+    ].join("\n");
+
+  it("flags x.cut(x.translate(...))", () => {
+    const code = wrap([
+      `  const x = makeBox(10, 10, 10);`,
+      `  return x.cut(x.translate(5, 0, 0));`,
+    ].join("\n"));
+    const { text, isError } = validateSyntaxPure(code);
+    expect(isError).toBe(false);
+    expect(text).toMatch(/Shape reuse after boolean/);
+    expect(text).toContain("x.cut/fuse/intersect(x.*)");
+  });
+
+  it("flags x.fuse(x.rotate(...))", () => {
+    const code = wrap([
+      `  const x = makeBox(10, 10, 10);`,
+      `  return x.fuse(x.rotate(45, [0, 0, 0], [0, 0, 1]));`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/Shape reuse after boolean/);
+  });
+
+  it("flags x.intersect(x)", () => {
+    const code = wrap([
+      `  const x = makeBox(10, 10, 10);`,
+      `  return x.intersect(x);`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/Shape reuse after boolean/);
+  });
+
+  it("does NOT flag a.cut(b.translate(...)) (distinct roots)", () => {
+    const code = wrap([
+      `  const a = makeBox(10, 10, 10);`,
+      `  const b = makeBox(5, 5, 5);`,
+      `  return a.cut(b.translate(2, 0, 0));`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/Shape reuse after boolean/);
+  });
+
+  it("does NOT flag shapes[i].cut(...) (computed receiver, conservative skip)", () => {
+    const code = wrap([
+      `  const shapes = [makeBox(10, 10, 10), makeBox(5, 5, 5)];`,
+      `  return shapes[0].cut(shapes[1]);`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/Shape reuse after boolean/);
+  });
+});
