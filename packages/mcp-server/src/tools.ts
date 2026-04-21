@@ -1184,12 +1184,21 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
       semanticWarnings.push(bezierWarning);
     }
 
-    // 6. .fuse(/.cut( inside a for-loop body — classic "slow pattern".
-    //    Walk the raw code, track brace depth from the `for (...)` header
-    //    to the matching `}`, and flag fuse/cut within.
+    // 6. Hand-rolled boolean loops — classic "slow pattern" that crosses the
+    //    WASM boundary N times instead of once. Detects five variants:
+    //    (a) for(...){...shape.cut/fuse/intersect...}
+    //    (b) while(...){...shape.cut/fuse/intersect...}
+    //    (c) arr.forEach(p => shape = shape.cut/fuse/intersect(p))
+    //    (d) arr.reduce((acc, p) => acc.cut/fuse/intersect(p), shape)
+    //    All recommend patterns.cutAt, which batches at the WASM boundary.
+    const boolInLoopBody = /\.\s*(fuse|cut|intersect)\s*\(/;
+
+    // (a) for-loop with brace-walk to extract body
+    let loopBoolSuggested = false;
+    let loopBoolKind = "";
+
     const forPattern = /\bfor\s*\([^)]*\)\s*\{/g;
     let forMatch: RegExpExecArray | null;
-    let loopBoolSuggested = false;
     while ((forMatch = forPattern.exec(code)) !== null) {
       let depth = 1;
       let i = forMatch.index + forMatch[0].length;
@@ -1201,14 +1210,63 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
         i++;
       }
       const body = code.slice(start, i);
-      if (/\.\s*(fuse|cut)\s*\(/.test(body)) {
+      if (boolInLoopBody.test(body)) {
         loopBoolSuggested = true;
+        loopBoolKind = "for";
         break;
       }
     }
+
+    // (b) while-loop — same brace-walk approach
+    if (!loopBoolSuggested) {
+      const whilePattern = /\bwhile\s*\([^)]*\)\s*\{/g;
+      let whileMatch: RegExpExecArray | null;
+      while ((whileMatch = whilePattern.exec(code)) !== null) {
+        let depth = 1;
+        let i = whileMatch.index + whileMatch[0].length;
+        const start = i;
+        while (i < code.length && depth > 0) {
+          const ch = code[i];
+          if (ch === "{") depth++;
+          else if (ch === "}") depth--;
+          i++;
+        }
+        const body = code.slice(start, i);
+        if (boolInLoopBody.test(body)) {
+          loopBoolSuggested = true;
+          loopBoolKind = "while";
+          break;
+        }
+      }
+    }
+
+    // (c) .forEach(... => ...cut/fuse/intersect...)
+    // Matches: arr.forEach(p => shape = shape.cut(p)) and arrow-body variants.
+    if (!loopBoolSuggested) {
+      const forEachBoolPattern = /\.forEach\s*\(\s*\w+\s*=>[^)]*\.\s*(fuse|cut|intersect)\s*\(/;
+      if (forEachBoolPattern.test(code)) {
+        loopBoolSuggested = true;
+        loopBoolKind = "forEach";
+      }
+    }
+
+    // (d) .reduce((acc, p) => acc.cut/fuse/intersect(p), ...)
+    if (!loopBoolSuggested) {
+      const reduceBoolPattern = /\.reduce\s*\(\s*\([^)]*\)\s*=>[^,)]*\.\s*(fuse|cut|intersect)\s*\(/;
+      if (reduceBoolPattern.test(code)) {
+        loopBoolSuggested = true;
+        loopBoolKind = "reduce";
+      }
+    }
+
     if (loopBoolSuggested) {
+      const construct = loopBoolKind === "forEach"
+        ? "`.forEach` loop"
+        : loopBoolKind === "reduce"
+          ? "`.reduce` accumulator"
+          : `\`${loopBoolKind}\` loop`;
       semanticWarnings.push(
-        "Multiple 3D `fuse`/`cut` inside a loop is slow — consider combining in 2D first (with `drawing.fuse()` / `drawing.cut()`) then a single `.extrude()` at the end. See the `booleans` category in get_api_reference."
+        `slow pattern: hand-rolled ${construct} with \`.cut\`/\`.fuse\`/\`.intersect\` calls is 2–5× slower than \`patterns.cutAt(shape, () => makeTool(), placements)\` — it batches at the WASM boundary. See the \`patterns\` category in get_api_reference.`
       );
     }
 
@@ -2216,7 +2274,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "validate_syntax",
-    "Validate TypeScript syntax and detect 6 common CAD pitfalls (sketch mischain, missing sketchOnPlane, unclosed pen, non-uniform scale, oversized fillet, booleans in loop). Does NOT verify imports, types, or runtime behavior — for that, call create_shape or modify_shape.",
+    "Validate TypeScript syntax and detect common CAD pitfalls (sketch mischain, missing sketchOnPlane, unclosed pen, non-uniform scale, oversized fillet, hand-rolled boolean loops including for/while/forEach/reduce with .cut/.fuse/.intersect, fillet-after-boolean). Does NOT verify imports, types, or runtime behavior — for that, call create_shape or modify_shape.",
     validateSyntaxSchema,
     safeHandler("validate_syntax", validateSyntaxImpl)
   );
