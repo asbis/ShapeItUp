@@ -123,6 +123,64 @@ const gnomonLabelZ = makeGnomonLabel("Z", "#3388ff");
 gnomonLabelZ.position.set(0, 0, 0.95);
 gnomonScene.add(gnomonLabelX, gnomonLabelY, gnomonLabelZ);
 
+// Fusion-style ViewCube: the three +axis labels plus three invisible hit
+// spheres on the -axis ends make the gnomon a 6-way clickable navigator.
+// The spheres are opacity:0 but still raycastable, so -X/-Y/-Z are reachable
+// without visual clutter. Each hit proxy carries the camera preset tuple on
+// `userData.preset` — the click handler reads it directly.
+gnomonLabelX.userData.preset = [1, 0, 0];   // click +X → right view
+gnomonLabelY.userData.preset = [0, 1, 0];   // click +Y → back view
+gnomonLabelZ.userData.preset = [0, 0, 1];   // click +Z → top view
+function makeGnomonHitProxy(position: THREE.Vector3, preset: [number, number, number]): THREE.Mesh {
+  const geo = new THREE.SphereGeometry(0.15, 8, 8);
+  const mat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthTest: false });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.copy(position);
+  mesh.userData.preset = preset;
+  return mesh;
+}
+const gnomonHitNegX = makeGnomonHitProxy(new THREE.Vector3(-0.95, 0, 0), [-1, 0, 0]);
+const gnomonHitNegY = makeGnomonHitProxy(new THREE.Vector3(0, -0.95, 0), [0, -1, 0]);
+const gnomonHitNegZ = makeGnomonHitProxy(new THREE.Vector3(0, 0, -0.95), [0, 0, -1]);
+gnomonScene.add(gnomonHitNegX, gnomonHitNegY, gnomonHitNegZ);
+
+const GNOMON_SIZE = 80;
+const GNOMON_MARGIN = 10;
+const gnomonRaycaster = new THREE.Raycaster();
+const gnomonMouse = new THREE.Vector2();
+
+function tryGnomonClick(event: MouseEvent): boolean {
+  if (!showCompass) return false;
+  const rect = renderer.domElement.getBoundingClientRect();
+  const localX = event.clientX - rect.left;
+  const localY = event.clientY - rect.top;
+
+  // Gnomon viewport spans the bottom-right square of the canvas, in CSS
+  // (top-left origin) coords:
+  //   x ∈ [rect.width - MARGIN - SIZE, rect.width - MARGIN]
+  //   y ∈ [rect.height - MARGIN - SIZE, rect.height - MARGIN]
+  const gnomonLeft = rect.width - GNOMON_MARGIN - GNOMON_SIZE;
+  const gnomonTop = rect.height - GNOMON_MARGIN - GNOMON_SIZE;
+  const u = (localX - gnomonLeft) / GNOMON_SIZE;   // 0 = left edge, 1 = right edge
+  const v = (localY - gnomonTop) / GNOMON_SIZE;    // 0 = top edge, 1 = bottom edge
+  if (u < 0 || u > 1 || v < 0 || v > 1) return false;
+
+  // Convert the local (u, v) to NDC for the gnomon's own camera. NDC y is
+  // flipped because the gnomon viewport, like the main canvas, uses
+  // bottom-left origin in GL but we measured v from the top.
+  gnomonMouse.x = u * 2 - 1;
+  gnomonMouse.y = 1 - v * 2;
+
+  gnomonRaycaster.setFromCamera(gnomonMouse, gnomonCamera);
+  const targets = [gnomonLabelX, gnomonLabelY, gnomonLabelZ, gnomonHitNegX, gnomonHitNegY, gnomonHitNegZ];
+  const hits = gnomonRaycaster.intersectObjects(targets, false);
+  if (hits.length === 0) return false;
+  const preset = hits[0].object.userData.preset as [number, number, number] | undefined;
+  if (!preset) return false;
+  setCameraAngle(preset);
+  return true;
+}
+
 // Draw the gnomon on top of whatever was just rendered into `renderer`.
 // Caller must have already rendered the main scene; we only add the overlay.
 // Invariants on exit: viewport restored to full target size, autoClear left
@@ -142,12 +200,13 @@ function renderGnomon(targetW: number, targetH: number) {
   gnomonCamera.position.copy(backward.multiplyScalar(3));
   gnomonCamera.updateMatrixWorld();
 
-  // 80x80 viewport in the lower-right with a 10px margin. In screenshot
-  // mode the caller resizes the renderer to targetW/H first, so using
-  // those values (not container.clientWidth) pins the gnomon to the
-  // correct corner of the captured frame rather than the live viewport.
-  const size = 80;
-  const margin = 10;
+  // GNOMON_SIZE × GNOMON_SIZE viewport in the lower-right with GNOMON_MARGIN
+  // padding. In screenshot mode the caller resizes the renderer to
+  // targetW/H first, so using those values (not container.clientWidth) pins
+  // the gnomon to the correct corner of the captured frame rather than the
+  // live viewport. `tryGnomonClick` reuses the same constants to hit-test.
+  const size = GNOMON_SIZE;
+  const margin = GNOMON_MARGIN;
   const prevViewport = new THREE.Vector4();
   renderer.getViewport(prevViewport);
   const prevScissorTest = renderer.getScissorTest();
@@ -217,11 +276,17 @@ function clearModelGroup() {
 // it arrives so the user sees progress rather than a frozen spinner.
 let streamingAccum: TessellatedPart[] = [];
 let streamingExpected = 0;
+// Visibility intents may arrive (via prepare-screenshot / set-part-visibility)
+// before all parts have streamed in. We stash them here and re-apply as parts
+// arrive and once more on mesh-done, so a delegating snippet whose resolved
+// runtime result is an assembly still gets focusPart/hideParts honored.
+let pendingVisibility: { focusPart?: string; hideParts?: string[] } | null = null;
 
 function beginStreaming(totalParts: number) {
   clearModelGroup();
   streamingAccum = [];
   streamingExpected = totalParts;
+  pendingVisibility = null;
   statusEl.textContent = totalParts > 1 ? `0/${totalParts} parts…` : "rendering…";
 }
 
@@ -266,6 +331,12 @@ function addPart(part: TessellatedPart) {
     statusEl.textContent = `${tVerts} verts, ${tTris} tris | ${streamingAccum.length}/${streamingExpected} parts…`;
   } else {
     statusEl.textContent = `${tVerts} verts, ${tTris} tris`;
+  }
+
+  // Replay any deferred visibility intent so this freshly-arrived part honors
+  // focusPart/hideParts immediately, instead of flashing visible first.
+  if (pendingVisibility) {
+    applyPartVisibility(pendingVisibility.focusPart, pendingVisibility.hideParts);
   }
 }
 
@@ -338,7 +409,12 @@ function setCameraAngle(position: [number, number, number]) {
 
   const dir = new THREE.Vector3(...position).normalize();
   camera.position.copy(center.clone().add(dir.multiplyScalar(dist)));
-  camera.up.set(0, 0, 1); // Z-up for CAD
+  // Preset views should always be Z-up — ArcballControls doesn't call
+  // lookAt() inside update(), so we set the orientation explicitly here.
+  // During free drag the arcball is free to rotate past the poles; this
+  // only anchors the preset angles.
+  camera.up.set(0, 0, 1);
+  camera.lookAt(center);
   controls.target.copy(center);
   controls.update();
 }
@@ -477,6 +553,14 @@ function handleWorkerMessage(msg: WorkerToWebview) {
 
     case "mesh-done":
       try {
+        // Final replay of any deferred visibility intent now that every part
+        // has landed. Any genuinely-missing names will now produce their
+        // warning (streaming is complete, so the "streaming" guard lifts).
+        if (pendingVisibility) {
+          const intent = pendingVisibility;
+          pendingVisibility = null;
+          applyPartVisibility(intent.focusPart, intent.hideParts);
+        }
         updateParamsUI(msg.params || []);
         if (sectionActive) updateSectionPlane();
         if (dimensionsVisible) updateDimensions();
@@ -792,10 +876,15 @@ const CAMERA_ANGLE_PRESETS: Record<string, [number, number, number]> = {
 
 // --- Per-part visibility control (used by render_preview focusPart/hideParts) ---
 function applyPartVisibility(focusPart?: string, hideParts?: string[]) {
-  // If the script returned a single part (non-assembly), these options are
-  // no-ops — but we still emit a warning if the caller explicitly named a part
-  // so they know it wasn't honored.
-  const isAssembly = currentParts.length > 1;
+  // Honor the worker-announced total so a delegating snippet (whose resolved
+  // runtime result is an assembly) isn't misdiagnosed as single-part just
+  // because the first part landed before the visibility command did.
+  const isAssembly = currentParts.length > 1 || streamingExpected > 1;
+  // True while more parts are still expected. While streaming, we defer the
+  // "name didn't match" and "not a multi-part assembly" warnings because the
+  // missing parts may simply not have streamed in yet. The intent is stashed
+  // in pendingVisibility and replayed from addPart + mesh-done.
+  const streaming = streamingExpected > 0 && currentParts.length < streamingExpected;
 
   if (focusPart) {
     if (!isAssembly) {
@@ -806,11 +895,15 @@ function applyPartVisibility(focusPart?: string, hideParts?: string[]) {
     } else {
       const match = currentParts.find((p) => p.name === focusPart);
       if (!match) {
-        postToExtension({
-          type: "part-warning",
-          message: `focusPart "${focusPart}" did not match any loaded part. Available: ${currentParts.map((p) => p.name).join(", ")}`,
-        });
-        // Fall through — nothing to focus; leave everything visible.
+        if (streaming) {
+          pendingVisibility = { focusPart, hideParts };
+        } else {
+          postToExtension({
+            type: "part-warning",
+            message: `focusPart "${focusPart}" did not match any loaded part. Available: ${currentParts.map((p) => p.name).join(", ")}`,
+          });
+        }
+        // Fall through — nothing to focus yet; leave everything visible.
       } else {
         for (const p of currentParts) {
           const visible = p.name === focusPart;
@@ -821,6 +914,10 @@ function applyPartVisibility(focusPart?: string, hideParts?: string[]) {
         // Re-compute the dim-label overlay so it reflects the focused part's
         // bbox instead of the full assembly's extents.
         updateDimensions();
+        // Keep the intent pending while more parts may still arrive so late
+        // parts are also hidden on landing.
+        if (streaming) pendingVisibility = { focusPart, hideParts };
+        else pendingVisibility = null;
         return;
       }
     }
@@ -836,7 +933,7 @@ function applyPartVisibility(focusPart?: string, hideParts?: string[]) {
     }
     const loadedNames = new Set(currentParts.map((p) => p.name));
     const missing = hideParts.filter((n) => !loadedNames.has(n));
-    if (missing.length > 0) {
+    if (missing.length > 0 && !streaming) {
       postToExtension({
         type: "part-warning",
         message: `hideParts name(s) did not match any loaded part: ${missing.join(", ")}. Available: ${currentParts.map((p) => p.name).join(", ")}`,
@@ -850,10 +947,13 @@ function applyPartVisibility(focusPart?: string, hideParts?: string[]) {
     }
     updatePartsList();
     updateDimensions();
+    if (streaming) pendingVisibility = { focusPart, hideParts };
+    else pendingVisibility = null;
   }
 }
 
 function restorePartVisibility() {
+  pendingVisibility = null;
   for (const p of currentParts) {
     p.visible = true;
     p.group.visible = true;
@@ -1230,6 +1330,9 @@ function addMeasurePoint(point: THREE.Vector3) {
 }
 
 renderer.domElement.addEventListener("click", (event) => {
+  // Gnomon click wins over everything else (including measure mode) so the
+  // bottom-right nav widget is always responsive.
+  if (tryGnomonClick(event)) return;
   if (!measureMode) return;
 
   const rect = renderer.domElement.getBoundingClientRect();
@@ -1246,6 +1349,72 @@ renderer.domElement.addEventListener("click", (event) => {
   const intersects = raycaster.intersectObjects(meshes);
   if (intersects.length > 0) {
     addMeasurePoint(intersects[0].point);
+  }
+});
+
+// Numpad-inspired preset map for keyboard view shortcuts. 1 = iso is the
+// most common starting view; the rest trace a (front/right/top, then
+// back/left/bottom) layout that reads naturally left-to-right.
+const KEY_TO_PRESET: Record<string, [number, number, number]> = {
+  "1": [1, -1, 0.7],   // iso
+  "2": [0, -1, 0],     // front
+  "3": [1, 0, 0],      // right
+  "4": [0, 0, 1],      // top
+  "5": [0, 1, 0],      // back
+  "6": [-1, 0, 0],     // left
+  "7": [0, 0, -1],     // bottom
+};
+
+// Keyboard view shortcuts — only fire when the user isn't typing into a
+// parameter slider's number input. Guarding on `document.activeElement` is
+// enough because all our text inputs live in the params panel; the canvas
+// itself isn't focusable.
+window.addEventListener("keydown", (event) => {
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  const active = document.activeElement;
+  if (
+    active &&
+    (active.tagName === "INPUT" ||
+      active.tagName === "TEXTAREA" ||
+      (active as HTMLElement).isContentEditable)
+  ) {
+    return;
+  }
+  const key = event.key.toLowerCase();
+  if (key === "f") {
+    if (modelGroup.children.length > 0) {
+      fitCameraToObject(camera, controls, modelGroup, dimensionsVisible ? dimensionGroup : undefined);
+    }
+    event.preventDefault();
+    return;
+  }
+  const preset = KEY_TO_PRESET[key];
+  if (preset) {
+    setCameraAngle(preset);
+    event.preventDefault();
+  }
+});
+
+// Fusion-style double-click to re-pivot: picking a feature makes it the new
+// orbit center. Without this, the pivot stays at the model-bbox center from
+// the last fit, so users can't inspect detail on one side of a large
+// assembly without the camera swinging wildly around the far side.
+renderer.domElement.addEventListener("dblclick", (event) => {
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+
+  const meshes: THREE.Mesh[] = [];
+  modelGroup.traverse((child) => {
+    if (child instanceof THREE.Mesh && child.visible) meshes.push(child);
+  });
+
+  const intersects = raycaster.intersectObjects(meshes);
+  if (intersects.length > 0) {
+    controls.target.copy(intersects[0].point);
+    controls.update();
   }
 });
 
