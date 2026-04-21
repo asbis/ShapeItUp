@@ -200,6 +200,25 @@ export interface ShapeProperties {
     qty?: number;
     /** Per-part material override (propagated from `PartInput.material`). */
     material?: { density: number; name?: string };
+    /**
+     * FDM-printability heuristics computed at render time from the
+     * tessellated triangle mesh + BRepCheck's manifold flag. Lets downstream
+     * tools (`get_render_status`, `export_shape`) warn the user before the
+     * slicer silently drops sub-nozzle features.
+     *
+     * - `manifold`: BRepCheck's global validity flag applied per-part. OCCT
+     *   validates the whole solid at once, so every part shares the value
+     *   (all true when the assembly is clean, all false when it's not).
+     * - `minFeatureSize_mm`: shortest triangle edge in this part's
+     *   tessellation. The tessellator subdivides along real feature edges,
+     *   so this tracks the smallest detail the user actually asked to print.
+     * - `issues[]`: human-readable list of concerns. Empty on clean parts.
+     */
+    printability?: {
+      manifold: boolean;
+      minFeatureSize_mm: number;
+      issues: string[];
+    };
   }>;
   totalVolume?: number;
   totalSurfaceArea?: number;
@@ -444,7 +463,16 @@ export async function executeShapeFile(
     const statsText = `${totalVerts} verts, ${totalTris} tris${partLabel} — ${result.execTimeMs}ms + ${result.tessTimeMs}ms`;
 
     const bbox = boundingBoxFromParts(result.parts);
-    const properties = aggregateProperties(result.parts);
+    // Feed the per-part printability heuristic with the BRepCheck manifold
+    // flag (shared across all parts — OCCT validates the whole solid) and the
+    // already-drained runtime warnings. `result.warnings` mixes stdlib
+    // advisories (e.g. `threads.tapInto at M2 produces sub-nozzle features`)
+    // with validateParts's geometric checks; both are worth attributing to
+    // any part whose name they mention.
+    const properties = aggregateProperties(result.parts, {
+      geometryValid: result.geometryValid,
+      runtimeWarnings: result.warnings,
+    });
 
     const currentParams: Record<string, number> = {};
     for (const p of result.params) currentParams[p.name] = p.value;
@@ -655,9 +683,88 @@ function boundingBoxFromParts(parts: ExecutedPart[]): { x: number; y: number; z:
   return bb ? { x: bb.x, y: bb.y, z: bb.z } : { x: 0, y: 0, z: 0 };
 }
 
-function aggregateProperties(parts: ExecutedPart[]): ShapeProperties {
+/**
+ * Default FDM nozzle diameter (mm) used by the printability heuristic. A
+ * 0.4 mm nozzle is the de-facto standard for desktop slicers (Cura /
+ * PrusaSlicer / Bambu Studio ship it as the default profile). Features
+ * narrower than this are rendered as thin zero-width extrusions or dropped
+ * entirely — `threads.tapInto` at M2/M3 is the canonical offender.
+ *
+ * Hardcoded here rather than a parameter knob because the heuristic is
+ * advisory: false positives on a 0.2 mm "detail nozzle" workflow are fine
+ * (the user knows their nozzle), and a threshold that tracks the common
+ * case catches the real bugs.
+ */
+const DEFAULT_NOZZLE_MM = 0.4;
+
+/**
+ * Compute the shortest triangle edge length across a tessellated part. The
+ * tessellator places vertices along real feature boundaries (sharp edges,
+ * cylinder seams, thread roots), so the smallest edge tracks the narrowest
+ * detail the CAD asked the slicer to reproduce.
+ *
+ * Hot path: iterates every triangle exactly once with flat arithmetic. We
+ * carry the squared minimum through the loop and only take one sqrt at the
+ * end so a 100k-triangle part pays one sqrt call, not 300k. Returns +Infinity
+ * for empty meshes — callers should check `Number.isFinite` before emitting.
+ */
+function minTriangleEdgeMm(vertices: Float32Array, triangles: Uint32Array): number {
+  let minSq = Infinity;
+  for (let i = 0; i < triangles.length; i += 3) {
+    const i0 = triangles[i] * 3;
+    const i1 = triangles[i + 1] * 3;
+    const i2 = triangles[i + 2] * 3;
+    const x0 = vertices[i0], y0 = vertices[i0 + 1], z0 = vertices[i0 + 2];
+    const x1 = vertices[i1], y1 = vertices[i1 + 1], z1 = vertices[i1 + 2];
+    const x2 = vertices[i2], y2 = vertices[i2 + 1], z2 = vertices[i2 + 2];
+    let dx = x1 - x0, dy = y1 - y0, dz = z1 - z0;
+    let d = dx * dx + dy * dy + dz * dz;
+    if (d < minSq) minSq = d;
+    dx = x2 - x1; dy = y2 - y1; dz = z2 - z1;
+    d = dx * dx + dy * dy + dz * dz;
+    if (d < minSq) minSq = d;
+    dx = x0 - x2; dy = y0 - y2; dz = z0 - z2;
+    d = dx * dx + dy * dy + dz * dz;
+    if (d < minSq) minSq = d;
+  }
+  return minSq === Infinity ? Infinity : Math.sqrt(minSq);
+}
+
+function aggregateProperties(
+  parts: ExecutedPart[],
+  opts?: { geometryValid?: boolean; runtimeWarnings?: string[] },
+): ShapeProperties {
+  const geometryValid = opts?.geometryValid !== false; // undefined/true → treat as valid
+  const runtimeWarnings = opts?.runtimeWarnings ?? [];
   const perPart = parts.map((p) => {
     const bbox = boundingBoxFromVertices(p.vertices);
+    const minEdge = minTriangleEdgeMm(p.vertices, p.triangles);
+    const issues: string[] = [];
+    if (!geometryValid) {
+      issues.push("Non-manifold geometry — OCCT validation failed");
+    }
+    if (Number.isFinite(minEdge) && minEdge < DEFAULT_NOZZLE_MM) {
+      issues.push(
+        `Smallest feature ${minEdge.toFixed(2)} mm is below typical ${DEFAULT_NOZZLE_MM.toFixed(1)} mm FDM nozzle width`,
+      );
+    }
+    // Attribute any drained runtime warning that names this part or calls out
+    // a threads.* helper (the known unsliceable offender at small metric
+    // sizes). String-contains is enough for MVP — we only want to surface
+    // hints the user already sees in the top-level warnings block.
+    for (const w of runtimeWarnings) {
+      if (typeof w !== "string") continue;
+      const mentionsPart = p.name && w.includes(p.name);
+      const mentionsThreads = w.includes("threads.");
+      if (mentionsPart || mentionsThreads) {
+        issues.push(w);
+      }
+    }
+    const printability = {
+      manifold: geometryValid,
+      minFeatureSize_mm: Number.isFinite(minEdge) ? minEdge : 0,
+      issues,
+    };
     return {
       name: p.name,
       volume: p.volume,
@@ -672,6 +779,7 @@ function aggregateProperties(parts: ExecutedPart[]): ShapeProperties {
       // walk a second data source. Absent when the script didn't declare them.
       ...(typeof p.qty === "number" ? { qty: p.qty } : {}),
       ...(p.material ? { material: p.material } : {}),
+      printability,
     };
   });
   let totalVolume = 0;
