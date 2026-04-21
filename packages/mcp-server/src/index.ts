@@ -50,13 +50,19 @@ function installProcessSafetyNet() {
   });
 }
 
+// Version baked in at build time by esbuild's `define` — reads
+// packages/mcp-server/package.json so the value advertised via MCP
+// `initialize` tracks the published npm version automatically. Falls back
+// to "0.0.0-dev" when running un-bundled source (tests, ts-node).
+const SERVER_VERSION: string = process.env.SHAPEITUP_MCP_VERSION ?? "0.0.0-dev";
+
 async function main() {
   muzzleStdout();
   installProcessSafetyNet();
 
   const server = new McpServer({
     name: "shapeitup",
-    version: "0.3.0",
+    version: SERVER_VERSION,
   });
 
   // Start the subscriber bus BEFORE registering tools — callers gate on
@@ -64,7 +70,7 @@ async function main() {
   // before any tool runs. Failure to bind (port exhaustion, sandbox
   // restriction) is non-fatal: we log to stderr and continue so the MCP
   // server still answers tool calls that don't need viewer sync.
-  const bus = getSubscriberBus(defaultGlobalStorageDir(), "0.3.0");
+  const bus = getSubscriberBus(defaultGlobalStorageDir(), SERVER_VERSION);
   try {
     const port = await bus.start();
     process.stderr.write(`[shapeitup-mcp] subscriber bus listening on 127.0.0.1:${port}\n`);

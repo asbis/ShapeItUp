@@ -1,11 +1,18 @@
 import * as esbuild from "esbuild";
-import { cpSync, mkdirSync, existsSync, writeFileSync, rmSync } from "fs";
+import { cpSync, mkdirSync, existsSync, writeFileSync, rmSync, readFileSync } from "fs";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import { execSync } from "child_process";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const watch = process.argv.includes("--watch");
+
+// Read the mcp-server package.json version at build time so the value baked
+// into the bundle always matches what npm publishes. Avoids a stale hardcoded
+// string in index.ts and avoids a runtime readFileSync on every boot.
+const mcpServerPkgVersion = JSON.parse(
+  readFileSync(resolve(__dirname, "packages/mcp-server/package.json"), "utf8"),
+).version;
 
 const sharedConfig = {
   bundle: true,
@@ -57,6 +64,13 @@ const workerConfig = {
 // bundle — keep it external so it loads from node_modules at runtime.
 const mcpExternal = ["esbuild-wasm", "replicad-opencascadejs", "@resvg/resvg-wasm"];
 
+// Compile-time constants injected into BOTH mcp-server bundles so the
+// serverInfo advertised over MCP tracks packages/mcp-server/package.json
+// without a runtime readFileSync.
+const mcpDefine = {
+  "process.env.SHAPEITUP_MCP_VERSION": JSON.stringify(mcpServerPkgVersion),
+};
+
 // 4. MCP Server (Node.js, ESM) — standalone
 const mcpServerConfig = {
   ...sharedConfig,
@@ -66,6 +80,7 @@ const mcpServerConfig = {
   format: "esm",
   banner: { js: "#!/usr/bin/env node\nimport { createRequire } from 'module'; const require = createRequire(import.meta.url);" },
   external: mcpExternal,
+  define: mcpDefine,
 };
 
 // 5. MCP Server copy bundled into extension dist (for auto-discovery).
@@ -79,6 +94,7 @@ const mcpServerExtConfig = {
   format: "esm",
   banner: { js: "import { createRequire } from 'module'; const require = createRequire(import.meta.url);" },
   external: mcpExternal,
+  define: mcpDefine,
 };
 
 function copyWasmFiles() {
