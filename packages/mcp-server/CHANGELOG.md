@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.6.3 (2026-04-21)
+
+Patch: unblock Claude Code after the 1.6.2 Gemini fix. 1.6.2's sanitizer
+stripped `$schema` (intentional, for Gemini) without also normalizing the
+draft-07 tuple syntax (`items: [schemaA, schemaB]`) that two tools emit
+via `z.tuple([...])`. Without the `$schema` annotation, Claude's API
+validator falls back to JSON Schema 2020-12, where `items: [array]` is
+invalid — causing `tools.N.custom.input_schema: JSON schema is invalid`
+errors on any session that loaded the ShapeItUp tool catalog.
+
+### Fixed
+- Sanitizer now rewrites draft-07 tuple items to uniform-array form:
+  `{ items: <shared schema>, minItems: N, maxItems: N }` for homogeneous
+  tuples, `{ minItems: N, maxItems: N }` for heterogeneous ones. Valid
+  under both JSON Schema 2020-12 (Claude) AND OpenAPI 3.0 (Gemini).
+- Affected tools: `check_collisions.acceptedPairs`, `verify_shape.
+  collisionAcceptedPairs` (both `z.array(z.tuple([z.string(), z.string()]))`).
+- Regression gate added: the tools/list integration test now asserts zero
+  tuples remain in the emitted catalog on every CI run.
+
+Users on 1.6.2 should upgrade — that version broke Claude Code.
+
 ## 1.6.2 (2026-04-21)
 
 Patch: MCP tool schemas sanitized for strict clients (Gemini CLI).

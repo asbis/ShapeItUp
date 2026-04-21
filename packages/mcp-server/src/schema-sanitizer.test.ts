@@ -85,6 +85,92 @@ describe("sanitizeSchemaForStrictClients — single-field transformations", () =
   });
 });
 
+describe("sanitizeSchemaForStrictClients — tuple normalization", () => {
+  // Draft-07 encodes tuples as `items: [schemaA, schemaB, ...]`. That form is
+  // invalid in JSON Schema 2020-12 (Claude Code's validator defaults to 2020-12
+  // when no `$schema` is present — which the sanitizer already strips for
+  // Gemini). 2020-12 replaced it with `prefixItems`, but Gemini's OpenAPI-3.0
+  // subset doesn't accept `prefixItems` either. The only syntax that works for
+  // both is the uniform-array form: `items: <schema>` + `minItems`/`maxItems`.
+
+  it("collapses homogeneous tuple to uniform-array form", () => {
+    const input = {
+      type: "array",
+      items: [{ type: "number" }, { type: "number" }, { type: "number" }],
+    };
+    const out = sanitizeSchemaForStrictClients(input) as Record<string, unknown>;
+    expect(out.items).toEqual({ type: "number" });
+    expect(out.minItems).toBe(3);
+    expect(out.maxItems).toBe(3);
+  });
+
+  it("drops element typing for heterogeneous tuples but pins length", () => {
+    const input = {
+      type: "array",
+      items: [{ type: "string" }, { type: "number" }],
+    };
+    const out = sanitizeSchemaForStrictClients(input) as Record<string, unknown>;
+    expect(out.items).toBeUndefined();
+    expect(out.minItems).toBe(2);
+    expect(out.maxItems).toBe(2);
+  });
+
+  it("respects existing minItems/maxItems if the caller set them", () => {
+    const input = {
+      type: "array",
+      items: [{ type: "number" }, { type: "number" }],
+      minItems: 1,
+      maxItems: 5,
+    };
+    const out = sanitizeSchemaForStrictClients(input) as Record<string, unknown>;
+    expect(out.items).toEqual({ type: "number" });
+    expect(out.minItems).toBe(1);
+    expect(out.maxItems).toBe(5);
+  });
+
+  it("leaves `items: <single schema>` alone", () => {
+    const input = {
+      type: "array",
+      items: { type: "string" },
+    };
+    const out = sanitizeSchemaForStrictClients(input) as Record<string, unknown>;
+    expect(out.items).toEqual({ type: "string" });
+    expect(out.minItems).toBeUndefined();
+    expect(out.maxItems).toBeUndefined();
+  });
+
+  it("recurses into nested tuples inside properties", () => {
+    const input = {
+      type: "object",
+      properties: {
+        pivot: {
+          type: "array",
+          items: [{ type: "number" }, { type: "number" }, { type: "number" }],
+        },
+      },
+    };
+    const out = sanitizeSchemaForStrictClients(input) as any;
+    expect(out.properties.pivot.items).toEqual({ type: "number" });
+    expect(out.properties.pivot.minItems).toBe(3);
+    expect(out.properties.pivot.maxItems).toBe(3);
+  });
+
+  it("handles tuples nested in arrays-of-arrays (acceptedPairs case)", () => {
+    // z.array(z.tuple([z.string(), z.string()])) emits this shape
+    const input = {
+      type: "array",
+      items: {
+        type: "array",
+        items: [{ type: "string" }, { type: "string" }],
+      },
+    };
+    const out = sanitizeSchemaForStrictClients(input) as any;
+    expect(out.items.items).toEqual({ type: "string" });
+    expect(out.items.minItems).toBe(2);
+    expect(out.items.maxItems).toBe(2);
+  });
+});
+
 describe("sanitizeSchemaForStrictClients — recursion", () => {
   it("recurses into properties", () => {
     const input = {
@@ -364,6 +450,21 @@ describe("tools/list emission is Gemini-safe", () => {
       if (ap !== undefined && ap !== true && ap !== false) {
         offenders.push(
           `object-valued additionalProperties at ${path} (value: ${JSON.stringify(ap)})`,
+        );
+      }
+      // Draft-07 tuple syntax (items: [array]) is invalid in JSON Schema
+      // 2020-12 (Claude's default when $schema is absent) AND unsupported by
+      // Gemini's OpenAPI-3.0 subset. The sanitizer must rewrite it.
+      if (Array.isArray(obj.items)) {
+        offenders.push(
+          `draft-07 tuple items:[array] at ${path} (length: ${(obj.items as unknown[]).length}) — must be normalized`,
+        );
+      }
+      // prefixItems is the 2020-12 replacement for tuple syntax, but Gemini
+      // rejects it. The sanitizer should collapse to uniform-array form.
+      if ("prefixItems" in obj) {
+        offenders.push(
+          `prefixItems present at ${path} — Gemini does not accept it; sanitizer must collapse`,
         );
       }
       if (typeof obj.description === "string" && obj.description.length > DESC_MAX) {

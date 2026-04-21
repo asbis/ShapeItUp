@@ -39,15 +39,58 @@ const SCHEMA_CHILD_KEYS = [
 
 /** Keys whose value is a single nested schema. */
 const SINGLE_SCHEMA_KEYS = [
-  "items",
   "contains",
   "if",
   "then",
   "else",
   "not",
-  // NOTE: we intentionally do NOT recurse into `additionalProperties` — if
+  // NOTE 1: `items` is handled separately below so we can rewrite draft-07
+  // tuple syntax (`items: [schemaA, schemaB]`) into the uniform-array form
+  // accepted by both JSON Schema 2020-12 and OpenAPI 3.0.
+  // NOTE 2: we intentionally do NOT recurse into `additionalProperties` — if
   // it is an object schema, the whole field is collapsed to `true` below.
 ] as const;
+
+/**
+ * Normalize a draft-07 tuple-style `items: [schemaA, schemaB, ...]` into the
+ * uniform `items: <schema>` + `minItems`/`maxItems` form that validates
+ * under BOTH JSON Schema 2020-12 (Claude's default validator, where
+ * `items: [array]` is invalid and `prefixItems` is the 2020-12 replacement —
+ * which Gemini's OpenAPI-3.0 subset rejects) AND OpenAPI 3.0 (Gemini).
+ *
+ * - Homogeneous tuple (every element's schema is identical): collapse to
+ *   `{ items: <common schema>, minItems: N, maxItems: N }`. Full type info
+ *   preserved — a [number,number,number] tuple still says "array of 3
+ *   numbers" on the wire.
+ * - Heterogeneous tuple: drop element typing and just pin length. The
+ *   runtime zod validator still enforces per-position types; the schema
+ *   just advertises "array of N items" to the model.
+ *
+ * Mutates `out` (the schema object being built) — adds items/minItems/
+ * maxItems entries as appropriate.
+ */
+function normalizeTupleItems(
+  tuple: unknown[],
+  out: Record<string, unknown>,
+): void {
+  const len = tuple.length;
+  if (len === 0) {
+    delete out.items;
+  } else {
+    const sanitized = tuple.map((item) => sanitizeSchemaForStrictClients(item));
+    const fingerprint = JSON.stringify(sanitized[0] ?? {});
+    const homogeneous = sanitized.every(
+      (item) => JSON.stringify(item) === fingerprint,
+    );
+    if (homogeneous) {
+      out.items = sanitized[0];
+    } else {
+      delete out.items;
+    }
+  }
+  if (out.minItems === undefined) out.minItems = len;
+  if (out.maxItems === undefined) out.maxItems = len;
+}
 
 /** Keys whose value is an array of nested schemas. */
 const SCHEMA_ARRAY_KEYS = [
@@ -108,6 +151,17 @@ export function sanitizeSchemaForStrictClients(schema: unknown): unknown {
     // --- description: clip at 1000 chars -------------------------------
     if (key === "description") {
       out[key] = truncateDescription(value);
+      continue;
+    }
+
+    // --- items: handle draft-07 tuple arrays OR single schema ---------
+    if (key === "items") {
+      if (Array.isArray(value)) {
+        // Draft-07 tuple syntax → rewrite to uniform-array form.
+        normalizeTupleItems(value, out);
+      } else {
+        out[key] = sanitizeSchemaForStrictClients(value);
+      }
       continue;
     }
 
