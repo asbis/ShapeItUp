@@ -1,89 +1,116 @@
-// Shared dimensions for the 20-needle mini flatbed knitting machine.
-// Units: mm. Convention: bed along +X, needles point +Y, up +Z.
-// Research-derived — see README / feedback doc for sources.
+// Mini flatbed knitter — central spec
+// Coordinate convention: bed runs along +X. Carriage traverses along +X.
+// Needles point in +Y (hooks toward +Y, butts toward -Y). Z is up.
+// Origin: center of the needle bed top face.
 
-// --- Needles (Brother bulky "9mm" class) ----------------------------------
-export const NEEDLE_COUNT       = 20;
-export const PITCH              = 9.0;   // groove center-to-center
-export const NEEDLE_LENGTH      = 150;
-export const NEEDLE_DIAMETER    = 1.4;
-export const BUTT_HEIGHT        = 1.5;   // above shaft top
-export const BUTT_THICKNESS     = 1.2;   // across-bed
-export const BUTT_LENGTH        = 2.5;   // along-needle
-export const BUTT_FROM_BACK     = 40;    // distance from rear tail of needle
+export const SPEC = {
+  // ── Needle bed geometry ─────────────────────────────────────────
+  needlePitch: 5.0,        // mm — E5 standard gauge (Brother/Passap)
+  needleCount: 20,         // total selectable needles
+  bedKnitLength: 100,      // = pitch × count
+  bedOverrun: 50,          // each side, gives carriage room beyond knit zone
+  bedLength: 200,          // bedKnitLength + 2×bedOverrun
+  bedWidth: 50,            // depth of bed (Y)
+  bedHeight: 20,           // bed body thickness (Z)
 
-// --- Needle bed -----------------------------------------------------------
-export const BED_LENGTH         = PITCH * (NEEDLE_COUNT + 4);   // 216 mm (2-needle margin each side)
-export const BED_DEPTH          = 55;    // along Y (front-to-back)
-export const BED_THICKNESS      = 12;
-export const GROOVE_WIDTH       = NEEDLE_DIAMETER + 0.3;        // 1.7 mm — +0.15/side FDM clearance
-export const GROOVE_DEPTH       = 3.0;
-export const GROOVE_LENGTH      = 48;    // how far the groove runs in Y
-export const GATE_PEG_HEIGHT    = 3.0;   // ridges above bed top, between grooves
-export const GATE_PEG_WIDTH     = 1.2;
+  // Trick (groove) — each needle slides in this slot
+  trickWidth: 1.6,         // mm wide groove; clears the 1.2 mm needle stem with 0.2 mm side play
+  trickDepth: 5.0,         // groove depth into bed top face
+  trickLength: 70,         // along Y; needle's working slide path
 
-// --- Cam plate / carriage -------------------------------------------------
-export const CAM_PLATE_THICKNESS    = 6;
-export const CAM_FACE_ANGLE_DEG     = 45;
-export const BUTT_LIFT_FULL         = 14;  // full clear travel
-export const BUTT_LIFT_TUCK         = 7;
-export const CAM_TRACK_HEIGHT       = BUTT_HEIGHT + 0.2;   // 1.7 mm closed-track slot
-export const CARRIAGE_LENGTH        = 80;  // along X (direction of travel)
-export const CARRIAGE_DEPTH         = 55;  // along Y (match bed)
-export const CARRIAGE_WALL          = 4;
-export const CARRIAGE_TOTAL_HEIGHT  = 32;
-export const CARRIAGE_AIR_GAP       = 0.8; // clearance between cam-plate face and bed surface
+  // Needle bed faceplate slot — captures latch needle laterally
+  bedTopFilletEdge: 1.5,   // chamfer along bed top edges for safety
+  bedMountBolt: "M4",      // bolts the bed to the chassis
+  bedMountBoltCount: 4,
+  bedMountInsetX: 25,      // from each end
+  bedMountInsetY: 8,       // from front/back face
 
-// --- Rails + end caps -----------------------------------------------------
-// Two rails stacked vertically on a single rear stanchion — keeps the
-// footprint small and gives anti-rotation for a short carriage.
-export const RAIL_DIAMETER          = 8;   // standard LM8UU linear rod
-export const RAIL_LENGTH            = BED_LENGTH + 60;    // overrun both ends
-export const RAIL_Y_BEHIND_BED      = -30; // both rails at this Y (bed frame)
-export const RAIL_Z_LOWER           = 18;  // lower rail Z (bed-frame), near cam plate
-export const RAIL_Z_UPPER           = 32;  // upper rail Z, gives 14 mm anti-rotation lever
-export const END_CAP_LENGTH         = 25;  // X
-export const END_CAP_HEIGHT         = 55;  // Z
-export const END_CAP_DEPTH          = 70;  // Y
+  // ── Latch needle ────────────────────────────────────────────────
+  needleStemThk: 1.2,      // mm — vertical thickness of needle stem
+  needleStemWid: 1.5,      // mm — width across (Z direction since needle is on its side)
+  needleLength: 75,        // total length, hook to butt
+  needleHookDia: 3.0,      // hook outer diameter
+  needleHookWire: 0.8,     // hook wire diameter
+  needleLatchLen: 6,       // latch length
+  needleButtH: 4.0,        // butt projection above stem
+  needleButtL: 3.0,        // butt length along needle
+  needleSelectedZ: 4.0,    // butt rises this high when solenoid fires
 
-// --- Solenoid bank --------------------------------------------------------
-export const SOLENOID_BODY_LENGTH   = 20;  // along the plunger axis (Y for this design — pushes needle butt sideways)
-export const SOLENOID_BODY_DIAMETER = 10;  // cylindrical micro push-pull
-export const SOLENOID_PLUNGER_STROKE = 4;
-export const SOLENOID_PLUNGER_DIAMETER = 2;
-export const SOLENOID_PITCH          = PITCH;  // one per needle
-export const SOLENOID_BANK_LENGTH    = PITCH * NEEDLE_COUNT + 20;
+  // ── Solenoid bank ──────────────────────────────────────────────
+  solDia: 10,              // tubular solenoid body Ø
+  solLen: 25,              // solenoid body length
+  solPlungerDia: 4,        // plunger Ø
+  solPlungerLen: 12,       // plunger extension when energized
+  solBankPlateThk: 6,      // plate that holds the solenoid bank
+  solBankPlateWidth: 40,   // Y depth of holding plate
 
-// --- Yarn carrier ---------------------------------------------------------
-export const YARN_EYELET_ID          = 2.0;
-export const YARN_CARRIER_DROP       = 6;   // distance below the cam-plate's lowest face to the yarn eyelet
+  // ── Carriage ───────────────────────────────────────────────────
+  carriageLength: 90,      // along X (travel axis)
+  carriageWidth: 60,       // along Y (across needles)
+  carriageHeight: 35,      // Z body height (above bed)
+  carriageWallThk: 5,      // shell thickness
+  carriagePlateThk: 6,     // top plate thickness
+  carriageRailGap: 0.4,    // bushing fit clearance
 
-// --- Base chassis ---------------------------------------------------------
-export const BASE_LENGTH             = BED_LENGTH + 60;   // 276 mm — full machine footprint
-export const BASE_DEPTH              = 150;
-export const BASE_THICKNESS          = 8;
+  // ── Cam plate (mounted under carriage) ─────────────────────────
+  camPlateLength: 80,
+  camPlateWidth: 40,
+  camPlateThk: 6,
+  camAngleDeg: 45,         // raise/lower cam wedge angle
+  camRiseHeight: 4.0,      // = needleSelectedZ — pushes butt over the apex
+  camApproachLen: 18,      // ramp length per side
 
-// --- NEMA17 standards (duplicated from stdlib for explicit assembly math) -
-export const NEMA17_BODY             = 42.3;
-export const NEMA17_HEIGHT           = 40;
-export const NEMA17_SHAFT_DIAMETER   = 5;
-export const NEMA17_SHAFT_LENGTH     = 24;
-export const NEMA17_BOLT_PITCH       = 31;  // bolt-hole grid M3
+  // ── Linear rails ───────────────────────────────────────────────
+  railDia: 8,              // mm steel rod
+  railLength: 240,
+  railSpacingY: 38,        // distance front-to-back between two rails
+  railZ: 30,               // height of rail centerlines above chassis top
 
-// Colors so each part gets a visually distinct tint in the assembly viewer.
+  // ── End caps (rail supports) ───────────────────────────────────
+  endCapWidth: 40,
+  endCapHeight: 50,
+  endCapThk: 8,
+
+  // ── Belt drive ─────────────────────────────────────────────────
+  pulleyDia: 16,           // GT2-20T pulley
+  pulleyHeight: 7.5,
+  beltWidth: 6,            // GT2-6
+  beltZ: 18,               // belt centerline above chassis
+
+  // ── Chassis ────────────────────────────────────────────────────
+  chassisLength: 280,
+  chassisWidth: 120,
+  chassisHeight: 6,        // base plate
+
+  // ── Yarn carrier ───────────────────────────────────────────────
+  yarnRailDia: 6,
+  yarnRailLength: 240,
+  yarnRailZ: 50,           // rail centerline above chassis (above bed)
+  yarnCarrierLength: 30,
+  yarnCarrierWidth: 14,
+  yarnCarrierHeight: 18,
+  yarnEyeDia: 1.6,         // yarn passes through this hole
+} as const;
+
+// Useful derived helpers
+export const X_NEEDLE_OFFSET = (i: number) =>
+  -SPEC.bedKnitLength / 2 + SPEC.needlePitch / 2 + i * SPEC.needlePitch;
+
+export const BED_TOP_Z = 0;          // top face of bed at Z=0
+export const BED_BOTTOM_Z = -SPEC.bedHeight;
+export const CHASSIS_TOP_Z = BED_BOTTOM_Z;          // bed sits on chassis
+export const CHASSIS_BOTTOM_Z = CHASSIS_TOP_Z - SPEC.chassisHeight;
+
+// Color palette (Fusion-360 friendly)
 export const COLORS = {
-  bed:        "#b3b6bb",
-  needle:     "#e6e1d8",
-  cam:        "#ff9c3d",
-  carriage:   "#5b6a7d",
-  rail:       "#9a9a9a",
-  endCap:     "#39434f",
-  yarnArm:    "#c94f4f",
-  solenoid:   "#222628",
-  solMount:   "#3d3f42",
-  stepper:    "#2b2b2b",
-  pulley:     "#b5651d",
-  belt:       "#141414",
-  base:       "#2e3338",
-  bracket:    "#6b7685",
+  steel: "#9ea7b0",
+  aluminum: "#bcc3cb",
+  printedDark: "#3a3f47",
+  printedAccent: "#d97744",
+  brass: "#c9a36a",
+  copper: "#b87333",
+  yarnRed: "#cf3a4a",
+  motor: "#1f1f22",
+  solenoid: "#5a5e66",
+  belt: "#1a1a1a",
 } as const;

@@ -1,68 +1,67 @@
-import { drawRoundedRectangle, makeBox, type Shape3D } from "replicad";
-import { shape3d } from "shapeitup";
-import {
-  NEEDLE_COUNT, PITCH,
-  BED_LENGTH, BED_DEPTH, BED_THICKNESS,
-  GROOVE_WIDTH, GROOVE_DEPTH, GROOVE_LENGTH,
-  GATE_PEG_WIDTH, GATE_PEG_HEIGHT,
-  COLORS,
-} from "./constants";
-
-export const params = { previewIndex: 0 };
-export const material = "PETG";
-
-// Local frame: bed centered at X=0, front edge at +Y, top surface at Z=0,
-// bottom at Z = -BED_THICKNESS.
+// Needle bed — block of plastic/metal with 20 parallel grooves ("tricks") that
+// each capture one needle. Grooves are open on top and at the +Y end (where the
+// hooks emerge). Mounted to chassis with 4× M4 bolts.
 //
-//   +Y  (front, where needle hooks emerge)
-//   ▲
-//   │  [front half: gate-peg ridges hold the fabric down]
-//   │  ───────────────────────────── y = +BED_DEPTH/2
-//   │  │ pegs here (Z ∈ [0, 3])     │
-//   │  │ ──────────────── y ≈ +5     │  <- groove y-range spans the whole bed,
-//   │  │ butt-travel band (no pegs) │     but pegs live only in the front band
-//   │  └────────────────── y = -GROOVE_LENGTH + BED_DEPTH/2
-//   ▼  ───────────────────────────── y = -BED_DEPTH/2
-//   -Y
+// Local frame: bed centered on X=0, Y=0. Top face at Z=0, body at Z∈[-bedHeight, 0].
+// Grooves run along +Y, distributed along X at SPEC.needlePitch.
 
-export function makeNeedleBed(): Shape3D {
+import { drawRectangle } from "replicad";
+import { shape3d, holes, patterns } from "shapeitup";
+import { SPEC, COLORS, X_NEEDLE_OFFSET } from "./constants";
+
+export const params = {
+  length: SPEC.bedLength,
+  width: SPEC.bedWidth,
+  height: SPEC.bedHeight,
+  trickWidth: SPEC.trickWidth,
+  trickDepth: SPEC.trickDepth,
+  trickLength: SPEC.trickLength,
+  needleCount: SPEC.needleCount,
+};
+
+export function makeNeedleBed(p: typeof params = params) {
   let bed = shape3d(
-    drawRoundedRectangle(BED_LENGTH, BED_DEPTH, 4)
-      .sketchOnPlane("XY", [0, 0, -BED_THICKNESS])
-      .extrude(BED_THICKNESS),
+    drawRectangle(p.length, p.width)
+      .sketchOnPlane("XY")
+      .extrude(-p.height)
   );
 
-  const grooveFrontY = BED_DEPTH / 2;
-  const grooveBackY = grooveFrontY - GROOVE_LENGTH;
-  // Split the groove length: front ~22 mm gets gate pegs (fabric support),
-  // back ~26 mm is clean for cam-plate clearance over butt travel.
-  const pegFrontY = grooveFrontY;
-  const pegBackY = 5; // leaves y ∈ [grooveBackY, 5] clear for cam plate
-  const butt_margin = 0.1;
+  // Cut needle tricks (grooves) — open at +Y end, sized to fit needle stem
+  // with 0.2mm clearance per side.
+  const trickToolFactory = () =>
+    shape3d(
+      drawRectangle(p.trickWidth, p.trickLength)
+        .sketchOnPlane("XY")
+        .extrude(-p.trickDepth)
+    ).translate(0, p.width / 2 - p.trickLength / 2 + 5, 0);
+  // ↑ groove pushed slightly past +Y face so needle hook can emerge
 
-  // 20 needle grooves (cut through top surface).
-  for (let i = 0; i < NEEDLE_COUNT; i++) {
-    const x = (i - (NEEDLE_COUNT - 1) / 2) * PITCH;
-    const groove = makeBox(
-      [x - GROOVE_WIDTH / 2, grooveBackY, -GROOVE_DEPTH],
-      [x + GROOVE_WIDTH / 2, grooveFrontY + butt_margin, butt_margin],
-    );
-    bed = bed.cut(groove);
-  }
+  // 20 grooves at the right pitch. Build placements explicitly using the
+  // X_NEEDLE_OFFSET helper so we know exactly where every needle sits.
+  const placements = Array.from({ length: p.needleCount }, (_, i) => ({
+    translate: [X_NEEDLE_OFFSET(i), 0, 0] as [number, number, number],
+  }));
+  bed = patterns.cutAt(bed, trickToolFactory, placements);
 
-  // 21 gate-peg ridges on top, between grooves, front half only.
-  for (let i = 0; i <= NEEDLE_COUNT; i++) {
-    const x = (i - NEEDLE_COUNT / 2) * PITCH;
-    const peg = makeBox(
-      [x - GATE_PEG_WIDTH / 2, pegBackY, 0],
-      [x + GATE_PEG_WIDTH / 2, pegFrontY, GATE_PEG_HEIGHT],
-    );
-    bed = bed.fuse(peg);
-  }
+  // 4× M4 mounting bolts to chassis (countersunk from top to keep needles flat)
+  const boltPlacements = [
+    [-(p.length / 2) + SPEC.bedMountInsetX,  (p.width / 2) - SPEC.bedMountInsetY],
+    [ (p.length / 2) - SPEC.bedMountInsetX,  (p.width / 2) - SPEC.bedMountInsetY],
+    [-(p.length / 2) + SPEC.bedMountInsetX, -(p.width / 2) + SPEC.bedMountInsetY],
+    [ (p.length / 2) - SPEC.bedMountInsetX, -(p.width / 2) + SPEC.bedMountInsetY],
+  ].map(([x, y]) => ({ translate: [x, y, 0] as [number, number, number] }));
+
+  bed = patterns.cutAt(
+    bed,
+    () => holes.countersink(SPEC.bedMountBolt, { plateThickness: p.height }).translate(0, 0, 0),
+    boltPlacements
+  );
 
   return bed;
 }
 
 export default function main() {
-  return [{ shape: makeNeedleBed(), name: "bed", color: COLORS.bed }];
+  return [
+    { shape: makeNeedleBed(), name: "needle-bed", color: COLORS.aluminum },
+  ];
 }

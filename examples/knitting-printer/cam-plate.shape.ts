@@ -1,76 +1,76 @@
-import { draw, drawRoundedRectangle, type Shape3D } from "replicad";
-import { shape3d } from "shapeitup";
-import {
-  CARRIAGE_LENGTH, CAM_PLATE_THICKNESS, CAM_TRACK_HEIGHT,
-  BUTT_LENGTH, BUTT_LIFT_FULL,
-  COLORS,
-} from "./constants";
+// Cam plate — bolted underneath the carriage. The cam tracks (raise + stitch
+// cams) deflect needle butts vertically as the carriage traverses, producing
+// the knit/tuck/miss action. For this v1 we model:
+//   • a flat plate
+//   • two raise cams (V-shape ramps up to apex) machined on the bottom face
+//
+// The cam wedge cross-section: rises from 0 → camRiseHeight over camApproachLen
+// then descends symmetrically.
+//
+// Local frame: plate centered on origin. Top face at Z=0 (mounts to carriage).
+// Cam profile is on the BOTTOM face (Z = -camPlateThk down to apex).
 
-// Cam plate local frame:
-//   centered at X=0 (direction of carriage travel)
-//   Y=0 is the plate centerline (back half of bed when assembled)
-//   bottom at Z=0, top at Z=CAM_PLATE_THICKNESS
-//   the cam slot is cut into the bottom face, depth CAM_TRACK_HEIGHT
-//
-// Butt rest position in plate-local Y = -BUTT_LIFT_FULL/2
-// Butt clear position in plate-local Y = +BUTT_LIFT_FULL/2
-// Ramp half-length along X = BUTT_LIFT_FULL (gives 45° face)
-//
-// Track centerline seen from below (XY plane):
-//
-//    y_clear  ______/\______
-//                  /  \
-//                 /    \
-//    y_rest  ___/      \____
-//           -40  -14  0 +14  +40
+import { drawRoundedRectangle, draw } from "replicad";
+import { shape3d, holes, patterns } from "shapeitup";
+import { SPEC, COLORS } from "./constants";
 
 export const params = {
-  length: CARRIAGE_LENGTH,
-  depth: 28,
-  thickness: CAM_PLATE_THICKNESS,
-  liftFull: BUTT_LIFT_FULL,
-  slotWidth: BUTT_LENGTH + 0.3,
-  trackHeight: CAM_TRACK_HEIGHT,
+  length: SPEC.camPlateLength,
+  width: SPEC.camPlateWidth,
+  thk: SPEC.camPlateThk,
+  apexHeight: SPEC.camRiseHeight,
+  approachLen: SPEC.camApproachLen,
 };
-export const material = "PETG";
 
-export function makeCamPlate(opts: Partial<typeof params> = {}): Shape3D {
-  const p = { ...params, ...opts };
-  const rampHalf = p.liftFull;      // 45° ⇒ ΔX = ΔY
-  const y_rest = -p.liftFull / 2;
-  const y_clear = +p.liftFull / 2;
-  const xL = -p.length / 2;
-  const xR = +p.length / 2;
-  const slotHi = p.slotWidth;
-
+export function makeCamPlate(p: typeof params = params) {
+  // Flat plate, top face at Z=0
   let plate = shape3d(
-    drawRoundedRectangle(p.length, p.depth, 3)
-      .sketchOnPlane("XY", [0, 0, 0])
-      .extrude(p.thickness),
+    drawRoundedRectangle(p.length, p.width, 4)
+      .sketchOnPlane("XY")
+      .extrude(-p.thk)
   );
 
-  // Chevron slot polygon (closed) — lower edge of the slot is the chevron,
-  // upper edge is a parallel chevron offset by slotHi in +Y.
-  const slot = draw([xL, y_rest])
-    .lineTo([-rampHalf, y_rest])
-    .lineTo([0, y_clear])
-    .lineTo([ rampHalf, y_rest])
-    .lineTo([xR, y_rest])
-    .lineTo([xR, y_rest + slotHi])
-    .lineTo([ rampHalf, y_rest + slotHi])
-    .lineTo([0, y_clear + slotHi])
-    .lineTo([-rampHalf, y_rest + slotHi])
-    .lineTo([xL, y_rest + slotHi])
+  // Cam wedge — triangular cross-section sketched on XZ plane, extruded along Y.
+  // Profile (in XZ): from (-half, 0) up to (0, apex) down to (half, 0).
+  // Built so top of cam touches Z = -p.thk (bottom face of plate) and apex
+  // protrudes downward by apexHeight.
+  const half = p.approachLen;
+  const apexZ = -p.thk - p.apexHeight;
+  const baseZ = -p.thk;
+
+  const camProfile = draw([-half, baseZ])
+    .lineTo([0, apexZ])
+    .lineTo([half, baseZ])
+    .lineTo([-half, baseZ])
     .close();
 
-  const slotSolid = shape3d(
-    slot.sketchOnPlane("XY", [0, 0, 0]).extrude(p.trackHeight),
+  // Sketch on XZ plane, extrude along Y by camPlateWidth (cam runs full width).
+  // sketchOnPlane("XZ").extrude(L) grows toward -Y; translate +width/2 to center.
+  const cam = shape3d(
+    camProfile.sketchOnPlane("XZ").extrude(p.width).translate(0, p.width / 2, 0)
+  );
+  plate = plate.fuse(cam);
+
+  // 4× M3 mounting bolt clearance through the plate (matches the carriage)
+  const boltX = p.length / 2 - 6;
+  const boltY = p.width / 2 - 6;
+  const boltPlacements = [
+    [ boltX,  boltY],
+    [ boltX, -boltY],
+    [-boltX,  boltY],
+    [-boltX, -boltY],
+  ].map(([x, y]) => ({ translate: [x, y, 0] as [number, number, number] }));
+  plate = patterns.cutAt(
+    plate,
+    () => holes.through("M3", { depth: p.thk + p.apexHeight + 2 }),
+    boltPlacements
   );
 
-  plate = plate.cut(slotSolid);
   return plate;
 }
 
-export default function main(p: typeof params) {
-  return [{ shape: makeCamPlate(p), name: "cam-plate", color: COLORS.cam }];
+export default function main() {
+  return [
+    { shape: makeCamPlate(), name: "cam-plate", color: COLORS.brass },
+  ];
 }

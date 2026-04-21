@@ -1,94 +1,97 @@
-import { drawRoundedRectangle, makeBox, type Shape3D } from "replicad";
-import { shape3d, holes } from "shapeitup";
-import {
-  END_CAP_LENGTH, RAIL_DIAMETER,
-  RAIL_Y_BEHIND_BED, RAIL_Z_LOWER, RAIL_Z_UPPER,
-  NEMA17_BOLT_PITCH, NEMA17_SHAFT_DIAMETER,
-  COLORS,
-} from "./constants";
-
-// Motor-side end cap. Local frame:
-//   X: 0 (inner face, toward carriage) → END_CAP_LENGTH (outer face, motor)
-//   Y: body spans [yMin, yMax] — NOT centered (motor shaft offset behind bed)
-//   Z: 0 (bottom / sits on base) → height
+// End cap (motor side) — vertical wall at -X end of chassis. Holds:
+//   • two 8mm linear rails (front + rear)
+//   • NEMA17 stepper face-mounted with shaft pointing into the machine (+X)
+//   • base flange that bolts to chassis (4× M5)
 //
-// The motor attaches to the +X face in the standard NEMA17 pattern, shaft
-// axis = +X, pokes through the pilot hole into the machine interior where
-// the GT2 pulley clamps to it. The belt runs along the carriage belt-clamp
-// plane (same Y as RAIL_Y_BEHIND_BED - 10 = -40 in bed frame).
+// Local frame: cap stands upright. Origin at the centre of the wall's bottom
+// edge. Wall extends +Z (up). Bolt-flange spreads ±Y. Front face at X=0,
+// motor mounted on -X face.
+
+import { drawRectangle } from "replicad";
+import { shape3d, holes, patterns, standards } from "shapeitup";
+import { SPEC, COLORS } from "./constants";
 
 export const params = {
-  length: END_CAP_LENGTH,
-  yMin: -60,
-  yMax: 5,
-  height: 55,
-  railY: RAIL_Y_BEHIND_BED,
-  railZLower: RAIL_Z_LOWER,
-  railZUpper: RAIL_Z_UPPER,
-  railSocketDepth: 15,
-  railDiameter: RAIL_DIAMETER,
-  motorY: -40,                 // belt plane — 10 mm behind the rails
-  motorZ: RAIL_Z_LOWER,        // shaft height matches carriage belt clamp
-  motorPilotDiameter: NEMA17_SHAFT_DIAMETER + 18, // ø23 pilot (clears 22mm boss)
-  motorBoltPitch: NEMA17_BOLT_PITCH,
+  width: SPEC.endCapWidth,
+  height: SPEC.endCapHeight,
+  thk: SPEC.endCapThk,
+  chassisFlangeLen: SPEC.endCapWidth + 16,
+  chassisFlangeThk: SPEC.chassisHeight,
 };
-export const material = "PETG";
 
-export function makeMotorEndCap(opts: Partial<typeof params> = {}): Shape3D {
-  const p = { ...params, ...opts };
-  const width = p.yMax - p.yMin;
-  const yCenter = (p.yMax + p.yMin) / 2;
-
-  // Main block — origin at inner-face bottom, at Y=0 line.
-  let cap = shape3d(
-    drawRoundedRectangle(p.length, width, 3)
-      .sketchOnPlane("XY", [p.length / 2, yCenter, 0])
-      .extrude(p.height),
+export function makeEndCapMotor(p: typeof params = params) {
+  // Vertical wall: spans Y across, Z up, narrow X (the "thickness" axis).
+  let wall = shape3d(
+    drawRectangle(p.thk, p.width)
+      .sketchOnPlane("XY")
+      .extrude(p.height)
   );
 
-  // Rail sockets on the inner (-X) face — blind bores into +X.
-  // stdlib axis "-X" => opens at tool's X=0, body spans X ∈ [0, depth].
-  for (const z of [p.railZLower, p.railZUpper]) {
-    const socket = holes.through(p.railDiameter + 0.2, { depth: p.railSocketDepth, axis: "-X" })
-      .translate(0, p.railY, z);
-    cap = cap.cut(socket);
-  }
+  // Horizontal flange at the bottom for chassis bolts (extends -X away from wall)
+  const flange = shape3d(
+    drawRectangle(p.chassisFlangeLen, p.width)
+      .sketchOnPlane("XY")
+      .extrude(-p.chassisFlangeThk)
+      .translate(-p.chassisFlangeLen / 2 + p.thk / 2, 0, 0.1)
+  );
+  wall = wall.fuse(flange);
 
-  // Motor pilot hole (through, on +X face).
-  const pilot = holes.through(p.motorPilotDiameter, { depth: p.length + 2, axis: "+X" })
-    .translate(p.length, p.motorY, p.motorZ);
-  cap = cap.cut(pilot);
-
-  // NEMA17 bolt pattern: 4× M3 through-holes at 31 mm grid.
-  const off = p.motorBoltPitch / 2;
-  for (const [dy, dz] of [[-off, -off], [off, -off], [-off, off], [off, off]] as [number, number][]) {
-    const h = holes.through("M3", { depth: p.length + 2, axis: "+X" })
-      .translate(p.length, p.motorY + dy, p.motorZ + dz);
-    cap = cap.cut(h);
-  }
-
-  // Base mounting — 4× M3 clearance, through top face, body into -Z.
-  // axis "+Z" => opens on +Z face, body into -Z, so translate to z=height.
-  const baseBolts: [number, number][] = [
-    [6, p.yMin + 6], [p.length - 6, p.yMin + 6],
-    [6, p.yMax - 6], [p.length - 6, p.yMax - 6],
+  // 2× rail bores — front rail at +Y, rear rail at -Y, both at SPEC.railZ
+  const railTool = () =>
+    holes.through(SPEC.railDia + 0.2, { depth: p.thk + 2, axis: "+X" })
+      .translate(p.thk / 2 + 1, 0, 0);
+  const railPlacements = [
+    { translate: [0,  SPEC.railSpacingY / 2, SPEC.railZ] as [number, number, number] },
+    { translate: [0, -SPEC.railSpacingY / 2, SPEC.railZ] as [number, number, number] },
   ];
-  for (const [bx, by] of baseBolts) {
-    const h = holes.through("M3", { depth: p.height + 2, axis: "+Z" })
-      .translate(bx, by, p.height);
-    cap = cap.cut(h);
-  }
+  wall = patterns.cutAt(wall, railTool, railPlacements);
 
-  // Cavity behind the motor shaft so the pulley has room to spin (Ø14 pulley + GT2 belt = ø16 envelope).
-  const pulleyCavity = makeBox(
-    [0, p.motorY - 12, p.motorZ - 12],
-    [p.length - 3, p.motorY + 12, p.motorZ + 12],
+  // Central NEMA17 shaft clearance + 4× M3 motor mount bolt circle.
+  // Motor sits on -X face, shaft pokes into +X. Bolt pattern is square at
+  // standards.NEMA17.boltPitch (= 31 mm).
+  const motorZ = SPEC.beltZ;
+  const shaftClearance = holes
+    .through(standards.NEMA17.pilotDia + 0.3, { depth: p.thk + 2, axis: "+X" })
+    .translate(p.thk / 2 + 1, 0, motorZ);
+  wall = wall.cut(shaftClearance);
+
+  const motorBoltPitch = standards.NEMA17.boltPitch / 2;
+  const motorBoltPlacements = [
+    [ motorBoltPitch,  motorBoltPitch],
+    [ motorBoltPitch, -motorBoltPitch],
+    [-motorBoltPitch,  motorBoltPitch],
+    [-motorBoltPitch, -motorBoltPitch],
+  ].map(([y, z]) => ({
+    translate: [0, y, motorZ + z] as [number, number, number],
+  }));
+  wall = patterns.cutAt(
+    wall,
+    () => holes.through("M3", { depth: p.thk + 2, axis: "+X" })
+      .translate(p.thk / 2 + 1, 0, 0),
+    motorBoltPlacements
   );
-  cap = cap.cut(pulleyCavity);
 
-  return cap;
+  // 4× M5 chassis bolts through flange
+  const flangeBoltX1 = -p.chassisFlangeLen / 2 + p.thk / 2 + 8;
+  const flangeBoltX2 = p.thk / 2 - 4;
+  const flangeBoltY  = p.width / 2 - 8;
+  const chassisBoltPlacements = [
+    { translate: [flangeBoltX1,  flangeBoltY, 0] as [number, number, number] },
+    { translate: [flangeBoltX1, -flangeBoltY, 0] as [number, number, number] },
+    { translate: [flangeBoltX2,  flangeBoltY, 0] as [number, number, number] },
+    { translate: [flangeBoltX2, -flangeBoltY, 0] as [number, number, number] },
+  ];
+  wall = patterns.cutAt(
+    wall,
+    () => holes.through("M5", { depth: p.chassisFlangeThk + 2 }),
+    chassisBoltPlacements
+  );
+
+  return wall;
 }
 
-export default function main(p: typeof params) {
-  return [{ shape: makeMotorEndCap(p), name: "end-cap-motor", color: COLORS.endCap }];
+export default function main() {
+  return [
+    { shape: makeEndCapMotor(), name: "end-cap-motor", color: COLORS.printedDark },
+  ];
 }

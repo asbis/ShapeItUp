@@ -1,85 +1,81 @@
-import { drawRoundedRectangle, makeBox, makeCylinder, type Shape3D } from "replicad";
-import { shape3d, holes, bearings } from "shapeitup";
-import {
-  END_CAP_LENGTH, RAIL_DIAMETER,
-  RAIL_Y_BEHIND_BED, RAIL_Z_LOWER, RAIL_Z_UPPER,
-  COLORS,
-} from "./constants";
+// End cap (idler side) — vertical wall at +X end of chassis. Holds:
+//   • two 8mm linear rails (front + rear)
+//   • 608 ball-bearing idler pulley pocket on the +X face
+//   • base flange that bolts to chassis
+//
+// Mirrors end-cap-motor structurally.
+
+import { drawRectangle } from "replicad";
+import { shape3d, holes, patterns } from "shapeitup";
+import { SPEC, COLORS } from "./constants";
 
 export const params = {
-  length: END_CAP_LENGTH,
-  yMin: -60,
-  yMax: 5,
-  height: 55,
-  railY: RAIL_Y_BEHIND_BED,
-  railZLower: RAIL_Z_LOWER,
-  railZUpper: RAIL_Z_UPPER,
-  railSocketDepth: 15,
-  railDiameter: RAIL_DIAMETER,
-  idlerY: -40,
-  idlerZ: RAIL_Z_LOWER,
-  idlerAxleDiameter: 8,
-  bearingOD: 22,
+  width: SPEC.endCapWidth,
+  height: SPEC.endCapHeight,
+  thk: SPEC.endCapThk,
+  chassisFlangeLen: SPEC.endCapWidth + 16,
+  chassisFlangeThk: SPEC.chassisHeight,
 };
-export const material = "PETG";
 
-export function makeIdlerEndCap(opts: Partial<typeof params> = {}): Shape3D {
-  const p = { ...params, ...opts };
-  const width = p.yMax - p.yMin;
-  const yCenter = (p.yMax + p.yMin) / 2;
-
-  let cap = shape3d(
-    drawRoundedRectangle(p.length, width, 3)
-      .sketchOnPlane("XY", [p.length / 2, yCenter, 0])
-      .extrude(p.height),
+export function makeEndCapIdler(p: typeof params = params) {
+  let wall = shape3d(
+    drawRectangle(p.thk, p.width)
+      .sketchOnPlane("XY")
+      .extrude(p.height)
   );
 
-  for (const z of [p.railZLower, p.railZUpper]) {
-    const socket = holes.through(p.railDiameter + 0.2, { depth: p.railSocketDepth, axis: "-X" })
-      .translate(0, p.railY, z);
-    cap = cap.cut(socket);
-  }
-
-  const bearingPocket = makeCylinder(
-    p.bearingOD / 2 + 0.15,
-    9,
-    [p.length + 0.5, p.idlerY, p.idlerZ],
-    [-1, 0, 0],
+  // Bottom flange (extends -X back toward chassis interior).
+  // Overlap into wall by 0.1mm so OCCT's fuse produces a single solid
+  // (touching-but-not-overlapping solids fuse as no-op).
+  const flange = shape3d(
+    drawRectangle(p.chassisFlangeLen, p.width)
+      .sketchOnPlane("XY")
+      .extrude(-p.chassisFlangeThk)
+      .translate(p.chassisFlangeLen / 2 - p.thk / 2, 0, 0.1)
   );
-  cap = cap.cut(bearingPocket);
+  wall = wall.fuse(flange);
 
-  const axleHole = makeCylinder(
-    p.idlerAxleDiameter / 2 + 0.15,
-    p.length + 2,
-    [-1, p.idlerY, p.idlerZ],
-    [1, 0, 0],
-  );
-  cap = cap.cut(axleHole);
-
-  const beltCavity = makeBox(
-    [0, p.idlerY - 6, p.idlerZ - 14],
-    [p.length - 9.5, p.idlerY + 6, p.idlerZ + 14],
-  );
-  cap = cap.cut(beltCavity);
-
-  // Base mounting — slotted along X (±1.5 mm travel) for belt tensioning.
-  const baseBoltPositions: [number, number][] = [
-    [6, p.yMin + 6], [p.length - 6, p.yMin + 6],
-    [6, p.yMax - 6], [p.length - 6, p.yMax - 6],
+  // Rail bores
+  const railTool = () =>
+    holes.through(SPEC.railDia + 0.2, { depth: p.thk + 2, axis: "+X" })
+      .translate(p.thk / 2 + 1, 0, 0);
+  const railPlacements = [
+    { translate: [0,  SPEC.railSpacingY / 2, SPEC.railZ] as [number, number, number] },
+    { translate: [0, -SPEC.railSpacingY / 2, SPEC.railZ] as [number, number, number] },
   ];
-  for (const [bx, by] of baseBoltPositions) {
-    const slot = holes.slot({ length: 6, width: 3.4, depth: p.height + 2, axis: "+Z" })
-      .translate(bx, by, p.height);
-    cap = cap.cut(slot);
-  }
+  wall = patterns.cutAt(wall, railTool, railPlacements);
 
-  return cap;
+  // 608 bearing seat on the +X face for the idler pulley axle.
+  // Build it directly along +X to avoid the rotation+offset gymnastics.
+  // 608: OD 22, ID 8, W 7. Pocket = OD+0.05 press fit, depth=5.
+  // Center axle through-hole = 8.2 (M8 clearance) all the way through.
+  const bearingPocket = holes.through(22.05, { depth: 5, axis: "+X" })
+    .translate(p.thk / 2 + 0.5, 0, SPEC.beltZ);
+  const axleHole = holes.through("M8", { depth: p.thk + 4, axis: "+X" })
+    .translate(p.thk / 2 + 1, 0, SPEC.beltZ);
+  wall = wall.cut(bearingPocket).cut(axleHole);
+
+  // 4× M5 chassis bolts
+  const flangeBoltX1 = p.chassisFlangeLen / 2 - p.thk / 2 - 8;
+  const flangeBoltX2 = -p.thk / 2 + 4;
+  const flangeBoltY  = p.width / 2 - 8;
+  const chassisBoltPlacements = [
+    { translate: [flangeBoltX1,  flangeBoltY, 0] as [number, number, number] },
+    { translate: [flangeBoltX1, -flangeBoltY, 0] as [number, number, number] },
+    { translate: [flangeBoltX2,  flangeBoltY, 0] as [number, number, number] },
+    { translate: [flangeBoltX2, -flangeBoltY, 0] as [number, number, number] },
+  ];
+  wall = patterns.cutAt(
+    wall,
+    () => holes.through("M5", { depth: p.chassisFlangeThk + 2 }),
+    chassisBoltPlacements
+  );
+
+  return wall;
 }
 
-export function makeIdlerBearing(): Shape3D {
-  return bearings.body("608");
-}
-
-export default function main(p: typeof params) {
-  return [{ shape: makeIdlerEndCap(p), name: "end-cap-idler", color: COLORS.endCap }];
+export default function main() {
+  return [
+    { shape: makeEndCapIdler(), name: "end-cap-idler", color: COLORS.printedDark },
+  ];
 }
