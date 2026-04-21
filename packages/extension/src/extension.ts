@@ -11,6 +11,7 @@ import {
   ensureMinimalTsconfig,
 } from "./workspace-types";
 import { registerMcpClientsView, showFirstRunNudgeIfNeeded } from "./mcp-clients-view";
+import { getCachedWasmAssets } from "./wasm-cache";
 
 let viewerProvider: ViewerProvider;
 export const outputChannel = vscode.window.createOutputChannel("ShapeItUp");
@@ -23,6 +24,17 @@ export function activate(context: vscode.ExtensionContext) {
   // cache. Windows fs scans + the Fusion reg query can take a few seconds
   // together — doing it here offloads that from the MCP request path.
   warmAppCache();
+
+  // Eagerly read OCCT + Manifold WASM assets into extension-host memory so
+  // the FIRST worker spawn (and every subsequent respawn after a watchdog
+  // restart) can skip the 1.2MB loader fetch + .wasm fetch. The viewer pulls
+  // these via a `request-wasm-assets` message in viewer-provider.ts. This is
+  // fire-and-forget — if the user opens a shape file before the read
+  // resolves, the viewer falls back to URL fetch (the pre-cache path).
+  const distDir = path.join(context.extensionUri.fsPath, "dist");
+  getCachedWasmAssets(distDir).catch((e) => {
+    outputChannel.appendLine(`[wasm-cache] preload failed: ${e?.message ?? e}`);
+  });
 
   // Register as a panel view (appears in the bottom panel area)
   context.subscriptions.push(
