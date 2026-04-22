@@ -2613,14 +2613,13 @@ export function registerTools(server: McpServer) {
         };
       }
 
-      // STL can't carry multi-part structure — all parts merge into a single
-      // mesh and lose their names/colors. We still honour the caller's
-      // request (the export itself succeeds), but append a one-time warning
-      // pointing at the STEP + per-part STL alternatives so the caller
-      // doesn't discover the loss of fidelity inside their slicer.
+      // Multi-part STL is emitted as ASCII multi-solid: one `solid <name>`
+      // block per part so slicers (PrusaSlicer, Cura, Bambu, Orca) treat each
+      // part as a separate object. Colors are still lost (STL has no color).
+      // Single-part exports stay binary for compactness.
       let multiPartWarning = "";
       if (format === "stl" && !partName && availablePartNames.length > 1) {
-        multiPartWarning = `\n\nWarning: exporting multi-part assembly (${availablePartNames.length} parts: ${availablePartNames.join(", ")}) to STL merges all parts into a single mesh — part names and colors are lost. Consider STEP format, or pass partName to export an individual part.`;
+        multiPartWarning = `\n\nNote: multi-part assembly (${availablePartNames.length} parts: ${availablePartNames.join(", ")}) written as ASCII multi-solid STL — PrusaSlicer/Cura/Bambu/Orca will recognize each part as a separate object. Colors are not preserved (STL format limitation). For full fidelity incl. assembly hierarchy + colors, use STEP format instead.`;
       }
 
       // Default output path: include the part name in the file name so
