@@ -11,7 +11,7 @@
  */
 
 import { makeCylinder, type Shape3D } from "replicad";
-import { BALL_BEARING, LINEAR_BEARING } from "./standards";
+import { BALL_BEARING, LINEAR_BEARING, CUT_EPSILON } from "./standards";
 import { applyAxis, type HoleAxis } from "./holes";
 
 /** Clearance behind the bearing back so the cut-tool doesn't coplanar-fail. */
@@ -117,6 +117,9 @@ function linearBearing(designation: string) {
  *   origin — callers typically `.translate()` the returned tool to the
  *   bearing center AFTER the axis has been applied (same contract as
  *   `holes.*`).
+ * @param opts.strict When true, skip the `CUT_EPSILON` extend-past-both-faces
+ *   nudge on the through-hole branch. Has no effect on the stepped pocket
+ *   (shoulder depth is a functional mating surface). Default false.
  * @returns Shape3D cut-tool positioned at the origin, oriented by `axis`
  *   (default +Z).
  */
@@ -127,6 +130,7 @@ export function seat(
     depth?: number;
     fit?: BearingFit;
     axis?: HoleAxis;
+    strict?: boolean;
   }
 ): Shape3D {
   const spec = ballBearing(designation);
@@ -135,13 +139,18 @@ export function seat(
 
   if (opts?.throughHole) {
     const depth = opts.depth ?? DEFAULT_THROUGH_DEPTH;
-    // Cylinder axis +Z; translate so top face sits at Z=0 → cavity into -Z.
-    const tool = makeCylinder(pocketRadius, depth, [0, 0, -depth], [0, 0, 1]);
+    // Extend past both faces by CUT_EPSILON so coincident faces don't produce
+    // non-manifold geometry. `strict: true` opts out.
+    const eps = opts.strict ? 0 : CUT_EPSILON;
+    const totalHeight = depth + eps * 2;
+    // Cylinder axis +Z; base at Z=-depth-eps so top sits at Z=+eps.
+    const tool = makeCylinder(pocketRadius, totalHeight, [0, 0, -depth - eps], [0, 0, 1]);
     return applyAxis(tool, opts.axis);
   }
 
   // Stepped pocket: full-width pocket at the seat, fused with a narrower
-  // relief bore extending deeper. The "shoulder" is the resulting step.
+  // relief bore extending deeper. The "shoulder" is the resulting step —
+  // a functional mating surface, so NOT extended by CUT_EPSILON.
   const seatHeight = spec.width + POCKET_BACK_CLEARANCE;
   const pocket = makeCylinder(
     pocketRadius,
@@ -199,19 +208,26 @@ export function body(designation: string): Shape3D {
  * @param opts.axis Pocket direction (default `"+Z"`). Pass "+X"/"-X"/"+Y"/
  *   "-Y"/"-Z" for a horizontal or upward-facing bore. Rotation happens
  *   around the origin — translate to the bearing center AFTER axis.
+ * @param opts.strict When true, skip the `CUT_EPSILON` extend-past-both-faces
+ *   nudge. Default false (stdlib adds `CUT_EPSILON` on each end to avoid OCCT
+ *   coincident-face failures).
  * @returns Shape3D cut-tool for the bearing pocket.
  */
 export function linearSeat(
   designation: string,
-  opts?: { fit?: BearingFit; axis?: HoleAxis }
+  opts?: { fit?: BearingFit; axis?: HoleAxis; strict?: boolean }
 ): Shape3D {
   const spec = linearBearing(designation);
   const allowance = normalizeFit(opts?.fit);
   const pocketRadius = (spec.od + allowance * 2) / 2;
+  // Extend past both faces by CUT_EPSILON so coincident faces don't produce
+  // non-manifold geometry. `strict: true` opts out.
+  const eps = opts?.strict ? 0 : CUT_EPSILON;
+  const totalLength = spec.length + eps * 2;
   const tool = makeCylinder(
     pocketRadius,
-    spec.length,
-    [0, 0, -spec.length],
+    totalLength,
+    [0, 0, -spec.length - eps],
     [0, 0, 1]
   );
   return applyAxis(tool, opts?.axis);

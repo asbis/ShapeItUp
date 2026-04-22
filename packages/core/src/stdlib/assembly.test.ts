@@ -19,7 +19,8 @@ vi.mock("replicad", () => ({
   }),
 }));
 
-import { composeAssembly } from "./assembly";
+import { composeAssembly, stack, stackOnZ } from "./assembly";
+import { Part } from "./parts";
 
 // A minimal shape-like stub — has `.clone()` (so normalizeMainResult accepts
 // it) and records transform calls without invoking OCCT. Each clone returns
@@ -203,5 +204,206 @@ describe("composeAssembly — input validation", () => {
         parts: [{ main: () => makeMockShape("x"), params: [1, 2] as any }],
       }),
     ).toThrow(/params must be a plain object/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// `stack` / `stackOnZ` — bbox-driven stacking along a principal axis.
+//
+// Build Parts backed by a BoxMock Shape3D stand-in that tracks its own
+// bounding box through .translate() / .clone() calls. No OCCT involvement;
+// the math under test is pure TypeScript.
+// ---------------------------------------------------------------------------
+
+type Bounds3 = [[number, number, number], [number, number, number]];
+
+/**
+ * Axis-aligned mock box with a bounding box that moves under .translate().
+ * Implements only the surface area stack() needs: `clone`, `translate`,
+ * and `boundingBox.bounds`. .rotate() is a no-op (stack doesn't use it).
+ */
+function boxShape(min: [number, number, number], max: [number, number, number]): any {
+  const self: any = {
+    __boxMock: true,
+    boundingBox: { bounds: [min.slice(), max.slice()] as Bounds3 },
+    clone() {
+      return boxShape(
+        self.boundingBox.bounds[0] as [number, number, number],
+        self.boundingBox.bounds[1] as [number, number, number],
+      );
+    },
+    translate(dx: number, dy: number, dz: number) {
+      const [mn, mx] = self.boundingBox.bounds;
+      return boxShape(
+        [mn[0] + dx, mn[1] + dy, mn[2] + dz],
+        [mx[0] + dx, mx[1] + dy, mx[2] + dz],
+      );
+    },
+    rotate() {
+      return self;
+    },
+    mirror() {
+      return self;
+    },
+  };
+  return self;
+}
+
+function boxPart(
+  min: [number, number, number],
+  max: [number, number, number],
+  name?: string,
+): Part {
+  return new Part(boxShape(min, max), { name });
+}
+
+/** Read the world-space bbox of a positioned Part. */
+function bboxOf(p: Part): Bounds3 {
+  return p.worldShape().boundingBox.bounds as Bounds3;
+}
+
+describe("stackOnZ — regression: behaves like the old +Z implementation", () => {
+  it("stacks three unit cubes along +Z with zero gap", () => {
+    const a = boxPart([0, 0, 0], [10, 10, 5]);
+    const b = boxPart([0, 0, 0], [10, 10, 3]);
+    const c = boxPart([0, 0, 0], [10, 10, 7]);
+    const [a0, b0, c0] = stackOnZ([a, b, c]);
+    expect(bboxOf(a0)).toEqual([[0, 0, 0], [10, 10, 5]]);
+    expect(bboxOf(b0)[0][2]).toBeCloseTo(5);
+    expect(bboxOf(b0)[1][2]).toBeCloseTo(8);
+    expect(bboxOf(c0)[0][2]).toBeCloseTo(8);
+    expect(bboxOf(c0)[1][2]).toBeCloseTo(15);
+  });
+
+  it("applies a uniform gap between parts", () => {
+    const a = boxPart([0, 0, 0], [10, 10, 4]);
+    const b = boxPart([0, 0, 0], [10, 10, 6]);
+    const [, b0] = stackOnZ([a, b], { gap: 2 });
+    expect(bboxOf(b0)[0][2]).toBeCloseTo(6); // 4 + 2
+    expect(bboxOf(b0)[1][2]).toBeCloseTo(12); // 6 + 2 + 4
+  });
+
+  it("matches stack({ axis: '+Z' }) exactly (wrapper fidelity)", () => {
+    const parts = [
+      boxPart([0, 0, 0], [10, 10, 5]),
+      boxPart([0, 0, 0], [10, 10, 3]),
+      boxPart([0, 0, 0], [10, 10, 7]),
+    ];
+    const viaLegacy = stackOnZ(parts, { gap: 1.5 }).map(bboxOf);
+    const viaGeneral = stack(parts, { axis: "+Z", gap: 1.5 }).map(bboxOf);
+    expect(viaGeneral).toEqual(viaLegacy);
+  });
+
+  it("returns an empty array for empty input", () => {
+    expect(stackOnZ([])).toEqual([]);
+  });
+
+  it("passes the first part through unchanged", () => {
+    const a = boxPart([1, 2, 3], [11, 12, 13]);
+    const [a0] = stackOnZ([a]);
+    expect(a0).toBe(a);
+  });
+});
+
+describe("stack — generalized axis + alignment", () => {
+  it("stacks along +X with center transverse alignment", () => {
+    // First part centred at (5, 5, 2.5); boxes of varying extents in YZ.
+    const a = boxPart([0, 0, 0], [10, 10, 5]);
+    const b = boxPart([0, -2, -1], [4, 6, 9]); // centre Y=2, Z=4
+    const [, b0] = stack([a, b], { axis: "+X" });
+    const bb = bboxOf(b0);
+    // Axial: b's min-X must sit on a's max-X (10).
+    expect(bb[0][0]).toBeCloseTo(10);
+    expect(bb[1][0]).toBeCloseTo(14);
+    // Transverse: b's Y-centre must match a's Y-centre (5). b's local Y
+    // extent is 8 (from -2 to 6, centre 2) → shifted by +3.
+    expect((bb[0][1] + bb[1][1]) / 2).toBeCloseTo(5);
+    expect((bb[0][2] + bb[1][2]) / 2).toBeCloseTo(2.5);
+  });
+
+  it("stacks downward along -Z", () => {
+    const a = boxPart([0, 0, 0], [10, 10, 4]);
+    const b = boxPart([0, 0, 0], [10, 10, 6]);
+    const [, b0] = stack([a, b], { axis: "-Z" });
+    const bb = bboxOf(b0);
+    // b's top face meets a's bottom face (0).
+    expect(bb[1][2]).toBeCloseTo(0);
+    expect(bb[0][2]).toBeCloseTo(-6);
+  });
+
+  it("-Z stack respects per-pair gap", () => {
+    const a = boxPart([0, 0, 0], [10, 10, 4]);
+    const b = boxPart([0, 0, 0], [10, 10, 6]);
+    const [, b0] = stack([a, b], { axis: "-Z", gap: 3 });
+    const bb = bboxOf(b0);
+    // Top of b = 0 - 3 = -3; bottom = -3 - 6 = -9.
+    expect(bb[1][2]).toBeCloseTo(-3);
+    expect(bb[0][2]).toBeCloseTo(-9);
+  });
+
+  it("accepts a per-pair gap array", () => {
+    const a = boxPart([0, 0, 0], [10, 10, 2]);
+    const b = boxPart([0, 0, 0], [10, 10, 3]);
+    const c = boxPart([0, 0, 0], [10, 10, 4]);
+    // Gaps: 1 between a&b, 5 between b&c.
+    const [, b0, c0] = stack([a, b, c], { gap: [1, 5] });
+    expect(bboxOf(b0)[0][2]).toBeCloseTo(3); // 2 + 1
+    expect(bboxOf(b0)[1][2]).toBeCloseTo(6);
+    expect(bboxOf(c0)[0][2]).toBeCloseTo(11); // 6 + 5
+    expect(bboxOf(c0)[1][2]).toBeCloseTo(15);
+  });
+
+  it("throws when the gap array length mismatches parts.length - 1", () => {
+    const a = boxPart([0, 0, 0], [10, 10, 2]);
+    const b = boxPart([0, 0, 0], [10, 10, 3]);
+    const c = boxPart([0, 0, 0], [10, 10, 4]);
+    expect(() => stack([a, b, c], { gap: [1, 2, 3] })).toThrow(
+      /gap array length 3 does not match parts\.length - 1 = 2/,
+    );
+    expect(() => stack([a, b, c], { gap: [1] })).toThrow(/length 1/);
+  });
+
+  it("align: 'min' aligns transverse min faces of subsequent parts with the first", () => {
+    const a = boxPart([0, 0, 0], [10, 20, 5]);
+    // Smaller in XY, centred at its own origin.
+    const b = boxPart([0, 0, 0], [4, 6, 3]);
+    const [, bMin] = stack([a, b], { axis: "+Z", align: "min" });
+    const [, bCenter] = stack([a, b], { axis: "+Z", align: "center" });
+    const bbMin = bboxOf(bMin);
+    const bbCenter = bboxOf(bCenter);
+    // With align: "min", b's min-X/Y should line up at 0 / 0.
+    expect(bbMin[0][0]).toBeCloseTo(0);
+    expect(bbMin[0][1]).toBeCloseTo(0);
+    // With align: "center", b's centre should sit at (5, 10, ...).
+    expect((bbCenter[0][0] + bbCenter[1][0]) / 2).toBeCloseTo(5);
+    expect((bbCenter[0][1] + bbCenter[1][1]) / 2).toBeCloseTo(10);
+    // Concretely different placements.
+    expect(bbMin[0][0]).not.toBeCloseTo(bbCenter[0][0]);
+    expect(bbMin[0][1]).not.toBeCloseTo(bbCenter[0][1]);
+  });
+
+  it("align: 'max' aligns transverse max faces", () => {
+    const a = boxPart([0, 0, 0], [10, 20, 5]);
+    const b = boxPart([0, 0, 0], [4, 6, 3]);
+    const [, bMax] = stack([a, b], { axis: "+Z", align: "max" });
+    const bb = bboxOf(bMax);
+    expect(bb[1][0]).toBeCloseTo(10);
+    expect(bb[1][1]).toBeCloseTo(20);
+  });
+
+  it("does not mutate the input parts array", () => {
+    const a = boxPart([0, 0, 0], [10, 10, 5]);
+    const b = boxPart([0, 0, 0], [10, 10, 3]);
+    const inputs = [a, b];
+    const out = stack(inputs, { axis: "+Z", gap: 2 });
+    expect(inputs).toEqual([a, b]);
+    expect(out).not.toBe(inputs);
+    // First part pointer-equal to input (passed through), second is new.
+    expect(out[0]).toBe(a);
+    expect(out[1]).not.toBe(b);
+  });
+
+  it("returns [] for empty input", () => {
+    expect(stack([])).toEqual([]);
   });
 });

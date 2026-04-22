@@ -217,6 +217,23 @@ export const T_SLOT_EXTRUSION: Record<string, ExtrusionProfileSpec> = {
 };
 
 /**
+ * Axial/radial nudge applied to through-cutting tools so the cutter extends
+ * past BOTH faces of the target body by this amount (mm). Prevents OCCT from
+ * producing coincident-face non-manifold geometry when a cutter's end face
+ * lands exactly flush with a target face — a tiny float-rounding error there
+ * can leave a near-zero-thickness sliver or a "face on face" boolean failure.
+ *
+ * Stdlib `holes.*` / `bearings.*` helpers apply this automatically when the
+ * cut is implied to pass through. Pass `{ strict: true }` on those helpers to
+ * opt out for precise mating surfaces.
+ *
+ * Hand-rolled cutters should extend past both faces by `2 * CUT_EPSILON`
+ * (i.e. start `CUT_EPSILON` before the near face and end `CUT_EPSILON` past
+ * the far face) to match the stdlib convention.
+ */
+export const CUT_EPSILON = 0.01;
+
+/**
  * Fit policy — allowance added to nominal diameters when cutting holes.
  *
  * Values are **radial** allowance in mm (added to the nominal diameter, so a

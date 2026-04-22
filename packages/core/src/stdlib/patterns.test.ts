@@ -24,6 +24,18 @@ describe("patterns.onPlane — plane remapper", () => {
     expect(typeof patterns.onPlane).toBe("function");
   });
 
+  it("`Placement` is exported from patterns module (source of truth for stdlib re-export)", () => {
+    // Type-only compile-time check: the assignment below will fail to typecheck
+    // if `Placement` stops being an exported type. Vitest compiles each .test.ts
+    // through its TS pipeline, so a broken export breaks the test build.
+    const sample: import("./patterns").Placement = { translate: [0, 0, 0] };
+    expect(sample.translate).toEqual([0, 0, 0]);
+    // The stdlib/index.ts re-export `export type { Placement } from "./patterns"`
+    // makes this same interface reachable to user scripts as
+    // `import type { Placement } from "shapeitup"`; that one is also a pure
+    // type-only re-export, so a build regression would surface there too.
+  });
+
   it("XY is identity — returns placements unchanged", () => {
     const src = patterns.grid(3, 2, 10, 5);
     const out = patterns.onPlane(src, "XY");
@@ -730,6 +742,100 @@ describe("patterns.linear — centered option", () => {
       [0, 0, 0],
       [0, 8, 0],
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P7 — inline `plane` option on grid / linear / polar.
+//
+// Adds an optional `plane?: "XY" | "YZ" | "XZ"` to each built-in generator.
+// When supplied, the generator produces XY placements as before and pipes
+// them through `onPlane` — so a one-call idiom replaces the old
+// `patterns.onPlane(patterns.grid(...), "YZ")` compose chain without
+// re-implementing the plane math.
+// ---------------------------------------------------------------------------
+
+describe("patterns.grid / linear / polar — inline `plane` option", () => {
+  it("grid({ plane: 'YZ' }) matches onPlane(grid(...), 'YZ') element-wise", () => {
+    // Identical geometry both ways — compared on translate only since
+    // grid produces rotation-free placements.
+    const inline = patterns.grid(3, 2, 10, 5, { plane: "YZ" });
+    const compose = patterns.onPlane(patterns.grid(3, 2, 10, 5), "YZ");
+    expect(inline.map((p) => p.translate)).toEqual(
+      compose.map((p) => p.translate),
+    );
+    // Every placement lives on the YZ plane (x == 0).
+    for (const p of inline) {
+      expect(p.translate[0]).toBe(0);
+    }
+    // Specific value: XY (-10, -2.5, 0) → YZ (0, -10, -2.5).
+    expect(inline[0].translate).toEqual([0, -10, -2.5]);
+    // Still marked as generator-produced.
+    expect((inline as any).__generated__).toBe(true);
+  });
+
+  it("grid default (no plane option) is unchanged — XY placements with z=0", () => {
+    // Guards against an accidental semantic regression on the legacy code
+    // path. Same output as before this change.
+    const out = patterns.grid(2, 2, 10);
+    expect(out.map((p) => p.translate)).toEqual([
+      [-5, -5, 0],
+      [5, -5, 0],
+      [-5, 5, 0],
+      [5, 5, 0],
+    ]);
+  });
+
+  it("linear({ plane: 'XZ' }) remaps the run onto the XZ plane", () => {
+    // 3 positions, step along +X, centered. Base XY placements:
+    //   (-10, 0, 0), (0, 0, 0), (10, 0, 0)
+    // After XZ remap [x, y, z] → [x, 0, y]: y becomes 0, Z picks up original Y.
+    const out = patterns.linear(3, [10, 0, 0], {
+      centered: true,
+      plane: "XZ",
+    });
+    expect(out.map((p) => p.translate)).toEqual([
+      [-10, 0, 0],
+      [0, 0, 0],
+      [10, 0, 0],
+    ]);
+    for (const p of out) {
+      expect(p.translate[1]).toBe(0);
+    }
+    expect((out as any).__generated__).toBe(true);
+  });
+
+  it("polar({ plane: 'YZ' }) preserves rotate and remaps axis to the new plane", () => {
+    // polar(4, 10, { orientOutward: true }) produces Z-axis spin rotations.
+    // After YZ remap, axis = [0,0,1] → [0,0,0] (consistent with onPlane's
+    // remap rule for the Z component on the YZ plane).
+    const inline = patterns.polar(4, 10, {
+      orientOutward: true,
+      plane: "YZ",
+    });
+    const compose = patterns.onPlane(
+      patterns.polar(4, 10, { orientOutward: true }),
+      "YZ",
+    );
+    expect(inline.map((p) => p.translate)).toEqual(
+      compose.map((p) => p.translate),
+    );
+    // Sanity-check that rotate survived on every entry.
+    for (let i = 0; i < inline.length; i++) {
+      expect(inline[i].rotate).toBe(compose[i].rotate);
+    }
+    // YZ plane → x == 0 on every placement.
+    for (const p of inline) {
+      expect(p.translate[0]).toBe(0);
+    }
+  });
+
+  it("plane: 'XY' is identity — matches the no-option path", () => {
+    const base = patterns.grid(2, 2, 10);
+    const withXY = patterns.grid(2, 2, 10, undefined, { plane: "XY" });
+    expect(withXY.map((p) => p.translate)).toEqual(
+      base.map((p) => p.translate),
+    );
   });
 });
 

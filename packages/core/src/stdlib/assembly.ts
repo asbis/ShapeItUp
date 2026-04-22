@@ -262,38 +262,154 @@ export function assemble(
   });
 }
 
-// ── stackOnZ — no-joints shortcut for coaxial +Z stacks ────────────────────
+// ── stack / stackOnZ — no-joints shortcut for coaxial stacks ───────────────
 
 export interface StackOptions {
   /** Axial gap between stacked parts (mm). Default 0. */
   gap?: number;
 }
 
+/** Stacking axis shorthand — any of the six principal directions. */
+export type StackAxis = "+X" | "-X" | "+Y" | "-Y" | "+Z" | "-Z";
+
+/** Transverse-alignment mode for `stack()`. */
+export type StackAlign = "center" | "min" | "max";
+
+export interface StackGeneralOptions {
+  /** Stacking direction. Default `"+Z"`. */
+  axis?: StackAxis;
+  /**
+   * Axial gap between consecutive parts (mm). A scalar applies uniformly;
+   * an array of length `parts.length - 1` gives per-gap control (index `i`
+   * is the gap between `parts[i]` and `parts[i+1]`). Default `0`.
+   */
+  gap?: number | number[];
+  /**
+   * Alignment on the two transverse axes:
+   * - `"center"` — match the first part's bbox centre (default).
+   * - `"min"`    — align min-face on each transverse axis.
+   * - `"max"`    — align max-face on each transverse axis.
+   */
+  align?: StackAlign;
+}
+
 /**
- * Stack parts along +Z using bounding-box math: each part is translated so
- * its bottom (min Z) sits on the previous part's top (max Z), plus `gap`.
- * The first part stays at its original transform.
+ * Stack parts along a principal axis using bounding-box math — no joint
+ * declarations required. The first part stays at its original transform;
+ * every subsequent part is translated so its leading face meets the previous
+ * part's trailing face plus `gap`, and on the two transverse axes aligned
+ * according to `align`.
  *
- * No joint declarations required — this is the simplest way to build
- * coaxial assemblies. For anything that needs rotation, non-Z axes, or
- * diameter-checked mates, use `mate()` + `assemble()` instead.
+ * ```typescript
+ * // Vertical column, 2 mm gap between layers, centred on the first part.
+ * stack([base, plate, cap], { axis: "+Z", gap: 2 });
+ * ```
+ *
+ * For anything that needs rotation or diameter-checked mates, use
+ * `mate()` + `assemble()` instead.
+ *
+ * @throws when `gap` is an array of the wrong length (must equal
+ *   `parts.length - 1`).
  */
-export function stackOnZ(parts: Part[], opts: StackOptions = {}): Part[] {
-  const gap = opts.gap ?? 0;
+export function stack(parts: Part[], opts: StackGeneralOptions = {}): Part[] {
   if (parts.length === 0) return [];
+
+  const axisSpec = opts.axis ?? "+Z";
+  const align = opts.align ?? "center";
+  const gapOpt = opts.gap ?? 0;
+
+  // Resolve axis into an index (0=X, 1=Y, 2=Z) and sign (+1 / -1).
+  const axisIndex = axisSpec[1] === "X" ? 0 : axisSpec[1] === "Y" ? 1 : 2;
+  const axisSign = axisSpec[0] === "+" ? 1 : -1;
+  const transverseAxes = [0, 1, 2].filter((i) => i !== axisIndex) as [number, number];
+
+  // Resolve gap into a per-pair array of length `parts.length - 1`.
+  const gaps: number[] = (() => {
+    const n = parts.length - 1;
+    if (Array.isArray(gapOpt)) {
+      if (gapOpt.length !== n) {
+        throw new Error(
+          `stack: gap array length ${gapOpt.length} does not match parts.length - 1 = ${n}. ` +
+            `Pass a scalar for a uniform gap, or exactly ${n} values for per-pair gaps.`,
+        );
+      }
+      return gapOpt.slice();
+    }
+    return new Array(n).fill(gapOpt);
+  })();
+
+  // Reference bbox (first part) — used to lock the transverse alignment so
+  // every later part lines up with the same frame rather than drifting as
+  // per-part bbox-centre differences compound.
+  const firstBounds = parts[0].worldShape().boundingBox.bounds;
+  const refMin = firstBounds[0];
+  const refMax = firstBounds[1];
+
+  // Trailing face of the currently-last-placed part along the stack axis.
+  // For "+Z", this is the max-Z face; for "-Z" it's the min-Z face.
+  let trailing =
+    axisSign > 0 ? refMax[axisIndex] : refMin[axisIndex];
+
   const out: Part[] = [parts[0]];
-  let previousTop = out[0].worldShape().boundingBox.bounds[1][2];
+
   for (let i = 1; i < parts.length; i++) {
     const p = parts[i];
     const bb = p.worldShape().boundingBox.bounds;
-    const bottom = bb[0][2];
-    const height = bb[1][2] - bb[0][2];
-    const dz = previousTop + gap - bottom;
-    const placed = p.translate(0, 0, dz);
+    const pMin = bb[0];
+    const pMax = bb[1];
+
+    // Axial translation: move the leading face to `trailing + sign*gap`.
+    // For "+Z", leading face is min-Z; target = trailing + gap. dAxis = target - pMin[axis].
+    // For "-Z", leading face is max-Z; target = trailing - gap. dAxis = target - pMax[axis].
+    const gap = gaps[i - 1];
+    let dAxis: number;
+    if (axisSign > 0) {
+      const target = trailing + gap;
+      dAxis = target - pMin[axisIndex];
+    } else {
+      const target = trailing - gap;
+      dAxis = target - pMax[axisIndex];
+    }
+
+    // Transverse translation: align on each non-stacking axis.
+    const translate: [number, number, number] = [0, 0, 0];
+    translate[axisIndex] = dAxis;
+    for (const t of transverseAxes) {
+      if (align === "min") {
+        translate[t] = refMin[t] - pMin[t];
+      } else if (align === "max") {
+        translate[t] = refMax[t] - pMax[t];
+      } else {
+        // center
+        const refCenter = (refMin[t] + refMax[t]) / 2;
+        const pCenter = (pMin[t] + pMax[t]) / 2;
+        translate[t] = refCenter - pCenter;
+      }
+    }
+
+    const placed = p.translate(translate[0], translate[1], translate[2]);
     out.push(placed);
-    previousTop = previousTop + gap + height;
+
+    // Advance the trailing face along the stack axis.
+    const extent = pMax[axisIndex] - pMin[axisIndex];
+    if (axisSign > 0) {
+      trailing = trailing + gap + extent;
+    } else {
+      trailing = trailing - gap - extent;
+    }
   }
   return out;
+}
+
+/**
+ * Stack parts along +Z — thin wrapper around `stack()` with `axis: "+Z"`.
+ *
+ * Retained for backwards compatibility. Prefer `stack()` directly when you
+ * need any axis other than +Z, per-pair gaps, or min/max transverse
+ * alignment.
+ */
+export function stackOnZ(parts: Part[], opts: StackOptions = {}): Part[] {
+  return stack(parts, { axis: "+Z", gap: opts.gap });
 }
 
 /**

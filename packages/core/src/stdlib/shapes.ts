@@ -11,6 +11,7 @@
 
 import {
   drawRectangle,
+  drawRoundedRectangle,
   makeBox,
   type DrawingInterface,
   type Shape3D,
@@ -25,6 +26,14 @@ export interface BoxOpts {
   from: Point3;
   /** Upper-corner in world coords `[x, y, z]`. Every component must exceed `from`. */
   to: Point3;
+  /**
+   * Optional fillet radius (mm) applied to the four vertical (Z-parallel) edges
+   * of the box — the typical "rounded slab / rounded pad" shape. Must be a
+   * finite non-negative number strictly less than half the shorter in-plane
+   * edge (`min(dx, dy) / 2`). When omitted or 0 the box has hard corners and
+   * the helper falls back to Replicad's plain `makeBox`.
+   */
+  rounded?: number;
 }
 
 /**
@@ -33,16 +42,23 @@ export interface BoxOpts {
  * corner (or a zero-size axis) produces a readable error instead of an
  * opaque OCCT pointer exception.
  *
- *   box({ from: [0, 0, 0], to: [40, 20, 10] })       // 40×20×10 block, corner at origin
- *   box({ from: [-10, -10, 0], to: [10, 10, 5] })    // centered 20×20 pad 5 mm tall
+ *   box({ from: [0, 0, 0], to: [40, 20, 10] })                 // 40×20×10 block, corner at origin
+ *   box({ from: [-10, -10, 0], to: [10, 10, 5] })              // centered 20×20 pad 5 mm tall
+ *   box({ from: [0, 0, 0], to: [40, 20, 10], rounded: 3 })     // same block, 3 mm vertical-edge fillets
+ *
+ * When `rounded` is set the four vertical (Z-parallel) edges are filleted —
+ * the overall bounding box is unchanged (rounding only removes material from
+ * the corners, never adds). Rounding the top/bottom Z-faces is not supported
+ * here; use Replicad's `.fillet()` on picked edges for that.
  *
  * @throws TypeError if `to[i] <= from[i]` on any axis (the error names which axis).
+ * @throws RangeError if `rounded` is negative or >= min(dx, dy) / 2.
  */
 export function box(opts: BoxOpts): Shape3D {
   if (!opts || typeof opts !== "object") {
-    throw new TypeError(`box: opts must be { from: [x,y,z], to: [x,y,z] }, got ${String(opts)}.`);
+    throw new TypeError(`box: opts must be { from: [x,y,z], to: [x,y,z], rounded? }, got ${String(opts)}.`);
   }
-  const { from, to } = opts;
+  const { from, to, rounded } = opts;
   const assertPoint = (label: string, p: unknown): void => {
     if (
       !Array.isArray(p) ||
@@ -67,7 +83,38 @@ export function box(opts: BoxOpts): Shape3D {
       );
     }
   }
-  return makeBox(from as [number, number, number], to as [number, number, number]) as Shape3D;
+
+  // Fast path — no rounding requested, delegate straight to OCCT's primitive.
+  if (rounded === undefined || rounded === 0) {
+    return makeBox(from as [number, number, number], to as [number, number, number]) as Shape3D;
+  }
+
+  if (typeof rounded !== "number" || !Number.isFinite(rounded) || rounded < 0) {
+    throw new TypeError(
+      `box: rounded must be a finite non-negative number, got ${String(rounded)}.`,
+    );
+  }
+  const dx = to[0] - from[0];
+  const dy = to[1] - from[1];
+  const dz = to[2] - from[2];
+  const maxRadius = Math.min(dx, dy) / 2;
+  if (rounded >= maxRadius) {
+    throw new RangeError(
+      `box: rounded (${rounded}) must be strictly less than half the shorter in-plane edge ` +
+        `(min(dx=${dx}, dy=${dy}) / 2 = ${maxRadius}). Use a smaller radius or enlarge the box.`,
+    );
+  }
+
+  // drawRoundedRectangle(w, h, r) is centred on the sketch-plane origin; sketch
+  // on XY, extrude along +Z for dz, then translate the centre to land the
+  // extruded body's bounding box exactly on [from, to] (near face at
+  // z = from[2], far face at z = from[2] + dz = to[2]).
+  const cx = (from[0] + to[0]) / 2;
+  const cy = (from[1] + to[1]) / 2;
+  const extruded = drawRoundedRectangle(dx, dy, rounded)
+    .sketchOnPlane("XY")
+    .extrude(dz) as unknown as Shape3D;
+  return extruded.translate(cx, cy, from[2]);
 }
 
 // ── prism ──────────────────────────────────────────────────────────────────
@@ -263,4 +310,87 @@ export function plate(opts: PlateOpts): Shape3D {
     ? drawRectangle(w, h)
     : drawRectangle(w, h).translate(w / 2, h / 2);
   return prism({ profile, along: normal, length: thickness });
+}
+
+// ── wall ───────────────────────────────────────────────────────────────────
+
+/** Options for {@link wall}. */
+export interface WallOpts {
+  /**
+   * Outward-facing normal of the wall (which direction the "near" face points).
+   * Same axis shorthand as {@link plate}'s `normal`. The wall body extends
+   * `thickness` into the axis's interior (near face AT the origin on that axis).
+   */
+  axis: PrismAxis;
+  /** Extent along `axis` in mm (positive, finite). */
+  thickness: number;
+  /** First transverse (in-plane) dimension in mm (positive, finite). */
+  width: number;
+  /** Second transverse (in-plane) dimension in mm (positive, finite). */
+  height: number;
+  /**
+   * When `true`, anchor the "height" transverse axis at 0 (base sits at 0 on
+   * the more-vertical transverse axis) instead of centering it. Default
+   * `false` — both transverse axes are centered, matching `plate()`'s
+   * default.
+   *
+   * Convention: for `axis` ∈ {"+X", "-X", "+Y", "-Y"} the wall's in-plane
+   * axes are the remaining horizontal axis (width) + world Z (height), so
+   * `baseAtZero: true` makes the wall's Z span `[0, height]`. For
+   * `axis` ∈ {"+Z", "-Z"} (a flat slab on XY) there is no vertical
+   * transverse axis, so `baseAtZero` is a no-op — the helper still accepts
+   * the flag so call sites stay symmetric.
+   */
+  baseAtZero?: boolean;
+}
+
+/**
+ * Vertical wall / panel — a plate whose outward normal is named by `axis`,
+ * with the common "base sits at Z=0" anchoring option built in. Spares users
+ * the `sketchOnPlane("YZ", -T/2).extrude(T)` incantation for end caps and
+ * side panels.
+ *
+ *   // +X-facing end cap, 80 mm wide × 120 mm tall, 4 mm thick, base on ground:
+ *   wall({ axis: "+X", thickness: 4, width: 80, height: 120, baseAtZero: true })
+ *
+ *   // Side panel facing -Y, centered vertically (default):
+ *   wall({ axis: "-Y", thickness: 3, width: 100, height: 50 })
+ *
+ * `width` maps to the in-plane axis that isn't world-Z (X or Y depending on
+ * `axis`); `height` maps to the other in-plane axis (world-Z for a
+ * side-facing wall). For `axis: "+Z"` / `"-Z"` (a flat slab) width/height
+ * map to X/Y respectively and `baseAtZero` is a no-op.
+ *
+ * @throws TypeError on bad axis / non-positive dimensions.
+ */
+export function wall(opts: WallOpts): Shape3D {
+  if (!opts || typeof opts !== "object") {
+    throw new TypeError(
+      `wall: opts must be { axis, thickness, width, height, baseAtZero? }, got ${String(opts)}.`,
+    );
+  }
+  const { axis, thickness, width, height } = opts;
+  const baseAtZero = opts.baseAtZero ?? false;
+  if (typeof width !== "number" || !Number.isFinite(width) || width <= 0) {
+    throw new TypeError(`wall: width must be a finite positive number, got ${String(width)}.`);
+  }
+  if (typeof height !== "number" || !Number.isFinite(height) || height <= 0) {
+    throw new TypeError(`wall: height must be a finite positive number, got ${String(height)}.`);
+  }
+  if (!(axis in PRISM_AXIS)) {
+    throw new TypeError(
+      `wall: axis must be one of "+X" | "-X" | "+Y" | "-Y" | "+Z" | "-Z", got ${JSON.stringify(axis)}.`,
+    );
+  }
+  // Delegate to plate() for the plane/sign math (and shared thickness/axis
+  // validation). `plate` is centered on both in-plane axes by default — then
+  // for baseAtZero we shift the wall up by height/2 along world Z so the
+  // wall's Z-min lands at 0. For the +Z/-Z axes (flat slab) the in-plane
+  // axes are X & Y, so "height" isn't vertical and baseAtZero is a no-op.
+  const slab = plate({ size: [width, height], thickness, normal: axis });
+  if (!baseAtZero) return slab;
+  const entry = PRISM_AXIS[axis];
+  // worldAxis === 2 → axis is +Z or -Z → height is in-plane on X/Y, not Z.
+  if (entry.worldAxis === 2) return slab;
+  return slab.translate(0, 0, height / 2);
 }

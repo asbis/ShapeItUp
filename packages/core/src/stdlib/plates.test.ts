@@ -63,7 +63,7 @@ vi.mock("replicad", () => ({
   makeBox: () => ({}),
 }));
 
-import { plate } from "./shapes";
+import { plate, wall } from "./shapes";
 
 function reset(): void {
   rectCalls.length = 0;
@@ -125,5 +125,52 @@ describe("shapes.plate — all 6 normals", () => {
       plate({ size: [10, 10], thickness: 5, normal: "+Q" as any }),
     ).toThrow(/normal/);
     expect(() => plate(null as any)).toThrow(/opts/);
+  });
+});
+
+describe("shapes.wall — delegates to plate + optional base-at-Z=0 shift", () => {
+  it("default (baseAtZero omitted) is pure delegation — same plane/extrude, no post-translate", () => {
+    reset();
+    wall({ axis: "+X", thickness: 4, width: 80, height: 120 });
+    // +X goes to YZ plane, extrude +thickness (from PRISM_AXIS table).
+    expect(planeCalls).toEqual(["YZ"]);
+    expect(extrudeCalls).toEqual([4]);
+    // drawRectangle receives the in-plane dims: (width, height).
+    expect(rectCalls).toEqual([{ w: 80, h: 120 }]);
+    // No baseAtZero shift → no post-translate.
+    expect(postTranslateCalls).toEqual([]);
+  });
+
+  it("baseAtZero: true shifts the wall's Z by +height/2 for a +X-facing wall", () => {
+    reset();
+    wall({ axis: "+X", thickness: 4, width: 80, height: 120, baseAtZero: true });
+    expect(planeCalls).toEqual(["YZ"]);
+    expect(extrudeCalls).toEqual([4]);
+    // Shift lands the wall's Z in [0, height], i.e. translate by +60 on Z.
+    expect(postTranslateCalls).toEqual([[0, 0, 60]]);
+  });
+
+  it("baseAtZero: true also applies to -Y-facing wall (axis is world-horizontal)", () => {
+    reset();
+    wall({ axis: "-Y", thickness: 3, width: 100, height: 50, baseAtZero: true });
+    expect(planeCalls).toEqual(["XZ"]);
+    // Side-facing wall shifts Z by height/2 so bbox Z ∈ [0, height].
+    expect(postTranslateCalls).toEqual([[0, 0, 25]]);
+  });
+
+  it("baseAtZero is a NO-OP for +Z / -Z (height is in-plane, not vertical)", () => {
+    reset();
+    wall({ axis: "+Z", thickness: 5, width: 60, height: 40, baseAtZero: true });
+    expect(planeCalls).toEqual(["XY"]);
+    expect(extrudeCalls).toEqual([5]);
+    // baseAtZero shouldn't translate — height maps to world-Y, not world-Z.
+    expect(postTranslateCalls).toEqual([]);
+  });
+
+  it("rejects bad inputs with named-field errors", () => {
+    expect(() => wall({ axis: "+X", thickness: 4, width: 0, height: 10 })).toThrow(/width/);
+    expect(() => wall({ axis: "+X", thickness: 4, width: 10, height: -1 })).toThrow(/height/);
+    expect(() => wall({ axis: "+Q" as any, thickness: 4, width: 10, height: 10 })).toThrow(/axis/);
+    expect(() => wall(null as any)).toThrow(/opts/);
   });
 });

@@ -14,13 +14,13 @@ import * as patterns from "./patterns";
 import { screws, bolts, washers, inserts, seatedOnPlate } from "./fasteners";
 import { fromBack, shape3d, placeOn, extrudeCentered } from "./placement";
 import { Part, joint, jointAt, part, faceAt, shaftAt, boreAt } from "./parts";
-import { mate, assemble, subassembly, stackOnZ, entries, symmetricPair, debugJoints, highlightJoints, composeAssembly } from "./assembly";
+import { mate, assemble, subassembly, stack, stackOnZ, entries, symmetricPair, debugJoints, highlightJoints, composeAssembly } from "./assembly";
 import { cylinder, rod } from "./cylinder";
-import { box, prism, plate } from "./shapes";
+import { box, prism, plate, wall } from "./shapes";
 // `plates` is a small namespace containing the plate-shaped helper(s). Kept
 // separate from the top-level `plate` export so user scripts can reach either
 // (`plates.plate({...})` mirrors `holes.through(...)` / `motors.nema17()`).
-const plates = { plate };
+const plates = { plate, wall };
 import * as motors from "./motors";
 import * as couplers from "./couplers";
 import * as threads from "./threads";
@@ -49,6 +49,12 @@ ensureThreadGuardPatched();
 // standards namespace. Supported sizes: "M2" | "M2.5" | "M3" | "M4" | "M5" |
 // "M6" | "M8" | "M10" | "M12" — see standards.ts for the source tables.
 export type { MetricSize, FitStyle } from "./standards";
+
+// Re-export the `Placement` shape so user scripts that assemble placements by
+// hand (or wrap `patterns.polar`/`grid` output in their own utilities) can
+// type-annotate without reaching into `patterns.Placement` — e.g.
+// `const rows: Placement[] = [...]`.
+export type { Placement } from "./patterns";
 
 // User-facing view of the standards namespace. Unknown-key reads throw with
 // a did-you-mean suggestion so `standards.NEMA17.pilotDiameter` (typo for
@@ -93,6 +99,7 @@ export {
   mate,
   assemble,
   subassembly,
+  stack,
   stackOnZ,
   entries,
   symmetricPair,
@@ -104,6 +111,7 @@ export {
   box,
   prism,
   plate,
+  wall,
   plates,
   motors,
   couplers,
@@ -142,6 +150,7 @@ export const shapeitupStdlib = {
   mate,
   assemble,
   subassembly,
+  stack,
   stackOnZ,
   entries,
   symmetricPair,
@@ -153,6 +162,7 @@ export const shapeitupStdlib = {
   box,
   prism,
   plate,
+  wall,
   plates,
   motors,
   couplers,

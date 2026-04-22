@@ -38,6 +38,7 @@ import {
   SOCKET_HEAD,
   FLAT_HEAD,
   FIT,
+  CUT_EPSILON,
   type FitStyle,
   type MetricSize,
   parseScrewDesignator,
@@ -202,6 +203,8 @@ function fitAllowance(style: FitStyle | undefined, fallback: FitStyle): number {
 }
 
 /**
+ * Axis convention: `axis` names the FACE the hole opens on; the body extends in the OPPOSITE direction (e.g. `axis: "+X"` → opens on +X face, body extends into -X).
+ *
  * Through clearance hole. Pass a metric screw designator (`"M3"`) to get a
  * clearance-sized hole, or a raw number (mm) for a plain cylindrical hole of
  * that diameter. Default depth: 50 mm (use `opts.depth` to match your plate).
@@ -232,6 +235,7 @@ function fitAllowance(style: FitStyle | undefined, fallback: FitStyle): number {
  * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the hole OPENS ON; the body penetrates in the OPPOSITE direction. `"+X"` = opens on +X face, drills -X. See `HoleAxis` docstring for full semantics.
  * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
  * @param opts.raw Pass `{ raw: true }` to treat the numeric diameter as intentional and suppress the "did you mean Mxx?" advisory that fires when a bare integer matches a standard metric size (3, 4, 5, 6, 8, 10, 12). No effect when `size` is a string designator.
+ * @param opts.strict When true, skip the `CUT_EPSILON` extend-past-both-faces nudge — useful for precise mating surfaces where the cutter must terminate exactly at the target face. Default false (stdlib adds `CUT_EPSILON` on each end to avoid OCCT coincident-face failures).
  * @returns Cut-tool Shape3D, axis=Z, top at Z=0, extends into -Z.
  */
 export function through(
@@ -243,6 +247,7 @@ export function through(
     // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
     drillDirection?: HoleAxis;
     raw?: boolean;
+    strict?: boolean;
   } = {}
 ): Shape3D {
   const axis = resolveHoleAxis("holes.through", opts.axis, opts.drillDirection);
@@ -259,13 +264,19 @@ export function through(
     const allowance = fitAllowance(opts.fit, "clearance");
     diameter = spec.shaft + allowance * 2;
   }
+  // Extend the cutter past both faces by CUT_EPSILON so coincident faces
+  // don't produce non-manifold geometry. `strict: true` opts out.
+  const eps = opts.strict ? 0 : CUT_EPSILON;
+  const totalHeight = depth + eps * 2;
   // makeCylinder(radius, height, location, direction) — location is the base
-  // of the cylinder. Put base at -depth so the top sits at Z=0.
-  const tool = makeCylinder(diameter / 2, depth, [0, 0, -depth], [0, 0, 1]);
+  // of the cylinder. Put base at -depth - eps so the top sits at +eps.
+  const tool = makeCylinder(diameter / 2, totalHeight, [0, 0, -depth - eps], [0, 0, 1]);
   return applyAxis(tool, axis);
 }
 
 /**
+ * Axis convention: `axis` names the FACE the hole opens on; the body extends in the OPPOSITE direction (e.g. `axis: "+X"` → opens on +X face, body extends into -X).
+ *
  * Alias for `holes.through(size, { fit: "clearance" })` — matches the common
  * engineering term "clearance hole". Identical behaviour to `through`, but
  * the `fit` option defaults to `"clearance"` when unspecified (which is
@@ -289,6 +300,7 @@ export function through(
  * @param size Metric designator (`"M3"`) or explicit diameter in mm.
  * @param opts Same options as `holes.through`, including `axis` for non-vertical holes.
  * @param opts.raw Pass `{ raw: true }` to treat the numeric diameter as intentional and suppress the "did you mean Mxx?" advisory that fires when a bare integer matches a standard metric size.
+ * @param opts.strict When true, skip the `CUT_EPSILON` extend-past-both-faces nudge. Default false.
  * @returns Cut-tool Shape3D, axis=Z, top at Z=0, extends into -Z.
  */
 export function clearance(
@@ -300,12 +312,15 @@ export function clearance(
     // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
     drillDirection?: HoleAxis;
     raw?: boolean;
+    strict?: boolean;
   } = {}
 ): Shape3D {
   return through(size, { ...opts, fit: opts.fit ?? "clearance" });
 }
 
 /**
+ * Axis convention: `axis` names the FACE the hole opens on; the body extends in the OPPOSITE direction (e.g. `axis: "+X"` → opens on +X face, body extends into -X).
+ *
  * Counterbored hole — clearance shaft through the plate plus a flat-bottomed
  * pocket sized for a socket-head cap screw head. Total cut depth = the
  * plate thickness; the pocket depth = `SOCKET_HEAD[size].headH + 0.2 mm`.
@@ -333,6 +348,7 @@ export function clearance(
  * @param opts.fit Fit style for the shaft (default `"clearance"`).
  * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the pocket OPENS ON; the shaft penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
  * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
+ * @param opts.strict When true, skip the `CUT_EPSILON` extend-past-both-faces nudge on the shaft (the pocket depth is a functional dimension and is unaffected). Default false.
  * @returns Cut-tool Shape3D, top of pocket at Z=0.
  */
 export function counterbore(
@@ -343,6 +359,7 @@ export function counterbore(
     axis?: HoleAxis;
     // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
     drillDirection?: HoleAxis;
+    strict?: boolean;
   }
 ): Shape3D {
   const axis = resolveHoleAxis("holes.counterbore", opts.axis, opts.drillDirection);
@@ -356,19 +373,23 @@ export function counterbore(
   const pocketH = head.headH + 0.2;
   const { plateThickness } = opts;
 
-  // Pocket: sits at the top (top face at Z=0, bottom at Z=-pocketH).
+  // Pocket: sits at the top (top face at Z=0, bottom at Z=-pocketH). Pocket
+  // depth is a functional dimension — intentionally NOT extended by the
+  // through-cut epsilon (the pocket does not pass through).
   const pocket = makeCylinder(
     pocketD / 2,
     pocketH,
     [0, 0, -pocketH],
     [0, 0, 1]
   );
-  // Shaft: runs the full plate thickness. Slight overlap into the pocket to
-  // guarantee a clean boolean.
+  // Shaft: runs the full plate thickness, extended past the bottom face by
+  // CUT_EPSILON so coincident faces don't produce non-manifold geometry. The
+  // original overlap into the pocket is preserved by starting at -plateThickness.
+  const eps = opts.strict ? 0 : CUT_EPSILON;
   const shaft = makeCylinder(
     shaftD / 2,
-    plateThickness + 0.01,
-    [0, 0, -plateThickness],
+    plateThickness + eps,
+    [0, 0, -plateThickness - eps],
     [0, 0, 1]
   );
   const tool = pocket.fuse(shaft);
@@ -376,6 +397,8 @@ export function counterbore(
 }
 
 /**
+ * Axis convention: `axis` names the FACE the hole opens on; the body extends in the OPPOSITE direction (e.g. `axis: "+X"` → opens on +X face, body extends into -X).
+ *
  * Countersunk hole — clearance shaft through the plate plus a 90° cone flare
  * sized to the ISO 10642 head OD. Cone depth = headD/2 (90° included angle).
  *
@@ -400,6 +423,7 @@ export function counterbore(
  * @param opts.fit Fit style for the shaft (default `"clearance"`).
  * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the flare OPENS ON; the shaft penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
  * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
+ * @param opts.strict When true, skip the `CUT_EPSILON` nudge that extends the shaft past the plate's back face (cone depth is a functional dimension and is unaffected). Default false.
  * @returns Cut-tool Shape3D, top of countersink at Z=0.
  */
 export function countersink(
@@ -410,6 +434,7 @@ export function countersink(
     axis?: HoleAxis;
     // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
     drillDirection?: HoleAxis;
+    strict?: boolean;
   }
 ): Shape3D {
   const axis = resolveHoleAxis("holes.countersink", opts.axis, opts.drillDirection);
@@ -424,9 +449,14 @@ export function countersink(
   const allowance = fitAllowance(opts.fit, "clearance");
   const shaftD = flat.shaft + allowance * 2;
   const headR = flat.headD / 2;
-  // 90° included angle → depth equals radius.
+  // 90° included angle → depth equals radius. Cone depth is a functional
+  // dimension — NOT extended by the through-cut epsilon.
   const coneDepth = headR;
   const { plateThickness } = opts;
+  // Extend the shaft past the plate's back face by CUT_EPSILON so coincident
+  // faces don't produce non-manifold geometry. `strict: true` opts out.
+  const eps = opts.strict ? 0 : CUT_EPSILON;
+  const shaftBottomZ = -plateThickness - eps;
 
   // Build the cone by revolving a 2D profile in the XZ plane. We sketch the
   // axial half-profile (x >= 0) and spin it around Z.
@@ -435,13 +465,13 @@ export function countersink(
   //   start  (0, 0)
   //   out to (headR, 0)       -- top of countersink at Z=0
   //   down   (shaftD/2, -coneDepth)
-  //   down   (shaftD/2, -plateThickness)
-  //   in     (0, -plateThickness)
+  //   down   (shaftD/2, -plateThickness - eps)
+  //   in     (0, -plateThickness - eps)
   //   close back to (0, 0)
   const profile = draw([0, 0])
     .hLine(headR)
     .lineTo([shaftD / 2, -coneDepth])
-    .lineTo([shaftD / 2, -plateThickness])
+    .lineTo([shaftD / 2, shaftBottomZ])
     .hLine(-shaftD / 2)
     .close();
 
@@ -453,6 +483,8 @@ export function countersink(
 }
 
 /**
+ * Axis convention: `axis` names the FACE the hole opens on; the body extends in the OPPOSITE direction (e.g. `axis: "+X"` → opens on +X face, body extends into -X).
+ *
  * Tapped hole — a cylinder of `SOCKET_HEAD[size].tapDrill` diameter. Threads
  * are implicit (user taps them in metal) or irrelevant (printed threads are
  * unreliable — prefer `inserts.pocket` for FDM).
@@ -476,6 +508,7 @@ export function countersink(
  * @param opts.depth Tap depth in mm (measured from Z=0 into -Z).
  * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the tap OPENS ON; the body penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
  * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
+ * @param opts.strict When true, skip the `CUT_EPSILON` extend-past-both-faces nudge — useful for precise mating surfaces. Default false.
  * @returns Cut-tool Shape3D, top at Z=0.
  */
 export function tapped(
@@ -485,6 +518,7 @@ export function tapped(
     axis?: HoleAxis;
     // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
     drillDirection?: HoleAxis;
+    strict?: boolean;
   }
 ): Shape3D {
   const axis = resolveHoleAxis("holes.tapped", opts.axis, opts.drillDirection);
@@ -492,11 +526,17 @@ export function tapped(
   assertPositiveFinite("holes.tapped", "opts.depth", depth);
   assertSupportedSize(size, SOCKET_HEAD, "socket-head");
   const diameter = SOCKET_HEAD[size].tapDrill;
-  const tool = makeCylinder(diameter / 2, depth, [0, 0, -depth], [0, 0, 1]);
+  // Extend past both faces by CUT_EPSILON so coincident faces don't produce
+  // non-manifold geometry. `strict: true` opts out.
+  const eps = opts.strict ? 0 : CUT_EPSILON;
+  const totalHeight = depth + eps * 2;
+  const tool = makeCylinder(diameter / 2, totalHeight, [0, 0, -depth - eps], [0, 0, 1]);
   return applyAxis(tool, axis);
 }
 
 /**
+ * Axis convention: `axis` names the FACE the hole opens on; the body extends in the OPPOSITE direction (e.g. `axis: "+X"` → opens on +X face, body extends into -X).
+ *
  * Creates a cut-tool for a threaded hole — a tap-drill-diameter cylinder.
  * The screw self-taps into the printed plastic on first install.
  *
@@ -519,6 +559,7 @@ export function tapped(
  * @param opts.depth Hole depth in mm.
  * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the hole OPENS ON; the body penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
  * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
+ * @param opts.strict When true, skip the `CUT_EPSILON` extend-past-both-faces nudge. Default false.
  * @returns Cut-tool Shape3D, top at Z=0.
  */
 export function threaded(
@@ -527,12 +568,15 @@ export function threaded(
     depth: number;
     axis?: HoleAxis;
     drillDirection?: HoleAxis;
+    strict?: boolean;
   }
 ): Shape3D {
   return tapped(size, opts);
 }
 
 /**
+ * Axis convention: `axis` names the FACE the hole opens on; the body extends in the OPPOSITE direction (e.g. `axis: "+X"` → opens on +X face, body extends into -X).
+ *
  * Teardrop hole — a horizontal-axis hole that prints cleanly on FDM with no
  * supports. Cross-section is a circle fused with a triangular tip pointing in
  * the +Z direction, giving a 45° roof that FDM handles without drooping.
@@ -554,11 +598,12 @@ export function threaded(
  * @param opts.depth Length of the hole along its axis in mm.
  * @param opts.axis `"+X"` or `"+Y"` (default `"+Y"`). Legacy: `"X"` → `"+X"`, `"Y"` → `"+Y"`.
  * @param opts.raw Pass `{ raw: true }` to treat the numeric diameter as intentional and suppress the "did you mean Mxx?" advisory that fires when a bare integer matches a standard metric size.
+ * @param opts.strict When true, skip the `CUT_EPSILON` extend-past-both-faces nudge. Default false.
  * @returns Cut-tool Shape3D positioned with its entry face at the origin.
  */
 export function teardrop(
   size: MetricSize | number,
-  opts: { depth: number; axis?: "+X" | "+Y" | "X" | "Y"; raw?: boolean }
+  opts: { depth: number; axis?: "+X" | "+Y" | "X" | "Y"; raw?: boolean; strict?: boolean }
 ): Shape3D {
   const rawAxis = opts.axis ?? "+Y";
   const axis: "+X" | "+Y" = rawAxis === "X" ? "+X" : rawAxis === "Y" ? "+Y" : rawAxis;
@@ -575,6 +620,11 @@ export function teardrop(
     diameter = spec.shaft + FIT.clearance * 2;
   }
   const r = diameter / 2;
+  // Extend past both faces by CUT_EPSILON so coincident faces don't produce
+  // non-manifold geometry. The cutter naturally spans [0, depth] along the
+  // extrude axis; we extend to [-eps, depth+eps] so both ends overshoot.
+  const eps = opts.strict ? 0 : CUT_EPSILON;
+  const totalDepth = depth + eps * 2;
 
   // Build the teardrop as the 3D fusion of a circle-prism and a triangle-prism.
   // Earlier attempts fused the two in 2D (circle + triangle as Drawings, then
@@ -584,13 +634,13 @@ export function teardrop(
   // robust — OCCT handles coplanar-face union of the circle's upper half and
   // the triangle's base without issue.
   //
-  //   axis = "+Y" → sketch on XZ, extrude along -Y (XZ normal). Local X → world X, local Y → world Z.
+  //   axis = "+Y" → sketch on XZ, extrude along +Y. Local X → world X, local Y → world Z.
   //   axis = "+X" → sketch on YZ, extrude along +X. Local X → world Y, local Y → world Z.
   const plane = axis === "+Y" ? "XZ" : "YZ";
 
   const circleSolid = drawCircle(r)
     .sketchOnPlane(plane)
-    .extrude(depth)
+    .extrude(totalDepth)
     .asShape3D();
 
   // Triangle: apex at (0, 2r), base corners DELIBERATELY below the circle's
@@ -605,13 +655,19 @@ export function teardrop(
     .lineTo([-r, -r])
     .close()
     .sketchOnPlane(plane)
-    .extrude(depth)
+    .extrude(totalDepth)
     .asShape3D();
 
-  return circleSolid.fuse(triangleSolid);
+  const fused = circleSolid.fuse(triangleSolid);
+  // Translate by -eps along the extrude axis so the cutter spans
+  // [-eps, depth+eps] — overshooting both the near and far faces.
+  if (eps === 0) return fused;
+  return axis === "+Y" ? fused.translate(0, -eps, 0) : fused.translate(-eps, 0, 0);
 }
 
 /**
+ * Axis convention: `axis` names the FACE the hole opens on; the body extends in the OPPOSITE direction (e.g. `axis: "+X"` → opens on +X face, body extends into -X).
+ *
  * Keyhole — a large circle joined by a narrow slot to a small circle. Used
  * for hang-on-screw mounts where a screw head enters the large opening and
  * slides into the small round.
@@ -647,6 +703,7 @@ export function teardrop(
  * @param opts.axis Entry-face spec (default "+Z"). Names the face the mouth OPENS ON; the pocket penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics.
  * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
  * @param opts.raw Pass `{ raw: true }` to treat the numeric diameters as intentional and suppress any "did you mean Mxx?" advisory (reserved for parity with other raw-diameter factories — keyhole currently consumes `largeD`/`smallD` as literal dimensions, but the flag is accepted so calls stay consistent with `through`/`clearance`).
+ * @param opts.strict When true, skip the `CUT_EPSILON` extend-past-both-faces nudge. Default false.
  * @returns Cut-tool Shape3D, top at Z=0.
  */
 export function keyhole(opts: {
@@ -658,6 +715,7 @@ export function keyhole(opts: {
   // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
   drillDirection?: HoleAxis;
   raw?: boolean;
+  strict?: boolean;
 }): Shape3D {
   const axis = resolveHoleAxis("holes.keyhole", opts.axis, opts.drillDirection);
   const { largeD, smallD, slot, depth } = opts;
@@ -675,11 +733,22 @@ export function keyhole(opts: {
   const neck = drawRectangle(smallD, slot).translate(0, -slot / 2);
 
   const profile = large.fuse(neck).fuse(small);
-  const tool = profile.sketchOnPlane("XY").extrude(-depth).asShape3D();
+  // Extend past both Z faces by CUT_EPSILON so coincident faces don't produce
+  // non-manifold geometry. Sketch on the XY plane offset by +eps so the near
+  // face sits at Z=+eps, then extrude by -(depth + 2*eps) so the far face
+  // lands at Z=-depth-eps.
+  const eps = opts.strict ? 0 : CUT_EPSILON;
+  const totalDepth = depth + eps * 2;
+  const tool = profile
+    .sketchOnPlane("XY", [0, 0, eps])
+    .extrude(-totalDepth)
+    .asShape3D();
   return applyAxis(tool, axis);
 }
 
 /**
+ * Axis convention: `axis` names the FACE the hole opens on; the body extends in the OPPOSITE direction (e.g. `axis: "+X"` → opens on +X face, body extends into -X).
+ *
  * Slotted hole — elongated hole with rounded ends, used for adjustment. The
  * overall length (tip-to-tip) is `length`; the width (hole diameter / radius
  * of the end-caps × 2) is `width`. The slot runs along the X axis.
@@ -721,6 +790,7 @@ export function keyhole(opts: {
  * @param opts.depth Hole depth in mm.
  * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the slot OPENS ON; the pocket penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics and the AXIS SEMANTICS table above for per-axis world-dimension mapping.
  * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
+ * @param opts.strict When true, skip the `CUT_EPSILON` extend-past-both-faces nudge. Default false.
  * @returns Cut-tool Shape3D, top at Z=0.
  */
 export function slot(opts: {
@@ -730,6 +800,7 @@ export function slot(opts: {
   axis?: HoleAxis;
   // for users who prefer drill-direction semantics (Fusion/SolidWorks convention)
   drillDirection?: HoleAxis;
+  strict?: boolean;
 }): Shape3D {
   const axis = resolveHoleAxis("holes.slot", opts.axis, opts.drillDirection);
   const { length, width, depth } = opts;
@@ -758,7 +829,16 @@ export function slot(opts: {
           .translate(-centres / 2, 0)
           .fuse(drawRectangle(centres, width))
           .fuse(drawCircle(r).translate(centres / 2, 0));
-  const tool = profile.sketchOnPlane("XY").extrude(-depth).asShape3D();
+  // Extend past both Z faces by CUT_EPSILON so coincident faces don't produce
+  // non-manifold geometry. Sketch on the XY plane offset by +eps so the near
+  // face sits at Z=+eps, then extrude by -(depth + 2*eps) so the far face
+  // lands at Z=-depth-eps.
+  const eps = opts.strict ? 0 : CUT_EPSILON;
+  const totalDepth = depth + eps * 2;
+  const tool = profile
+    .sketchOnPlane("XY", [0, 0, eps])
+    .extrude(-totalDepth)
+    .asShape3D();
   return applyAxis(tool, axis);
 }
 
@@ -839,6 +919,8 @@ function checkAtOnPlateTop(
 }
 
 /**
+ * Axis convention: `axis` names the FACE the hole opens on; the body extends in the OPPOSITE direction (e.g. `axis: "+X"` → opens on +X face, body extends into -X).
+ *
  * Convenience wrapper: builds a through-hole cutter and cuts it out of `plate`
  * at the given `at` coordinate in one call.
  *
@@ -863,6 +945,7 @@ export function throughAt(
     fit?: FitStyle;
     axis?: HoleAxis;
     drillDirection?: HoleAxis;
+    strict?: boolean;
     at: [number, number, number];
   },
 ): Shape3D {
@@ -873,6 +956,8 @@ export function throughAt(
 }
 
 /**
+ * Axis convention: `axis` names the FACE the hole opens on; the body extends in the OPPOSITE direction (e.g. `axis: "+X"` → opens on +X face, body extends into -X).
+ *
  * Convenience wrapper: builds a tapped-hole cutter and cuts it out of `plate`
  * at the given `at` coordinate in one call.
  *
@@ -894,6 +979,7 @@ export function tappedAt(
     depth: number;
     axis?: HoleAxis;
     drillDirection?: HoleAxis;
+    strict?: boolean;
     at: [number, number, number];
   },
 ): Shape3D {
@@ -904,6 +990,8 @@ export function tappedAt(
 }
 
 /**
+ * Axis convention: `axis` names the FACE the hole opens on; the body extends in the OPPOSITE direction (e.g. `axis: "+X"` → opens on +X face, body extends into -X).
+ *
  * Convenience wrapper: builds a counterbore cutter and cuts it out of `plate`
  * at the given `at` coordinate in one call.
  *
@@ -926,6 +1014,7 @@ export function counterboreAt(
     fit?: FitStyle;
     axis?: HoleAxis;
     drillDirection?: HoleAxis;
+    strict?: boolean;
     at: [number, number, number];
   },
 ): Shape3D {

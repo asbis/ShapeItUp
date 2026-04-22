@@ -128,6 +128,7 @@ export function applyPlacement(shape: Shape3D, p: Placement): Shape3D {
  *   polar(6, 20)                        // 6 positions on a 20mm-radius circle
  *   polar(4, 15, { startAngle: 45 })    // first point at 45°
  *   polar(6, 25, { orientOutward: true }) // each copy rotated to face +X outward
+ *   polar(6, 25, { plane: "YZ" })       // remap the XY circle onto the YZ plane
  *
  * @param n Number of positions (≥ 1).
  * @param radius Circle radius in mm.
@@ -136,6 +137,10 @@ export function applyPlacement(shape: Shape3D, p: Placement): Shape3D {
  * @param opts.orientOutward If true, each placement rotates its shape so that
  *   its local +X axis points outward from the center (useful when the shape
  *   itself has an intrinsic "outward" direction — e.g. a spoke, a mounting tab).
+ * @param opts.plane Optional principal plane remap: `"XY" | "YZ" | "XZ"`.
+ *   When set, the generated XY-plane placements are piped through
+ *   {@link onPlane} so the pattern lives on a wall (YZ/XZ) without a
+ *   two-call idiom. Default `"XY"` (no remap) preserves legacy behaviour.
  */
 export function polar(
   n: number,
@@ -144,6 +149,7 @@ export function polar(
     startAngle?: number;
     axis?: "X" | "Y" | "Z";
     orientOutward?: boolean;
+    plane?: "XY" | "YZ" | "XZ";
   } = {}
 ): Placement[] {
   if (n < 1) throw new Error(`polar: n must be >= 1, got ${n}`);
@@ -185,14 +191,21 @@ export function polar(
     }
     placements.push(placement);
   }
-  return markGenerated(placements);
+  const marked = markGenerated(placements);
+  // Optional plane remap — delegate to onPlane so we never re-implement the
+  // XY→YZ/XZ math. `onPlane("XY")` is identity; we still mark the output to
+  // keep a stable return contract for non-XY planes.
+  return opts.plane && opts.plane !== "XY"
+    ? markGenerated(onPlane(marked, opts.plane))
+    : marked;
 }
 
 /**
  * 2D grid of placements on the XY plane, centered on the origin.
  *
- *   grid(3, 4, 10)       // 3×4 grid, 10mm spacing both axes
- *   grid(3, 4, 10, 15)   // 3×4 grid, 10mm along X, 15mm along Y
+ *   grid(3, 4, 10)                    // 3×4 grid, 10mm spacing both axes
+ *   grid(3, 4, 10, 15)                // 3×4 grid, 10mm along X, 15mm along Y
+ *   grid(3, 4, 10, 15, { plane: "YZ" }) // same grid, remapped onto the YZ plane
  *
  * For a 1-column or 1-row grid the corresponding spacing is still required
  * (and ignored on the singleton axis).
@@ -201,12 +214,17 @@ export function polar(
  * @param ny Number of rows along Y (≥ 1).
  * @param dx Column spacing in mm.
  * @param dy Row spacing in mm. Defaults to `dx`.
+ * @param opts.plane Optional principal plane remap: `"XY" | "YZ" | "XZ"`.
+ *   When set, the generated XY-plane placements are piped through
+ *   {@link onPlane} so the grid lives on a wall (YZ/XZ) without a
+ *   two-call idiom. Default `"XY"` (no remap) preserves legacy behaviour.
  */
 export function grid(
   nx: number,
   ny: number,
   dx: number,
-  dy?: number
+  dy?: number,
+  opts: { plane?: "XY" | "YZ" | "XZ" } = {}
 ): Placement[] {
   if (nx < 1 || ny < 1) throw new Error(`grid: nx and ny must be >= 1`);
   const spacingY = dy ?? dx;
@@ -220,7 +238,10 @@ export function grid(
       });
     }
   }
-  return markGenerated(placements);
+  const marked = markGenerated(placements);
+  return opts.plane && opts.plane !== "XY"
+    ? markGenerated(onPlane(marked, opts.plane))
+    : marked;
 }
 
 /**
@@ -362,11 +383,16 @@ export function rectOnPlane(opts: {
  * @param opts.centered When true, offsets every placement by `-((n-1)/2)*step`
  *   so the pattern is symmetric about the origin. Default `false` so existing
  *   callers are unaffected.
+ * @param opts.plane Optional principal plane remap: `"XY" | "YZ" | "XZ"`.
+ *   When set, placements are piped through {@link onPlane} after generation
+ *   so the run lives on a wall (YZ/XZ). Default `"XY"` (no remap) preserves
+ *   legacy behaviour — note that step vectors with a non-zero Z component
+ *   are still produced as usual; `plane` only remaps the final coordinates.
  */
 export function linear(
   n: number,
   step: Point3,
-  opts: { centered?: boolean } = {}
+  opts: { centered?: boolean; plane?: "XY" | "YZ" | "XZ" } = {}
 ): Placement[] {
   if (n < 1) throw new Error(`linear: n must be >= 1, got ${n}`);
   // Centering offset: shifts every placement by `-((n-1)/2)*step` so indices
@@ -386,7 +412,10 @@ export function linear(
       translate: [norm(step[0] * k), norm(step[1] * k), norm(step[2] * k)],
     });
   }
-  return markGenerated(placements);
+  const marked = markGenerated(placements);
+  return opts.plane && opts.plane !== "XY"
+    ? markGenerated(onPlane(marked, opts.plane))
+    : marked;
 }
 
 /**
