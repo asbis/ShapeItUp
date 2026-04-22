@@ -169,6 +169,54 @@ export function scanImportBindings(source: string): ImportBinding[] {
 }
 
 /**
+ * Return true when any of the entry file's directly-imported local modules
+ * declares `export const params = {...}`. Used to suppress the "Entry
+ * file's params does not declare [...]" warning when the extra runtime keys
+ * came from an imported factory module — esbuild merges scopes across
+ * inlined sibling imports, so a factory's own params appear in the
+ * combined `result.params` object even though the entry file never claimed
+ * them as sliders.
+ *
+ * Only first-hop imports are scanned. The reported false positive fires
+ * exactly at first-hop (entry imports `foo.shape.ts` which exports
+ * `params`); deeper transitives don't go through the same scope merge.
+ * Best-effort: returns false on any filesystem error rather than lying.
+ *
+ * Exported for unit testing.
+ */
+export function anyLocalImportExportsParams(
+  sourceCode: string,
+  entryAbsPath: string,
+): boolean {
+  const entryDir = dirname(entryAbsPath);
+  const re = /\bfrom\s+['"](\.[^'"]+)['"]/g;
+  const tried = new Set<string>();
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(sourceCode)) !== null) {
+    const spec = m[1];
+    // Try the specifier as-given, then with common .ts / .shape.ts
+    // extensions. esbuild's resolve is broader than this (package.json main
+    // fields, index files), but local `.shape.ts` projects overwhelmingly
+    // use the flat "`./foo.shape`" or "`./foo`" form — covering those two
+    // extensions plus bare catches the false positive without fighting the
+    // resolver.
+    const candidates = [spec, `${spec}.ts`, `${spec}.shape.ts`];
+    for (const cand of candidates) {
+      const abs = isAbsolute(cand) ? cand : resolve(entryDir, cand);
+      if (tried.has(abs)) continue;
+      tried.add(abs);
+      try {
+        const content = readFileSync(abs, "utf-8");
+        if (/\bexport\s+const\s+params\s*=/.test(content)) return true;
+      } catch {
+        // File doesn't exist at this candidate extension — try next.
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * Walk an esbuild metafile.inputs graph starting at `entryKey` (the metafile
  * key for the wrapper / entry), chasing `imports[].path` recursively so that
  * TRANSITIVE dependencies land in the returned set along with direct ones.
@@ -1258,8 +1306,25 @@ export async function executeShapeFile(
     const declaredSet = new Set(status.declaredParams ?? []);
     const runtimeKeys = Object.keys(currentParams);
     const extraKeys = runtimeKeys.filter((k) => !declaredSet.has(k));
-    const importedParamsWarning =
+    // Suppress the warning when a directly-imported local module also
+    // declares `export const params`. esbuild inlines sibling modules into
+    // the merged scope; the imported module's keys appear in the runtime
+    // `result.params` object even though the entry file never listed them.
+    // The warning existed to flag "you forgot to declare a slider", but
+    // when the extras match the shape of an imported factory's own params
+    // it's almost certainly a false positive — the user is using a factory
+    // helper whose params travel with it for typing, not for slider
+    // binding. Every false positive here erodes trust in the whole
+    // warning channel (top P1 from knitting-printer v7 feedback), so we
+    // prefer suppressing a rare legitimate case to shipping the routine
+    // noise. A proper AST-level fix that only merges params from DEFAULT-
+    // exported-main consumers is tracked separately.
+    const hasImportedParamsCollision =
       entryHasParamsDeclaration && extraKeys.length > 0
+        ? anyLocalImportExportsParams(code, absPath)
+        : false;
+    const importedParamsWarning =
+      entryHasParamsDeclaration && extraKeys.length > 0 && !hasImportedParamsCollision
         ? `Entry file's 'export const params' does not declare [${extraKeys.join(", ")}]. Imported module's params are being merged into the slider set — consumers (tune_params UI, render status) may show keys that edits to this file cannot change.`
         : undefined;
 

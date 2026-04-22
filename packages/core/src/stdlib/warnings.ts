@@ -213,7 +213,7 @@ export function getPredictedExtrudeBbox(
 // the warning when the predicted interval is still substantially inside the
 // final bbox. If the user translated the part out of the predicted region, the
 // hint is silently discarded.
-interface PendingExtrudeHint {
+export interface PendingExtrudeHint {
   plane: string;
   length: number;
   predicted: { axis: "x" | "y" | "z"; lo: number; hi: number };
@@ -227,6 +227,24 @@ interface PendingExtrudeHint {
    * lying about the predicted interval — see that function's body.
    */
   originOffset?: number | [number, number, number];
+  /**
+   * Cumulative post-extrude translate applied to the solid this hint tracks.
+   * Populated by {@link shiftPendingExtrudeHint} whenever the instrumentation
+   * sees a `.translate` / `.translateX` / `.translateY` / `.translateZ` on a
+   * shape that was produced by this extrude (tracked via a WeakMap in
+   * instrumentation.ts). Summed into the axis shift at drain time so the
+   * canonical "center on origin" idiom —
+   *
+   *     drawX().sketchOnPlane("YZ").extrude(L).translate(-L/2, 0, 0)
+   *
+   * — shifts the predicted interval from [0, L] to [-L/2, L/2]. The existing
+   * center-near-zero check in {@link drainExtrudeHints} then suppresses the
+   * warning. Without this, the drain's overlap heuristic can't tell a
+   * centered extrude from a still-off-origin one whenever the extruded
+   * part is fused into a larger solid whose bbox covers the predicted
+   * interval for unrelated reasons (a top P1 from knitting-printer v7).
+   */
+  postTranslate?: [number, number, number];
 }
 
 const pendingExtrudeHints: PendingExtrudeHint[] = [];
@@ -247,9 +265,9 @@ export function enqueueExtrudeHint(
   plane: string,
   length: number,
   originOffset?: unknown,
-): void {
+): PendingExtrudeHint | null {
   const predicted = getPredictedExtrudeBbox(plane, length);
-  if (!predicted) return;
+  if (!predicted) return null;
 
   // Decode the `sketchOnPlane` origin arg into something we can reason about.
   //   undefined             → no shift (sketch is on the plane through origin)
@@ -281,7 +299,7 @@ export function enqueueExtrudeHint(
     ];
   } else {
     // Opaque Plane object or otherwise undecodable — stay silent.
-    return;
+    return null;
   }
 
   const stack = new Error().stack ?? "";
@@ -301,13 +319,42 @@ export function enqueueExtrudeHint(
     .filter((line) => !/[\\/]stdlib[\\/]warnings\.(ts|js)/.test(line))
     .join("\n");
   const origin = /[\\/]stdlib[\\/]/.test(stackWithoutSelf) ? "stdlib" : "user";
-  pendingExtrudeHints.push({
+  const hint: PendingExtrudeHint = {
     plane,
     length,
     predicted,
     origin,
     originOffset: normalizedOffset,
-  });
+  };
+  pendingExtrudeHints.push(hint);
+  return hint;
+}
+
+/**
+ * Record a post-extrude translate against a pending hint. Called from
+ * instrumentation's `.translate` / `.translateX` / `.translateY` / `.translateZ`
+ * post-hook when the receiver was produced (directly or via shape3d) by an
+ * extrude that enqueued a hint. Accumulates per-axis deltas into
+ * {@link PendingExtrudeHint.postTranslate}; {@link drainExtrudeHints} folds
+ * the total into the predicted-interval shift so the canonical centered-
+ * translate idiom suppresses the warning.
+ *
+ * Non-finite components are ignored. Calling this with all-zeros is a
+ * harmless no-op (zero shift leaves the interval unchanged).
+ */
+export function shiftPendingExtrudeHint(
+  hint: PendingExtrudeHint,
+  dx: number,
+  dy: number,
+  dz: number,
+): void {
+  const safe = (n: number): number => (Number.isFinite(n) ? n : 0);
+  const sx = safe(dx);
+  const sy = safe(dy);
+  const sz = safe(dz);
+  if (sx === 0 && sy === 0 && sz === 0) return;
+  const current = hint.postTranslate ?? [0, 0, 0];
+  hint.postTranslate = [current[0] + sx, current[1] + sy, current[2] + sz];
 }
 
 /**
@@ -382,13 +429,19 @@ export function drainExtrudeHints(
     if (hint.origin === "stdlib") continue;
     const { axis, lo: baseLo, hi: baseHi } = hint.predicted;
 
-    // Shift the predicted interval by the sketchOnPlane origin offset.
-    // `sketchOnPlane("YZ", -T/2).extrude(T)` was previously warning about
-    // X ∈ [0, T] (the pre-translate interval) even though the finished shape
-    // actually sits at X ∈ [-T/2, T/2] — a centered slab, no footgun. The
-    // shifted predicted interval reflects where the extrude will ACTUALLY land
-    // on the plane's normal axis.
-    const shift = normalAxisShift(axis, hint.originOffset);
+    // Shift the predicted interval by the sketchOnPlane origin offset PLUS
+    // any post-extrude translate the instrumentation observed on the resulting
+    // shape (tracked via WeakMap in instrumentation.ts and accumulated by
+    // `shiftPendingExtrudeHint`). Origin offset handles
+    // `sketchOnPlane("YZ", -T/2).extrude(T)` (interval already centered at
+    // sketch time); post-translate handles `.extrude(T).translate(-T/2, 0, 0)`
+    // (interval centered after the fact — a P1 false positive from
+    // knitting-printer v7). Both produce the same centered-on-origin final
+    // placement; the drain treats them identically by summing both shifts.
+    const axisIdx = axis === "x" ? 0 : axis === "y" ? 1 : 2;
+    const originShift = normalAxisShift(axis, hint.originOffset);
+    const translateShift = hint.postTranslate ? hint.postTranslate[axisIdx] : 0;
+    const shift = originShift + translateShift;
     const lo = baseLo + shift;
     const hi = baseHi + shift;
     const width = hi - lo;

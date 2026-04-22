@@ -15,6 +15,7 @@ import {
   populateMeshCache,
   readSourceForCacheKey,
   scanImportBindings,
+  anyLocalImportExportsParams,
   collectBundleInputsRecursive,
   type EngineStatus,
   type BundleCacheEntry,
@@ -1579,6 +1580,106 @@ describe("executeShapeFile — importedParamsWarning (Fix 2)", () => {
     },
     60_000,
   );
+
+  it(
+    "no warning when entry declares params AND imports a factory module that also exports params (P1.2 mitigation)",
+    async () => {
+      // The knitting-printer v7 false positive: entry declares its own
+      // params, but because esbuild inlines the imported factory's module
+      // scope, the runtime params object includes the factory's params
+      // keys too. Pre-fix we warned "entry doesn't declare [lenX]" even
+      // though the code is correct. The mitigation detects the imported-
+      // params declaration and suppresses the warning.
+      const workdir = mkdtempSync(join(tmpdir(), "siu-ipw-factory-"));
+      const storage = mkdtempSync(join(tmpdir(), "siu-ipw-factory-storage-"));
+      try {
+        writeFileSync(
+          join(workdir, "cam-plate.shape.ts"),
+          [
+            `import { drawRectangle } from "replicad";`,
+            `export const params = { lenX: 40 };`,
+            `export function makeCamPlate(p: typeof params) {`,
+            `  return drawRectangle(p.lenX, 10).sketchOnPlane("XY").extrude(2);`,
+            `}`,
+          ].join("\n"),
+        );
+        const entryPath = join(workdir, "carriage.shape.ts");
+        writeFileSync(
+          entryPath,
+          [
+            `import { makeCamPlate } from "./cam-plate.shape";`,
+            `export const params = { camPlateLenX: 40 };`,
+            `export default function main({ camPlateLenX }: typeof params) {`,
+            `  return makeCamPlate({ lenX: camPlateLenX });`,
+            `}`,
+          ].join("\n"),
+        );
+        const { status } = await executeShapeFile(entryPath, storage);
+        expect(status.success).toBe(true);
+        expect(status.importedParamsWarning).toBeUndefined();
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+});
+
+describe("anyLocalImportExportsParams — unit tests", () => {
+  it("returns true when a directly-imported .shape.ts exports params", () => {
+    const dir = mkdtempSync(join(tmpdir(), "siu-aliep-hit-"));
+    try {
+      writeFileSync(
+        join(dir, "cam-plate.shape.ts"),
+        `export const params = { lenX: 40 };\nexport function makeCamPlate() {}\n`,
+      );
+      const entryPath = join(dir, "carriage.shape.ts");
+      const src = `import { makeCamPlate } from "./cam-plate.shape";\n`;
+      expect(anyLocalImportExportsParams(src, entryPath)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns false when imported module has no params declaration", () => {
+    const dir = mkdtempSync(join(tmpdir(), "siu-aliep-miss-"));
+    try {
+      writeFileSync(
+        join(dir, "helper.shape.ts"),
+        `export function makeHelper() {}\n`,
+      );
+      const entryPath = join(dir, "entry.shape.ts");
+      const src = `import { makeHelper } from "./helper.shape";\n`;
+      expect(anyLocalImportExportsParams(src, entryPath)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns false when the file has no local imports", () => {
+    const dir = mkdtempSync(join(tmpdir(), "siu-aliep-none-"));
+    try {
+      const entryPath = join(dir, "entry.shape.ts");
+      const src = `import { drawRectangle } from "replicad";\nexport default function main() {}\n`;
+      expect(anyLocalImportExportsParams(src, entryPath)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("returns false when the imported file doesn't exist (best-effort, no throw)", () => {
+    // Stat failure on the candidate paths must NOT throw; we'd rather leave
+    // the warning in place for a genuinely-missing file than crash.
+    const dir = mkdtempSync(join(tmpdir(), "siu-aliep-missing-"));
+    try {
+      const entryPath = join(dir, "entry.shape.ts");
+      const src = `import { something } from "./does-not-exist";\n`;
+      expect(anyLocalImportExportsParams(src, entryPath)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

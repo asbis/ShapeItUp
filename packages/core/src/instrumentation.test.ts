@@ -1112,6 +1112,172 @@ describe("extrude hints — dedup and origin shift", () => {
 });
 
 // ---------------------------------------------------------------------------
+// P1.3 — post-extrude translate tracking.
+//
+// Canonical false positive from knitting-printer v7:
+//
+//   const hook = shape3d(
+//     profile.sketchOnPlane("YZ").extrude(T),
+//   ).translate(-T / 2, 0, 0);
+//
+// The extrude enqueues a hint predicting X ∈ [0, T]. The user then
+// .translate(-T/2, 0, 0)s the slab so it actually sits at X ∈ [-T/2, T/2] —
+// centered. Without post-translate tracking, the drain's 50%-overlap check
+// against the FINAL part's X bbox (which often covers [0, T] for unrelated
+// reasons, e.g. the hook is fused into a larger needle) still fires, even
+// though the user's centered the extrude. The fix: post-hooks on
+// translate/translateX/Y/Z accumulate the delta into the hint's
+// `postTranslate`, which the drain folds into the shift. The existing
+// center-near-zero check then suppresses the warning.
+// ---------------------------------------------------------------------------
+describe("extrude hints — post-translate tracking (P1.3)", () => {
+  beforeEach(() => {
+    beginInstrumentation();
+    resetRuntimeWarnings();
+  });
+
+  function makeFullPipelineExports() {
+    // Sketch.extrude returns a Solid; Solid.translate / translateX/Y/Z
+    // return a NEW Solid (matching replicad's destructive-transform
+    // contract). The instrumentation walks the new Solid's prototype via
+    // the same wrapper it applied originally — as long as the new object
+    // is an instance of Solid, the translate hook fires on further calls.
+    function Solid(this: any) {}
+    (Solid as any).prototype.translate = function (
+      this: any,
+      _x: any,
+      _y?: any,
+      _z?: any,
+    ): any {
+      return new (Solid as any)();
+    };
+    (Solid as any).prototype.translateX = function (this: any, _d: any): any {
+      return new (Solid as any)();
+    };
+    (Solid as any).prototype.translateY = function (this: any, _d: any): any {
+      return new (Solid as any)();
+    };
+    (Solid as any).prototype.translateZ = function (this: any, _d: any): any {
+      return new (Solid as any)();
+    };
+    function Sketch(this: any) {}
+    (Sketch as any).prototype.extrude = function (
+      this: any,
+      _len: number,
+    ): any {
+      return new (Solid as any)();
+    };
+    Object.defineProperty((Sketch as any).prototype, "blueprint", {
+      get() {
+        return { boundingBox: { width: 10, height: 10 } };
+      },
+    });
+    function Drawing(this: any) {}
+    (Drawing as any).prototype.sketchOnPlane = function (
+      this: any,
+      _plane: any,
+      _origin?: any,
+    ): any {
+      return new (Sketch as any)();
+    };
+    return { Drawing, Sketch, Solid } as any;
+  }
+
+  it("YZ.extrude(T).translate(-T/2, 0, 0) suppresses the warning (centered)", () => {
+    const exports: any = makeFullPipelineExports();
+    instrumentReplicadExports(exports);
+    const T = 4;
+    const d = new exports.Drawing();
+    // The feedback's exact idiom, minus shape3d (identity function — doesn't
+    // alter the WeakMap binding).
+    d.sketchOnPlane("YZ").extrude(T).translate(-T / 2, 0, 0);
+    // Final bbox covers both the pre-translate [0, T] region AND the
+    // post-translate [-T/2, T/2] region — a realistic case where the
+    // extrude got fused into a larger part. Without post-translate
+    // tracking, the 50%-overlap check fires a false positive here.
+    const finalBboxes = [
+      { min: [-20, -10, -10] as [number, number, number], max: [20, 10, 10] as [number, number, number] },
+    ];
+    const msgs = drainExtrudeHints(finalBboxes);
+    expect(msgs.length).toBe(0);
+  });
+
+  it("extrude WITHOUT a centering translate still fires the hint", () => {
+    // Regression guard: the post-translate tracking mustn't accidentally
+    // silence the original case the hint exists for.
+    const exports: any = makeFullPipelineExports();
+    instrumentReplicadExports(exports);
+    const d = new exports.Drawing();
+    d.sketchOnPlane("YZ").extrude(4);
+    const finalBboxes = [
+      { min: [0, -5, -5] as [number, number, number], max: [4, 5, 5] as [number, number, number] },
+    ];
+    const msgs = drainExtrudeHints(finalBboxes);
+    expect(msgs.length).toBe(1);
+  });
+
+  it("extrude + translate by a NON-centering amount leaves the hint in place", () => {
+    // Only a translate that actually centers the slab near zero should
+    // suppress — a small nudge of 1mm doesn't.
+    const exports: any = makeFullPipelineExports();
+    instrumentReplicadExports(exports);
+    const d = new exports.Drawing();
+    d.sketchOnPlane("YZ").extrude(4).translate(1, 0, 0);
+    const finalBboxes = [
+      { min: [1, -5, -5] as [number, number, number], max: [5, 5, 5] as [number, number, number] },
+    ];
+    const msgs = drainExtrudeHints(finalBboxes);
+    expect(msgs.length).toBe(1);
+  });
+
+  it("translateX alone also suppresses the warning on the matching axis", () => {
+    // The instrumented Solid exposes translateX/Y/Z as separate methods;
+    // each post-hook should shift only its axis. Test the same centering
+    // with translateX on YZ (normal=X).
+    const exports: any = makeFullPipelineExports();
+    instrumentReplicadExports(exports);
+    const T = 6;
+    const d = new exports.Drawing();
+    d.sketchOnPlane("YZ").extrude(T).translateX(-T / 2);
+    const finalBboxes = [
+      { min: [-20, -10, -10] as [number, number, number], max: [20, 10, 10] as [number, number, number] },
+    ];
+    const msgs = drainExtrudeHints(finalBboxes);
+    expect(msgs.length).toBe(0);
+  });
+
+  it("translateY on a YZ-plane extrude does NOT suppress (wrong axis)", () => {
+    // translate delta must be on the plane's NORMAL axis to count. For YZ
+    // (normal X), a translateY contributes 0 on X — hint should remain.
+    const exports: any = makeFullPipelineExports();
+    instrumentReplicadExports(exports);
+    const d = new exports.Drawing();
+    d.sketchOnPlane("YZ").extrude(4).translateY(-2);
+    const finalBboxes = [
+      { min: [0, -5, -5] as [number, number, number], max: [4, 5, 5] as [number, number, number] },
+    ];
+    const msgs = drainExtrudeHints(finalBboxes);
+    expect(msgs.length).toBe(1);
+  });
+
+  it("chained translates accumulate — two shifts summing to -L/2 still suppress", () => {
+    // User might write `.translate(-T/4, 0, 0).translate(-T/4, 0, 0)` in
+    // factored helpers. The post-translate field accumulates across calls
+    // via the re-binding of PENDING_HINT_BY_SHAPE onto each new result.
+    const exports: any = makeFullPipelineExports();
+    instrumentReplicadExports(exports);
+    const T = 8;
+    const d = new exports.Drawing();
+    d.sketchOnPlane("YZ").extrude(T).translate(-T / 4, 0, 0).translate(-T / 4, 0, 0);
+    const finalBboxes = [
+      { min: [-20, -10, -10] as [number, number, number], max: [20, 10, 10] as [number, number, number] },
+    ];
+    const msgs = drainExtrudeHints(finalBboxes);
+    expect(msgs.length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // BRepCheck → geometryValid pipeline (Bug #4)
 // ---------------------------------------------------------------------------
 

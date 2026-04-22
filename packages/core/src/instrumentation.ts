@@ -2,7 +2,9 @@ import { assertPositiveFinite } from "./stdlib/standards";
 import {
   claimNonXYPlaneHint,
   enqueueExtrudeHint,
+  shiftPendingExtrudeHint,
   pushRuntimeWarning,
+  type PendingExtrudeHint,
 } from "./stdlib/warnings";
 
 /**
@@ -41,6 +43,27 @@ interface SketchPlaneInfo {
   explicitlyOffset?: boolean;
 }
 const SKETCH_PLANE: WeakMap<object, SketchPlaneInfo> = new WeakMap();
+
+/**
+ * Binds a 3D shape to the pending extrude hint its ancestor extrude
+ * enqueued. Populated by the extrude post-hook; transferred by the
+ * translate/translateX/Y/Z post-hooks (Replicad transforms are destructive —
+ * each returns a new Solid, so we re-bind the new result). Used by the
+ * translate post-hooks to call `shiftPendingExtrudeHint` so the hint's
+ * predicted interval tracks the shape's actual world position on the plane's
+ * normal axis. The drain's center-near-zero check then suppresses the
+ * warning when the user has translated the extrude to straddle the origin
+ * — the canonical `.extrude(L).translate(-L/2, 0, 0)` idiom (P1.3 false
+ * positive from the knitting-printer v7 feedback).
+ *
+ * Bindings naturally dissolve on destructive booleans (fuse/cut return a
+ * new shape not tracked in the map, which is the right call: once the
+ * extrude is fused into a bigger solid the hint's "where is my slab" claim
+ * stops meaning anything). Rotate/scale are not tracked — they'd require
+ * re-computing the predicted axis, which is not worth the complexity for a
+ * deferred-hint suppression signal.
+ */
+const PENDING_HINT_BY_SHAPE: WeakMap<object, PendingExtrudeHint> = new WeakMap();
 
 /**
  * Drawings produced by coordinate-centered primitives (`drawRectangle`,
@@ -479,6 +502,106 @@ const PROTO_VALIDATORS: Record<string, (self: any, ...args: any[]) => void> = ((
  * validator pipeline; introduce a richer API only if a second use case
  * appears.
  */
+/**
+ * Extract a per-axis translate delta from the various argument shapes
+ * `.translate()` accepts on 3D shapes. Mirrors the forms `validateTranslateArgs`
+ * knows about:
+ *
+ *   translate(x, y, z)       → three numbers
+ *   translate([x, y, z])     → number tuple
+ *   translate({ x, y, z })   → point object (all keys optional)
+ *
+ * Anything we can't decode returns null — the post-hook then leaves the
+ * pending hint's `postTranslate` field untouched rather than risk shifting
+ * by a wrong delta. Non-finite components in an otherwise-valid shape get
+ * dropped to 0 (the same policy as `shiftPendingExtrudeHint`), so a partial
+ * translate still contributes whatever axes DID decode.
+ */
+function decodeTranslateArgs(
+  args: any[],
+): [number, number, number] | null {
+  if (args.length === 0) return null;
+  const first = args[0];
+  if (typeof first === "number") {
+    return [
+      Number.isFinite(first) ? first : 0,
+      typeof args[1] === "number" && Number.isFinite(args[1]) ? args[1] : 0,
+      typeof args[2] === "number" && Number.isFinite(args[2]) ? args[2] : 0,
+    ];
+  }
+  if (Array.isArray(first) && first.length === 3) {
+    return [
+      typeof first[0] === "number" && Number.isFinite(first[0]) ? first[0] : 0,
+      typeof first[1] === "number" && Number.isFinite(first[1]) ? first[1] : 0,
+      typeof first[2] === "number" && Number.isFinite(first[2]) ? first[2] : 0,
+    ];
+  }
+  if (first !== null && typeof first === "object") {
+    const obj = first as Record<string, unknown>;
+    const x = typeof obj.x === "number" && Number.isFinite(obj.x) ? obj.x : 0;
+    const y = typeof obj.y === "number" && Number.isFinite(obj.y) ? obj.y : 0;
+    const z = typeof obj.z === "number" && Number.isFinite(obj.z) ? obj.z : 0;
+    return [x, y, z];
+  }
+  return null;
+}
+
+/**
+ * Extrude post-hook — enqueue the deferred bbox-off-origin hint for this
+ * extrude and bind the resulting Solid into PENDING_HINT_BY_SHAPE so later
+ * translate post-hooks can shift the predicted interval. Runs only when the
+ * Sketch was recorded as coming from a non-XY `sketchOnPlane` with a
+ * decodable origin (matching the pre-move behavior of validateSketchExtrude).
+ */
+function extrudePostHook(self: any, result: any, distance: unknown): void {
+  if (!result || typeof result !== "object") return;
+  const info =
+    typeof self === "object" && self !== null ? SKETCH_PLANE.get(self) : undefined;
+  if (!info || typeof info.plane !== "string") return;
+  if (info.origin === "opaque") {
+    // User passed a Plane object whose true origin we can't decode
+    // statically. Conservatively skip the hint rather than fabricate a
+    // predicted interval.
+    return;
+  }
+  if (info.explicitlyOffset) {
+    // User passed an affirmative origin offset to sketchOnPlane — they're
+    // telling us they know where this slab lands. Skip the nudge.
+    return;
+  }
+  if (typeof distance !== "number" || !Number.isFinite(distance) || distance === 0) {
+    // Defensive: the validator will already have thrown in this case, but
+    // keep the post-hook robust in the unlikely event it runs with bad input.
+    return;
+  }
+  const hint = enqueueExtrudeHint(info.plane, distance, info.origin);
+  if (hint) PENDING_HINT_BY_SHAPE.set(result, hint);
+}
+
+/**
+ * Shared body of the translate family's post-hooks. When the receiver was
+ * produced by a tracked extrude (or propagated through a prior translate),
+ * shift the hint's cumulative post-translate by the per-axis deltas and
+ * re-bind the new result into PENDING_HINT_BY_SHAPE. Replicad's translates
+ * are destructive and return a new Solid, so without the re-bind a SECOND
+ * translate on the same chain wouldn't find the hint.
+ */
+function translatePostHook(
+  self: any,
+  result: any,
+  dx: number,
+  dy: number,
+  dz: number,
+): void {
+  if (!self || typeof self !== "object") return;
+  const hint = PENDING_HINT_BY_SHAPE.get(self);
+  if (!hint) return;
+  shiftPendingExtrudeHint(hint, dx, dy, dz);
+  if (result && typeof result === "object" && result !== self) {
+    PENDING_HINT_BY_SHAPE.set(result, hint);
+  }
+}
+
 const PROTO_POST_HOOKS_RAW: Record<
   string,
   (self: any, result: any, ...args: any[]) => void
@@ -494,6 +617,32 @@ const PROTO_POST_HOOKS_RAW: Record<
   drawCircle: (_self: any, result: any) => tagCenteredDrawing(result),
   drawEllipse: (_self: any, result: any) => tagCenteredDrawing(result),
   drawPolysides: (_self: any, result: any) => tagCenteredDrawing(result),
+  // Sketch.extrude post-hook: enqueue the bbox-off-origin hint for this
+  // extrude and bind the resulting Solid so downstream translate calls can
+  // shift the predicted interval. Moved out of the pre-hook validator so
+  // we have access to the returned Solid identity.
+  extrude: (self: any, result: any, distance: unknown) =>
+    extrudePostHook(self, result, distance),
+  // Translate family — shift the pending hint by the translate delta (if
+  // this shape is linked to one) and transfer the WeakMap binding to the
+  // new result (replicad translates are destructive).
+  translate: (self: any, result: any, ...args: any[]) => {
+    const d = decodeTranslateArgs(args);
+    if (!d) return;
+    translatePostHook(self, result, d[0], d[1], d[2]);
+  },
+  translateX: (self: any, result: any, d: unknown) => {
+    if (typeof d !== "number" || !Number.isFinite(d)) return;
+    translatePostHook(self, result, d, 0, 0);
+  },
+  translateY: (self: any, result: any, d: unknown) => {
+    if (typeof d !== "number" || !Number.isFinite(d)) return;
+    translatePostHook(self, result, 0, d, 0);
+  },
+  translateZ: (self: any, result: any, d: unknown) => {
+    if (typeof d !== "number" || !Number.isFinite(d)) return;
+    translatePostHook(self, result, 0, 0, d);
+  },
   // Pen-axis Drawing methods — tag both the receiver and the returned
   // Drawing so the pen-state flag propagates across chained returns. These
   // are the methods that make the "sketchOnPlane(non-XY) → pen axes map
@@ -575,6 +724,8 @@ const PROTO_POST_HOOKS: Record<
     let classes: string[];
     if (method === "sketchOnPlane") {
       classes = DRAWING_CLASSES;
+    } else if (method === "extrude") {
+      classes = SKETCH_CLASSES;
     } else if (PEN_AXIS_METHODS.has(method)) {
       classes = PEN_AXIS_CLASSES;
     } else {
@@ -860,34 +1011,12 @@ function validateSketchExtrude(self: any, distance: unknown): void {
       `extrude: distance must be a finite non-zero number, got ${String(distance)} (${typeof distance}).`,
     );
   }
-  // Issue #1: if this Sketch came from a non-XY `sketchOnPlane`, the extrude
-  // will grow into the plane's signed normal — "XZ" produces a slab with
-  // Y ∈ [-L, 0], not the centered Y ∈ [-L/2, L/2] most users expect.
-  // Historically we emitted the hint synchronously here, but that fired even
-  // when the user then .translate()'d the part into +Y space, turning a useful
-  // heads-up into noise. We now enqueue the predicted interval and let core's
-  // drain step cross-check it against the FINAL part bboxes — the hint only
-  // survives if the problem region is actually still covered by the finished
-  // geometry. See `drainExtrudeHints` in stdlib/warnings.ts for the criterion.
-  const info = typeof self === "object" && self !== null ? SKETCH_PLANE.get(self) : undefined;
-  if (info && typeof info.plane === "string") {
-    if (info.origin === "opaque") {
-      // User passed a Plane object whose true origin we can't decode
-      // statically. Conservatively skip the hint rather than fabricate a
-      // predicted interval — the warning panel stays silent on a case we
-      // can't verify, which beats a false positive.
-    } else if (info.explicitlyOffset) {
-      // Skip the "bbox off-origin" hint when the user passed a non-trivial
-      // origin offset to sketchOnPlane — passing any non-zero origin is the
-      // affirmative opt-in that says "I know where this slab will land."
-      // Firing the warning anyway is the #1 signal-to-noise complaint.
-    } else {
-      // undefined (no 2nd arg), scalar offset, or [x,y,z] tuple — all three
-      // are decodable by `enqueueExtrudeHint` which will shift the predicted
-      // interval along the plane's normal accordingly.
-      enqueueExtrudeHint(info.plane, distance, info.origin);
-    }
-  }
+  // Issue #1's hint — predicted bbox when sketching on a non-XY plane — is
+  // enqueued by the extrude POST-hook (see `extrudePostHook` below), not
+  // here. The post-hook has access to the resulting Solid and can bind it
+  // into PENDING_HINT_BY_SHAPE so downstream translate calls can shift the
+  // predicted interval. This validator focuses purely on pre-OCCT arg
+  // guards; the sketch-plane decoding happens once, at the post-hook site.
   try {
     const bp = self?.blueprint;
     if (!bp) return;
