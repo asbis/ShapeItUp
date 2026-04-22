@@ -6,6 +6,7 @@ import { execSync } from "child_process";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const watch = process.argv.includes("--watch");
+const mcpOnly = process.argv.includes("--mcp-only");
 
 // Read the mcp-server package.json version at build time so the value baked
 // into the bundle always matches what npm publishes. Avoids a stale hardcoded
@@ -281,30 +282,27 @@ function copySkillFiles() {
 }
 
 async function build() {
-  copyWasmFiles();
-  copySkillFiles();
-  copyExtensionTypings();
-  copyTypingsToMcpServer();
+  // In --mcp-only mode we skip the WASM + typings copies (extension-side
+  // assets that don't affect the mcp-server bundle) and only rebuild the two
+  // mcp-server configs. Keeps `pnpm dev:mcp` fast when iterating on the server.
+  if (!mcpOnly) {
+    copyWasmFiles();
+    copySkillFiles();
+    copyExtensionTypings();
+    copyTypingsToMcpServer();
+  }
+
+  const configs = mcpOnly
+    ? [mcpServerConfig, mcpServerExtConfig]
+    : [extensionConfig, viewerConfig, workerConfig, mcpServerConfig, mcpServerExtConfig];
 
   if (watch) {
-    const contexts = await Promise.all([
-      esbuild.context(extensionConfig),
-      esbuild.context(viewerConfig),
-      esbuild.context(workerConfig),
-      esbuild.context(mcpServerConfig),
-      esbuild.context(mcpServerExtConfig),
-    ]);
+    const contexts = await Promise.all(configs.map((c) => esbuild.context(c)));
     await Promise.all(contexts.map((ctx) => ctx.watch()));
-    console.log("Watching for changes...");
+    console.log(mcpOnly ? "Watching mcp-server for changes..." : "Watching for changes...");
   } else {
-    await Promise.all([
-      esbuild.build(extensionConfig),
-      esbuild.build(viewerConfig),
-      esbuild.build(workerConfig),
-      esbuild.build(mcpServerConfig),
-      esbuild.build(mcpServerExtConfig),
-    ]);
-    console.log("Build complete.");
+    await Promise.all(configs.map((c) => esbuild.build(c)));
+    console.log(mcpOnly ? "MCP server build complete." : "Build complete.");
   }
 }
 

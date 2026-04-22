@@ -5,11 +5,14 @@
   "description": "Scripted CAD for VSCode — TypeScript + Replicad + Three.js",
   "scripts": {
     "dev": "node esbuild.config.mjs --watch",
+    "dev:mcp": "node esbuild.config.mjs --watch --mcp-only",
     "build": "node esbuild.config.mjs",
+    "build:mcp": "node esbuild.config.mjs --mcp-only",
     "lint": "tsc -b packages/extension packages/mcp-server",
     "package": "pnpm build && cd packages/extension && vsce package --no-dependencies",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "release:check": "node scripts/release-check.mjs"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
