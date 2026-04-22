@@ -58,6 +58,14 @@ export interface BundleCacheEntry {
   entryPath: string;
   /** Absolute input path -> mtimeMs for every file esbuild pulled in. */
   inputMtimes: Record<string, number>;
+  /**
+   * Wall-clock (`Date.now()`) ms at which this cache entry was built.
+   * Used as the authoritative "is any dep newer than the cached bundle?"
+   * signal — catches the case where a transitive file's recorded mtime
+   * accidentally matches the on-disk stat but the file was edited again
+   * after caching. Compared via `stat.mtimeMs > builtAtMs` on every dep.
+   */
+  builtAtMs: number;
 }
 
 const MAX_BUNDLE_CACHE_SIZE = 32;
@@ -232,6 +240,20 @@ export function checkBundleCache(
   try {
     for (const [inputPath, recordedMtime] of Object.entries(entry.inputMtimes)) {
       const stat = statSync(inputPath);
+      // Primary, authoritative signal: if the dep file was modified AFTER
+      // the bundle was built, the cache is stale. This catches the
+      // transitive-edit bug where an edit to e.g. `constants.ts` arrives
+      // between cache storage and the next render — the recorded
+      // `inputMtimes` entry may happen to match the on-disk mtime (same
+      // filesystem tick) yet the content the bundle closed over is stale.
+      // Comparing against `builtAtMs` is independent of per-file mtime
+      // parity.
+      if (stat.mtimeMs > entry.builtAtMs) {
+        return `input mtime changed: ${inputPath}`;
+      }
+      // Fallback: per-file mtime drift against the recorded value. Keeps
+      // coverage for exotic cases (mtime rolled backwards, cache tampered
+      // with, etc.) that the `builtAtMs` check wouldn't flag.
       if (Math.abs(stat.mtimeMs - recordedMtime) > 1) {
         return `input mtime changed: ${inputPath}`;
       }
@@ -1125,6 +1147,10 @@ export async function executeShapeFile(
       entryContent: code,
       entryPath: absPath,
       inputMtimes,
+      // Record wall-clock build time so checkBundleCache can detect deps
+      // modified AFTER this bundle was produced, independent of whether the
+      // per-file recorded mtime happens to match on-disk stat.
+      builtAtMs: Date.now(),
     });
     } // end else (cache miss)
   } catch (e: any) {

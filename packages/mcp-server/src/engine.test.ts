@@ -470,6 +470,8 @@ describe("checkBundleCache — unit tests (no OCCT)", () => {
         entryContent: `import { makeThing } from "./dep.shape";`,
         entryPath: join(dir, "entry.shape.ts"),
         inputMtimes: { [depPath]: depMtime },
+        // Dep mtime is at-or-before this; cache should remain valid.
+        builtAtMs: depMtime + 1000,
       };
       const result = checkBundleCache(
         entry,
@@ -490,6 +492,7 @@ describe("checkBundleCache — unit tests (no OCCT)", () => {
         entryContent: "const old = 1;",
         entryPath: join(dir, "entry.shape.ts"),
         inputMtimes: {},
+        builtAtMs: Date.now(),
       };
       const result = checkBundleCache(entry, "const new_ = 2;", dir);
       expect(result).not.toBeNull();
@@ -511,10 +514,49 @@ describe("checkBundleCache — unit tests (no OCCT)", () => {
         entryContent: `import { makeThing } from "./dep.shape";`,
         entryPath: join(dir, "entry.shape.ts"),
         inputMtimes: { [depPath]: fakeMtime },
+        // builtAt also in the past so the on-disk (current) mtime exceeds
+        // it — both the builtAtMs and per-file drift checks should fire,
+        // either producing the same reason.
+        builtAtMs: fakeMtime,
       };
       const result = checkBundleCache(
         entry,
         `import { makeThing } from "./dep.shape";`,
+        dir,
+      );
+      expect(result).not.toBeNull();
+      expect(result).toMatch(/input mtime changed/);
+      expect(result).toContain(depPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("invalidates when a transitive dep is edited AFTER builtAtMs even if its recorded mtime matches on-disk", () => {
+    // Reproduces the external-tester "edits to constants.ts don't bust the
+    // cache" report. The per-file recorded mtime can accidentally match the
+    // fresh stat (e.g. same filesystem tick, or a consumer that probes the
+    // file and re-reads the same value), but the dep was actually edited
+    // after the bundle was produced — `builtAtMs` is the authoritative
+    // signal that catches this.
+    const dir = makeDir();
+    try {
+      const depPath = join(dir, "constants.ts");
+      writeFileSync(depPath, "export const W = 80;");
+      const depMtime = statSync(depPath).mtimeMs;
+      // Simulate: bundle was built BEFORE the latest edit to constants.ts.
+      // The recorded inputMtimes entry mirrors the current on-disk mtime
+      // (so the drift check would pass), but builtAtMs predates it.
+      const entry: BundleCacheEntry = {
+        js: "bundled",
+        entryContent: `import { W } from "./constants";`,
+        entryPath: join(dir, "entry.shape.ts"),
+        inputMtimes: { [depPath]: depMtime },
+        builtAtMs: depMtime - 5_000, // bundle produced 5s before latest edit
+      };
+      const result = checkBundleCache(
+        entry,
+        `import { W } from "./constants";`,
         dir,
       );
       expect(result).not.toBeNull();
@@ -535,6 +577,7 @@ describe("checkBundleCache — unit tests (no OCCT)", () => {
         entryContent: `export default function main() {}`,
         entryPath: join(dir, "entry.shape.ts"),
         inputMtimes: {},
+        builtAtMs: Date.now(),
       };
       // Live source now imports a new local file.
       const newSource = `import { helper } from "./newdep";\nexport default function main() {}`;
@@ -562,6 +605,7 @@ describe("checkBundleCache — unit tests (no OCCT)", () => {
         entryContent: liveCode,
         entryPath: join(dir, "entry.shape.ts"),
         inputMtimes: {}, // newdep NOT tracked
+        builtAtMs: Date.now(),
       };
       const result = checkBundleCache(entry, liveCode, dir);
       expect(result).not.toBeNull();
@@ -581,6 +625,7 @@ describe("checkBundleCache — unit tests (no OCCT)", () => {
         entryContent: source,
         entryPath: join(dir, "entry.shape.ts"),
         inputMtimes: {},
+        builtAtMs: Date.now(),
       };
       const result = checkBundleCache(entry, source, dir);
       // "replicad" is not local — should be a cache hit (null).
@@ -599,6 +644,7 @@ describe("checkBundleCache — unit tests (no OCCT)", () => {
         entryContent: `import { x } from "./missing.shape";`,
         entryPath: join(dir, "entry.shape.ts"),
         inputMtimes: { [missingPath]: Date.now() }, // recorded but file deleted
+        builtAtMs: Date.now(),
       };
       const result = checkBundleCache(entry, `import { x } from "./missing.shape";`, dir);
       expect(result).not.toBeNull();
