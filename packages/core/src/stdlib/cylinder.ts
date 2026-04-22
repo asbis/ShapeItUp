@@ -18,9 +18,14 @@ import { type Axis, normalizeAxis } from "./parts";
 import type { Point3 } from "./standards";
 
 export interface CylinderOpts {
-  /** Anchor at the BASE of the cylinder (the end the axis extends away from). Mutually exclusive with `top`. */
+  /** End-cap ANCHOR (not a midpoint): the center of the cylinder's bottom
+   *  face sits at this world position; body extends `length` along `direction`.
+   *  Mutually exclusive with `top`. */
   bottom?: Point3;
-  /** Anchor at the TOP of the cylinder (the end opposite the axis). Mutually exclusive with `bottom`. */
+  /** End-cap ANCHOR (not a midpoint): the center of the cylinder's top face
+   *  sits at this world position; body extends `length` OPPOSITE `direction`.
+   *  Mutually exclusive with `bottom`. Combining `top` with an explicit
+   *  `direction` throws — use `bottom` + `direction` for non-default axes. */
   top?: Point3;
   /** Axial length in mm. */
   length: number;
@@ -40,6 +45,19 @@ export function cylinder(opts: CylinderOpts): Shape3D {
   if (hasTop === hasBottom) {
     throw new Error(
       "cylinder: exactly one of { top, bottom } must be provided."
+    );
+  }
+  // `top` is already direction-relative: it names the end OPPOSITE `direction`.
+  // Combining `top` + explicit `direction` is ambiguous — "top at [0,0,0] with
+  // direction -Z" reads as "high-Z end at origin, body hangs down" but resolves
+  // to "body extends upward from origin" because of the direction-relative
+  // definition. Refuse the combination; for a downward-hanging cylinder, use
+  // `bottom` + `direction`.
+  if (hasTop && opts.direction !== undefined) {
+    throw new Error(
+      "cylinder: `top` + `direction` is ambiguous — `top` already names the end opposite `direction`. " +
+        "For a cylinder hanging from [0,0,0] downward, use `{ top: [0,0,0], length, diameter }` (default direction=+Z). " +
+        "To change the axis, use `{ bottom, length, diameter, direction }` (e.g. `{ bottom: [0,0,0], length, diameter, direction: '-Z' }`)."
     );
   }
   const direction = normalizeAxis(opts.direction ?? "+Z");

@@ -60,6 +60,14 @@ interface BundleCacheEntry {
   entryPath: string;
   /** Absolute input path -> mtimeMs for every file esbuild pulled in. */
   inputMtimes: Record<string, number>;
+  /**
+   * Wall-clock (Date.now()) at which this bundle was built. Any tracked input
+   * whose on-disk mtime exceeds this value is newer than the bundle, even if
+   * per-file mtime drift against `inputMtimes` happens to pass — catches the
+   * "edit arrived in the same filesystem tick" race that per-file parity
+   * misses. Mirrors the engine.ts cache invariant.
+   */
+  builtAtMs: number;
 }
 
 /**
@@ -924,6 +932,14 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     try {
       for (const [inputPath, recordedMtime] of Object.entries(entry.inputMtimes)) {
         const stat = fs.statSync(inputPath);
+        // Primary signal: any tracked input newer than the bundle build
+        // time is stale, regardless of per-file mtime parity. Catches the
+        // same-tick-edit race that bit users editing `constants.ts`
+        // between cache-store and next auto-preview (see engine.ts
+        // checkBundleCache for the canonical implementation).
+        if (stat.mtimeMs > entry.builtAtMs) {
+          return `input mtime changed: ${inputPath}`;
+        }
         if (Math.abs(stat.mtimeMs - recordedMtime) > 1) {
           return `input mtime changed: ${inputPath}`;
         }
@@ -1125,6 +1141,7 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           entryContent: code,
           entryPath: normalizedPath,
           inputMtimes,
+          builtAtMs: Date.now(),
         });
       }
 

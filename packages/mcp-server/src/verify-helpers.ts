@@ -712,6 +712,97 @@ const fmtNum = (n: number) => (Math.abs(n) >= 1000 ? n.toFixed(0) : n.toFixed(2)
 const pairWord = (n: number) => `${n} pair${n === 1 ? "" : "s"}`;
 
 /**
+ * Strip a trailing index suffix (`-0`, `-12`, `-a`) from a part name so
+ * `solenoid-0`, `solenoid-1`, …, `solenoid-19` collapse to `solenoid`.
+ */
+function stripIndexSuffix(name: string): string {
+  return name.replace(/-\d+$/, "").replace(/-[a-z]$/i, "");
+}
+
+function withinOnePercent(a: number, b: number): boolean {
+  const denom = Math.max(Math.abs(a), Math.abs(b), 0.001);
+  return Math.abs(a - b) / denom <= 0.01;
+}
+
+type SystematicGroup = {
+  prefix: string;
+  count: number;
+  volume: number;
+  depths: { x: number; y: number; z: number };
+  dominantAxis: "X" | "Y" | "Z";
+  dominantDepth: number;
+  memberIndices: number[];
+};
+
+/**
+ * Fold N≥3 pairs that share a common name prefix AND have identical
+ * (within 1%) overlap volume + per-axis depth into a single "systematic
+ * size/spacing mismatch" group. Matches the pre-pass in tools.ts
+ * `formatCollisionPairs`; kept local to this file to avoid a circular
+ * import (tools.ts already depends on verify-helpers.ts).
+ */
+function groupSystematicRecords(
+  real: CollisionRecord[],
+): { groups: SystematicGroup[]; groupedIndices: Set<number> } {
+  const groups: SystematicGroup[] = [];
+  const groupedIndices = new Set<number>();
+  if (real.length < 3) return { groups, groupedIndices };
+
+  for (let i = 0; i < real.length; i++) {
+    if (groupedIndices.has(i)) continue;
+    const seed = real[i];
+    if (!seed.region) continue;
+    const prefixA = stripIndexSuffix(seed.a);
+    const prefixB = stripIndexSuffix(seed.b);
+    if (prefixA !== prefixB) continue;
+    const prefix = prefixA;
+
+    const bucket: number[] = [i];
+    for (let j = i + 1; j < real.length; j++) {
+      if (groupedIndices.has(j)) continue;
+      const cand = real[j];
+      if (!cand.region) continue;
+      if (stripIndexSuffix(cand.a) !== prefix) continue;
+      if (stripIndexSuffix(cand.b) !== prefix) continue;
+      if (!withinOnePercent(cand.volume, seed.volume)) continue;
+      if (!withinOnePercent(cand.region.depths.x, seed.region.depths.x)) continue;
+      if (!withinOnePercent(cand.region.depths.y, seed.region.depths.y)) continue;
+      if (!withinOnePercent(cand.region.depths.z, seed.region.depths.z)) continue;
+      bucket.push(j);
+    }
+
+    if (bucket.length < 3) continue;
+    const d = seed.region.depths;
+    let dominantAxis: "X" | "Y" | "Z" = "X";
+    let dominantDepth = d.x;
+    if (d.y > dominantDepth) { dominantAxis = "Y"; dominantDepth = d.y; }
+    if (d.z > dominantDepth) { dominantAxis = "Z"; dominantDepth = d.z; }
+
+    groups.push({
+      prefix,
+      count: bucket.length,
+      volume: seed.volume,
+      depths: { ...d },
+      dominantAxis,
+      dominantDepth,
+      memberIndices: bucket,
+    });
+    for (const idx of bucket) groupedIndices.add(idx);
+  }
+  return { groups, groupedIndices };
+}
+
+function formatSystematicGroupLines(g: SystematicGroup): string[] {
+  return [
+    `  - Systematic overlap: ${g.count} ${g.prefix}-* pairs, each ${fmtNum(g.volume)} mm\u00b3, ` +
+      `overlap depth X=${fmtNum(g.depths.x)}mm Y=${fmtNum(g.depths.y)}mm Z=${fmtNum(g.depths.z)}mm (dominant axis: ${g.dominantAxis}).`,
+    `    Design-class hint: identical overlap across ${g.count} pairs sharing prefix "${g.prefix}" suggests a size/spacing mismatch ` +
+      `on the ${g.dominantAxis} axis — part extent exceeds pitch by ${fmtNum(g.dominantDepth)}mm. ` +
+      `Fix by shrinking the ${g.prefix} body on ${g.dominantAxis} OR widening the ${g.dominantAxis}-pitch.`,
+  ];
+}
+
+/**
  * Render the `CollisionReport` to the same text payload `check_collisions`
  * produced before the refactor.
  */
@@ -744,7 +835,11 @@ export function formatCollisionReport(report: CollisionReport): string {
 
     if (report.real.length > 0) {
       const lines: string[] = [];
-      for (const c of report.real) {
+      const { groups, groupedIndices } = groupSystematicRecords(report.real);
+      for (const g of groups) lines.push(...formatSystematicGroupLines(g));
+      for (let idx = 0; idx < report.real.length; idx++) {
+        if (groupedIndices.has(idx)) continue;
+        const c = report.real[idx];
         lines.push(`  - ${c.a} \u2194 ${c.b}: ${fmtNum(c.volume)} mm\u00b3 overlap`);
         if (c.region) {
           const r = c.region;

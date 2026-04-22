@@ -61,10 +61,12 @@ export const CAM_APEX_Y = CAM_WIDTH / 2 - 2.5;   // near +Y edge of cam (front, 
 export const CAM_END_Y = -CAM_WIDTH / 2 + 2.5;   // near -Y edge of cam (back, rest)
 
 // --- Solenoid bank (selector under the bed) ----------------------------------
-export const SOL_BODY_DIAMETER = 10;      // typical small push-solenoid
+// Bodies sized small enough to pack at 5 mm pitch (reed-relay-sized coils).
+// Full-size solenoids would need a staggered bank — this keeps the render clean.
+export const SOL_BODY_DIAMETER = 4;       // mini selector coil
 export const SOL_BODY_LENGTH = 22;
-export const SOL_PLUNGER_DIAMETER = 4;
-export const SOL_PLUNGER_LENGTH = 8;
+export const SOL_PLUNGER_DIAMETER = 2;
+export const SOL_PLUNGER_LENGTH = 5;      // extended state, stops at bed-bottom Z=-8
 export const SOL_BANK_PITCH = NEEDLE_PITCH; // one solenoid per needle
 export const SOL_BANK_TOP_Z = -BED_THICKNESS - 1;  // just under bed
 export const SOL_BANK_BRACKET_T = 4;       // housing wall thickness

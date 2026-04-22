@@ -13,19 +13,18 @@ import {
 } from "./constants";
 
 export function makeEndCapIdler(): Shape3D {
-  // The idler end-cap is this cap mirrored: wall at +X end of base.
-  const baseZMid = CHASSIS_TOP_Z + ENDCAP_BASE_T / 2;
+  const baseZBottom = CHASSIS_TOP_Z;
   const wallXMid = ENDCAP_BASE_L / 2 - ENDCAP_WALL_T / 2;
-  const wallZMid = CHASSIS_TOP_Z + ENDCAP_BASE_T + ENDCAP_WALL_H / 2;
+  const wallZBottom = CHASSIS_TOP_Z + ENDCAP_BASE_T;
 
   const base = shape3d(
     drawRoundedRectangle(ENDCAP_BASE_L, ENDCAP_BASE_W, 2)
-      .sketchOnPlane("XY", [0, 0, baseZMid])
+      .sketchOnPlane("XY", [0, 0, baseZBottom])
       .extrude(ENDCAP_BASE_T)
   );
   let wall = shape3d(
     drawRoundedRectangle(ENDCAP_WALL_T, ENDCAP_WALL_W, 2)
-      .sketchOnPlane("XY", [wallXMid, 0, wallZMid])
+      .sketchOnPlane("XY", [wallXMid, 0, wallZBottom])
       .extrude(ENDCAP_WALL_H)
   );
 
@@ -40,7 +39,7 @@ export function makeEndCapIdler(): Shape3D {
   }
 
   // Single Ø8 idler shaft bore at motor-height (so the belt runs flat).
-  const idlerZ = CHASSIS_TOP_Z + ENDCAP_BASE_T + 30;
+  const idlerZ = wallZBottom + ENDCAP_WALL_H / 2;
   wall = wall.cut(
     holes.through(8.5, {
       depth: ENDCAP_WALL_T + 2, axis: "+X", raw: true,

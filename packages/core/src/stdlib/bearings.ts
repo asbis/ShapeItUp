@@ -12,7 +12,7 @@
 
 import { makeCylinder, type Shape3D } from "replicad";
 import { BALL_BEARING, LINEAR_BEARING, CUT_EPSILON } from "./standards";
-import { applyAxis, type HoleAxis } from "./holes";
+import { applyAxis, resolveHoleAxis, type HoleAxis } from "./holes";
 
 /** Clearance behind the bearing back so the cut-tool doesn't coplanar-fail. */
 const POCKET_BACK_CLEARANCE = 0.2;
@@ -130,9 +130,14 @@ export function seat(
     depth?: number;
     fit?: BearingFit;
     axis?: HoleAxis;
+    /** Inverse alias of `axis` — names the direction a drill bit would point.
+     *  `drillDirection: "+X"` is equivalent to `axis: "-X"`. Mutually
+     *  exclusive with `axis`; mirrors `holes.through`. */
+    drillDirection?: HoleAxis;
     strict?: boolean;
   }
 ): Shape3D {
+  const axis = resolveHoleAxis("bearings.seat", opts?.axis, opts?.drillDirection);
   const spec = ballBearing(designation);
   const allowance = normalizeFit(opts?.fit);
   const pocketRadius = (spec.od + allowance * 2) / 2;
@@ -145,7 +150,7 @@ export function seat(
     const totalHeight = depth + eps * 2;
     // Cylinder axis +Z; base at Z=-depth-eps so top sits at Z=+eps.
     const tool = makeCylinder(pocketRadius, totalHeight, [0, 0, -depth - eps], [0, 0, 1]);
-    return applyAxis(tool, opts.axis);
+    return applyAxis(tool, axis);
   }
 
   // Stepped pocket: full-width pocket at the seat, fused with a narrower
@@ -169,7 +174,7 @@ export function seat(
   );
 
   const tool = pocket.fuse(relief);
-  return applyAxis(tool, opts?.axis);
+  return applyAxis(tool, axis);
 }
 
 /**
@@ -215,8 +220,17 @@ export function body(designation: string): Shape3D {
  */
 export function linearSeat(
   designation: string,
-  opts?: { fit?: BearingFit; axis?: HoleAxis; strict?: boolean }
+  opts?: {
+    fit?: BearingFit;
+    axis?: HoleAxis;
+    /** Inverse alias of `axis` — names the direction a drill bit would point.
+     *  `drillDirection: "+X"` is equivalent to `axis: "-X"`. Mutually
+     *  exclusive with `axis`; mirrors `holes.through`. */
+    drillDirection?: HoleAxis;
+    strict?: boolean;
+  }
 ): Shape3D {
+  const axis = resolveHoleAxis("bearings.linearSeat", opts?.axis, opts?.drillDirection);
   const spec = linearBearing(designation);
   const allowance = normalizeFit(opts?.fit);
   const pocketRadius = (spec.od + allowance * 2) / 2;
@@ -230,7 +244,7 @@ export function linearSeat(
     [0, 0, -spec.length - eps],
     [0, 0, 1]
   );
-  return applyAxis(tool, opts?.axis);
+  return applyAxis(tool, axis);
 }
 
 /**

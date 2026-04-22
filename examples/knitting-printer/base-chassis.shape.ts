@@ -11,10 +11,10 @@ import {
 } from "./constants";
 
 export function makeChassis(): Shape3D {
-  const zMid = CHASSIS_TOP_Z - CHASSIS_THICKNESS / 2;
+  // Top face at CHASSIS_TOP_Z; sketch at BOTTOM face, extrude +Z.
   let plate = shape3d(
     drawRoundedRectangle(CHASSIS_LENGTH, CHASSIS_WIDTH, 4)
-      .sketchOnPlane("XY", [0, 0, zMid])
+      .sketchOnPlane("XY", [0, 0, CHASSIS_TOP_Z - CHASSIS_THICKNESS])
       .extrude(CHASSIS_THICKNESS)
   );
 

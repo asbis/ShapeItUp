@@ -12,26 +12,26 @@ import {
 } from "./constants";
 
 export function makeYarnCarrier(): Shape3D {
-  // Vertical arm: thin X×Z plate extending downward, 12 mm wide in X
+  // Vertical arm Z ∈ [-YARN_ARM_H, 0], sketch on XY at bottom then +Z.
   const armW = 12;
   const vert = shape3d(
     drawRoundedRectangle(armW, YARN_ARM_T, 1)
-      .sketchOnPlane("XY", [0, 0, -YARN_ARM_H / 2])
+      .sketchOnPlane("XY", [0, 0, -YARN_ARM_H])
       .extrude(YARN_ARM_H)
   );
-  // Horizontal arm: extends in +Y from the bottom of the vertical arm
+  // Horizontal arm: bottom flush with vertical arm bottom, extrude +Z by T.
   const horiz = shape3d(
     drawRoundedRectangle(armW, YARN_ARM_L, 1)
-      .sketchOnPlane("XY", [0, YARN_ARM_L / 2, -YARN_ARM_H + YARN_ARM_T / 2])
+      .sketchOnPlane("XY", [0, YARN_ARM_L / 2, -YARN_ARM_H])
       .extrude(YARN_ARM_T)
   );
   let body = vert.fuse(horiz);
 
-  // Yarn eyelet — Ø2.2 vertical through-hole at the end of the horizontal arm
+  // Yarn eyelet — Ø2.2 vertical through-hole at the end of the horizontal arm.
   body = body.cut(
     holes.through(YARN_EYELET_DIA, {
       depth: YARN_ARM_T + 2, raw: true,
-    }).translate(0, YARN_ARM_L - 3, -YARN_ARM_H + YARN_ARM_T + 0.01),
+    }).translate(0, YARN_ARM_L - 3, -YARN_ARM_H + YARN_ARM_T),
   );
   return body;
 }

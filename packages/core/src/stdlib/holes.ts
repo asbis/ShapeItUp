@@ -135,8 +135,12 @@ function flipAxis(axis: HoleAxis): HoleAxis {
  * the direction the drill bit points (so the hole opens on -X), which equals
  * `axis: "-X"`. If both are provided we throw — they are inverse aliases and
  * specifying both is almost certainly a user error.
+ *
+ * Exported so other cut-tool factories (e.g. `bearings.seat`, `bearings.linearSeat`)
+ * can mirror the same axis/drillDirection resolution rules without duplicating
+ * the error message.
  */
-function resolveHoleAxis(
+export function resolveHoleAxis(
   fnName: string,
   axis: HoleAxis | undefined,
   drillDirection: HoleAxis | undefined,

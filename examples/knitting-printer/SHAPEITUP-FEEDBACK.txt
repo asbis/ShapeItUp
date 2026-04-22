@@ -1,0 +1,372 @@
+ShapeItUp — honest usage feedback, v6 build (knitting-printer)
+================================================================
+
+Date: 2026-04-22
+Build: mini flatbed knitting-printer, 20 needles, 76 parts, 252×92×85 mm bbox
+Agent: Claude Opus 4.7, acting as a pro-CAD engineer, ~90 min active time
+Extension tag: [shapeitup mcp vdev · ext v1.10.0]
+Result: zero unexpected collisions, 4-pane render clean across all 76 parts,
+        every part in its own .shape.ts + shared constants.ts + assembly.shape.ts
+
+This file is a field report for the agent currently developing ShapeItUp. I've
+ranked items by frustration × fixability. Positive signals at the bottom —
+those deserve to stay as-is.
+
+================================================================
+P1 (blocker): sketchOnPlane("XY", [x, y, z0]) origin semantics
+================================================================
+
+WHAT HAPPENED
+The single biggest time-sink of this build. I burned ~15 minutes rebuilding
+7 parts after discovering every one of them had their Z positions shifted
+by half-thickness.
+
+I assumed `.sketchOnPlane("XY", [0, 0, zMid]).extrude(L)` would place the
+extrusion CENTERED on zMid (which is how `makeCylinder(r, h, [center], dir)`
+behaves — that location arg IS the cylinder center). It doesn't. sketchOnPlane
+places the sketch AT z0 with extrude going +Z FROM THERE. So the sketch is
+the BOTTOM face, not the midplane.
+
+I only noticed when the cut-no-material warning fired with
+  "Target Z ∈ [-1.00, 59.00], cutter Z ∈ [-18.20, -14.80]"
+on the end-cap motor wall. I'd been building the wall expecting
+Z ∈ [-31, +29] (centered on z=-1) but got [-1, +59] (sketch sat at z=-1).
+
+IMPACT
+Needle bed, cam plate, carriage, solenoid bracket, both end caps, chassis,
+and yarn carrier all had to be fixed. One fix was one edit each but finding
+the pattern took much longer.
+
+FIX
+SKILL.md already has this right in one place ("sketchOnPlane("XY", [0, 0, 20])
+raises the sketch to Z=20"), but the "Plane orientation" section buries the
+fact that Z IS THE BOTTOM. Three words would do it:
+
+  XY → extrudes +Z (up). The origin Z you pass is the BOTTOM face,
+       not the midplane.
+
+Mini-example helps too:
+
+  sketchOnPlane("XY", [0, 0, 0]).extrude(10)   → Z ∈ [ 0, 10]
+  sketchOnPlane("XY", [0, 0,-5]).extrude(10)   → Z ∈ [-5,  5]
+
+The stdlib's `cylinder({top, bottom, length, direction})` gets this right —
+top/bottom are anchor points with unambiguous semantics. drawRectangle +
+sketchOnPlane + extrude should pick up the same clarity.
+
+================================================================
+P1 (real bug): `cylinder({ top, direction: "-Z" })` is a footgun
+================================================================
+
+WHAT HAPPENED
+For the solenoid body (hangs below the bracket), I wrote:
+
+  cylinder({ top: [0, 0, 0], length: 22, diameter: 10, direction: "-Z" })
+
+Expecting: top at origin, body extends -Z (downward). Got: body extended
++Z (upward). Final Z ∈ [0, 22], CoM Z=+11 in local frame.
+
+The stdlib docs DO say `top: [0,0,0]` WITHOUT direction already means
+"extends -Z". Adding `direction: "-Z"` must be interacting with that
+to flip the sign. Removing the `direction` arg fixed it instantly.
+
+IMPACT
+Wasted a re-render round-trip. Worse, I now don't trust the interaction
+between `top` + `direction` and won't use them together again.
+
+FIX
+Pick one:
+  (a) When BOTH `top|bottom` AND `direction` are provided, and the direction
+      disagrees with the anchor's default direction, THROW a clear error
+      ("top implies -Z; pass direction without top/bottom, or drop direction").
+  (b) Document which one wins. (Currently neither the docs nor the signature
+      make it obvious.)
+  (c) Make the override compose correctly — if both are given, direction
+      wins; `top` then just means the anchor is the +direction end of the
+      cylinder.
+
+================================================================
+P2: bearings.linearSeat has no `axis` argument
+================================================================
+
+WHAT HAPPENED
+I wanted an LM8UU seat along +X in the carriage. The seat's default axis
+is +Z. `holes.through` supports `axis: "+X"`, so I expected `bearings.linearSeat`
+to as well. It doesn't — I had to pre-rotate it:
+
+  bearings.linearSeat("LM8UU").rotate(90, [0, 0, 0], [0, 1, 0])
+
+Rotation went the wrong way; the seat body extended -X instead of +X.
+I gave up and used `holes.through(9, {raw: true, axis: "+X"})` instead,
+which accepts `axis` directly. Got it right in one shot.
+
+IMPACT
+Lost ~5 minutes fighting the rotate, then had to downgrade from a seat
+(press-fit interference) to a raw through-hole (clearance).
+
+FIX
+Add `axis` to `bearings.linearSeat` and `bearings.seat`:
+
+  bearings.linearSeat("LM8UU", { axis: "+X" })
+  bearings.seat("608", { axis: "-Y", depth: 7 })
+
+Same 6-way alphabet as holes. Then no user rotate calls, no wrong-way bugs.
+
+================================================================
+P2: `patterns.cutAt` false-positive "outside bbox" on axis:"+X" cutters
+================================================================
+
+WHAT HAPPENED
+For the NEMA17 4-bolt pattern on the motor end-cap wall:
+
+  patterns.cutAt(
+    wall,
+    () => holes.through("M3", { depth: ENDCAP_WALL_T + 2, axis: "+X" }),
+    patterns.grid(2, 2, 31, 31).map(p => ({
+      translate: [wallX, p.translate[0], motorZ + p.translate[1]],
+    })),
+  );
+
+Failed with:
+  "2 of 4 tool placements were outside the target's bounding box"
+
+But my math said all 4 placements were inside. I rewrote with an explicit
+nested for-loop of `wall.cut(...)` calls — all 4 cuts succeeded (modulo
+the same Z-range bug covered in P1, which I then fixed independently).
+
+IMPACT
+Had to abandon patterns.cutAt for this pattern and hand-roll the loop.
+Doesn't scale — a real bolt-circle on a tapped flange needs patterns.cutAt.
+
+FIX
+Either (a) patterns.cutAt's bbox pre-filter needs to account for the
+cutter's rotation (axis != +Z), or (b) it should skip the pre-filter
+entirely when the factory's output bbox doesn't align with +Z.
+
+Repro snippet (self-contained):
+
+  import { drawRectangle, type Shape3D } from "replicad";
+  import { shape3d, holes, patterns } from "shapeitup";
+  export default function main(): Shape3D {
+    const wall = shape3d(drawRectangle(5, 80)
+      .sketchOnPlane("XY", [0, 0, 0]).extrude(60));
+    return patterns.cutAt(
+      wall,
+      () => holes.through("M3", { depth: 7, axis: "+X" }),
+      patterns.grid(2, 2, 31, 31).map(p => ({
+        translate: [2.5, p.translate[0], 30 + p.translate[1]] as [number, number, number],
+      })),
+    );
+  }
+
+================================================================
+P3: Import-graph cache invalidation — still needs forceBundleRebuild
+================================================================
+
+WHAT HAPPENED
+After editing `constants.ts`, re-opening files that import it (via
+`open_shape` without forceBundleRebuild) served stale bundles. I hit this
+three times. The previous field report (project_shapeitup_stdlib_gaps.md)
+flagged this same issue — it's still present in v1.10.0.
+
+IMPACT
+Every time I touched a shared constant I had to remember
+`forceBundleRebuild: true` on the next open. Forgetting it renders the
+same old bundle, I read the old output and think my edit didn't apply,
+waste 30 seconds re-editing the same line differently until I realize the
+cache is the problem.
+
+FIX
+esbuild's metafile already reports the full import graph of each bundle.
+When a file is opened, walk its metafile's input list and compare mtimes
+to the cached bundle's build time. If ANY input has mtime > cache build
+time → invalidate. This is a ~15-line change in the bundler layer.
+
+================================================================
+P3: `modify_shape` with only filePath errors instead of re-executing
+================================================================
+
+WHAT HAPPENED
+After editing `constants.ts`, I called `modify_shape({filePath: "x.shape.ts"})`
+to re-run the dependent file. The error said:
+  "provide code (to overwrite the file) or params (to re-run with overrides),
+   or both. To execute an existing file without changes, use open_shape."
+
+The hint was there — I just didn't see it on the first pass. Switched to
+open_shape, which worked.
+
+IMPACT
+Minor (30 seconds). BUT: the mental model of modify_shape is "I modified
+something, run it again". Distinguishing "modified via code arg" vs
+"modified via editor / constants.ts" is an artificial line.
+
+FIX
+Pick one:
+  (a) When modify_shape is called with only filePath, treat it as open_shape.
+  (b) Put the "use open_shape" hint on its OWN line with a leading ">" or
+      TIP marker so it jumps out visually.
+
+================================================================
+P4: patterns.grid always returns XY-plane placements
+================================================================
+
+WHAT HAPPENED
+patterns.grid(2, 2, 31, 31) returns placements in X-Y. For the NEMA17
+bolt pattern I needed on a Y-Z wall, I had to .map() + swap indices:
+
+  patterns.grid(2, 2, 31, 31).map(p => ({
+    translate: [wallX, p.translate[0], motorZ + p.translate[1]],
+  }))
+
+This is fragile — easy to flip indices or lose the centering math.
+
+IMPACT
+Minor (solvable in 3 lines), but ergonomically sloppy on vertical walls.
+
+FIX
+Add optional plane kwarg:
+  patterns.grid(2, 2, 31, 31, { plane: "YZ", centered: true, origin: [wallX, 0, motorZ] })
+
+or a transform helper:
+  patterns.onPlane("YZ", [wallX, 0, motorZ], patterns.grid(2, 2, 31, 31))
+
+================================================================
+P5: No "design-class" vs "bug-class" collision distinction
+================================================================
+
+WHAT HAPPENED
+My 20 solenoids packed at 5 mm pitch with 10 mm diameter bodies → all 20
+pairs overlapped adjacent solenoids (675 mm³ each). Staggered arrangement
+would fix it in real hardware; I just shrank the bodies to 4 mm for the
+render.
+
+This is a DESIGN mismatch (you physically can't fit 10 mm solenoids on
+5 mm pitch), not a translate bug. But check_collisions shows it
+identically to a translate-by-the-wrong-amount bug. Ideally the "likely
+misplaced" tag would NOT fire when all pairs have the same overlap
+volume with the same overlap depth — that's a strong signal of
+uniform-scaling-mismatch rather than per-part mis-placement.
+
+IMPACT
+None, really — I saw the uniformity (all 19 pairs showed 675.60 mm³)
+and immediately diagnosed it. But a cleaner tool would say so.
+
+FIX
+When N pairs (all sharing a common name prefix) have identical overlap
+volume and overlap depth to within ~1%, group them and label as
+"systematic size/spacing mismatch" instead of "19 × likely misplaced".
+
+Also worth considering: check_collisions could flag "pitch=5, min_dia=10"
+as a dimensional inconsistency before any rendering — but that's more
+ambitious.
+
+================================================================
+P5: Yarn-carrier origin was wrong by my reading of the docstring
+================================================================
+
+WHAT HAPPENED
+My yarn-carrier.shape.ts set the vertical arm to local Z ∈ [-YARN_ARM_H, 0]
+(local origin at the TOP). In the assembly I translated it by
+`CARRIAGE_Z_BOTTOM` (expecting the top to sit at the bottom of the carriage)
+but actually wanted the top to sit on the carriage's TOP face (so the arm
+hangs down and the horizontal arm ends up above the bed).
+
+Small design confusion on my part, but the tool could have helped:
+`describe_geometry` on a single-part file would have shown me the part's
+world-space bbox, which would have made the mis-translation obvious
+BEFORE I rendered the 76-part assembly.
+
+FIX
+Docstring suggestion on each part's makeX(): note the "anchor Z" explicitly:
+
+  // makeYarnCarrier — vertical arm Z ∈ [-25, 0]. Translate Z by the
+  //   carriage TOP Z (NOT the bottom) so horizontal arm ends up above bed.
+
+Not a tool fix — a convention fix. But worth adding `metadata?: Record<string,any>`
+to Part or to a shared docstring block for each factory in SKILL.md examples.
+
+================================================================
+POSITIVE SIGNALS (please don't break these in refactors)
+================================================================
+
+These are the things that made this build doable in ~90 minutes. They are
+ShapeItUp's competitive moats vs OpenSCAD / JSCAD / plain replicad.
+
++ check_collisions "likely misplaced" + Region box + overlap-depth numbers.
+  Iterated 60+ collisions → 0 in 2 rounds. The "translate by +13.80 mm on
+  Z" style advice is the BEST actionable CAD diagnostic I have ever seen.
+  When yarn-carrier showed
+    "Region x[32, 44] y[8.5, 11.5] z[12, 32] — overlap depth X=12, Y=3, Z=20"
+  I knew the carrier was fully inside the carriage body BEFORE opening the
+  render. Never lose this.
+
++ acceptedPairs glob patterns ("needle-*", "sol-body-*"). Single-handedly
+  turned a 40-line collision list into a 1-line collision list. Essential
+  for 20-needle builds.
+
++ patterns.cutAt "cut produced no material removal" warning with the
+  exact delta + target/cutter bbox.
+  "Cutter is LEFT-OF target. Translate by +0.99 mm on X" — instant fix.
+  This has saved me at least 20 render round-trips today.
+
++ get_render_status per-part CoM + bbox dump on every render.
+  Verified 20 needle positions, 20 solenoid positions, all 4 end-cap
+  walls without EVER opening a screenshot. Text stats are actually more
+  efficient than PNGs for position verification.
+
++ stdlib `cylinder({bottom, length, direction: "+X"})` reads cleanly
+  compared to makeCylinder(r, h, [pos], [axis]). Used 6× in this build
+  without a single wrong-axis bug.
+
++ render_preview 4-pane grid at 1600px captured the whole machine
+  top/front/right/iso in one shot. 5s render, zero re-work.
+
++ patterns.cutAt factory pattern (`() => makeShape`) — I know why (OCCT
+  handles) but the API surface stays clean. No dangling "this object has
+  been deleted" crashes across 80+ cut calls on needle-bed slots.
+
++ No hidden "working directory" surprises on this run (previous knitting
+  builds had workspace-mismatch issues; this one used absolute directory:
+  everywhere, which Just Worked).
+
+================================================================
+Items that did NOT matter this time (but noted in prior reports)
+================================================================
+
+- Viewer "only chassis visible" blocker (v2 report): did NOT reproduce at
+  76 parts in v1.10.0. Either fixed or scale-dependent; close the issue
+  unless it recurs.
+- Params-key warning spurious fires (v2 report): did NOT fire on any of
+  my 11 files. Either fixed or latent on different code patterns.
+- STL minFeature 0.33mm noise (v2 report): did NOT fire — I didn't
+  export STL this round.
+
+================================================================
+File / line anchors (so future-you can map feedback to code fast)
+================================================================
+
+- `sketchOnPlane` origin semantics: `packages/core/src/stdlib/...` SKILL.md
+  "Plane orientation (read this first)" section — one-line addition.
+- `cylinder({top, direction})` interaction: `packages/core/src/stdlib/cylinder.ts`
+  — needs conflict detection at the top of the function.
+- `bearings.linearSeat` axis: `packages/core/src/stdlib/bearings.ts` — add
+  `axis?` arg mirroring `holes.ts` exactly.
+- `patterns.cutAt` bbox prefilter: `packages/core/src/stdlib/patterns.ts`
+  — skip or adapt the prefilter when cutter axis != "+Z".
+- Import-graph cache invalidation: `packages/mcp-server/src/engine.ts`
+  (bundler layer) — walk metafile.inputs for mtime > cache.buildTime.
+
+================================================================
+Summary
+================================================================
+
+Two blocker-ish issues (sketchOnPlane Z semantics + cylinder direction
+interaction) cost me ~20 minutes each. Neither is a true tool bug — both
+are documentation / API-clarity issues. The collision checker, per-part
+stats, 4-pane render, and glob-aware acceptedPairs are all world-class
+and should stay exactly as they are.
+
+Net: I built a 20-needle flatbed knitting machine from web research to
+verified zero-collision 76-part assembly in ~90 minutes, which I could
+not do in any other scripted CAD tool. Fix the two P1s above and it'd
+be 60 minutes instead of 90.

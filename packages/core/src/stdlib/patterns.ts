@@ -60,6 +60,61 @@ function readBounds(shape: Shape3D): [[number, number, number], [number, number,
 }
 
 /**
+ * AABB derived from a tessellated mesh of the shape. Used as a fallback /
+ * override to `readBounds` when the caller suspects Replicad's `boundingBox`
+ * getter is returning a stale pre-rotation AABB (the OCCT `TopLoc_Location`
+ * on the wrapped shape isn't always baked into `BRepBndLib::Add`'s input).
+ *
+ * Symptom this exists to fix: `patterns.cutAt` with `axis:"+X"` cutters
+ * falsely flagging "placements outside the target's bounding box" because
+ * the rotated cutter's reported AABB is its un-rotated local-frame extent.
+ *
+ * Mesh tolerance is loose (0.5 mm) — we only need AABB extremes, not a
+ * render-quality mesh. Degenerate tessellations (empty vertex list, NaN
+ * coords) return undefined so callers fall through to their usual "can't
+ * tell, skip the check" branch rather than reporting a bogus bbox.
+ */
+function readBoundsFromMesh(shape: Shape3D): [[number, number, number], [number, number, number]] | undefined {
+  try {
+    const meshFn = (shape as any).mesh;
+    if (typeof meshFn !== "function") return undefined;
+    const m = meshFn.call(shape, { tolerance: 0.5, angularTolerance: 0.5 });
+    const v = m?.vertices;
+    if (!v || v.length < 3) return undefined;
+    let x0 = Infinity, y0 = Infinity, z0 = Infinity;
+    let x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+    for (let i = 0; i + 2 < v.length; i += 3) {
+      const x = v[i], y = v[i + 1], z = v[i + 2];
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return undefined;
+      if (x < x0) x0 = x; if (x > x1) x1 = x;
+      if (y < y0) y0 = y; if (y > y1) y1 = y;
+      if (z < z0) z0 = z; if (z > z1) z1 = z;
+    }
+    if (!Number.isFinite(x0) || !Number.isFinite(x1)) return undefined;
+    return [[x0, y0, z0], [x1, y1, z1]];
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Bounds read for a cutter that may have been rotated by `applyPlacement`
+ * (e.g. `holes.through({ axis: "+X" })` cylinders are rotated 90° about Y).
+ *
+ * Prefer mesh-derived AABB for rotated cutters — Replicad's `.boundingBox`
+ * can return the pre-rotation local-frame extent after `.rotate()`, which
+ * produces false "outside target bbox" prefilter rejections in `cutAt`. The
+ * mesh read is authoritative because it samples the final world-space
+ * vertex positions directly.
+ *
+ * Falls back to `.boundingBox` if tessellation fails (kernel-free test mocks,
+ * degenerate geometry).
+ */
+function readToolBounds(shape: Shape3D): [[number, number, number], [number, number, number]] | undefined {
+  return readBoundsFromMesh(shape) ?? readBounds(shape);
+}
+
+/**
  * Best-effort volume read. Returns undefined if measurement is unavailable
  * (kernel-free mock in tests) or if the call throws — callers treat undefined
  * as "can't tell" and skip the corresponding no-op check rather than risking
@@ -206,6 +261,8 @@ export function polar(
  *   grid(3, 4, 10)                    // 3×4 grid, 10mm spacing both axes
  *   grid(3, 4, 10, 15)                // 3×4 grid, 10mm along X, 15mm along Y
  *   grid(3, 4, 10, 15, { plane: "YZ" }) // same grid, remapped onto the YZ plane
+ *   grid(2, 2, 31, 31,                  // NEMA17 4-bolt pattern anchored on a
+ *     { plane: "YZ", origin: [wallX, 0, motorZ] }) //   specific wall face
  *
  * For a 1-column or 1-row grid the corresponding spacing is still required
  * (and ignored on the singleton axis).
@@ -218,13 +275,19 @@ export function polar(
  *   When set, the generated XY-plane placements are piped through
  *   {@link onPlane} so the grid lives on a wall (YZ/XZ) without a
  *   two-call idiom. Default `"XY"` (no remap) preserves legacy behaviour.
+ * @param opts.origin Optional world-space offset added to every placement
+ *   AFTER the plane remap. Lets you anchor the centered grid at an arbitrary
+ *   world point (e.g. a bolt pattern on a specific wall face) without a
+ *   downstream `.map(p => ({ translate: [wx+p.translate[0], ...] }))`. For
+ *   plane `"YZ"` with `origin: [wallX, 0, motorZ]` each placement lands at
+ *   `[wallX, gridY, motorZ + gridZ]` — centered on `(0, motorZ)` of the wall.
  */
 export function grid(
   nx: number,
   ny: number,
   dx: number,
   dy?: number,
-  opts: { plane?: "XY" | "YZ" | "XZ" } = {}
+  opts: { plane?: "XY" | "YZ" | "XZ"; origin?: Point3 } = {}
 ): Placement[] {
   if (nx < 1 || ny < 1) throw new Error(`grid: nx and ny must be >= 1`);
   const spacingY = dy ?? dx;
@@ -238,59 +301,89 @@ export function grid(
       });
     }
   }
-  const marked = markGenerated(placements);
-  return opts.plane && opts.plane !== "XY"
-    ? markGenerated(onPlane(marked, opts.plane))
-    : marked;
+  // Delegate plane remap + origin offset to `onPlane` so the math lives in
+  // one place; an XY-only call with no origin identity-returns the array.
+  return onPlane(markGenerated(placements), opts.plane ?? "XY", opts.origin);
 }
 
 /**
- * Remap a list of XY-plane placements onto the YZ or XZ plane. The existing
- * 2D pattern builders (`grid`, `polar`, `linear`) emit placements in the XY
- * plane; `onPlane` is a composable post-processor that rotates those
- * placements into one of the other principal planes without changing how
- * the original pattern was described.
+ * Remap a list of XY-plane placements onto the YZ or XZ plane, optionally
+ * offsetting every placement by a world-space origin. The existing 2D pattern
+ * builders (`grid`, `polar`, `linear`) emit placements in the XY plane;
+ * `onPlane` is a composable post-processor that rotates those placements into
+ * one of the other principal planes without changing how the original pattern
+ * was described.
  *
  * Mapping (translation coords):
- *   - `"XY"` — identity (returns placements unchanged).
+ *   - `"XY"` — identity (returns placements unchanged when `origin` is absent).
  *   - `"YZ"` — `[x, y, z]` → `[0, x, y]` (the plane normal is +X).
  *   - `"XZ"` — `[x, y, z]` → `[x, 0, y]` (the plane normal is +Y).
  *
  * Any `rotate` value is preserved, and `axis` (if present) is remapped with
  * the same rule so a rotation that was "around the plane's normal" stays
- * that way after the remap.
+ * that way after the remap. `origin` is added AFTER the plane remap, so it's
+ * a world-space translation (same frame as the target shape).
  *
- * Example — drill a YZ-facing vent array into a PCB enclosure side wall:
+ * Example — drill a YZ-facing vent array into a PCB enclosure side wall with
+ * the grid center anchored at `[wallX, 0, wallZ]`:
  *
  *   patterns.cutAt(
  *     enclosure,
  *     () => cylinder({ diameter: 3, length: 10, axis: "X" }).translate(-5, 0, 0),
- *     patterns.onPlane(patterns.grid(5, 3, 6, 6), "YZ").map(p => ({
- *       ...p,
- *       translate: [wallX, p.translate[1], p.translate[2] + wallZ],
- *     })),
+ *     patterns.onPlane(patterns.grid(5, 3, 6, 6), "YZ", [wallX, 0, wallZ]),
  *   );
  *
  * @param placements Placements to remap (typically from `grid`/`polar`/`linear`).
  * @param plane Target plane: `"XY"`, `"YZ"`, or `"XZ"`.
+ * @param origin Optional world-space offset added to every placement's
+ *   `translate` AFTER the plane remap. Does NOT shift `axis` (which is a
+ *   direction vector, not a point). When the caller's pattern is already
+ *   XY-centered, passing `origin` lets you anchor the whole pattern at a
+ *   specific wall-face point in one step.
  */
 export function onPlane(
   placements: Placement[],
-  plane: "XY" | "YZ" | "XZ"
+  plane: "XY" | "YZ" | "XZ",
+  origin?: Point3
 ): Placement[] {
   if (plane !== "XY" && plane !== "YZ" && plane !== "XZ") {
     throw new Error(
       `patterns.onPlane: unknown plane "${plane}". Expected "XY", "YZ", or "XZ".`
     );
   }
-  if (plane === "XY") return placements;
+  // No-op fast path: XY plane with no origin shift = input unchanged. Preserves
+  // the existing identity-return contract that `grid/linear/polar` and the
+  // test suite rely on.
+  const hasOrigin = origin !== undefined;
+  if (plane === "XY" && !hasOrigin) return placements;
+  if (hasOrigin) {
+    if (!Array.isArray(origin) || origin.length !== 3) {
+      throw new Error(
+        `patterns.onPlane: origin must be a [x, y, z] Point3, got ${JSON.stringify(origin)}.`
+      );
+    }
+    for (let i = 0; i < 3; i++) {
+      if (!Number.isFinite(origin[i])) {
+        throw new Error(
+          `patterns.onPlane: origin[${i}] must be a finite number, got ${origin[i]}.`
+        );
+      }
+    }
+  }
 
   const remap = (pt: Point3): Point3 =>
-    plane === "YZ" ? [0, pt[0], pt[1]] : [pt[0], 0, pt[1]];
+    plane === "YZ" ? [0, pt[0], pt[1]] : plane === "XZ" ? [pt[0], 0, pt[1]] : pt;
 
+  const [ox, oy, oz] = hasOrigin ? origin : [0, 0, 0];
   const mapped = placements.map((p) => {
-    const out: Placement = { translate: remap(p.translate) };
+    const r = remap(p.translate);
+    const out: Placement = {
+      translate: hasOrigin ? [r[0] + ox, r[1] + oy, r[2] + oz] : r,
+    };
     if (p.rotate !== undefined) out.rotate = p.rotate;
+    // `axis` is a direction vector, not a point — it gets the plane remap
+    // but NEVER the origin offset. Translating a unit axis by a world point
+    // would silently corrupt rotation semantics.
     if (p.axis !== undefined) out.axis = remap(p.axis);
     return out;
   });
@@ -324,6 +417,10 @@ export function onPlane(
  * @param opts.dy Spacing along the plane's second axis (mm).
  * @param opts.centered Default `true` — matches `grid`'s built-in centering.
  *   Pass `false` to anchor the first cell at `[0, 0]` on the plane.
+ * @param opts.origin Optional world-space offset added to every placement
+ *   AFTER the plane remap. Lets you anchor the whole pattern at an arbitrary
+ *   world point (e.g. a bolt pattern on a specific wall face) without a
+ *   downstream `.map(p => ({ translate: [wx+p.translate[0], ...] }))`.
  */
 export function rectOnPlane(opts: {
   plane: "XY" | "YZ" | "XZ";
@@ -332,6 +429,7 @@ export function rectOnPlane(opts: {
   dx: number;
   dy: number;
   centered?: boolean;
+  origin?: Point3;
 }): Placement[] {
   if (!opts || typeof opts !== "object") {
     throw new TypeError(
@@ -362,7 +460,18 @@ export function rectOnPlane(opts: {
   // `onPlane` already re-marks its mapped output and identity-returns the
   // already-marked array for XY. Mark explicitly for the XY path too, in case
   // a future onPlane refactor changes the identity contract.
-  return markGenerated(onPlane(base, plane));
+  const remapped = onPlane(base, plane);
+  if (opts.origin) {
+    const [ox, oy, oz] = opts.origin;
+    for (const p of remapped) {
+      p.translate = [
+        p.translate[0] + ox,
+        p.translate[1] + oy,
+        p.translate[2] + oz,
+      ];
+    }
+  }
+  return markGenerated(remapped);
 }
 
 /**
@@ -704,16 +813,14 @@ export function cutAt(
     const p = placements[i];
     // The bbox check MUST read bounds AFTER applyPlacement has baked in the
     // placement's rotate+translate, so the AABB we compare is world-space
-    // (the same space targetBounds lives in). If the factory itself returns
-    // a shape that's already been rotated/translated, Replicad's boundingBox
-    // getter recomputes via BRepBndLib::Add on the current TopoDS_Shape —
-    // so it reflects any transforms already baked in. Reading before
-    // applyPlacement (or from a local pre-transform pose) would miss this
-    // entirely — a rotated cylinder's world AABB is very different from
-    // its unrotated pose's AABB.
+    // (the same space targetBounds lives in). We use `readToolBounds` (mesh-
+    // derived) rather than `.boundingBox` because Replicad's bbox getter
+    // sometimes returns the pre-rotation local-frame extent for shapes with
+    // an unapplied TopLoc_Location — biting `axis:"+X"` hole cutters in
+    // particular, producing false "outside target bbox" warnings.
     const placedTool = applyPlacement(makeTool(), p);
     if (targetBounds) {
-      const toolBounds = readBounds(placedTool);
+      const toolBounds = readToolBounds(placedTool);
       if (toolBounds) {
         checkedCount++;
         if (!firstToolBounds) firstToolBounds = toolBounds;

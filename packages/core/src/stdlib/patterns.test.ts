@@ -837,6 +837,94 @@ describe("patterns.grid / linear / polar — inline `plane` option", () => {
       base.map((p) => p.translate),
     );
   });
+
+  // ---- `origin` offset on grid / onPlane -----------------------------------
+  // Closes P4 from the v6 knitting-printer field report: wall-absolute bolt
+  // patterns shouldn't need a downstream `.map(p => ({ translate: [...] }))`.
+
+  it("grid({ plane: 'YZ', origin }) offsets every placement by the world-space origin", () => {
+    const out = patterns.grid(2, 2, 31, 31, {
+      plane: "YZ",
+      origin: [2.5, 0, 30],
+    });
+    // Base XY grid centered on origin:
+    //   (-15.5, -15.5, 0), (15.5, -15.5, 0), (-15.5, 15.5, 0), (15.5, 15.5, 0)
+    // YZ remap: [x, y, z] → [0, x, y]
+    //   (0, -15.5, -15.5), (0, 15.5, -15.5), (0, -15.5, 15.5), (0, 15.5, 15.5)
+    // Origin offset [2.5, 0, 30]:
+    //   (2.5, -15.5, 14.5), (2.5, 15.5, 14.5), (2.5, -15.5, 45.5), (2.5, 15.5, 45.5)
+    expect(out.map((p) => p.translate)).toEqual([
+      [2.5, -15.5, 14.5],
+      [2.5, 15.5, 14.5],
+      [2.5, -15.5, 45.5],
+      [2.5, 15.5, 45.5],
+    ]);
+    expect((out as any).__generated__).toBe(true);
+  });
+
+  it("grid({ origin }) without plane offsets on XY (no remap)", () => {
+    // Common case: centered grid, then shift the whole thing to a board center.
+    const out = patterns.grid(2, 2, 10, undefined, { origin: [100, 50, 0] });
+    expect(out.map((p) => p.translate)).toEqual([
+      [95, 45, 0],
+      [105, 45, 0],
+      [95, 55, 0],
+      [105, 55, 0],
+    ]);
+  });
+
+  it("onPlane(p, plane, origin) matches grid({ plane, origin }) element-wise", () => {
+    // Explicit composition of the same call via onPlane — validates that
+    // grid's `origin` is just sugar for `onPlane(grid(...), plane, origin)`.
+    const inline = patterns.grid(3, 2, 10, 5, {
+      plane: "XZ",
+      origin: [7, 0, 11],
+    });
+    const compose = patterns.onPlane(
+      patterns.grid(3, 2, 10, 5),
+      "XZ",
+      [7, 0, 11],
+    );
+    expect(inline.map((p) => p.translate)).toEqual(
+      compose.map((p) => p.translate),
+    );
+  });
+
+  it("onPlane origin does NOT translate axis vectors (direction stays a direction)", () => {
+    // polar(4, 10, { orientOutward: true }) emits axis = [0, 0, 1] on each
+    // placement; after YZ remap that becomes [0, 0, 0] (consistent with the
+    // existing axis-remap behaviour). Origin MUST NOT touch it — translating
+    // a direction vector would silently corrupt rotation semantics.
+    const src = patterns.polar(4, 10, { orientOutward: true });
+    const out = patterns.onPlane(src, "YZ", [1000, 2000, 3000]);
+    const withoutOrigin = patterns.onPlane(src, "YZ");
+    for (let i = 0; i < out.length; i++) {
+      expect(out[i].axis).toEqual(withoutOrigin[i].axis);
+      expect(out[i].rotate).toBe(withoutOrigin[i].rotate);
+    }
+  });
+
+  it("onPlane('XY', origin) still applies the origin offset (no remap, shift only)", () => {
+    const src = patterns.grid(2, 2, 10);
+    const out = patterns.onPlane(src, "XY", [3, 4, 5]);
+    expect(out.map((p) => p.translate)).toEqual([
+      [-2, -1, 5],
+      [8, -1, 5],
+      [-2, 9, 5],
+      [8, 9, 5],
+    ]);
+    // `.map()` allocates — no longer identity-return with origin present.
+    expect(out).not.toBe(src);
+  });
+
+  it("onPlane throws on a non-finite origin component", () => {
+    expect(() =>
+      patterns.onPlane(patterns.grid(2, 2, 10), "YZ", [NaN, 0, 0]),
+    ).toThrow(/origin\[0\] must be a finite number/);
+    expect(() =>
+      patterns.onPlane(patterns.grid(2, 2, 10), "YZ", [0, Infinity, 0]),
+    ).toThrow(/origin\[1\] must be a finite number/);
+  });
 });
 
 // ---------------------------------------------------------------------------

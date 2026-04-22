@@ -2467,6 +2467,133 @@ function misplacedHint(c: CollisionEntry): string {
   return ` (${smallerName} likely misplaced)`;
 }
 
+/**
+ * Strip a trailing index suffix (`-0`, `-12`, `-a`, `-1a`) from a part name so
+ * `solenoid-0`, `solenoid-1`, …, `solenoid-19` collapse to `solenoid`, and
+ * lettered-matrix names like `pin-1a`, `pin-1b` also collapse to `pin`.
+ *
+ * Letter-strip runs FIRST so a mixed suffix like `-1a` peels `-a` then `-1`;
+ * running digits-first would leave `pin-1a` as `pin-1` (asymmetric with
+ * `pin-a1` which stays `pin-a1`). Conservative by design — `main-bracket`
+ * and other multi-letter tails stay intact because each replace matches only
+ * a single trailing letter or a digit run.
+ */
+function stripIndexSuffix(name: string): string {
+  return name.replace(/-[a-z]$/i, "").replace(/-\d+$/, "");
+}
+
+/** True if |a - b| / max(|a|,|b|,epsilon) <= 0.01 (within 1%). */
+function withinOnePercent(a: number, b: number): boolean {
+  const denom = Math.max(Math.abs(a), Math.abs(b), 0.001);
+  return Math.abs(a - b) / denom <= 0.01;
+}
+
+/**
+ * A group of N≥3 collision pairs that share a common name prefix AND have
+ * identical (within 1%) overlap volume + per-axis overlap depth. When N
+ * adjacent parts in a chain collide with the same amount, the underlying
+ * cause is a size/spacing mismatch — "part width > pitch" — not a
+ * per-placement bug. Surfacing this as one line instead of N "likely
+ * misplaced" lines is a UX win without hiding the underlying detail.
+ */
+type SystematicCollisionGroup = {
+  prefix: string;
+  count: number;
+  volume: number;
+  depths: { x: number; y: number; z: number };
+  dominantAxis: "X" | "Y" | "Z";
+  dominantDepth: number;
+  /** Indices into the original `realC` array (used to filter out after grouping). */
+  memberIndices: number[];
+};
+
+/**
+ * Scan `realC` for N≥3 pairs sharing a common name prefix and identical
+ * volume + depth. Returns discovered groups + the indices they consumed.
+ *
+ * Heuristic: groups are only formed when BOTH sides of every pair share the
+ * same stripped prefix (e.g. pair = ("solenoid-3", "solenoid-4") → both
+ * strip to "solenoid"). This matches the intended signal ("adjacent parts
+ * in a uniform chain") while avoiding false groupings like
+ * ("bearing-0", "shaft-0") + ("bearing-1", "shaft-1") where the LHS/RHS
+ * swap mid-list.
+ */
+function groupSystematicCollisions(
+  realC: CollisionEntry[],
+): { groups: SystematicCollisionGroup[]; groupedIndices: Set<number> } {
+  const groups: SystematicCollisionGroup[] = [];
+  const groupedIndices = new Set<number>();
+  if (realC.length < 3) return { groups, groupedIndices };
+
+  for (let i = 0; i < realC.length; i++) {
+    if (groupedIndices.has(i)) continue;
+    const seed = realC[i];
+    if (!seed.region) continue;
+    const seedPrefixA = stripIndexSuffix(seed.a);
+    const seedPrefixB = stripIndexSuffix(seed.b);
+    // Only chain-like patterns (same-base adjacent parts) form groups —
+    // heterogenous pairs like bearing↔shaft are legitimate per-pair reports.
+    if (seedPrefixA !== seedPrefixB) continue;
+    const prefix = seedPrefixA;
+
+    const bucket: number[] = [i];
+    for (let j = i + 1; j < realC.length; j++) {
+      if (groupedIndices.has(j)) continue;
+      const cand = realC[j];
+      if (!cand.region) continue;
+      const candPrefixA = stripIndexSuffix(cand.a);
+      const candPrefixB = stripIndexSuffix(cand.b);
+      if (candPrefixA !== prefix || candPrefixB !== prefix) continue;
+      if (!withinOnePercent(cand.volume, seed.volume)) continue;
+      if (!withinOnePercent(cand.region.depths.x, seed.region.depths.x)) continue;
+      if (!withinOnePercent(cand.region.depths.y, seed.region.depths.y)) continue;
+      if (!withinOnePercent(cand.region.depths.z, seed.region.depths.z)) continue;
+      bucket.push(j);
+    }
+
+    if (bucket.length < 3) continue;
+
+    const d = seed.region.depths;
+    let dominantAxis: "X" | "Y" | "Z" = "X";
+    let dominantDepth = d.x;
+    if (d.y > dominantDepth) { dominantAxis = "Y"; dominantDepth = d.y; }
+    if (d.z > dominantDepth) { dominantAxis = "Z"; dominantDepth = d.z; }
+
+    groups.push({
+      prefix,
+      count: bucket.length,
+      volume: seed.volume,
+      depths: { ...d },
+      dominantAxis,
+      dominantDepth,
+      memberIndices: bucket,
+    });
+    for (const idx of bucket) groupedIndices.add(idx);
+  }
+  return { groups, groupedIndices };
+}
+
+/**
+ * Render a systematic-mismatch group as a single collision line + hint.
+ * `fmt` is the shared number formatter used elsewhere in this section.
+ */
+function formatSystematicGroup(
+  g: SystematicCollisionGroup,
+  fmt: (n: number) => string,
+): string {
+  const lines: string[] = [];
+  lines.push(
+    `  - Systematic overlap: ${g.count} ${g.prefix}-* pairs, each ${fmt(g.volume)} mm\u00b3, ` +
+      `overlap depth X=${fmt(g.depths.x)}mm Y=${fmt(g.depths.y)}mm Z=${fmt(g.depths.z)}mm (dominant axis: ${g.dominantAxis}).`,
+  );
+  lines.push(
+    `    Design-class hint: identical overlap across ${g.count} pairs sharing prefix "${g.prefix}" suggests a size/spacing mismatch ` +
+      `on the ${g.dominantAxis} axis — part extent exceeds pitch by ${fmt(g.dominantDepth)}mm. ` +
+      `Fix by shrinking the ${g.prefix} body on ${g.dominantAxis} OR widening the ${g.dominantAxis}-pitch.`,
+  );
+  return lines.join("\n");
+}
+
 /** Render the per-pair collision block for check_collisions. */
 export function formatCollisionPairs(
   realC: CollisionEntry[],
@@ -2490,9 +2617,18 @@ export function formatCollisionPairs(
 
   if (realC.length > 0 || pressFitC.length > 0 || acceptedC.length > 0) {
     if (realC.length > 0) {
+      // Pre-pass: fold N≥3 "same prefix, same overlap volume+depth" pairs
+      // into one "systematic size/spacing mismatch" line. Ungrouped
+      // collisions keep their per-pair detail (region box, depth hint,
+      // "likely misplaced" tag). This is additive — a purely heterogenous
+      // collision list renders unchanged.
+      const { groups, groupedIndices } = groupSystematicCollisions(realC);
+      const ungroupedC = realC.filter((_, idx) => !groupedIndices.has(idx));
+
       if (reportFormat === "full") {
         const lines: string[] = [];
-        for (const c of realC) {
+        for (const g of groups) lines.push(formatSystematicGroup(g, fmt));
+        for (const c of ungroupedC) {
           lines.push(`  - ${c.a} \u2194 ${c.b}: ${fmt(c.volume)} mm\u00b3 overlap${misplacedHint(c)}`);
           if (c.region) {
             const r = c.region;
@@ -2510,22 +2646,25 @@ export function formatCollisionPairs(
         sections.push(`\nCollisions (sorted by volume desc):\n${lines.join("\n")}`);
       } else {
         const lines: string[] = [];
-        const [worst, ...rest] = realC;
-        lines.push(`  - ${worst.a} \u2194 ${worst.b}: ${fmt(worst.volume)} mm\u00b3 overlap${misplacedHint(worst)}`);
-        if (worst.region) {
-          const r = worst.region;
-          lines.push(
-            `    Region: x${fmtRange(r.min[0], r.max[0])} y${fmtRange(r.min[1], r.max[1])} z${fmtRange(r.min[2], r.max[2])} mm`,
-          );
-          lines.push(
-            `    Overlap depth: X=${fmt(r.depths.x)}mm, Y=${fmt(r.depths.y)}mm, Z=${fmt(r.depths.z)}mm`,
-          );
-        }
-        if (worst.center) {
-          lines.push(`    Center: ${fmtPt(worst.center)} mm`);
-        }
-        for (const c of rest) {
-          lines.push(`  - ${c.a} vs ${c.b} \u2014 ${fmt(c.volume)} mm\u00b3${misplacedHint(c)}`);
+        for (const g of groups) lines.push(formatSystematicGroup(g, fmt));
+        if (ungroupedC.length > 0) {
+          const [worst, ...rest] = ungroupedC;
+          lines.push(`  - ${worst.a} \u2194 ${worst.b}: ${fmt(worst.volume)} mm\u00b3 overlap${misplacedHint(worst)}`);
+          if (worst.region) {
+            const r = worst.region;
+            lines.push(
+              `    Region: x${fmtRange(r.min[0], r.max[0])} y${fmtRange(r.min[1], r.max[1])} z${fmtRange(r.min[2], r.max[2])} mm`,
+            );
+            lines.push(
+              `    Overlap depth: X=${fmt(r.depths.x)}mm, Y=${fmt(r.depths.y)}mm, Z=${fmt(r.depths.z)}mm`,
+            );
+          }
+          if (worst.center) {
+            lines.push(`    Center: ${fmtPt(worst.center)} mm`);
+          }
+          for (const c of rest) {
+            lines.push(`  - ${c.a} vs ${c.b} \u2014 ${fmt(c.volume)} mm\u00b3${misplacedHint(c)}`);
+          }
         }
         sections.push(`\nCollisions (sorted by volume desc):\n${lines.join("\n")}`);
       }
@@ -2945,7 +3084,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "modify_shape",
-    "Overwrite an existing .shape.ts file with new code and execute it, OR (when `code` is omitted and `params` is provided) re-execute the file with ephemeral param overrides — skipping the disk write entirely. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd(). If both `code` and `params` are provided, `code` wins and `params` is reported as ignored.",
+    "Overwrite an existing .shape.ts file with new code and execute it, OR (when `code` is omitted and `params` is provided) re-execute the file with ephemeral param overrides — skipping the disk write entirely. When BOTH are omitted, behaves like `open_shape` (re-executes the file from disk) — useful after editing a dependency like `constants.ts` that the target imports. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd(). If both `code` and `params` are provided, `code` wins and `params` is reported as ignored.",
     {
       filePath: z.string().describe("Path to the .shape.ts file. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
       code: z.string().optional().describe("New TypeScript source code. Omit when you only want to re-run with different `params`."),
@@ -2960,13 +3099,13 @@ export function registerTools(server: McpServer) {
           isError: true,
         };
       }
-      if (code === undefined && params === undefined) {
-        return {
-          content: [{ type: "text" as const, text: "modify_shape: provide `code` (to overwrite the file) or `params` (to re-run with overrides), or both. To execute an existing file without changes, use open_shape." }],
-          isError: true,
-        };
-      }
 
+      // Lenient fallback: when neither `code` nor `params` is provided, fall
+      // through to a plain re-execution (equivalent to open_shape). The
+      // common trigger is "I edited a sibling file like constants.ts that
+      // this file imports — run it again"; rejecting that call with a
+      // terminology error just burns an iteration. The re-exec still runs
+      // the same bundler/cache invariants so transitive changes pick up.
       let actionLabel: string;
       let paramsIgnoredNote = "";
       if (code !== undefined) {
@@ -2975,8 +3114,10 @@ export function registerTools(server: McpServer) {
         if (params !== undefined) {
           paramsIgnoredNote = "\nNote: `params` ignored — `code` was provided, so the file was overwritten and executed with its declared param defaults.";
         }
-      } else {
+      } else if (params !== undefined) {
         actionLabel = "Re-executed (file NOT modified) with params override";
+      } else {
+        actionLabel = "Re-executed (no code/params — equivalent to open_shape)";
       }
 
       const callOverrides = code === undefined ? params : undefined;
@@ -6462,6 +6603,14 @@ that shifts the plane along its own normal. \`sketchOnPlane("XY", [0,0,20])\` pl
 sketch on XY raised 20 mm in +Z. For "XZ" the normal is -Y (so [0,-20,0] shifts 20 mm
 toward camera); for "YZ" the normal is +X. To translate within the plane, use \`drawing.translate(dx, dy)\` before \`sketchOnPlane\`, not the origin arg.
 
+The origin sits on the BOTTOM face of the extrude, NOT the midplane. \`extrude(L)\` pushes
+from the sketch plane along the "extrudes toward" axis (see table below) for \`L\` mm —
+so for XY the sketch Z becomes the low-Z face, and the solid occupies [Zsketch, Zsketch+L].
+This trips up people who treat the origin as a center (the way \`cylinder({top|bottom})\` does).
+To center a slab on z=0: sketch at [0,0,-L/2], then extrude(L). Examples:
+  drawRectangle(W,H).sketchOnPlane("XY", [0,0, 0]).extrude(10)  → Z ∈ [ 0, 10]
+  drawRectangle(W,H).sketchOnPlane("XY", [0,0,-5]).extrude(10)  → Z ∈ [-5,  5]
+
 Pen axis mapping (sketchOnPlane):
   Plane  | pen h → world | pen v → world | extrudes toward
   XY     | +X            | +Y            | +Z
@@ -6831,13 +6980,25 @@ is a stepped pocket with the bearing resting on a 3 mm shoulder; pass
 ## patterns — placement arrays + single-call apply
 
 \`\`\`typescript
-patterns.polar(n, radius, { startAngle?, axis?: "X"|"Y"|"Z", orientOutward? })
-patterns.grid(nx, ny, dx, dy?)                       // centered on origin
-patterns.linear(n, [dx, dy, dz])                     // N copies along a vector
+patterns.polar(n, radius, { startAngle?, axis?: "X"|"Y"|"Z", orientOutward?, plane? })
+patterns.grid(nx, ny, dx, dy?, { plane?, origin? })  // centered on origin
+patterns.linear(n, [dx, dy, dz], { centered?, plane? })  // N copies along a vector
+patterns.onPlane(placements, plane, origin?)         // remap XY→YZ/XZ + world offset
 
 patterns.spread(makeShape, placements)               // fuse N copies (positive shape)
 patterns.cutAt(target, makeTool, placements)         // cut N copies (cut-tool shape)
 patterns.applyPlacement(shape, placement)            // low-level: apply one
+\`\`\`
+
+Wall-absolute placement without \`.map()\` — pass \`origin\` to either \`grid\` or
+\`onPlane\`. It's added AFTER the plane remap, so it's a world-space translation:
+
+\`\`\`typescript
+// NEMA17 4-hole pattern on a YZ wall at x=wallX, centered on z=motorZ:
+patterns.grid(2, 2, 31, 31, { plane: "YZ", origin: [wallX, 0, motorZ] })
+
+// Equivalent via explicit composition:
+patterns.onPlane(patterns.grid(2, 2, 31, 31), "YZ", [wallX, 0, motorZ])
 \`\`\`
 
 **Important**: \`spread\` and \`cutAt\` take a **factory** (\`() => Shape3D\`), not

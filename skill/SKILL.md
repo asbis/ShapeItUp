@@ -111,6 +111,15 @@ XZ → extrudes -Y (toward camera)
 YZ → extrudes +X
 ```
 
+**The origin you pass is the SKETCH FACE (the base of the extrude), NOT the midplane.** Unlike `cylinder({ top, bottom })` where the anchor is an end-cap center, `sketchOnPlane(plane, origin)` lands the 2D sketch AT `origin` and `.extrude(L)` grows ONE-SIDED from there — so the passed Z/Y/X is the bottom of the resulting solid, not its middle.
+
+```
+sketchOnPlane("XY", [0, 0, 0]).extrude(10)   → Z ∈ [ 0, 10]  (NOT [-5, +5])
+sketchOnPlane("XY", [0, 0,-5]).extrude(10)   → Z ∈ [-5,  5]
+```
+
+For a slab symmetric around a target Z, use `extrudeCentered(sketch, d)` or (better) `placeOn(drawing, plane, { into, distance })` — both remove the "is this the midplane or the face?" question.
+
 No exceptions, no flags, no "it depends". To flip direction, pass a negative extrude depth (`.extrude(-L)`) — this reverses the direction vector without touching the pen-axis mapping. Avoid the reverse-named plane trick (`XZ`↔`ZX`) if your sketch uses `hLine`/`vLine`/`lineTo` — it silently swaps which world axis each pen move writes to (see Pen axis mapping above). `sketchOnPlane("XZ", [0, 0, 20])`'s origin offset is in WORLD coordinates, so the `[0, 0, 20]` raises along world Z, NOT along the XZ plane's local axis.
 
 Or skip all that and use `prism({ along: "+Y", length: 20 })` — same shape, no sign puzzle.
@@ -234,7 +243,7 @@ return [
 - **Units**: millimeters.
 - **Axes**: X right, Y forward, Z up.
 - **Planes**: see [Plane orientation](#plane-orientation-read-this-first) at the top of this doc — `"XY"` extrudes +Z, `"XZ"` extrudes **-Y** (toward camera), `"YZ"` extrudes +X. Reverse-named planes (`"YX"` / `"ZX"` / `"ZY"`) or a negative extrude depth flip the direction.
-- **`sketchOnPlane(plane, origin?)` origin semantics**: `origin` is an offset in WORLD coordinates, NOT plane-local. `sketchOnPlane("XY", [0, 0, 20])` raises the sketch to Z=20. `sketchOnPlane("XZ", [10, 0, 0])` shifts it along world X.
+- **`sketchOnPlane(plane, origin?)` origin semantics**: `origin` is an offset in WORLD coordinates, NOT plane-local. It places the SKETCH FACE at that world position — not the midplane. `sketchOnPlane("XY", [0, 0, 20])` puts the 2D sketch at Z=20; a subsequent `.extrude(10)` grows the solid to Z ∈ [20, 30] (never straddles Z=20). `sketchOnPlane("XZ", [10, 0, 0])` shifts it along world X.
 
 ---
 
@@ -275,7 +284,7 @@ Signatures only — full reference: `get_api_reference({ category: "drawing" })`
 
 ```typescript
 drawRectangle(50, 30).sketchOnPlane("XY");              // on top
-drawCircle(10).sketchOnPlane("XY", [0, 0, 20]);         // raised to Z=20 (world coords)
+drawCircle(10).sketchOnPlane("XY", [0, 0, 20]);         // sketch face at Z=20 (world); extrude grows +Z from there
 sketchCircle(10, { plane: "XY" });                       // one-liner; already a Sketch
 new Sketcher("XZ").hLine(20).vLine(10).hLine(-20).close(); // freeform; on XZ, hLine → world X, vLine → world Z (see Pen axis mapping)
 ```
@@ -584,6 +593,9 @@ export default function main() { return makeNeedle(); }
 
 ```typescript
 // bolt.shape.ts
+// makeBolt — anchor Z: head bottom face sits at Z=0 (head Z ∈ [0, 5], shaft
+// Z ∈ [-length, 0]). Translate the returned shape by the TOP-face Z of the
+// part you're bolting INTO so the shaft hangs down into it.
 import { sketchCircle, drawPolysides } from "replicad";
 export function makeBolt(diameter = 8, length = 30) {
   const head = drawPolysides(diameter * 0.9, 6).sketchOnPlane("XY").extrude(5);
@@ -592,6 +604,8 @@ export function makeBolt(diameter = 8, length = 30) {
 }
 export default function main() { return makeBolt(); }
 ```
+
+**Convention — always document the anchor Z in your factory docstring.** For any `makeX()` you write, add a one-liner naming (a) which face of the part sits at the local Z origin and (b) what the assembly caller should translate by. Pays for itself the first time you misalign two parts by half a thickness.
 
 ```typescript
 // assembly.shape.ts
@@ -896,9 +910,14 @@ patterns.polar(6, 25)                    // 6 on a 25 mm circle (XY plane by def
 // Remap any XY-plane pattern onto YZ or XZ — for vent grids on side walls etc.
 patterns.onPlane(patterns.grid(5, 3, 6, 6), "YZ")
 // grid cells were (x, y, 0); after onPlane("YZ") they become (0, x, y).
+
+// Wall-absolute bolt pattern — one call, no `.map()` to shift each placement.
+// A NEMA17 4-hole pattern on a YZ wall at x=wallX, centered on z=motorZ:
+patterns.grid(2, 2, 31, 31, { plane: "YZ", origin: [wallX, 0, motorZ] })
+// equivalent: patterns.onPlane(patterns.grid(2, 2, 31, 31), "YZ", [wallX, 0, motorZ])
 ```
 
-`grid` is already centered. `linear` now takes `{ centered: true }` for the same behaviour when you want a run straddling the origin.
+`grid` is already centered. `linear` takes `{ centered: true }` for the same behaviour when you want a run straddling the origin. Both `grid` and `onPlane` accept a world-space `origin` that is added AFTER the plane remap — use it to anchor a centered pattern on a specific wall face without a downstream `.map()`.
 
 ### Motors — assembly Part vs. mount-plate cut tool
 
