@@ -1250,6 +1250,299 @@ export function checkShapeReuseAfterBoolean(code: string): string | null {
   return warning;
 }
 
+
+/**
+ * Pitfall #11 (AST-based): flag a `draw(...)` pen chain that self-
+ * intersects when all pen moves use literal numeric arguments.
+ * Reconstructs the 2D polyline, then does a straightforward O(n²)
+ * segment-vs-segment crossing test skipping adjacent segments and
+ * shared endpoints.
+ *
+ * Dialect: lineTo/line/hLineTo/hLine/vLineTo/vLine and close(). Arcs,
+ * beziers, splines, and movePointerTo are treated as "abort the scan"
+ * — we can't cheaply model curves, and allowing them would either miss
+ * intersections (under-approximating as chords) or false-flag (curves
+ * that turn away from the straight line). Conservative abort is the
+ * safer default for an advisory warning.
+ *
+ * Any non-literal argument in any pen call aborts the scan for the
+ * whole chain — we can't statically evaluate variables, and a partial
+ * reconstruction would be misleading. Returns null when the polyline is
+ * clean (or when TypeScript isn't reachable, matching the other AST
+ * helpers).
+ *
+ * Reports line + segment indices so callers can pinpoint the bad pair
+ * in multi-profile files.
+ */
+export function checkDrawSelfIntersection(code: string): string | null {
+  const tsMod = loadTypescript();
+  if (!tsMod) return null;
+  const ts: typeof import("typescript") = tsMod;
+  let source: import("typescript").SourceFile;
+  try {
+    source = ts.createSourceFile("__validate__.ts", code, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  } catch {
+    return null;
+  }
+
+  // Read a signed numeric literal (allowing a prefix unary minus). Returns
+  // null for any other node shape so the caller bails out of the analysis.
+  function asNumber(node: import("typescript").Node): number | null {
+    if (ts.isNumericLiteral(node)) {
+      const v = parseFloat(node.text);
+      return isFinite(v) ? v : null;
+    }
+    if (
+      ts.isPrefixUnaryExpression(node) &&
+      node.operator === ts.SyntaxKind.MinusToken &&
+      ts.isNumericLiteral(node.operand)
+    ) {
+      const v = -parseFloat(node.operand.text);
+      return isFinite(v) ? v : null;
+    }
+    return null;
+  }
+
+  // Read a literal [x, y] 2-tuple argument. Returns null for any non-
+  // literal shape so the whole chain can bail.
+  function asTuple(node: import("typescript").Node): [number, number] | null {
+    if (!ts.isArrayLiteralExpression(node)) return null;
+    if (node.elements.length !== 2) return null;
+    const x = asNumber(node.elements[0]);
+    const y = asNumber(node.elements[1]);
+    if (x === null || y === null) return null;
+    return [x, y];
+  }
+
+  // Standard 2D segment intersection. Returns the intersection point if
+  // two open segments cross in their interiors (not at shared endpoints,
+  // not collinear). The parameter range [eps, 1 - eps] excludes endpoint
+  // touches that we treat as "adjacent" in the caller's skip logic.
+  function segIntersect(
+    p1: [number, number],
+    p2: [number, number],
+    p3: [number, number],
+    p4: [number, number]
+  ): [number, number] | null {
+    const [x1, y1] = p1;
+    const [x2, y2] = p2;
+    const [x3, y3] = p3;
+    const [x4, y4] = p4;
+    const denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+    if (Math.abs(denom) < 1e-12) return null; // parallel / collinear
+    const t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom;
+    const u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom;
+    const eps = 1e-9;
+    if (t <= eps || t >= 1 - eps) return null;
+    if (u <= eps || u >= 1 - eps) return null;
+    return [x1 + t * (x2 - x1), y1 + t * (y2 - y1)];
+  }
+
+  // Walk back from a `.sketchOnPlane(` / `.extrude(` / standalone draw chain
+  // to the root `draw(...)` call, collecting pen methods in chain order.
+  // Returns [start, methodCallNodesInOrder] or null if the chain doesn't
+  // start at `draw(`.
+  type PenCall = {
+    name: string;
+    args: import("typescript").NodeArray<import("typescript").Expression>;
+    node: import("typescript").CallExpression;
+  };
+
+  function collectPenChain(
+    rootCall: import("typescript").CallExpression
+  ): { start: [number, number]; calls: PenCall[] } | null {
+    // Walk from rootCall up the property-access chain into the draw(...)
+    // call. rootCall here is the outermost .method() at the end of the
+    // chain — we iterate through its `.expression` chain.
+    const calls: PenCall[] = [];
+    let cur: import("typescript").Expression = rootCall;
+    for (let guard = 0; guard < 256; guard++) {
+      if (ts.isCallExpression(cur) && ts.isPropertyAccessExpression(cur.expression)) {
+        const methodName = cur.expression.name.text;
+        calls.push({ name: methodName, args: cur.arguments, node: cur });
+        cur = cur.expression.expression;
+        continue;
+      }
+      if (ts.isCallExpression(cur) && ts.isIdentifier(cur.expression)) {
+        if (cur.expression.text !== "draw") return null;
+        // draw([x, y]) or draw() — both valid starts. Non-literal arg bails.
+        if (cur.arguments.length === 0) {
+          calls.reverse();
+          return { start: [0, 0], calls };
+        }
+        if (cur.arguments.length === 1) {
+          const t = asTuple(cur.arguments[0]);
+          if (!t) return null;
+          calls.reverse();
+          return { start: t, calls };
+        }
+        return null;
+      }
+      return null;
+    }
+    return null;
+  }
+
+  let warning: string | null = null;
+
+  function analyzeDrawChain(rootCall: import("typescript").CallExpression): void {
+    const chain = collectPenChain(rootCall);
+    if (!chain) return;
+    const { start, calls } = chain;
+
+    // Build segments. Each segment is [from, to, index].
+    const segments: Array<{ from: [number, number]; to: [number, number]; idx: number }> = [];
+    let cursor: [number, number] = start;
+    let segIdx = 0;
+    for (const call of calls) {
+      const name = call.name;
+      if (name === "lineTo") {
+        if (call.args.length !== 1) return;
+        const t = asTuple(call.args[0]);
+        if (!t) return;
+        segments.push({ from: cursor, to: t, idx: segIdx++ });
+        cursor = t;
+      } else if (name === "line") {
+        // Can be called as line(dx, dy) or line([dx, dy]); support both.
+        let dx: number | null = null;
+        let dy: number | null = null;
+        if (call.args.length === 2) {
+          dx = asNumber(call.args[0]);
+          dy = asNumber(call.args[1]);
+        } else if (call.args.length === 1) {
+          const t = asTuple(call.args[0]);
+          if (t) { dx = t[0]; dy = t[1]; }
+        }
+        if (dx === null || dy === null) return;
+        const to: [number, number] = [cursor[0] + dx, cursor[1] + dy];
+        segments.push({ from: cursor, to, idx: segIdx++ });
+        cursor = to;
+      } else if (name === "hLineTo") {
+        if (call.args.length !== 1) return;
+        const x = asNumber(call.args[0]);
+        if (x === null) return;
+        const to: [number, number] = [x, cursor[1]];
+        segments.push({ from: cursor, to, idx: segIdx++ });
+        cursor = to;
+      } else if (name === "hLine") {
+        if (call.args.length !== 1) return;
+        const dx = asNumber(call.args[0]);
+        if (dx === null) return;
+        const to: [number, number] = [cursor[0] + dx, cursor[1]];
+        segments.push({ from: cursor, to, idx: segIdx++ });
+        cursor = to;
+      } else if (name === "vLineTo") {
+        if (call.args.length !== 1) return;
+        const y = asNumber(call.args[0]);
+        if (y === null) return;
+        const to: [number, number] = [cursor[0], y];
+        segments.push({ from: cursor, to, idx: segIdx++ });
+        cursor = to;
+      } else if (name === "vLine") {
+        if (call.args.length !== 1) return;
+        const dy = asNumber(call.args[0]);
+        if (dy === null) return;
+        const to: [number, number] = [cursor[0], cursor[1] + dy];
+        segments.push({ from: cursor, to, idx: segIdx++ });
+        cursor = to;
+      } else if (name === "close" || name === "closeWithMirror") {
+        // close() adds a segment back to start. closeWithMirror actually
+        // mirrors the path, but we treat it identically here — for an
+        // advisory warning, flagging its main closing segment is fine.
+        segments.push({ from: cursor, to: start, idx: segIdx++ });
+        cursor = start;
+        break; // nothing after close matters for sketch intersection
+      } else if (name === "sketchOnPlane" || name === "extrude" || name === "done") {
+        break; // chain termination; we already collected the pen moves
+      } else {
+        // Unknown / unsupported pen op (movePointerTo, arcs, beziers, ...).
+        // Bail conservatively — we'd rather miss the warning than false-
+        // positive on a curve that turns away from the chord we'd infer.
+        return;
+      }
+    }
+
+    if (segments.length < 2) return;
+
+    // O(n²) crossing test, skipping adjacent pairs (they share endpoints
+    // by construction and segIntersect would have to special-case that).
+    for (let i = 0; i < segments.length && !warning; i++) {
+      for (let j = i + 2; j < segments.length; j++) {
+        // Also skip the first/last adjacency introduced by close() — a
+        // closed polygon's final segment shares an endpoint with segment 0.
+        if (i === 0 && j === segments.length - 1) {
+          // Only skip if the final segment actually closes back to start.
+          const last = segments[j];
+          const first = segments[0];
+          if (
+            Math.abs(last.to[0] - first.from[0]) < 1e-9 &&
+            Math.abs(last.to[1] - first.from[1]) < 1e-9
+          ) {
+            continue;
+          }
+        }
+        const hit = segIntersect(
+          segments[i].from, segments[i].to,
+          segments[j].from, segments[j].to
+        );
+        if (hit) {
+          const [hx, hy] = hit;
+          const line = source.getLineAndCharacterOfPosition(rootCall.getStart(source)).line + 1;
+          const roundedX = Math.round(hx * 1000) / 1000;
+          const roundedY = Math.round(hy * 1000) / 1000;
+          warning =
+            `line ${line}: draw() chain self-intersects at approximately [${roundedX}, ${roundedY}] ` +
+            `between segment ${segments[i].idx} and segment ${segments[j].idx}. ` +
+            `Self-intersecting sketches extrude to invalid solids.`;
+          return;
+        }
+      }
+    }
+  }
+
+  // Find every outermost call expression whose chain roots at `draw(...)`.
+  // We scan all call expressions and only analyse those whose root is a
+  // draw() call AND whose parent isn't also part of a larger chain ending
+  // in a draw-rooted call — prevents analysing the same chain N times.
+  function scan(node: import("typescript").Node): void {
+    if (warning) return;
+    if (ts.isCallExpression(node)) {
+      // Only analyse from the outermost chain tip. A call whose parent is
+      // a PropertyAccessExpression feeding another CallExpression is an
+      // inner link; skip it so we analyse each chain once.
+      const parent = node.parent;
+      const isInnerLink =
+        parent &&
+        ts.isPropertyAccessExpression(parent) &&
+        parent.expression === node &&
+        parent.parent &&
+        ts.isCallExpression(parent.parent) &&
+        parent.parent.expression === parent;
+      if (!isInnerLink) {
+        // Check if the chain roots at draw(
+        let cur: import("typescript").Expression = node;
+        for (let guard = 0; guard < 256; guard++) {
+          if (ts.isCallExpression(cur) && ts.isPropertyAccessExpression(cur.expression)) {
+            cur = cur.expression.expression;
+            continue;
+          }
+          if (ts.isCallExpression(cur) && ts.isIdentifier(cur.expression)) {
+            if (cur.expression.text === "draw") {
+              analyzeDrawChain(node);
+            }
+            break;
+          }
+          break;
+        }
+      }
+    }
+    if (!warning) ts.forEachChild(node, scan);
+  }
+  scan(source);
+  return warning;
+}
+
+
 /**
  * Compute the effective meshQuality to use for a render_preview call.
  *
@@ -1455,6 +1748,111 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
         break; // one warning is enough
       }
     }
+
+    // 4a. Unanchored `draw()` followed by a far-from-origin absolute *To
+    //     pen move. `draw()` with no arg defaults the cursor to [0, 0];
+    //     the first `.lineTo([-40, -5])` then silently inserts a segment
+    //     from origin to that literal, which commonly crosses a later
+    //     `.close()` segment and crashes OCCT with an opaque self-
+    //     intersection fault. Threshold: 5mm on any axis — below that the
+    //     implicit segment rarely causes trouble and the rule stays quiet
+    //     for tiny sketches legitimately anchored at origin.
+    //
+    //     Guards against false positives:
+    //       - `draw([x, y]).lineTo(...)` — anchor arg present, skipped by
+    //         the `\(\s*\)` pattern.
+    //       - `draw().movePointerTo(...).lineTo(...)` — an explicit pointer
+    //         move before the first *To means the user knows what they're
+    //         doing; we only flag when the very first chained method is a
+    //         *To.
+    //       - Relative forms (`.line`, `.hLine`, `.vLine`, `.polarLine`)
+    //         are not flagged — they deliberately start relative to [0,0].
+    const unanchoredDrawPattern =
+      /\bdraw\s*\(\s*\)\s*\.\s*(lineTo|hLineTo|vLineTo|polarLineTo)\s*\(([^()]*)\)/g;
+    let udMatch: RegExpExecArray | null;
+    const unanchoredSeen = new Set<string>();
+    while ((udMatch = unanchoredDrawPattern.exec(code)) !== null) {
+      const method = udMatch[1];
+      const rawArgs = udMatch[2].trim();
+      // Parse literal coords only — bail silently on any non-literal arg
+      // so computed sketches never false-positive here.
+      let flaggedCoords: string | null = null;
+      if (method === "lineTo" || method === "polarLineTo") {
+        // Expect a single literal 2-tuple: [x, y] (or [r, theta]).
+        const tupleMatch = rawArgs.match(
+          /^\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]$/
+        );
+        if (!tupleMatch) continue;
+        const a = parseFloat(tupleMatch[1]);
+        const b = parseFloat(tupleMatch[2]);
+        if (!isFinite(a) || !isFinite(b)) continue;
+        if (method === "lineTo") {
+          if (Math.abs(a) > 5 || Math.abs(b) > 5) {
+            flaggedCoords = `[${a}, ${b}]`;
+          }
+        } else {
+          // polarLineTo: first element is the radius r (distance), so
+          // compare magnitude directly. Angle theta is unrestricted.
+          if (Math.abs(a) > 5) {
+            flaggedCoords = `[${a}, ${b}]`;
+          }
+        }
+      } else {
+        // hLineTo / vLineTo — single scalar literal.
+        const scalarMatch = rawArgs.match(/^(-?\d+(?:\.\d+)?)$/);
+        if (!scalarMatch) continue;
+        const v = parseFloat(scalarMatch[1]);
+        if (!isFinite(v)) continue;
+        if (Math.abs(v) > 5) flaggedCoords = `${v}`;
+      }
+      if (!flaggedCoords) continue;
+      // Dedupe — if the same literal call appears twice (copy-paste in
+      // a multi-profile script), one warning is plenty.
+      const dedupeKey = `${method}:${flaggedCoords}`;
+      if (unanchoredSeen.has(dedupeKey)) continue;
+      unanchoredSeen.add(dedupeKey);
+      semanticWarnings.push(
+        `draw() defaults to origin [0,0]. First move .${method}(${flaggedCoords}) ` +
+          `implicitly adds a segment from [0,0] to ${flaggedCoords} that may self-intersect. ` +
+          `Pass the start point to draw(${flaggedCoords}) or begin with .movePointerTo(...).`
+      );
+    }
+
+    // 4b. Zero-length first segment — `draw([x, y]).lineTo([x, y])` with
+    //     (near-)identical coords. The first segment has length ~0 which
+    //     OCCT rejects as a degenerate edge. Almost always a literal
+    //     copy-paste typo; we only match literal numeric tuples so
+    //     parameterised sketches don't false-positive.
+    const zeroLenFirstPattern =
+      /\bdraw\s*\(\s*\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]\s*\)\s*\.\s*lineTo\s*\(\s*\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]\s*\)/g;
+    let zlMatch: RegExpExecArray | null;
+    const zeroLenSeen = new Set<string>();
+    while ((zlMatch = zeroLenFirstPattern.exec(code)) !== null) {
+      const sx = parseFloat(zlMatch[1]);
+      const sy = parseFloat(zlMatch[2]);
+      const ex = parseFloat(zlMatch[3]);
+      const ey = parseFloat(zlMatch[4]);
+      if (![sx, sy, ex, ey].every((n) => isFinite(n))) continue;
+      const dx = sx - ex;
+      const dy = sy - ey;
+      if (Math.hypot(dx, dy) >= 1e-3) continue;
+      const dedupeKey = `${sx},${sy}->${ex},${ey}`;
+      if (zeroLenSeen.has(dedupeKey)) continue;
+      zeroLenSeen.add(dedupeKey);
+      semanticWarnings.push(
+        `draw([${sx}, ${sy}]).lineTo([${ex}, ${ey}]) has a zero-length first segment (start equals end). ` +
+          `OCCT rejects degenerate edges — update one of the coords or drop the redundant .lineTo().`
+      );
+    }
+
+    // 4c. Literal-only polyline self-intersection. AST walker; see the
+    //     helper doc for the dialect it understands and the conservative
+    //     bail-outs (any non-literal arg -> skip the whole chain).
+    const selfIntersectWarning = checkDrawSelfIntersection(code);
+    if (selfIntersectWarning) {
+      semanticWarnings.push(selfIntersectWarning);
+    }
+
 
     // 5. Fillet/chamfer radius sanity check against observed dimensions.
     //    Collect numeric literals from shape-factory calls and extrude

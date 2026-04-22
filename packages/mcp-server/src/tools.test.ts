@@ -1129,3 +1129,185 @@ describe("validateSyntaxPure — shape reuse after boolean", () => {
     expect(text).not.toMatch(/Shape reuse after boolean/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Pitfall detector — unanchored draw() footguns (Rules A, B, C)
+// A: `draw()` followed by a far-from-origin absolute *To move silently
+//    inserts a segment from [0,0] that commonly causes self-intersection.
+// B: `draw([x, y]).lineTo([x, y])` — zero-length first segment typo.
+// C: Literal-only draw chains whose polyline self-intersects.
+// ---------------------------------------------------------------------------
+
+describe("validateSyntaxPure — unanchored draw() + far literal move (Rule A)", () => {
+  const wrap = (body: string) =>
+    [
+      `import { draw } from "replicad";`,
+      `export default function main() {`,
+      body,
+      `}`,
+    ].join("\n");
+
+  it("flags draw().lineTo([-40, -5]) — big absolute jump from origin", () => {
+    const code = wrap(`  return draw().lineTo([-40, -5]).lineTo([0, 0]).close();`);
+    const { text, isError } = validateSyntaxPure(code);
+    expect(isError).toBe(false);
+    expect(text).toMatch(/defaults to origin/);
+    expect(text).toContain(".lineTo([-40, -5])");
+    expect(text).toContain("draw([-40, -5])");
+  });
+
+  it("flags draw().hLineTo(30) — big absolute X jump", () => {
+    const code = wrap(`  return draw().hLineTo(30).vLine(10).close();`);
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/defaults to origin/);
+    expect(text).toContain(".hLineTo(30)");
+  });
+
+  it("flags draw().vLineTo(-20) — big absolute Y jump", () => {
+    const code = wrap(`  return draw().vLineTo(-20).hLine(5).close();`);
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/defaults to origin/);
+    expect(text).toContain(".vLineTo(-20)");
+  });
+
+  it("flags draw().polarLineTo([50, 0.5]) — r > 5", () => {
+    const code = wrap(`  return draw().polarLineTo([50, 0.5]).close();`);
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/defaults to origin/);
+    expect(text).toContain(".polarLineTo([50, 0.5])");
+  });
+
+  it("does NOT flag draw([-40, -5]).lineTo(...) — already anchored", () => {
+    const code = wrap(`  return draw([-40, -5]).lineTo([0, 0]).close();`);
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/defaults to origin/);
+  });
+
+  it("does NOT flag draw().line(30, 0) — relative move starts at origin intentionally", () => {
+    const code = wrap(`  return draw().line(30, 0).vLine(20).close();`);
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/defaults to origin/);
+  });
+
+  it("does NOT flag draw().lineTo([3, 2]) — within 5mm threshold", () => {
+    const code = wrap(`  return draw().lineTo([3, 2]).close();`);
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/defaults to origin/);
+  });
+
+  it("does NOT flag draw().movePointerTo(...).lineTo(...) — explicit pointer move first", () => {
+    // movePointerTo isn't a *To we scan for (it's not in the regex list);
+    // the first chained method must be one of lineTo/hLineTo/vLineTo/polarLineTo.
+    const code = wrap(`  return draw().movePointerTo([-40, -5]).lineTo([-30, -5]).close();`);
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/defaults to origin/);
+  });
+
+  it("does NOT flag draw().lineTo([varX, 0]) — non-literal arg is skipped", () => {
+    const code = wrap([
+      `  const varX = 40;`,
+      `  return draw().lineTo([varX, 0]).close();`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/defaults to origin/);
+  });
+});
+
+describe("validateSyntaxPure — zero-length first segment (Rule B)", () => {
+  const wrap = (body: string) =>
+    [
+      `import { draw } from "replicad";`,
+      `export default function main() {`,
+      body,
+      `}`,
+    ].join("\n");
+
+  it("flags draw([10, 5]).lineTo([10, 5]) — identical coords", () => {
+    const code = wrap(`  return draw([10, 5]).lineTo([10, 5]).lineTo([20, 5]).close();`);
+    const { text, isError } = validateSyntaxPure(code);
+    expect(isError).toBe(false);
+    expect(text).toMatch(/zero-length first segment/);
+  });
+
+  it("flags draw([0, 0]).lineTo([0, 0])", () => {
+    const code = wrap(`  return draw([0, 0]).lineTo([0, 0]).lineTo([10, 0]).close();`);
+    const { text } = validateSyntaxPure(code);
+    expect(text).toMatch(/zero-length first segment/);
+  });
+
+  it("does NOT flag draw([10, 5]).lineTo([10, 6]) — differ by 1mm", () => {
+    const code = wrap(`  return draw([10, 5]).lineTo([10, 6]).close();`);
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/zero-length first segment/);
+  });
+
+  it("does NOT flag when start is a variable (non-literal bail)", () => {
+    const code = wrap([
+      `  const p = [10, 5];`,
+      `  return draw(p).lineTo([10, 5]).close();`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/zero-length first segment/);
+  });
+});
+
+describe("validateSyntaxPure — literal polyline self-intersection (Rule C)", () => {
+  const wrap = (body: string) =>
+    [
+      `import { draw } from "replicad";`,
+      `export default function main() {`,
+      body,
+      `}`,
+    ].join("\n");
+
+  it("flags a literal bowtie quadrilateral (figure-8 self-cross)", () => {
+    // Four points forming a crossing bowtie: (0,0) -> (10,10) -> (10,0) -> (0,10) -> close
+    // segment 0 [(0,0)-(10,10)] crosses segment 2 [(10,0)-(0,10)] at (5,5).
+    const code = wrap([
+      `  return draw([0, 0])`,
+      `    .lineTo([10, 10])`,
+      `    .lineTo([10, 0])`,
+      `    .lineTo([0, 10])`,
+      `    .close();`,
+    ].join("\n"));
+    const { text, isError } = validateSyntaxPure(code);
+    expect(isError).toBe(false);
+    expect(text).toMatch(/self-intersects at approximately/);
+  });
+
+  it("does NOT flag a simple clean rectangle", () => {
+    const code = wrap([
+      `  return draw([0, 0])`,
+      `    .lineTo([10, 0])`,
+      `    .lineTo([10, 10])`,
+      `    .lineTo([0, 10])`,
+      `    .close();`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/self-intersects/);
+  });
+
+  it("does NOT flag a chain with a non-literal coord (conservative skip)", () => {
+    const code = wrap([
+      `  const w = 10;`,
+      `  return draw([0, 0]).lineTo([w, w]).lineTo([w, 0]).lineTo([0, w]).close();`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/self-intersects/);
+  });
+
+  it("does NOT flag a chain that uses movePointerTo (bail on unsupported pen op)", () => {
+    // movePointerTo jumps the cursor without drawing — we can't cheaply
+    // model that and stay conservative.
+    const code = wrap([
+      `  return draw([0, 0])`,
+      `    .lineTo([10, 10])`,
+      `    .movePointerTo([10, 0])`,
+      `    .lineTo([0, 10])`,
+      `    .close();`,
+    ].join("\n"));
+    const { text } = validateSyntaxPure(code);
+    expect(text).not.toMatch(/self-intersects/);
+  });
+});
+
