@@ -6,15 +6,96 @@ import {
 } from "./stdlib/warnings";
 
 /**
- * WeakMap threading the plane-name from `Drawing.sketchOnPlane(plane)` to the
- * returned Sketch instance, so `Sketch.extrude` can emit the plane-aware
- * bounding-box hint (Issue #1 — silent Y ∈ [-20,0] on XZ sketches). Using a
- * WeakMap keeps the association per-sketch, per-run without polluting the
- * sketch object with enumerable properties that the user might observe. The
- * entry is populated in the `sketchOnPlane` post-hook below and consumed
- * lazily in `validateSketchExtrude`.
+ * WeakMap threading the plane-name (and optional origin offset) from
+ * `Drawing.sketchOnPlane(plane, origin?)` to the returned Sketch instance, so
+ * `Sketch.extrude` can emit the plane-aware bounding-box hint (Issue #1 —
+ * silent Y ∈ [-20,0] on XZ sketches). Using a WeakMap keeps the association
+ * per-sketch, per-run without polluting the sketch object with enumerable
+ * properties that the user might observe. The entry is populated in the
+ * `sketchOnPlane` post-hook below and consumed lazily in
+ * `validateSketchExtrude`.
+ *
+ * The optional `origin` field tracks the 2nd arg to `sketchOnPlane`:
+ *   - number            → scalar offset along the plane normal (e.g.
+ *                          `sketchOnPlane("YZ", -5)` shifts the sketch 5mm
+ *                          along +X, so the downstream extrude's predicted
+ *                          interval must be shifted too).
+ *   - [x, y, z]         → explicit 3D origin; we keep the full tuple and pick
+ *                          the normal-axis component when predicting.
+ *   - undefined / Plane → omitted (we either have no shift or can't decode
+ *                          the opaque Plane object; `enqueueExtrudeHint`
+ *                          skips the hint entirely on the latter).
  */
-const SKETCH_PLANE: WeakMap<object, string> = new WeakMap();
+interface SketchPlaneInfo {
+  plane: string;
+  origin?: number | [number, number, number] | "opaque";
+  /**
+   * True when the user passed a non-trivial `origin` argument to
+   * `sketchOnPlane` — a non-zero scalar, or a 3-tuple with any non-zero
+   * component. Signals affirmative intent: "I know where this slab will
+   * land on the plane's normal axis." When set, `validateSketchExtrude`
+   * skips `enqueueExtrudeHint` because the bbox-off-origin warning only
+   * has pedagogical value when the user was oblivious to the plane's
+   * normal direction — an explicit origin offset is the opposite signal.
+   */
+  explicitlyOffset?: boolean;
+}
+const SKETCH_PLANE: WeakMap<object, SketchPlaneInfo> = new WeakMap();
+
+/**
+ * Drawings produced by coordinate-centered primitives (`drawRectangle`,
+ * `drawRoundedRectangle`, `drawCircle`, `drawEllipse`, `drawPolysides`). Used
+ * by `isDrawingCenteredOnOrigin` to short-circuit the "pen axis mapping"
+ * warning: a drawing known to come from a centered primitive CANNOT have used
+ * `hLine`/`vLine`/`vhLine` during construction, so the warning is definitionally
+ * irrelevant. Prior to this tag, the bbox-inspection fallback returned `false`
+ * whenever the blueprint's bbox couldn't be read — which fired on every plain
+ * `drawRectangle(...).sketchOnPlane("XZ").extrude(...)` in the test harness
+ * (no OCCT blueprint there) and on a handful of real `.shape.ts` files where
+ * the blueprint exists but its bbox center is slightly off due to compound
+ * fuses. The tag is the authoritative "definitely centered" signal; the bbox
+ * heuristic remains as a fallback for pen-built drawings that lack the tag.
+ *
+ * Populated in `PROTO_POST_HOOKS_RAW` entries for each centered primitive.
+ * Uses WeakSet so drawings are garbage-collected normally.
+ */
+const CENTERED_DRAWINGS: WeakSet<object> = new WeakSet();
+
+/**
+ * Drawings whose construction invoked a pen-axis method (hLine, vLine,
+ * vhLine, polarLine, polarLineTo, tangentArc, hSagittaArc, vSagittaArc).
+ * These methods map to world axes differently on each sketchOnPlane choice,
+ * so the "pen axis mapping" advisory is ONLY useful when such a method was
+ * actually used. Scripts built entirely from absolute `.lineTo([x,y])`
+ * coordinates don't care which world axis "h" or "v" means — the advisory
+ * is pure noise on those.
+ *
+ * Populated by the Drawing-family post-hooks below that tag both `self` and
+ * `result` (pen state propagates across the chained return value).
+ * `validateSketchOnPlane` gates the non-XY warning on membership so drawings
+ * without any pen-axis call stay silent.
+ */
+const PEN_AXIS_DRAWINGS: WeakSet<object> = new WeakSet();
+
+function tagPenAxisDrawing(self: unknown, result: unknown): void {
+  if (self && typeof self === "object") {
+    PEN_AXIS_DRAWINGS.add(self as object);
+  }
+  if (result && typeof result === "object") {
+    PEN_AXIS_DRAWINGS.add(result as object);
+  }
+}
+
+/**
+ * Mark a drawing as known-centered-by-construction. Used from the primitive
+ * post-hooks; exported for tests so they can simulate "the drawing came from
+ * a centered primitive" without needing a real replicad wrapper chain.
+ */
+function tagCenteredDrawing(result: unknown): void {
+  if (result && typeof result === "object") {
+    CENTERED_DRAWINGS.add(result as object);
+  }
+}
 
 /**
  * Read-only accessor for the sketch→plane association the `sketchOnPlane`
@@ -25,7 +106,8 @@ const SKETCH_PLANE: WeakMap<object, string> = new WeakMap();
  */
 export function getSketchPlane(sketch: unknown): string | undefined {
   if (typeof sketch !== "object" || sketch === null) return undefined;
-  return SKETCH_PLANE.get(sketch as object);
+  const info = SKETCH_PLANE.get(sketch as object);
+  return info?.plane;
 }
 
 interface TimingEntry {
@@ -292,6 +374,30 @@ const SKETCH_CLASSES = ["Sketch", "Sketches", "CompoundSketch"];
 // regardless of which drawing helper the user started with.
 const DRAWING_CLASSES = ["Drawing", "Blueprint", "CompoundBlueprint", "Blueprints"];
 
+// Fix 6: pen-axis methods (`hLine`, `vLine`, etc.) live on the pen/sketcher
+// classes replicad exposes from `draw()` and `new Sketcher(...)`. We tag the
+// Drawing families too so any wrapper class that implements the pen API
+// (custom subclass, test stub) also propagates pen-state when the method is
+// called on it — the tagger adds `self` + `result` to PEN_AXIS_DRAWINGS, so
+// the final close()→Drawing carries the flag forward.
+const PEN_AXIS_CLASSES = [
+  ...DRAWING_CLASSES,
+  "DrawingPen",
+  "Sketcher",
+  "BaseSketcher2d",
+  "DrawingInterface",
+];
+const PEN_AXIS_METHODS = new Set([
+  "hLine",
+  "vLine",
+  "vhLine",
+  "polarLine",
+  "polarLineTo",
+  "tangentArc",
+  "hSagittaArc",
+  "vSagittaArc",
+]);
+
 const PROTO_VALIDATORS: Record<string, (self: any, ...args: any[]) => void> = (() => {
   const out: Record<string, (self: any, ...args: any[]) => void> = {};
   for (const method of Object.keys(PROTO_VALIDATORS_RAW)) {
@@ -327,13 +433,80 @@ const PROTO_POST_HOOKS_RAW: Record<
   string,
   (self: any, result: any, ...args: any[]) => void
 > = {
-  sketchOnPlane: (_self: any, result: any, planeName?: unknown) => {
+  // Free-function post-hooks for coordinate-centered drawing primitives.
+  // Every one of these produces a drawing that's centered on origin by
+  // construction, so `isDrawingCenteredOnOrigin` can short-circuit to `true`
+  // without hitting the bbox-inspection fallback (which returns `false` on
+  // stubbed / unreadable blueprints — the exact false-positive the tester
+  // hit). See `CENTERED_DRAWINGS` above for rationale.
+  drawRectangle: (_self: any, result: any) => tagCenteredDrawing(result),
+  drawRoundedRectangle: (_self: any, result: any) => tagCenteredDrawing(result),
+  drawCircle: (_self: any, result: any) => tagCenteredDrawing(result),
+  drawEllipse: (_self: any, result: any) => tagCenteredDrawing(result),
+  drawPolysides: (_self: any, result: any) => tagCenteredDrawing(result),
+  // Pen-axis Drawing methods — tag both the receiver and the returned
+  // Drawing so the pen-state flag propagates across chained returns. These
+  // are the methods that make the "sketchOnPlane(non-XY) → pen axes map
+  // unexpectedly" advisory actually meaningful; drawings that never call
+  // any of them don't need the warning because their geometry is specified
+  // in absolute coordinates.
+  hLine: (self: any, result: any) => tagPenAxisDrawing(self, result),
+  vLine: (self: any, result: any) => tagPenAxisDrawing(self, result),
+  vhLine: (self: any, result: any) => tagPenAxisDrawing(self, result),
+  polarLine: (self: any, result: any) => tagPenAxisDrawing(self, result),
+  polarLineTo: (self: any, result: any) => tagPenAxisDrawing(self, result),
+  tangentArc: (self: any, result: any) => tagPenAxisDrawing(self, result),
+  hSagittaArc: (self: any, result: any) => tagPenAxisDrawing(self, result),
+  vSagittaArc: (self: any, result: any) => tagPenAxisDrawing(self, result),
+  sketchOnPlane: (_self: any, result: any, planeName?: unknown, origin?: unknown) => {
     if (typeof planeName !== "string") return;
-    if (result && typeof result === "object") {
-      SKETCH_PLANE.set(result, planeName);
+    if (!result || typeof result !== "object") return;
+    // Capture the 2nd arg (origin offset) so the deferred extrude-hint can
+    // shift its predicted interval to match the actual centered placement.
+    //   sketchOnPlane("YZ", -T/2).extrude(T)  → really sits at X ∈ [-T/2, T/2]
+    // Prior to this we stored only the plane name and the hint would warn
+    // about X ∈ [0, T] — a false positive that spammed the warnings panel.
+    //
+    // Accept: number (scalar offset along plane normal), 3-tuple of numbers
+    // (explicit origin point), or undefined. A Plane object is opaque to us
+    // (its internal origin depends on user construction) — tag it as "opaque"
+    // so `enqueueExtrudeHint` can skip the hint conservatively rather than
+    // fabricate an interval.
+    let captured: number | [number, number, number] | "opaque" | undefined;
+    let explicitlyOffset = false;
+    if (origin === undefined) {
+      captured = undefined;
+    } else if (typeof origin === "number" && Number.isFinite(origin)) {
+      captured = origin;
+      if (origin !== 0) explicitlyOffset = true;
+    } else if (
+      Array.isArray(origin) &&
+      origin.length === 3 &&
+      origin.every((n) => typeof n === "number" && Number.isFinite(n))
+    ) {
+      captured = [origin[0] as number, origin[1] as number, origin[2] as number];
+      if (captured[0] !== 0 || captured[1] !== 0 || captured[2] !== 0) {
+        explicitlyOffset = true;
+      }
+    } else {
+      // Opaque Plane object or unrecognised shape.
+      captured = "opaque";
     }
+    SKETCH_PLANE.set(result, { plane: planeName, origin: captured, explicitlyOffset });
   },
 };
+
+// Free-function post-hook names — kept in-sync with the `PROTO_POST_HOOKS_RAW`
+// entries that tag centered-by-construction drawing primitives. These go into
+// `PROTO_POST_HOOKS` under the bare function name (no class prefix), which is
+// what `wrap(name, ...)` uses for free-function exports.
+const FREE_FUNCTION_POST_HOOKS = new Set([
+  "drawRectangle",
+  "drawRoundedRectangle",
+  "drawCircle",
+  "drawEllipse",
+  "drawPolysides",
+]);
 
 const PROTO_POST_HOOKS: Record<
   string,
@@ -342,9 +515,21 @@ const PROTO_POST_HOOKS: Record<
   const out: Record<string, (self: any, result: any, ...args: any[]) => void> = {};
   for (const method of Object.keys(PROTO_POST_HOOKS_RAW)) {
     const fn = PROTO_POST_HOOKS_RAW[method];
-    // Today the only post-hook is on sketchOnPlane — expand only over the
-    // Drawing family, matching the pre-validator table above.
-    const classes = method === "sketchOnPlane" ? DRAWING_CLASSES : SHAPE3D_CLASSES;
+    if (FREE_FUNCTION_POST_HOOKS.has(method)) {
+      // Free function — registered under its bare name so `wrap(name, ...)`
+      // picks it up directly. No class-prefix expansion needed.
+      out[method] = fn;
+      continue;
+    }
+    // Prototype method — expand over the appropriate class family.
+    let classes: string[];
+    if (method === "sketchOnPlane") {
+      classes = DRAWING_CLASSES;
+    } else if (PEN_AXIS_METHODS.has(method)) {
+      classes = PEN_AXIS_CLASSES;
+    } else {
+      classes = SHAPE3D_CLASSES;
+    }
     for (const cls of classes) {
       out[`${cls}.${method}`] = fn;
     }
@@ -625,17 +810,6 @@ function validateSketchExtrude(self: any, distance: unknown): void {
       `extrude: distance must be a finite non-zero number, got ${String(distance)} (${typeof distance}).`,
     );
   }
-  // Negative extrude distances reach OCCT as a raw WASM pointer exception —
-  // Replicad's pipeline doesn't sign-check before handing the length to
-  // BRepPrimAPI_MakePrism. Sketchers reach for a negative length when they
-  // want to flip direction; the idiomatic Replicad fix is to sketch on the
-  // mirrored plane name instead (XY ↔ YX, etc.), which reverses the plane's
-  // normal without changing the length.
-  if (distance < 0) {
-    throw new Error(
-      `extrude: distance must be positive (got ${distance}mm). Negative lengths aren't supported — use a positive distance and flip the plane name to reverse direction (XY ↔ YX, XZ ↔ ZX, YZ ↔ ZY).`,
-    );
-  }
   // Issue #1: if this Sketch came from a non-XY `sketchOnPlane`, the extrude
   // will grow into the plane's signed normal — "XZ" produces a slab with
   // Y ∈ [-L, 0], not the centered Y ∈ [-L/2, L/2] most users expect.
@@ -645,9 +819,24 @@ function validateSketchExtrude(self: any, distance: unknown): void {
   // drain step cross-check it against the FINAL part bboxes — the hint only
   // survives if the problem region is actually still covered by the finished
   // geometry. See `drainExtrudeHints` in stdlib/warnings.ts for the criterion.
-  const plane = typeof self === "object" && self !== null ? SKETCH_PLANE.get(self) : undefined;
-  if (typeof plane === "string") {
-    enqueueExtrudeHint(plane, distance);
+  const info = typeof self === "object" && self !== null ? SKETCH_PLANE.get(self) : undefined;
+  if (info && typeof info.plane === "string") {
+    if (info.origin === "opaque") {
+      // User passed a Plane object whose true origin we can't decode
+      // statically. Conservatively skip the hint rather than fabricate a
+      // predicted interval — the warning panel stays silent on a case we
+      // can't verify, which beats a false positive.
+    } else if (info.explicitlyOffset) {
+      // Skip the "bbox off-origin" hint when the user passed a non-trivial
+      // origin offset to sketchOnPlane — passing any non-zero origin is the
+      // affirmative opt-in that says "I know where this slab will land."
+      // Firing the warning anyway is the #1 signal-to-noise complaint.
+    } else {
+      // undefined (no 2nd arg), scalar offset, or [x,y,z] tuple — all three
+      // are decodable by `enqueueExtrudeHint` which will shift the predicted
+      // interval along the plane's normal accordingly.
+      enqueueExtrudeHint(info.plane, distance, info.origin);
+    }
   }
   try {
     const bp = self?.blueprint;
@@ -705,7 +894,14 @@ function validateSketchOnPlane(self: any, planeName: unknown): void {
   // can't be read (e.g. a unit-test stub without `.blueprint`), we fall back
   // to firing the hint — preserving the prior behaviour for non-replicad
   // receivers.
-  if (planeName !== "XY" && !isDrawingCenteredOnOrigin(self) && claimNonXYPlaneHint()) {
+  if (
+    planeName !== "XY" &&
+    typeof self === "object" &&
+    self !== null &&
+    PEN_AXIS_DRAWINGS.has(self) &&
+    !isDrawingCenteredOnOrigin(self) &&
+    claimNonXYPlaneHint()
+  ) {
     pushRuntimeWarning(
       `sketchOnPlane("${planeName}"): pen hLine/vLine map to different world ` +
         `axes on each plane (e.g. on "ZX", hLine → world Z, vLine → world X). ` +
@@ -721,13 +917,28 @@ function validateSketchOnPlane(self: any, planeName: unknown): void {
  * because the coordinate primitives place their geometry on origin while the
  * pen draws relative to wherever `startAt` left off.
  *
- * Returns `false` when we can't cheaply inspect the bbox (missing blueprint,
- * non-numeric center, inspection threw, etc.) so the caller defaults to
- * firing the warning — preserving the pre-polish behaviour in ambiguous
- * cases and keeping existing tests (which stub sketchOnPlane without a
- * blueprint) unaffected.
+ * Resolution order (first match wins):
+ *   1. The `CENTERED_DRAWINGS` tag — populated when `drawRectangle`,
+ *      `drawRoundedRectangle`, `drawCircle`, `drawEllipse`, or `drawPolysides`
+ *      ran through instrumentation. An authoritative "known centered" signal.
+ *      This is the fix for the external tester's false positive: every
+ *      `drawRectangle(...).sketchOnPlane("XZ").extrude(...)` used to trip
+ *      the pen-axis warning because the bbox inspection below can't read a
+ *      stubbed blueprint and the old fallback returned `false`.
+ *   2. Blueprint bbox inspection — falls back for drawings without a tag
+ *      (e.g. `draw().hLine().vLine().close()` pen chains), which is exactly
+ *      the case we DO want to inspect for off-origin construction.
+ *   3. When bbox inspection fails (missing blueprint, throws, etc.) we
+ *      still return `false` — the pen is the likely origin, and preserving
+ *      the prior behaviour keeps existing tests passing.
  */
 function isDrawingCenteredOnOrigin(self: any): boolean {
+  // Fast path: the drawing was produced by a coordinate-centered primitive.
+  // No pen methods could have been involved, so the pen axis warning is
+  // definitionally irrelevant.
+  if (self && typeof self === "object" && CENTERED_DRAWINGS.has(self)) {
+    return true;
+  }
   try {
     // Drawings expose `.boundingBox` directly; Blueprints / CompoundBlueprints
     // do too. The types share the BoundingBox2d shape (center: [cx, cy],

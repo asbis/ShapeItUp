@@ -1,6 +1,10 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { beginInstrumentation, instrumentReplicadExports } from "./instrumentation";
-import { drainRuntimeWarnings, resetRuntimeWarnings } from "./stdlib/warnings";
+import {
+  drainExtrudeHints,
+  drainRuntimeWarnings,
+  resetRuntimeWarnings,
+} from "./stdlib/warnings";
 
 // ---------------------------------------------------------------------------
 // These tests verify the pre-OCCT validation hooks (Bugs #7 + #8).
@@ -690,6 +694,23 @@ describe("instrumentation — prototype method validators", () => {
     expect(result).toEqual({ _after: "extrude" });
   });
 
+  it("Sketch.extrude: negative distance is allowed through (Fix 2 — replicad accepts it natively)", () => {
+    // Replicad's Sketch.extrude accepts negative distances — the sign flips
+    // the extrude direction along the plane's normal. Instrumentation must
+    // NOT intercept a legal replicad call with a false-premise "distance
+    // must be positive" error; the previous guard rested on a misdiagnosed
+    // WASM pointer exception that didn't actually reproduce.
+    const exports: any = makeShape3DExports();
+    instrumentReplicadExports(exports);
+
+    const sketch = new exports.Sketch();
+    Object.defineProperty(sketch, "blueprint", {
+      get: () => ({ boundingBox: { width: 10, height: 20 } }),
+    });
+
+    expect(() => sketch.extrude(-15)).not.toThrow();
+  });
+
   it("Sketch.revolve: angle in radians (> 1000 deg) throws with units hint", () => {
     const exports: any = makeShape3DExports();
     instrumentReplicadExports(exports);
@@ -778,6 +799,300 @@ describe("instrumentation — prototype method validators", () => {
 
     const d = new exports.Drawing();
     expect(() => d.sketchOnPlane({ _plane: "custom" } as any)).not.toThrow();
+  });
+
+  // -------------------------------------------------------------------------
+  // Fix 3 — pen axis-mapping warning false positive.
+  //
+  // Drawings produced by coordinate-centered primitives (drawRectangle,
+  // drawCircle, drawRoundedRectangle, drawEllipse, drawPolysides) must NOT
+  // trip the pen-axis warning because those primitives don't involve the pen
+  // at all. Prior to the CENTERED_DRAWINGS tag, the bbox-inspection fallback
+  // returned false on a stubbed drawing (no blueprint accessor), and the
+  // warning fired on every centered-primitive → sketchOnPlane("XZ") chain.
+  // -------------------------------------------------------------------------
+  function makePrimitivePlusDrawingExports() {
+    // A minimal replicad-shaped exports bundle: a Drawing class whose
+    // sketchOnPlane returns a Sketch marker, plus free-function primitives
+    // that return a stubbed Drawing instance (so instrumentation's post-hook
+    // can tag it). Drawing also stubs a handful of pen-axis methods so Fix 6
+    // tests can exercise the PEN_AXIS_DRAWINGS tagging path via hLine/vLine.
+    // Each pen-axis method returns the SAME receiver (not a fresh instance)
+    // to mimic replicad's chainable-builder pattern — the tagger adds both
+    // self and result to the set anyway, so this just keeps the test concise.
+    function Drawing(this: any) {}
+    (Drawing as any).prototype.sketchOnPlane = function (
+      this: any,
+      _plane: any,
+      _origin?: any,
+    ) {
+      return { _sketched: true };
+    };
+    (Drawing as any).prototype.lineTo = function (this: any, _p: any) {
+      return this;
+    };
+    (Drawing as any).prototype.close = function (this: any) {
+      return this;
+    };
+    (Drawing as any).prototype.hLine = function (this: any, _d: any) {
+      return this;
+    };
+    (Drawing as any).prototype.vLine = function (this: any, _d: any) {
+      return this;
+    };
+    function makeDrawingResult() {
+      return new (Drawing as any)();
+    }
+    // Bare stub functions — no prototype methods, so instrumentation treats
+    // them as free exports and wraps them for post-hooks.
+    const drawRectangle = ((_w: number, _h: number) =>
+      makeDrawingResult()) as any;
+    const drawCircle = ((_r: number) => makeDrawingResult()) as any;
+    const drawRoundedRectangle = ((_w: number, _h: number, _r?: number) =>
+      makeDrawingResult()) as any;
+    return { Drawing, drawRectangle, drawCircle, drawRoundedRectangle } as any;
+  }
+
+  it("drawRectangle().sketchOnPlane('XZ') does NOT emit the pen-axis warning", () => {
+    resetRuntimeWarnings();
+    const exports: any = makePrimitivePlusDrawingExports();
+    instrumentReplicadExports(exports);
+
+    const dr = exports.drawRectangle(10, 20);
+    dr.sketchOnPlane("XZ");
+
+    const warnings = drainRuntimeWarnings();
+    expect(warnings.some((w) => /pen hLine\/vLine/.test(w))).toBe(false);
+  });
+
+  it("drawCircle().sketchOnPlane('ZX') does NOT emit the pen-axis warning", () => {
+    resetRuntimeWarnings();
+    const exports: any = makePrimitivePlusDrawingExports();
+    instrumentReplicadExports(exports);
+
+    const dr = exports.drawCircle(5);
+    dr.sketchOnPlane("ZX");
+
+    const warnings = drainRuntimeWarnings();
+    expect(warnings.some((w) => /pen hLine\/vLine/.test(w))).toBe(false);
+  });
+
+  it("drawing with only absolute lineTo on non-XY plane does NOT emit the pen-axis warning", () => {
+    // Fix 6: a drawing built entirely from absolute-coordinate `.lineTo([x,y])`
+    // calls (no hLine/vLine/polarLine/tangentArc/etc.) has no pen-axis state
+    // to be confused about — the advisory is noise on these. PEN_AXIS_DRAWINGS
+    // stays empty for this receiver so the gate short-circuits.
+    resetRuntimeWarnings();
+    const exports: any = makePrimitivePlusDrawingExports();
+    instrumentReplicadExports(exports);
+
+    const dr = new exports.Drawing();
+    dr.lineTo([10, 0]).lineTo([10, 10]).close().sketchOnPlane("XZ");
+
+    const warnings = drainRuntimeWarnings();
+    expect(warnings.some((w) => /pen hLine\/vLine/.test(w))).toBe(false);
+  });
+
+  it("drawing with hLine/vLine on non-XY plane DOES emit the pen-axis warning", () => {
+    // Fix 6: hLine/vLine/polarLine/tangentArc/etc. are pen-axis methods —
+    // their meaning depends on which plane the drawing lands on. When a
+    // non-XY plane is chosen AND a pen-axis method was used, the advisory
+    // becomes genuinely actionable, so PEN_AXIS_DRAWINGS tags the receiver
+    // and the non-XY sketchOnPlane hook fires.
+    resetRuntimeWarnings();
+    const exports: any = makePrimitivePlusDrawingExports();
+    instrumentReplicadExports(exports);
+
+    const dr = new exports.Drawing();
+    dr.hLine(5).vLine(5).close().sketchOnPlane("XZ");
+
+    const warnings = drainRuntimeWarnings();
+    expect(warnings.some((w) => /pen hLine\/vLine/.test(w))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix 1 + Fix 2 — extrude-hint dedup and sketchOnPlane origin-offset shift.
+//
+// These drive the warnings.ts enqueue/drain pair via the full instrumentation
+// pipeline (sketchOnPlane post-hook → extrude pre-validator → drain). Going
+// through the pipeline matters because `enqueueExtrudeHint` uses the caller's
+// stack to distinguish user-origin from stdlib-origin calls; calling it
+// directly from a test would (correctly) flag the test file's frame as
+// non-stdlib, but ALSO include warnings.ts's own frame — which matches
+// `/stdlib/` and drops the hint. Going through instrumentation puts the
+// caller in `validateSketchExtrude` (which is in `src/instrumentation.ts`,
+// not `/stdlib/`) so the stdlib check runs as it would in production.
+// ---------------------------------------------------------------------------
+describe("extrude hints — dedup and origin shift", () => {
+  beforeEach(() => {
+    beginInstrumentation();
+    resetRuntimeWarnings();
+  });
+
+  function makeSketchExports() {
+    // Minimal replicad-shaped bundle exercising the sketchOnPlane → Sketch
+    // .extrude path. Drawing returns a Sketch marker; Sketch.extrude returns
+    // a fresh Shape marker. The pre-extrude validator inspects blueprint
+    // dimensions — we provide a stub blueprint with positive w/h so it
+    // doesn't throw on degenerate-dimension checks.
+    function Sketch(this: any) {}
+    (Sketch as any).prototype.extrude = function (_len: number) {
+      return { _extruded: true };
+    };
+    // stub blueprint accessor so validateSketchExtrude's degenerate-dim
+    // check sees positive dimensions and passes.
+    Object.defineProperty((Sketch as any).prototype, "blueprint", {
+      get() {
+        return { boundingBox: { width: 10, height: 10 } };
+      },
+    });
+    function Drawing(this: any) {}
+    (Drawing as any).prototype.sketchOnPlane = function (
+      this: any,
+      _plane: any,
+      _origin?: any,
+    ) {
+      return new (Sketch as any)();
+    };
+    return { Drawing, Sketch } as any;
+  }
+
+  it("20 identical extrudes collapse to one emitted hint per (plane, length)", () => {
+    // Simulate a knitting-needle assembly: 20 parts each built with the
+    // same sketchOnPlane("XZ").extrude(1.6) pattern. Prior to dedup the
+    // drainer emitted 20 copies of the same multi-line advisory.
+    const exports: any = makeSketchExports();
+    instrumentReplicadExports(exports);
+    const d = new exports.Drawing();
+    for (let i = 0; i < 20; i += 1) {
+      d.sketchOnPlane("XZ").extrude(1.6);
+    }
+    // Final bbox covers the predicted Y ∈ [-1.6, 0] region fully.
+    const finalBboxes = [
+      { min: [-5, -1.6, -5] as [number, number, number], max: [5, 0, 5] as [number, number, number] },
+    ];
+    const msgs = drainExtrudeHints(finalBboxes);
+    expect(msgs.length).toBe(1);
+    expect(msgs[0]).toMatch(/sketchOnPlane\('XZ'\)\.extrude\(1\.6\)/);
+  });
+
+  it("different (plane, length) pairs emit independently", () => {
+    const exports: any = makeSketchExports();
+    instrumentReplicadExports(exports);
+    const d = new exports.Drawing();
+    d.sketchOnPlane("XZ").extrude(1.6);
+    d.sketchOnPlane("XZ").extrude(1.6); // dup — collapses
+    d.sketchOnPlane("XZ").extrude(3.0); // distinct length
+    d.sketchOnPlane("YZ").extrude(1.6); // distinct plane
+    // Broad final bbox keeps every prediction covered.
+    const finalBboxes = [
+      { min: [-5, -5, -5] as [number, number, number], max: [5, 5, 5] as [number, number, number] },
+    ];
+    const msgs = drainExtrudeHints(finalBboxes);
+    expect(msgs.length).toBe(3);
+  });
+
+  it("sketchOnPlane('YZ', -T/2).extrude(T) is NOT warned about (centered)", () => {
+    // The tester's reported false positive. YZ extrudes natively along
+    // +X into [0, T]; the -T/2 origin offset lands the sketch plane at
+    // X=-T/2, so the extrude runs X ∈ [-T/2, T/2] — centered. The drain
+    // silence the hint because the shifted interval has |center| ≈ 0.
+    const exports: any = makeSketchExports();
+    instrumentReplicadExports(exports);
+    const d = new exports.Drawing();
+    const T = 10;
+    d.sketchOnPlane("YZ", -T / 2).extrude(T);
+    const finalBboxes = [
+      { min: [-T / 2, -5, -5] as [number, number, number], max: [T / 2, 5, 5] as [number, number, number] },
+    ];
+    const msgs = drainExtrudeHints(finalBboxes);
+    expect(msgs.length).toBe(0);
+  });
+
+  it("non-centering origin offset still checks the shifted interval against the bbox", () => {
+    // A +10 origin shift on YZ/length=4: un-shifted prediction is X ∈ [0, 4];
+    // shifted is X ∈ [10, 14] (center=12, not centered). Final bbox at
+    // X ∈ [0, 4] → no overlap with shifted interval → no warning. This
+    // pins the shift math: without it the overlap check would compare the
+    // un-shifted [0, 4] and fire a false positive.
+    const exports: any = makeSketchExports();
+    instrumentReplicadExports(exports);
+    const d = new exports.Drawing();
+    d.sketchOnPlane("YZ", 10).extrude(4);
+    const finalBboxes = [
+      { min: [0, -2, -2] as [number, number, number], max: [4, 2, 2] as [number, number, number] },
+    ];
+    const msgs = drainExtrudeHints(finalBboxes);
+    expect(msgs.length).toBe(0);
+  });
+
+  it("origin offset given as [x,y,z] tuple shifts on the plane's normal axis", () => {
+    // For plane YZ the normal axis is X; a [-T/2, 0, 0] origin should
+    // shift the predicted X interval by -T/2, landing centered. The
+    // centering branch silences the hint.
+    const exports: any = makeSketchExports();
+    instrumentReplicadExports(exports);
+    const d = new exports.Drawing();
+    const T = 4;
+    d.sketchOnPlane("YZ", [-T / 2, 0, 0]).extrude(T);
+    const finalBboxes = [
+      { min: [-T / 2, -2, -2] as [number, number, number], max: [T / 2, 2, 2] as [number, number, number] },
+    ];
+    const msgs = drainExtrudeHints(finalBboxes);
+    expect(msgs.length).toBe(0);
+  });
+
+  it("origin offset of 0 still warns for the classic un-translated case", () => {
+    // Sanity: the no-offset case must still produce its hint. Without this
+    // guardrail we could silently regress Issue #1 while fixing the false
+    // positive.
+    const exports: any = makeSketchExports();
+    instrumentReplicadExports(exports);
+    const d = new exports.Drawing();
+    d.sketchOnPlane("XZ").extrude(20);
+    const finalBboxes = [
+      { min: [-25, -20, -15] as [number, number, number], max: [25, 0, 15] as [number, number, number] },
+    ];
+    const msgs = drainExtrudeHints(finalBboxes);
+    expect(msgs.length).toBe(1);
+    expect(msgs[0]).toMatch(/Y ∈ \[-20, 0\]/);
+  });
+
+  it("Fix 4: any non-trivial origin offset is an opt-in signal — no hint emitted", () => {
+    // Fix 4: passing a non-zero `origin` to `sketchOnPlane` is the user's
+    // affirmative "I know where this slab will land" statement. The extrude
+    // hint exists to catch the oblivious case where the user didn't realise
+    // the plane's normal direction; once they offset the origin, firing the
+    // advisory anyway is pure noise (the top signal-to-noise complaint from
+    // the external-agent stress tests). The enqueue-side gate drops the
+    // hint before it ever reaches the drain queue, regardless of whether
+    // the shifted interval still overlaps the final bbox.
+    const exports: any = makeSketchExports();
+    instrumentReplicadExports(exports);
+    const d = new exports.Drawing();
+    d.sketchOnPlane("YZ", -20).extrude(20);
+    const finalBboxes = [
+      { min: [-20, -5, -5] as [number, number, number], max: [0, 5, 5] as [number, number, number] },
+    ];
+    const msgs = drainExtrudeHints(finalBboxes);
+    expect(msgs.length).toBe(0);
+  });
+
+  it("opaque Plane-object origin drops the hint rather than lying", () => {
+    // A non-number / non-tuple origin means the sketchOnPlane received a
+    // Plane object whose origin we can't decode. validateSketchExtrude
+    // should skip enqueueExtrudeHint entirely for "opaque" origins, so no
+    // hint appears at drain time regardless of the final bbox.
+    const exports: any = makeSketchExports();
+    instrumentReplicadExports(exports);
+    const d = new exports.Drawing();
+    d.sketchOnPlane("XZ", { _opaque: true }).extrude(5);
+    const finalBboxes = [
+      { min: [-5, -5, -5] as [number, number, number], max: [5, 0, 5] as [number, number, number] },
+    ];
+    const msgs = drainExtrudeHints(finalBboxes);
+    expect(msgs.length).toBe(0);
   });
 });
 

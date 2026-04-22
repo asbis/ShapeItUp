@@ -98,7 +98,11 @@ let extrudePlaneHintFired = false;
  * length=0 independently, and non-string planes are Plane objects we can't
  * reason about statically).
  */
-export function emitExtrudePlaneHint(plane: string, length: number): string | null {
+export function emitExtrudePlaneHint(
+  plane: string,
+  length: number,
+  normalShift: number = 0,
+): string | null {
   if (extrudePlaneHintFired) return null;
   if (typeof plane !== "string" || plane === "XY") return null;
   if (typeof length !== "number" || !Number.isFinite(length) || length === 0) return null;
@@ -130,11 +134,14 @@ export function emitExtrudePlaneHint(plane: string, length: number): string | nu
   // to "point the other direction" without changing the plane.
   const effectiveSign = entry.sign * (length < 0 ? -1 : 1);
   const mag = Math.abs(length);
-  const [lo, hi] = effectiveSign === 1 ? [0, mag] : [-mag, 0];
+  const [baseLo, baseHi] = effectiveSign === 1 ? [0, mag] : [-mag, 0];
+  const shift = Number.isFinite(normalShift) ? normalShift : 0;
+  const lo = baseLo + shift;
+  const hi = baseHi + shift;
 
   // Translate suggestion: to center the bbox on the origin along the extrude
-  // axis, shift by -(lo + hi) / 2 = -effectiveSign * mag / 2 along that axis.
-  const centerShift = -effectiveSign * (mag / 2);
+  // axis, shift by -(lo + hi) / 2 along that axis.
+  const centerShift = -(lo + hi) / 2;
   const dx = entry.axis === "X" ? centerShift : 0;
   const dy = entry.axis === "Y" ? centerShift : 0;
   const dz = entry.axis === "Z" ? centerShift : 0;
@@ -211,6 +218,15 @@ interface PendingExtrudeHint {
   length: number;
   predicted: { axis: "x" | "y" | "z"; lo: number; hi: number };
   origin: "user" | "stdlib";
+  /**
+   * Optional sketch-plane origin offset (2nd arg to `sketchOnPlane`). A scalar
+   * offset shifts the predicted interval along the plane's normal axis; an
+   * explicit [x,y,z] tuple does the same along that axis component. Omitted
+   * (undefined) means "unknown / no shift". If the user passed a Plane object
+   * we can't decode, `enqueueExtrudeHint` skips the hint entirely rather than
+   * lying about the predicted interval — see that function's body.
+   */
+  originOffset?: number | [number, number, number];
 }
 
 const pendingExtrudeHints: PendingExtrudeHint[] = [];
@@ -227,16 +243,89 @@ const pendingExtrudeHints: PendingExtrudeHint[] = [];
  * use the callsite instead. User-origin hints keep going through the normal
  * >50% overlap check in `drainExtrudeHints`.
  */
-export function enqueueExtrudeHint(plane: string, length: number): void {
+export function enqueueExtrudeHint(
+  plane: string,
+  length: number,
+  originOffset?: unknown,
+): void {
   const predicted = getPredictedExtrudeBbox(plane, length);
   if (!predicted) return;
+
+  // Decode the `sketchOnPlane` origin arg into something we can reason about.
+  //   undefined             → no shift (sketch is on the plane through origin)
+  //   number                → scalar offset along the plane's normal axis
+  //   [x, y, z]             → explicit 3D offset; we pick the normal-axis
+  //                            component only (the tangent components shift the
+  //                            sketch IN the plane, which doesn't affect the
+  //                            extrude's normal-axis interval)
+  //   anything else (Plane) → unknowable; drop the hint rather than lie. The
+  //                            2nd-arg to sketchOnPlane can be a full Plane
+  //                            object, whose origin depends on the user's
+  //                            construction — fabricating a predicted interval
+  //                            from that would produce a worse false positive
+  //                            than just staying silent.
+  let normalizedOffset: number | [number, number, number] | undefined;
+  if (originOffset === undefined) {
+    normalizedOffset = undefined;
+  } else if (typeof originOffset === "number" && Number.isFinite(originOffset)) {
+    normalizedOffset = originOffset;
+  } else if (
+    Array.isArray(originOffset) &&
+    originOffset.length === 3 &&
+    originOffset.every((n) => typeof n === "number" && Number.isFinite(n))
+  ) {
+    normalizedOffset = [
+      originOffset[0] as number,
+      originOffset[1] as number,
+      originOffset[2] as number,
+    ];
+  } else {
+    // Opaque Plane object or otherwise undecodable — stay silent.
+    return;
+  }
+
   const stack = new Error().stack ?? "";
   // Match both POSIX `/stdlib/` and Windows `\stdlib\` path separators. V8's
   // `file:///C:/...` URL form normalises to forward slashes in the stack, so
   // a single `/` branch also handles Windows-style `file://` frames; the `\\`
   // branch handles native Node stack frames on Windows.
-  const origin = /[\\/]stdlib[\\/]/.test(stack) ? "stdlib" : "user";
-  pendingExtrudeHints.push({ plane, length, predicted, origin });
+  //
+  // Exclude this file's own frame from the detection — `warnings.ts` IS in
+  // `/stdlib/`, and a naive test would tag every call as stdlib-origin and
+  // drop every hint. Stripping `warnings.ts` frames leaves real callers
+  // (`holes.ts`, `fasteners.ts`, etc.) visible; non-stdlib callers like
+  // `validateSketchExtrude` in instrumentation.ts don't match either regex
+  // so they fall through to "user".
+  const stackWithoutSelf = stack
+    .split("\n")
+    .filter((line) => !/[\\/]stdlib[\\/]warnings\.(ts|js)/.test(line))
+    .join("\n");
+  const origin = /[\\/]stdlib[\\/]/.test(stackWithoutSelf) ? "stdlib" : "user";
+  pendingExtrudeHints.push({
+    plane,
+    length,
+    predicted,
+    origin,
+    originOffset: normalizedOffset,
+  });
+}
+
+/**
+ * Return the scalar shift (along the plane's normal axis) that the given
+ * origin offset represents. A scalar `number` offset shifts directly along
+ * the normal; a 3-tuple contributes only its component on the normal axis
+ * (the in-plane components translate the sketch within the plane, which
+ * doesn't move the extrude's normal-axis bbox interval). `undefined` means
+ * no shift.
+ */
+function normalAxisShift(
+  axis: "x" | "y" | "z",
+  offset: number | [number, number, number] | undefined,
+): number {
+  if (offset === undefined) return 0;
+  if (typeof offset === "number") return offset;
+  const idx = axis === "x" ? 0 : axis === "y" ? 1 : 2;
+  return offset[idx] ?? 0;
 }
 
 /** Reset the pending-hint queue. Called from resetRuntimeWarnings(). */
@@ -273,6 +362,17 @@ export function drainExtrudeHints(
   const COVERAGE_THRESHOLD = 0.5;
   const hints = pendingExtrudeHints.slice();
   pendingExtrudeHints.length = 0;
+
+  // Per-render dedup: 20 needles with identical `sketchOnPlane("XZ").extrude(1.6)`
+  // previously pushed 20 hints that each survived the overlap check, emitting
+  // the same multi-line advisory 20 times. Collapse by the (plane, length,
+  // normalAxisShift) triple so genuinely different extrudes (different length,
+  // or same geometry translated to a different origin offset) still warn
+  // independently. Set stays local to this drain call so the next render starts
+  // fresh — consistent with the per-execute lifecycle the rest of this module
+  // uses.
+  const seenKey = new Set<string>();
+
   for (const hint of hints) {
     // Stdlib-internal sketches (e.g. holes.countersink(), fasteners
     // .socketHeadBody()) legitimately sketch on XZ/ZX to revolve a profile.
@@ -280,9 +380,32 @@ export function drainExtrudeHints(
     // the revolved cutter's final bbox legitimately covers the predicted
     // region — so filter by callsite instead. Tagged at enqueue time.
     if (hint.origin === "stdlib") continue;
-    const { axis, lo, hi } = hint.predicted;
+    const { axis, lo: baseLo, hi: baseHi } = hint.predicted;
+
+    // Shift the predicted interval by the sketchOnPlane origin offset.
+    // `sketchOnPlane("YZ", -T/2).extrude(T)` was previously warning about
+    // X ∈ [0, T] (the pre-translate interval) even though the finished shape
+    // actually sits at X ∈ [-T/2, T/2] — a centered slab, no footgun. The
+    // shifted predicted interval reflects where the extrude will ACTUALLY land
+    // on the plane's normal axis.
+    const shift = normalAxisShift(axis, hint.originOffset);
+    const lo = baseLo + shift;
+    const hi = baseHi + shift;
     const width = hi - lo;
     if (!(width > 0)) continue;
+
+    // Silence the hint when the SHIFTED prediction is already centered on
+    // the origin. The warning exists to flag "your part ended up on ONE
+    // half-space along the plane's normal, not centered as you probably
+    // expected". If the user provided an explicit origin offset that lands
+    // the interval symmetrically across zero, they clearly understand the
+    // mechanics and don't need the nudge. Threshold: interval center within
+    // 10% of its width from zero (tight enough that a raw sketchOnPlane(XZ)
+    // extrude with lo=0, hi=L, center=L/2 → center/width = 0.5 stays FLAGGED,
+    // loose enough to absorb float noise on a carefully centered offset).
+    const center = (lo + hi) / 2;
+    if (Math.abs(center) < width * 0.1) continue;
+
     const idx = axis === "x" ? 0 : axis === "y" ? 1 : 2;
     let keep = false;
     for (const bb of finalBboxes) {
@@ -297,12 +420,22 @@ export function drainExtrudeHints(
       }
     }
     if (!keep) continue;
+
+    // Dedup identical advisories. Key on the 4-tuple that determines the
+    // emitted message — same plane, same length, and same effective origin
+    // shift (rounded to a few decimals to absorb float noise from helpers
+    // that compute -T/2 etc.).
+    const key = `${hint.plane}|${hint.length}|${shift.toFixed(4)}`;
+    if (seenKey.has(key)) continue;
+    seenKey.add(key);
+
     // Reset the one-shot latch just so we reuse `emitExtrudePlaneHint` to build
     // the full message string; it would otherwise return null on a second call
-    // in the same run. We reset AFTER the fact to keep the latch semantics
-    // (one emission per run) intact for any direct callers that still exist.
+    // in the same run. We reset BEFORE each emission so multiple distinct
+    // (plane, length) pairs can each get their own message in one render —
+    // the Set above is what enforces "at most once per pair", not the latch.
     resetExtrudePlaneHint();
-    const msg = emitExtrudePlaneHint(hint.plane, hint.length);
+    const msg = emitExtrudePlaneHint(hint.plane, hint.length, shift);
     if (msg) out.push(msg);
   }
   return out;
