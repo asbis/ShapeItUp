@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { executeScript, extractParamsStatic, rewriteImports } from "./executor";
+import {
+  executeScript,
+  extractExpectedContactsStatic,
+  extractParamsStatic,
+  rewriteImports,
+} from "./executor";
 import {
   patchShapeMeshLeak,
   patchShapeCutNoOpGuard,
@@ -664,6 +669,39 @@ describe("extractParamsStatic", () => {
       export default function main() { return 1; }
     `;
     expect(extractParamsStatic(src)).toEqual(["a", "b", "c"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractExpectedContactsStatic — shape-authored acceptance pairs for
+// check_collisions. Mirrors extractParamsStatic's static-extraction approach
+// so the MCP tool can merge the user's declared contact list with the
+// `acceptedPairs` argument without executing the script.
+// ---------------------------------------------------------------------------
+
+describe("extractExpectedContactsStatic", () => {
+  it("extracts pair tuples including glob patterns", () => {
+    const src = `
+      export const expectedContacts = [["a","b"],["c-*","d"]];
+      export default function main() { return 1; }
+    `;
+    expect(extractExpectedContactsStatic(src)).toEqual([
+      ["a", "b"],
+      ["c-*", "d"],
+    ]);
+  });
+
+  it("returns [] when the export is absent", () => {
+    const src = `export default function main() { return 1; }`;
+    expect(extractExpectedContactsStatic(src)).toEqual([]);
+  });
+
+  it("returns [] when the export is an empty array", () => {
+    const src = `
+      export const expectedContacts = [];
+      export default function main() { return 1; }
+    `;
+    expect(extractExpectedContactsStatic(src)).toEqual([]);
   });
 });
 

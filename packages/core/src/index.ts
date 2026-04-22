@@ -9,7 +9,7 @@
 
 import type { ParamDef } from "@shapeitup/shared";
 import { executeScript } from "./executor";
-export { extractParamsStatic } from "./executor";
+export { extractParamsStatic, extractExpectedContactsStatic } from "./executor";
 import { normalizeParts, tessellatePart, type MeshQuality, type PartInput, type PartStatsLevel, type TessellatedPart } from "./tessellate";
 import { exportShapes } from "./exporter";
 import {

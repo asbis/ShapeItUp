@@ -6,6 +6,8 @@ import {
   formatGeometryReport,
   formatCollisionReport,
   formatJointReport,
+  nameMatches,
+  matchesAnyAcceptedPair,
 } from "./verify-helpers.js";
 
 // ---------------------------------------------------------------------------
@@ -179,6 +181,74 @@ describe("extractCollisions", () => {
     expect(region!.depths.z).toBeCloseTo(7.0, 2);
     expect(region!.min).toEqual([-6.71, 5.0, 0.5]);
     expect(region!.max).toEqual([6.71, 9.5, 7.5]);
+  });
+
+  it("acceptedPairs: literal pair is still exact-matched", () => {
+    const overlapShape = { mesh: () => ({ vertices: [0, 0, 0, 1, 1, 1, 0, 1, 0] }), delete: () => {} };
+    const a = mockPart("bolt", { aabb: [0, 0, 0, 1, 1, 1] });
+    a.shape.intersect = () => overlapShape;
+    const b = mockPart("plate", { aabb: [0, 0, 0, 1, 1, 1] });
+    const fakeReplicad = {
+      measureShapeVolumeProperties: () => ({ volume: 10, centerOfMass: [0, 0, 0], delete: () => {} }),
+    };
+    const result = extractCollisions([a, b], {
+      replicad: fakeReplicad,
+      acceptedPairs: [["bolt", "plate"]],
+    });
+    expect(result.accepted.length).toBe(1);
+    expect(result.real.length).toBe(0);
+    // Non-matching literal should NOT swallow the collision.
+    const result2 = extractCollisions([a, b], {
+      replicad: fakeReplicad,
+      acceptedPairs: [["screw", "plate"]],
+    });
+    expect(result2.accepted.length).toBe(0);
+    expect(result2.real.length).toBe(1);
+  });
+
+  it("acceptedPairs: `*` wildcard accepts matching names symmetrically", () => {
+    const overlapShape = { mesh: () => ({ vertices: [0, 0, 0, 1, 1, 1, 0, 1, 0] }), delete: () => {} };
+    const makeReplicad = () => ({
+      measureShapeVolumeProperties: () => ({ volume: 10, centerOfMass: [0, 0, 0], delete: () => {} }),
+    });
+    const needleA = mockPart("needle-001", { aabb: [0, 0, 0, 1, 1, 1] });
+    needleA.shape.intersect = () => overlapShape;
+    const needleB = mockPart("needle-042", { aabb: [0, 0, 0, 1, 1, 1] });
+    needleB.shape.intersect = () => overlapShape;
+    const bed = mockPart("needle-bed", { aabb: [0, 0, 0, 1, 1, 1] });
+    bed.shape.intersect = () => overlapShape;
+
+    // One pattern covers all needle-*↔needle-bed intersections.
+    const result = extractCollisions([needleA, needleB, bed], {
+      replicad: makeReplicad(),
+      acceptedPairs: [["needle-*", "needle-bed"]],
+    });
+    // Both needle-* ↔ needle-bed pairs accepted; needle-001↔needle-042 pair
+    // (not covered) should land in `real`.
+    expect(result.accepted.length).toBe(2);
+    expect(result.real.length).toBe(1);
+    expect(result.real[0].rawA).toMatch(/needle-0/);
+    expect(result.real[0].rawB).toMatch(/needle-0/);
+  });
+
+  it("nameMatches + matchesAnyAcceptedPair handle edges correctly", () => {
+    // Exact literals.
+    expect(nameMatches("foo", "foo")).toBe(true);
+    expect(nameMatches("foo", "foobar")).toBe(false);
+    // Trailing / leading / middle wildcards.
+    expect(nameMatches("foo-*", "foo-bar")).toBe(true);
+    expect(nameMatches("foo-*", "foo-")).toBe(true); // `*` matches empty run
+    expect(nameMatches("foo-*", "foo")).toBe(false); // literal hyphen required
+    expect(nameMatches("*-bar", "foo-bar")).toBe(true);
+    expect(nameMatches("*", "anything")).toBe(true);
+    // Regex metachars in pattern are escaped, not interpreted.
+    expect(nameMatches("a.b", "a.b")).toBe(true);
+    expect(nameMatches("a.b", "aXb")).toBe(false);
+    // Symmetric accept.
+    const pats: Array<[string, string]> = [["bolt-*", "plate"]];
+    expect(matchesAnyAcceptedPair("bolt-m3", "plate", pats)).toBe(true);
+    expect(matchesAnyAcceptedPair("plate", "bolt-m3", pats)).toBe(true);
+    expect(matchesAnyAcceptedPair("plate", "nut", pats)).toBe(false);
   });
 
   it("formatCollisionReport includes an 'Overlap depth' line per real collision", () => {

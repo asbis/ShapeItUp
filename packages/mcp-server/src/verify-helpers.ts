@@ -444,6 +444,53 @@ export interface ExtractCollisionsOptions {
   replicad?: any;
 }
 
+// ---------------------------------------------------------------------------
+// acceptedPairs wildcard matching — shared by extractCollisions and the
+// in-lined check_collisions path in tools.ts (re-exported below).
+//
+// `*` matches any run of characters within a name. Exact-literal patterns
+// still do an O(1) string compare; patterns with `*` compile to a RegExp
+// once per pattern per call (the set is tiny — typically < 10 entries — so
+// no further caching is warranted).
+// ---------------------------------------------------------------------------
+
+function escapeRegex(s: string): string {
+  // Escape every RegExp metachar; `*` is separately carved out before we
+  // reach here (it's the ONLY wildcard we honour).
+  return s.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** True if `name` matches `pattern`. `*` in the pattern matches any run of chars. */
+export function nameMatches(pattern: string, name: string): boolean {
+  if (!pattern.includes("*")) return pattern === name;
+  const re = new RegExp(
+    "^" + pattern.split("*").map(escapeRegex).join(".*") + "$",
+  );
+  return re.test(name);
+}
+
+/**
+ * Symmetric wildcard match over a list of accepted `[a, b]` patterns. A
+ * collision pair `(x, y)` is accepted iff SOME `[a, b]` satisfies
+ * `(a~x && b~y) || (a~y && b~x)`.
+ *
+ * Exported so the mirror implementation in `tools.ts` can share exactly
+ * this logic — there's no benefit to maintaining two copies of the glob
+ * semantics.
+ */
+export function matchesAnyAcceptedPair(
+  x: string,
+  y: string,
+  patterns: ReadonlyArray<readonly [string, string]>,
+): boolean {
+  for (const [a, b] of patterns) {
+    if ((nameMatches(a, x) && nameMatches(b, y)) || (nameMatches(a, y) && nameMatches(b, x))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 const AABB_EPS = 1e-6;
 
 interface AABB {
@@ -511,14 +558,26 @@ export function extractCollisions(
     };
   }
 
-  const pairKey = (a: string, b: string): string =>
-    a < b ? `${a}|${b}` : `${b}|${a}`;
-  const acceptedSet = new Set<string>();
+  // Accepted-pair matcher with `*` wildcard support.
+  //
+  // Each side of an accepted pair can be a literal name (exact match, the old
+  // behaviour) OR a glob-ish pattern with `*` acting as "any run of chars in a
+  // name". Examples:
+  //   ["needle", "needle-bed"]     — same as before (exact on both sides)
+  //   ["needle-*", "needle-bed"]   — matches any part whose name starts with
+  //                                  "needle-" paired with "needle-bed"
+  //   ["bolt-*", "plate-*"]        — matches any bolt against any plate
+  //
+  // The match is symmetric: for a collision pair (x, y) we accept it iff SOME
+  // configured pair `[a, b]` satisfies either `a~x && b~y` OR `a~y && b~x`.
+  const acceptedPatterns: Array<[string, string]> = [];
   for (const pair of opts.acceptedPairs ?? []) {
-    if (Array.isArray(pair) && pair.length === 2) {
-      acceptedSet.add(pairKey(pair[0], pair[1]));
+    if (Array.isArray(pair) && pair.length === 2 && typeof pair[0] === "string" && typeof pair[1] === "string") {
+      acceptedPatterns.push([pair[0], pair[1]]);
     }
   }
+  const isAcceptedPair = (a: string, b: string): boolean =>
+    matchesAnyAcceptedPair(a, b, acceptedPatterns);
 
   const boxes: Array<AABB | null> = parts.map((p) => aabbFromVertices(p.vertices));
   const nameCounts = new Map<string, number>();
@@ -622,8 +681,8 @@ export function extractCollisions(
     }
   }
 
-  const accepted = collisions.filter((c) => acceptedSet.has(pairKey(c.rawA, c.rawB)));
-  const unaccepted = collisions.filter((c) => !acceptedSet.has(pairKey(c.rawA, c.rawB)));
+  const accepted = collisions.filter((c) => isAcceptedPair(c.rawA, c.rawB));
+  const unaccepted = collisions.filter((c) => !isAcceptedPair(c.rawA, c.rawB));
   const real = unaccepted
     .filter((c) => c.volume > pressFit)
     .sort((a, b) => b.volume - a.volume);

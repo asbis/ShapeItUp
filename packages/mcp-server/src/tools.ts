@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync } from "fs";
 import { join, resolve, basename, dirname, isAbsolute, sep } from "path";
+import { extractExpectedContactsStatic } from "@shapeitup/core";
 import { homedir } from "os";
 import {
   appendScreenshotMetadata,
@@ -25,6 +26,7 @@ import {
   extractGeometry,
   extractCollisions,
   extractJoints,
+  matchesAnyAcceptedPair,
   type GeometryFormat,
   type GeometryFacesFilter,
   type GeometryEdgesFilter,
@@ -4737,7 +4739,7 @@ export function registerTools(server: McpServer) {
       workingDir: z.string().optional().describe("Directory to write the temp snippet file in when `code` is provided. When set, relative imports (`./foo.shape`) resolve against this directory. Defaults to a private globalStorage path (isolated; relative imports won't work)."),
       params: z.record(z.string(), z.number()).optional().describe("Numeric param overrides applied to the shape's `export const params` for this single check. Same shape as tune_params accepts. Does NOT persist — merged with tune_params values for this execution only, so you can collision-check an articulation angle (e.g. `{ cam_angle_deg: 180 }`) without editing the shape."),
       tolerance: z.number().optional().describe("Minimum intersection volume in mm³ to count as a collision. Defaults to 0.001 — filters out numerical-noise overlaps on touching-but-not-overlapping parts. Negative values are clamped to 0."),
-      acceptedPairs: z.array(z.tuple([z.string(), z.string()])).optional().describe("Pairs of part names whose intersection is EXPECTED and should not be flagged — e.g. [['needle','bed'], ['bolt','plate']]. Accepted pairs are rolled into a single-line summary count (with volume range) instead of listed individually. Order is symmetric: ['a','b'] also covers ['b','a']. When a name appears on multiple parts, every such pair is accepted."),
+      acceptedPairs: z.array(z.tuple([z.string(), z.string()])).optional().describe("Pairs of part names whose intersection is EXPECTED and should not be flagged. Each side accepts `*` as a glob wildcard matching any run of chars, e.g. [['needle-body-*','needle-bed'], ['bolt-*','plate-*']]. A pattern without `*` is matched exactly (back-compat). Order is symmetric: ['a','b'] also covers ['b','a']. Accepted pairs collapse into a single summary line."),
       pressFitThreshold: z.number().optional().describe("Volume threshold (mm³) at or below which a collision is classified as 'nominal contact' (press fit / touching interface) and listed in a compact section instead of the main Collisions block. Default 0.5 mm³. Set to 0 to disable the tag (every non-accepted collision is treated as real)."),
       format: z.enum(["summary", "full", "ids"]).optional().describe("Report verbosity. summary (default): count + worst pair detail + per-pair {a,b,volume}. full: per-pair with region+center geometry. ids: minimal [a,b,vol] tuples."),
     },
@@ -4794,20 +4796,38 @@ export function registerTools(server: McpServer) {
         tol,
         typeof pressFitThreshold === "number" ? pressFitThreshold : 0.5,
       );
-      // Build the accepted-pairs lookup with symmetric keys. The user passes
-      // raw part names (the same names their `part({ name: "..." })` calls
-      // used); we match against `parts[i].name`, not the indexed label that
+      // Build the accepted-pairs pattern list. The user passes raw part
+      // names (the same names their `part({ name: "..." })` calls used); we
+      // match against `parts[i].name`, not the indexed label that
       // duplicate-name disambiguation would produce — otherwise users of
       // `patterns.spread` (where 20 needles all carry name="needle") would
       // have to list 20 tuples instead of one.
-      const pairKey = (a: string, b: string): string =>
-        a < b ? `${a}|${b}` : `${b}|${a}`;
-      const acceptedSet = new Set<string>();
+      //
+      // Patterns support `*` as a wildcard within a name (e.g.
+      // `["needle-*", "needle-bed"]` covers every needle against the bed).
+      // The matcher lives in verify-helpers so both this inline path and
+      // `extractCollisions` share exactly one implementation.
+      const acceptedPatterns: Array<[string, string]> = [];
+      // Pick up any expectedContacts = [...] exported from the shape file — lets authors colocate acceptance rules with the code that produces the contact.
+      try {
+        if (existsSync(absPath)) {
+          const src = readFileSync(absPath, "utf8");
+          for (const pair of extractExpectedContactsStatic(src)) {
+            if (Array.isArray(pair) && pair.length === 2 && typeof pair[0] === "string" && typeof pair[1] === "string") {
+              acceptedPatterns.push([pair[0], pair[1]]);
+            }
+          }
+        }
+      } catch {
+        // Source-read failure falls back to user-supplied pairs only.
+      }
       for (const pair of acceptedPairs ?? []) {
-        if (Array.isArray(pair) && pair.length === 2) {
-          acceptedSet.add(pairKey(pair[0], pair[1]));
+        if (Array.isArray(pair) && pair.length === 2 && typeof pair[0] === "string" && typeof pair[1] === "string") {
+          acceptedPatterns.push([pair[0], pair[1]]);
         }
       }
+      const isAcceptedPair = (a: string, b: string): boolean =>
+        matchesAnyAcceptedPair(a, b, acceptedPatterns);
 
       // Step 2: compute per-part AABBs from the tessellated vertex arrays.
       // Same math as engine.boundingBoxFromVertices but we keep the raw
@@ -4995,10 +5015,10 @@ export function registerTools(server: McpServer) {
       // of a single flat count. Sorting each bucket by volume descending puts
       // the worst offender at the top of its block.
       const acceptedC = collisions.filter((c) =>
-        acceptedSet.has(pairKey(c.rawA, c.rawB)),
+        isAcceptedPair(c.rawA, c.rawB),
       );
       const unacceptedC = collisions.filter(
-        (c) => !acceptedSet.has(pairKey(c.rawA, c.rawB)),
+        (c) => !isAcceptedPair(c.rawA, c.rawB),
       );
       const realC = unacceptedC
         .filter((c) => c.volume > pressFit)

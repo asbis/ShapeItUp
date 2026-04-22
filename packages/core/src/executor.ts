@@ -125,6 +125,29 @@ export function extractConfigStatic(
 }
 
 /**
+ * Statically extracts `export const expectedContacts = [["a","b"], ...]` from a
+ * shape-file source. Used by `check_collisions` to auto-merge shape-authored
+ * acceptance rules into the user's `acceptedPairs` argument. Tolerates glob
+ * patterns (`*`) — downstream matcher handles them.
+ *
+ * Returns `[]` if the export is absent, malformed, or empty.
+ */
+export function extractExpectedContactsStatic(src: string): Array<[string, string]> {
+  // Greedy outer capture: the payload contains nested `[...]` pair literals,
+  // so a lazy `[\s\S]*?` would stop at the first inner `]` and miss every
+  // pair after the first. Greedy `[\s\S]*` together with the trailing `\]`
+  // extends to the LAST `]` in the file — fine because the pair-matcher
+  // below ignores non-pair noise (closing braces, semicolons, etc.).
+  const m = src.match(/export\s+const\s+expectedContacts\s*=\s*\[([\s\S]*)\]\s*;?/);
+  if (!m) return [];
+  const pairs: Array<[string, string]> = [];
+  const pairRe = /\[\s*["']([^"']+)["']\s*,\s*["']([^"']+)["']\s*\]/g;
+  let p: RegExpExecArray | null;
+  while ((p = pairRe.exec(m[1])) !== null) pairs.push([p[1], p[2]]);
+  return pairs;
+}
+
+/**
  * Phase A of script execution: rewrite user imports/exports so the bundled JS
  * can run inside a `new Function(...)` wrapper.
  *
