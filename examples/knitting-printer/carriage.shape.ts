@@ -14,10 +14,9 @@ import {
 } from "./constants";
 
 export function makeCarriage(): Shape3D {
-  const cZ = CARRIAGE_Z_BOTTOM + CARRIAGE_THICKNESS / 2;
   let body = shape3d(
     drawRoundedRectangle(CARRIAGE_LENGTH, CARRIAGE_WIDTH, 4)
-      .sketchOnPlane("XY", [0, 0, cZ])
+      .sketchOnPlane("XY", [0, 0, CARRIAGE_Z_BOTTOM])
       .extrude(CARRIAGE_THICKNESS)
   );
 

@@ -12,19 +12,20 @@ import {
 } from "./constants";
 
 export function makeNeedleBed(): Shape3D {
+  // XY-plane sketchOnPlane origin = BOTTOM of the extrusion. Extrude goes +Z.
+  // Bed top at Z=0, bottom at Z=-BED_THICKNESS.
   let bed = shape3d(
     drawRectangle(BED_LENGTH, BED_WIDTH)
-      .sketchOnPlane("XY", [0, 0, -BED_THICKNESS / 2])
+      .sketchOnPlane("XY", [0, 0, -BED_THICKNESS])
       .extrude(BED_THICKNESS)
   );
 
-  // 20 needle slots — each a thin rectangular pocket cut downward from the top face.
-  // The slot runs the full BED_WIDTH (Y axis) so the needle can slide freely.
+  // 20 needle slots — each runs full Y and spans slot-depth downward from top.
   for (let i = 0; i < N_NEEDLES; i++) {
     const x = FIRST_NEEDLE_X + i * NEEDLE_PITCH;
     const slot = shape3d(
       drawRectangle(SLOT_WIDTH, BED_WIDTH + 2)
-        .sketchOnPlane("XY", [x, 0, -SLOT_DEPTH / 2])
+        .sketchOnPlane("XY", [x, 0, -SLOT_DEPTH])
         .extrude(SLOT_DEPTH)
     );
     bed = bed.cut(slot);

@@ -14,20 +14,19 @@ import {
 } from "./constants";
 
 export function makeEndCapMotor(): Shape3D {
-  // Base at Z ∈ [CHASSIS_TOP_Z, CHASSIS_TOP_Z + ENDCAP_BASE_T]
-  // Wall at X ∈ [0, ENDCAP_WALL_T] (centered on 0 local-X of this part).
-  const baseZMid = CHASSIS_TOP_Z + ENDCAP_BASE_T / 2;
+  // Base Z ∈ [CHASSIS_TOP_Z, CHASSIS_TOP_Z + ENDCAP_BASE_T]. Wall sits on base.
+  const baseZBottom = CHASSIS_TOP_Z;
   const wallXMid = -ENDCAP_BASE_L / 2 + ENDCAP_WALL_T / 2;  // wall at -X end of base
-  const wallZMid = CHASSIS_TOP_Z + ENDCAP_BASE_T + ENDCAP_WALL_H / 2;
+  const wallZBottom = CHASSIS_TOP_Z + ENDCAP_BASE_T;
 
   const base = shape3d(
     drawRoundedRectangle(ENDCAP_BASE_L, ENDCAP_BASE_W, 2)
-      .sketchOnPlane("XY", [0, 0, baseZMid])
+      .sketchOnPlane("XY", [0, 0, baseZBottom])
       .extrude(ENDCAP_BASE_T)
   );
   let wall = shape3d(
     drawRoundedRectangle(ENDCAP_WALL_T, ENDCAP_WALL_W, 2)
-      .sketchOnPlane("XY", [wallXMid, 0, wallZMid])
+      .sketchOnPlane("XY", [wallXMid, 0, wallZBottom])
       .extrude(ENDCAP_WALL_H)
   );
 
@@ -47,7 +46,7 @@ export function makeEndCapMotor(): Shape3D {
   // Center hole for the NEMA17 motor shaft + 4 × M3 corner-pattern mounting
   // holes (standard 31 mm NEMA17 pitch). Motor is bolted to the -X face of
   // the wall, shaft passes through via a Ø24 clearance pilot.
-  const motorZ = CHASSIS_TOP_Z + ENDCAP_BASE_T + 30;  // motor center
+  const motorZ = wallZBottom + ENDCAP_WALL_H / 2;  // motor center vertically on wall
   wall = wall.cut(
     holes.through(24, {
       depth: ENDCAP_WALL_T + 2, axis: "+X", raw: true,

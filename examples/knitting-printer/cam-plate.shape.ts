@@ -16,10 +16,10 @@ import {
 } from "./constants";
 
 export function makeCamPlate(): Shape3D {
-  // Body
+  // Body — sketch sits AT CAM_Z_BOTTOM, extrude +Z by CAM_THICKNESS.
   let plate = shape3d(
     drawRoundedRectangle(CAM_LENGTH, CAM_WIDTH, 2)
-      .sketchOnPlane("XY", [0, 0, (CAM_Z_BOTTOM + CAM_Z_TOP) / 2])
+      .sketchOnPlane("XY", [0, 0, CAM_Z_BOTTOM])
       .extrude(CAM_THICKNESS)
   );
 

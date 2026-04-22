@@ -20,13 +20,14 @@ import {
 } from "./constants";
 
 export function makeSolenoidBracket(): Shape3D {
-  // Bracket: flat plate holding all solenoids. Sits under the bed.
+  // Bracket: flat plate holding all solenoids. Top at SOL_BANK_TOP_Z, extrude +Z
+  // from the bottom face.
   const brW = BED_WIDTH - 10;
   const brL = BED_LENGTH - 4;
   const brZ_TOP = SOL_BANK_TOP_Z;
   let bracket = shape3d(
     drawRoundedRectangle(brL, brW, 3)
-      .sketchOnPlane("XY", [0, 0, brZ_TOP - SOL_BANK_BRACKET_T / 2])
+      .sketchOnPlane("XY", [0, 0, brZ_TOP - SOL_BANK_BRACKET_T])
       .extrude(SOL_BANK_BRACKET_T)
   );
   // 20 pass-through holes for each solenoid body — raw 10.5 mm
