@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { validateSyntaxPure, detectPathDoubling, detectPathDoublingInfo, extractSignatures, safeHandler, computePartsLine, computeEffectiveMeshQuality, formatCollisionPairs, formatSweepCollisions, registerTools, getVersionTag, getViewerStatus, formatViewerBlock, type CollisionEntry, type SweepCollisionEntry } from "./tools.js";
+import { validateSyntaxPure, detectPathDoubling, detectPathDoublingInfo, extractSignatures, safeHandler, computePartsLine, computeEffectiveMeshQuality, formatCollisionPairs, formatSweepCollisions, formatLastScreenshotLine, registerTools, getVersionTag, getViewerStatus, formatViewerBlock, type CollisionEntry, type SweepCollisionEntry } from "./tools.js";
+import type { EngineStatus } from "./engine.js";
 
 // ---------------------------------------------------------------------------
 // Bug #6 — validate_syntax must trust .method() calls whose receiver was
@@ -1311,3 +1312,111 @@ describe("validateSyntaxPure — literal polyline self-intersection (Rule C)", (
   });
 });
 
+// ---------------------------------------------------------------------------
+// Fix 1 — `formatLastScreenshotLine` must scrub stale paths from OTHER
+// workspaces. The global `shapeitup-status.json` is shared across every
+// VSCode window and every MCP shell on the machine; when a screenshot taken
+// in workspace A leaks into responses while an agent is working in
+// workspace B, the agent will Read the wrong PNG and reason about the wrong
+// assembly. Hotfix: emit the line only when the stored path sits under one
+// of the plausible current-workspace roots (heartbeat / default / cwd).
+// ---------------------------------------------------------------------------
+
+describe("formatLastScreenshotLine — cross-workspace leak guard", () => {
+  const baseStatus = (path: string): EngineStatus => ({
+    success: true,
+    timestamp: new Date().toISOString(),
+    fileName: "whatever.shape.ts",
+    stats: "",
+    lastScreenshot: {
+      path,
+      timestamp: Date.now(),
+      renderMode: "ai",
+      cameraAngle: "iso",
+    },
+  });
+
+  it("emits the Last screenshot line when the stored path is under process.cwd()", () => {
+    // process.cwd() is always a candidate; a path inside it passes the guard.
+    const cwd = process.cwd();
+    const pathUnderCwd = `${cwd}/shapeitup-previews/foo.png`.replace(/\\/g, "/");
+    const out = formatLastScreenshotLine(baseStatus(pathUnderCwd));
+    expect(out).toContain("Last screenshot:");
+    expect(out).toContain(pathUnderCwd);
+  });
+
+  it("scrubs the line when the path is under an unrelated workspace (cross-workspace leak)", () => {
+    // Pick a definitely-unrelated absolute path that cannot be under cwd
+    // or any workspace candidate — a sibling that shares no prefix.
+    // On Windows `C:\not-a-real-shapeitup-ws-\...`, on POSIX `/not-a-real-ws/...`.
+    const stray = process.platform === "win32"
+      ? "C:/definitely-not-current-ws-9f2e/shapeitup-previews/leak.png"
+      : "/definitely-not-current-ws-9f2e/shapeitup-previews/leak.png";
+    const out = formatLastScreenshotLine(baseStatus(stray));
+    expect(out).toBe("");
+  });
+
+  it("returns empty string when lastScreenshot is missing", () => {
+    const status: EngineStatus = {
+      success: true,
+      timestamp: new Date().toISOString(),
+      fileName: "x.shape.ts",
+      stats: "",
+    };
+    expect(formatLastScreenshotLine(status)).toBe("");
+  });
+
+  it("scrubs the line when the current response's shape differs from the screenshot's shape", () => {
+    // Cross-shape leak: last render was on shape_A, current tool response
+    // is for shape_B. Emitting the shape_A PNG footer on the shape_B reply
+    // points the agent at the wrong picture. Guard fires even when the
+    // path is under cwd and still within the 5-min TTL.
+    const cwd = process.cwd();
+    const pathUnderCwd = `${cwd}/shapeitup-previews/shape_A.png`.replace(/\\/g, "/");
+    const status: EngineStatus = {
+      success: true,
+      timestamp: new Date().toISOString(),
+      fileName: "shape_B.shape.ts",
+      stats: "",
+      lastScreenshot: {
+        path: pathUnderCwd,
+        timestamp: Date.now(),
+        renderMode: "ai",
+        cameraAngle: "iso",
+        fileName: "shape_A.shape.ts",
+      },
+    };
+    expect(formatLastScreenshotLine(status)).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix 2 + Fix 3 — API-reference docs surface `raw?` on holes.through and the
+// Placement shape on patterns. Before: `raw?` was only discoverable via the
+// runtime advisory warning; users had to reverse-engineer the Placement
+// object by reading the source. These doc bumps are terse but they land the
+// parameter in the first-line signature and the Placement shape right after
+// the cutAt/spread examples.
+// ---------------------------------------------------------------------------
+
+describe("getApiReference — stdlib surface area bumps", () => {
+  it("advertises holes.through(size, { …, raw? }) in the signature line", async () => {
+    const { getApiReference } = await import("./tools.js");
+    const ref = getApiReference("stdlib");
+    expect(ref).toMatch(/holes\.through\(size,\s*\{\s*depth\?,\s*fit\?,\s*axis\?,\s*raw\?\s*\}\)/);
+    // And the one-line example so agents see the literal-diameter escape hatch.
+    expect(ref).toMatch(/holes\.through\(10,\s*\{\s*raw:\s*true\s*\}\)/);
+  });
+
+  it("documents the Placement shape after the patterns examples", async () => {
+    const { getApiReference } = await import("./tools.js");
+    const ref = getApiReference("stdlib");
+    expect(ref).toContain("Placement shape");
+    // The block names both the required field and the optional rotate/axis.
+    expect(ref).toMatch(/translate:\s*\[x,\s*y,\s*z\]/);
+    expect(ref).toMatch(/rotate\?/);
+    expect(ref).toMatch(/axis\?/);
+    // And reminds callers that the factory is nullary.
+    expect(ref).toMatch(/factory\s*`?\(\)\s*=>\s*Shape3D`?\s*takes\s*NO\s*args/);
+  });
+});

@@ -653,15 +653,87 @@ function formatRelativeTimestamp(epochMs: number): string {
   return `${d}d ago`;
 }
 
-function formatLastScreenshotLine(status: EngineStatus): string {
+/**
+ * Case-insensitive-on-Windows path prefix check. Returns true when `child`
+ * lives inside `parent` (or equals it). Both paths are `resolve()`-d first
+ * so trailing separators, `..` segments, and mixed `/`+`\` don't throw the
+ * comparison off. Used by the cross-workspace screenshot-leak guard.
+ */
+function _pathIsInside(child: string, parent: string): boolean {
+  try {
+    const c0 = resolve(child);
+    const p0 = resolve(parent);
+    const norm = (s: string) =>
+      process.platform === "win32" ? s.toLowerCase().replace(/\\/g, "/") : s;
+    const c = norm(c0);
+    const p = norm(p0);
+    if (c === p) return true;
+    const pSep = p.endsWith("/") ? p : p + "/";
+    return c.startsWith(pSep);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Cross-workspace "Last screenshot" leak guard (hotfix — Option A).
+ *
+ * `shapeitup-status.json` is global (shared across every VSCode window and
+ * every MCP shell the user runs). A screenshot taken while focused on
+ * workspace A writes an absolute PNG path into the file; a later MCP call
+ * made from workspace B would otherwise happily surface that stale path as
+ * "Last screenshot: …/A/…/shapeitup-previews/foo.png". An agent that follows
+ * the hint then reads the wrong PNG and reasons about the wrong assembly.
+ *
+ * Fix: before emitting the line, verify the stored path sits under one of
+ * the plausible current-workspace roots — (a) any live heartbeat-reported
+ * workspace, (b) the tool's own default directory, (c) process.cwd(). If
+ * none contain the path, drop the line entirely. Matching workspaces keep
+ * the breadcrumb intact.
+ */
+function _lastScreenshotBelongsToCurrentWorkspace(absPath: string): boolean {
+  // Probe every candidate "current workspace" surface we know about. Any
+  // match is a green light; false only when the path lives somewhere else
+  // entirely (classic cross-workspace leak).
+  const candidates: string[] = [];
+  try {
+    for (const root of getHeartbeatWorkspaceRoots()) candidates.push(root);
+  } catch {
+    // Bus / heartbeat reader may throw during early init — fall through.
+  }
+  try {
+    candidates.push(getDefaultDirectory());
+  } catch {}
+  try {
+    candidates.push(process.cwd());
+  } catch {}
+  for (const root of candidates) {
+    if (root && _pathIsInside(absPath, root)) return true;
+  }
+  return false;
+}
+
+export function formatLastScreenshotLine(status: EngineStatus): string {
   const ls = status.lastScreenshot;
   if (!ls || !ls.path) return "";
+  // Cross-workspace leak guard: scrub stale paths from other workspaces
+  // rather than letting an agent follow them to the wrong assembly.
+  if (!_lastScreenshotBelongsToCurrentWorkspace(ls.path)) return "";
+  // Cross-shape leak guard: if the current response's shape differs from
+  // the screenshot's shape, the stored footer belongs to a previous render
+  // on a sibling file — suppress it rather than pointing the agent at the
+  // wrong PNG when they just modified/validated a different shape.
+  if (status.fileName && ls.fileName && basename(status.fileName) !== basename(ls.fileName)) return "";
+  // TTL: suppress the footer once the screenshot is older than 5 minutes.
+  // Stale paths mislead agents into reasoning about past state as if current.
+  if (typeof ls.timestamp === "number" && Date.now() - ls.timestamp > 5 * 60 * 1000) return "";
   const when = typeof ls.timestamp === "number"
     ? ` (${formatRelativeTimestamp(ls.timestamp)})`
     : "";
   const mode = ls.renderMode ? `, mode=${ls.renderMode}` : "";
   const cam = ls.cameraAngle ? `, camera=${ls.cameraAngle}` : "";
-  return `\nLast screenshot: ${ls.path}${when}${mode}${cam}`;
+  const file = ls.fileName ? `, file=${ls.fileName}` : "";
+  return `\nLast screenshot: ${ls.path}${when}${mode}${cam}${file}`;
 }
 
 /**
@@ -794,7 +866,35 @@ function formatStatusText(status: EngineStatus, verbosity: "summary" | "full" = 
   if (Array.isArray(partsList) && partsList.length === 1) {
     const p = partsList[0];
     const minZ = p.boundingBox?.min?.[2];
-    if (typeof minZ === "number" && minZ < -1) {
+    const maxZ = p.boundingBox?.max?.[2];
+    // "Suspended above Z=0" convention bypass: when a part's TOP edge sits
+    // at-or-near the origin (bbox.max.z ≤ 1 mm), it's a legitimately hung
+    // component — a chassis with top-at-Z=0 datum, an end cap that drops
+    // below its mount face, a solenoid housing hanging from a rail — NOT
+    // a rotation-direction bug. Suppress the warning in that case;
+    // otherwise fall through to the original "extends below z=0" check.
+    const isSuspendedConvention = typeof maxZ === "number" && maxZ <= 1;
+    // Cry-wolf fix: only warn on tiny incidental dips (-5 < minZ < 0).
+    // Substantial excursions below Z=0 are almost always intentional
+    // (centred parts, floor-anchored frames, etc.). Also bail when the
+    // centre-of-mass sits below Z=0 — the part is clearly meant to live there.
+    const comZ = status.properties?.centerOfMass?.[2];
+    const comBelowZero = typeof comZ === "number" && comZ < 0;
+    // Skip symmetric-about-z=0 bboxes: horizontal shafts/cylinders with centerline on z=0 are not "falling through" — their geometry requires ±r clearance.
+    const isSymmetricAboutZero =
+      typeof minZ === "number" &&
+      typeof maxZ === "number" &&
+      maxZ > 0 &&
+      minZ < 0 &&
+      Math.abs(maxZ + minZ) < 0.5 * (maxZ - minZ);
+    if (
+      !isSuspendedConvention &&
+      !comBelowZero &&
+      !isSymmetricAboutZero &&
+      typeof minZ === "number" &&
+      minZ < -0.05 &&
+      minZ > -5
+    ) {
       const depth = (-minZ).toFixed(1);
       belowZeroWarn =
         `\n\u26a0 Geometry: part '${p.name}' extends ${depth} mm below z=0. If it should rest on a baseplate (z=0), check your rotation direction or pivot point.`;
@@ -1252,7 +1352,6 @@ export function checkShapeReuseAfterBoolean(code: string): string | null {
   return warning;
 }
 
-
 /**
  * Pitfall #11 (AST-based): flag a `draw(...)` pen chain that self-
  * intersects when all pen moves use literal numeric arguments.
@@ -1543,7 +1642,6 @@ export function checkDrawSelfIntersection(code: string): string | null {
   scan(source);
   return warning;
 }
-
 
 /**
  * Compute the effective meshQuality to use for a render_preview call.
@@ -1854,7 +1952,6 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
     if (selfIntersectWarning) {
       semanticWarnings.push(selfIntersectWarning);
     }
-
 
     // 5. Fillet/chamfer radius sanity check against observed dimensions.
     //    Collect numeric literals from shape-factory calls and extrude
@@ -6013,9 +6110,13 @@ function installGeminiSchemaShim(server: McpServer): void {
 }
 
 // Fix #1: large assemblies (Asbjørn's 86-part build) blow the MCP token cap
-// when every part's per-row stats are emitted. Default to a 10-row cap;
-// callers can opt into the full list with verbosity: "full".
-const SUMMARY_PARTS_CAP = 10;
+// when every part's per-row stats are emitted. Default to a 25-row cap;
+// callers can opt into the full list with verbosity: "full". When every
+// part has a meaningful author-chosen name (not `part_0` / `part 1`), auto-
+// expand up to FULL_LIST_HARD_CAP so named small-to-medium assemblies stay
+// fully visible without an explicit verbosity bump.
+const SUMMARY_PARTS_CAP = 25;
+const FULL_LIST_HARD_CAP = 200;
 
 function formatProperties(
   props: ShapeProperties | undefined,
@@ -6042,7 +6143,14 @@ function formatProperties(
   }
   if (props.parts && props.parts.length > 1) {
     const allParts = props.parts;
-    const capped = verbosity === "summary" && allParts.length > SUMMARY_PARTS_CAP;
+    const n = allParts.length;
+    const allNamedMeaningfully = allParts.every((p) =>
+      typeof p.name === "string" && !/^part[_ ]?\d+$/i.test(p.name)
+    );
+    const capped =
+      verbosity === "summary" &&
+      n > SUMMARY_PARTS_CAP &&
+      !(allNamedMeaningfully && n <= FULL_LIST_HARD_CAP);
     const visible = capped ? allParts.slice(0, SUMMARY_PARTS_CAP) : allParts;
     for (const p of visible) {
       const bits: string[] = [];
@@ -6236,7 +6344,7 @@ export function extractSignatures(body: string, category: string): string {
     : `# ${category} — signatures only\n\n(No signature-shaped lines found in this category — the content is prose / recipes. Call get_api_reference without signaturesOnly for the full text.)`;
 }
 
-function getApiReference(category: string): string {
+export function getApiReference(category: string): string {
   const refs: Record<string, string> = {
     overview: `# ShapeItUp / Replicad API Overview
 
@@ -6631,8 +6739,9 @@ plate.cut(hole);  // OK
 ## holes — cut-tool shapes
 
 \`\`\`typescript
-holes.through(size, { depth?, fit?, axis? })               // clearance hole ("M3" or raw mm)
-holes.clearance(size, { depth?, fit?, axis? })             // alias of through — same signature, common engineering term
+holes.through(size, { depth?, fit?, axis?, raw? })         // clearance hole ("M3" or raw mm)
+holes.through(10, { raw: true })                           // literal diameter — no M-designation nag
+holes.clearance(size, { depth?, fit?, axis?, raw? })       // alias of through — same signature, common engineering term
 holes.counterbore(spec, { plateThickness, fit?, axis? })   // socket-head pocket + shaft
 holes.countersink(spec, { plateThickness, fit?, axis? })   // 90° flat-head flare + shaft
 holes.tapped(size, { depth, axis? })                       // tap-drill sized (metal taps or skip — use inserts.pocket for FDM)
@@ -6754,6 +6863,13 @@ plate = patterns.cutAt(
   patterns.grid(2, 2, 50, 40),
 );
 \`\`\`
+
+Placement shape (what grid/polar/linear return, what spread/cutAt consume):
+\`\`\`typescript
+{ translate: [x, y, z], rotate?: number /* deg */, axis?: [x, y, z] }
+\`\`\`
+The \`cutAt\`/\`spread\` factory \`() => Shape3D\` takes NO args — it's stateless.
+Call it once per placement; one tool shape per call.
 
 ---
 
