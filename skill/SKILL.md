@@ -111,9 +111,36 @@ XZ → extrudes -Y (toward camera)
 YZ → extrudes +X
 ```
 
-No exceptions, no flags, no "it depends". To flip direction, use the reverse-named plane (`YX` → -Z, `ZX` → +Y, `ZY` → -X) or pass a negative extrude depth (`.extrude(-L)`). `sketchOnPlane("XZ", [0, 0, 20])`'s origin offset is in WORLD coordinates, so the `[0, 0, 20]` raises along world Z, NOT along the XZ plane's local axis.
+No exceptions, no flags, no "it depends". To flip direction, pass a negative extrude depth (`.extrude(-L)`) — this reverses the direction vector without touching the pen-axis mapping. Avoid the reverse-named plane trick (`XZ`↔`ZX`) if your sketch uses `hLine`/`vLine`/`lineTo` — it silently swaps which world axis each pen move writes to (see Pen axis mapping above). `sketchOnPlane("XZ", [0, 0, 20])`'s origin offset is in WORLD coordinates, so the `[0, 0, 20]` raises along world Z, NOT along the XZ plane's local axis.
 
 Or skip all that and use `prism({ along: "+Y", length: 20 })` — same shape, no sign puzzle.
+
+### `placeOn(drawing, plane, { into, distance })` — plane + explicit half-space
+
+When you know the target plane AND which direction you want the solid to grow, use `placeOn` instead of `sketchOnPlane(plane).extrude(d)`. It throws at call time if the `into` axis doesn't match the plane's normal (no silent wrong placement), and always lands the bbox in a predictable half-space on that axis.
+
+```typescript
+import { placeOn } from "shapeitup";
+
+// 20 mm-thick wall sitting AT x=-20, extending further into -X (bbox X ∈ [-40, -20]):
+const wall = placeOn(drawRectangle(60, 80), "YZ", { into: "-X", distance: 20 })
+  .translate(-20, 0, 0);
+//            ^ after placeOn, bbox X ∈ [-20, 0]; translate by -20 lands it at [-40, -20]
+
+// 20 mm slab above Y=0, sketched on XZ (bbox Y ∈ [0, 20] — sketchOnPlane alone gives [-20, 0]):
+placeOn(drawRectangle(40, 50), "XZ", { into: "+Y", distance: 20 });
+
+// 10 mm pad below Z=0 (flip the XY default grow-up):
+placeOn(drawCircle(5), "XY", { into: "-Z", distance: 10 });
+```
+
+Rules:
+- `plane` is any of `"XY" | "YX" | "XZ" | "ZX" | "YZ" | "ZY"`.
+- `into` MUST match the plane's normal axis: `"XY"`/`"YX"` → `"+Z"`|`"-Z"`; `"XZ"`/`"ZX"` → `"+Y"`|`"-Y"`; `"YZ"`/`"ZY"` → `"+X"`|`"-X"`. Mismatches throw with a message naming the valid pair.
+- `distance` must be positive finite.
+- Result bbox on the normal axis: `[0, distance]` for positive `into`, `[-distance, 0]` for negative `into`.
+
+Prefer `placeOn` over raw `sketchOnPlane(plane, offset).extrude(length)` whenever you know the plane and direction up front — it removes the extrude-sign puzzle and the world-coord `origin` trap in one call. For a sketch already built via `.sketchOnPlane(...)` that you want centered on its plane instead of lopsided, use `extrudeCentered(sketch, distance)` (bbox on normal axis is always `[-d/2, +d/2]`).
 
 ### Pen axis mapping (`draw().hLine` / `.vLine`, `Sketcher`)
 
@@ -305,6 +332,28 @@ shape.intersect(other)   // intersection — FRAGILE on curved solids
 - If 3D `intersect` fails, use the **mold-cut workaround** — see [Organic Shapes](#organic--sculptural-shapes).
 - Booleans inside a `for` loop are slow. Combine in 2D first (one `drawing.fuse` chain), then a single `.extrude()`.
 
+### Through-cut epsilon (coincident-face avoidance)
+
+When a cutter's end face lands exactly flush with a target face, OCCT can produce non-manifold geometry (zero-thickness slivers, "face on face" failures). The stdlib exports `standards.CUT_EPSILON` (0.01 mm) and applies it automatically to `holes.through` / `holes.tapped` / `holes.counterbore` / `holes.countersink` / `holes.keyhole` / `holes.slot` / `holes.teardrop` / `bearings.seat({ throughHole: true })` / `bearings.linearSeat` — they extend the cutter by `CUT_EPSILON` past BOTH faces.
+
+Pass `{ strict: true }` on those helpers to opt out (precise mating surfaces). Hand-rolled cutters should extend their extrude length by `2 * CUT_EPSILON` and shift the base by `-CUT_EPSILON` so the tool overshoots both faces.
+
+### Canonical through-cut idiom
+
+For a cutter that must pass through a part of thickness D along world Y, sketch on the far face and extrude through in the plane's natural direction:
+
+    const EPS = standards.CUT_EPSILON;
+    const cutter = drawCircle(r)
+      .sketchOnPlane("XZ", [0, +D/2 + EPS, 0])  // start on +Y face
+      .extrude(D + 2 * EPS);                     // XZ grows -Y, so cuts through to -Y face
+
+This is safer than `.extrude(-L)` + negative-offset or than flipping `XZ`↔`ZX`:
+- The pen axes stay on their documented mapping (hLine → +X, vLine → +Z), so `hLine`/`vLine`/`lineTo([x,z])` keep their intuitive meaning.
+- The sign of the extrude matches the sign conventions in the Pen-axis table above (no mental negation).
+- The `±EPS` padding is the same one `holes.*` applies automatically.
+
+Swap plane/offset for other axes: `YZ` sketched at `[+D/2+EPS, 0, 0]` cuts along -X; `XY` sketched at `[0, 0, -D/2-EPS]` with positive extrude cuts along +Z. General rule: offset is in WORLD coords on the plane-normal axis, and the sign is opposite the plane's natural extrude direction.
+
 ---
 
 ## Organic / Sculptural Shapes
@@ -386,6 +435,22 @@ shape.rotate(angleDeg, position?, direction?)
 shape.mirror(plane?, origin?)
 shape.scale(factor, center?)   // UNIFORM only — one number
 ```
+
+> **Transforms consume their input.** Unlike Three.js, Replicad's `translate`, `rotate`, `mirror`, and `scale` are destructive: they delete the original shape. Reusing the input variable afterward throws `"this object has been deleted"`. Assign the result to a new variable, or use pattern helpers (`patterns.spread`, `patterns.cutAt`) which call a factory once per placement.
+>
+> ```typescript
+> // ❌ Wrong: reuses original after transform
+> let shape = drawRectangle(50, 30).sketchOnPlane("XY").extrude(10);
+> const moved = shape.translate(10, 0, 0);  // ✓ OK
+> const copy2 = shape.translate(-10, 0, 0); // ❌ CRASH — shape is deleted
+>
+> // ✅ Right: factory + pattern
+> const factory = () => drawRectangle(50, 30).sketchOnPlane("XY").extrude(10);
+> const parts = patterns.spread(factory, [[10, 0, 0], [-10, 0, 0]]);
+> ```
+
+> **Part transforms preserve joints.** The destructive rule above applies to raw `Shape3D` values. The stdlib `Part` wrapper (from `part()`, `motors.nema17()`, `bearings.body()`, etc.) composes transforms internally — `part.translate(...)`, `part.rotate(...)`, and `part.mirror(...)` return a new `Part` whose `.joints.<name>` resolves to the correctly transformed world-space position and axis. Compose freely; `mate()` still works after any chain of transforms.
+
 
 `scale()` is uniform-only (OpenCascade constraint — no `scaleNonUniform` exists). To stretch non-uniformly:
 - Parameterize the dimensions (`drawRectangle(W, H)` with W and H as separate params, then use `tune_params`).
@@ -588,9 +653,10 @@ For multi-part designs where parts should fit together without overlapping, call
 
 | Format | `partName`? | Use for |
 |--------|-------------|---------|
-| `"step"` | omit | CAD/CAM workflow — STEP preserves all named components in one structured file (send the whole assembly to FreeCAD/Fusion360) |
-| `"stl"` | per part | 3D printing — one STL per printable part, each oriented independently on the build plate (STL can't carry multi-part structure) |
-| `"stl"` | omit | Single-part print, or a pre-merged assembly where all parts share orientation |
+| `"step"` | omit | CAD/CAM workflow — STEP is the **recommended assembly handoff format**: preserves every named component as a distinct solid in one structured file (FreeCAD/Fusion360 load the full hierarchy + colors). |
+| `"stl"` | per part | 3D printing with per-part orientation — one STL per printable part, each oriented independently on the build plate. |
+| `"stl"` | omit (multi-part) | Assembly STL for slicers — emitted as **ASCII multi-solid** (one `solid <name>` block per part), so PrusaSlicer/Cura/Bambu/Orca recognize each part as a separate object. Colors are lost (STL format limitation). |
+| `"stl"` | omit (single-part) | Compact binary STL — default for scripts that return a single shape. |
 
 Example — enclosure with case/lid/bracket for 3D printing:
 
@@ -720,6 +786,27 @@ Mechanical / 3D-printing helpers layered on top of Replicad. **Use these instead
 import { holes, screws, bolts, washers, inserts, bearings, extrusions, printHints } from "shapeitup";
 ```
 
+### Primitive anchor / Z-convention matrix
+
+Every stdlib primitive has a fixed relationship between its options and where the resulting bbox lands. Read this before translating — most "the cut removed nothing" and "my part is 20 mm lower than I expected" bugs come from mixing conventions.
+
+| Primitive | Default axis | Anchor (origin sits at…) | Bbox on default axis |
+|-----------|--------------|--------------------------|----------------------|
+| `box({ from, to })` | n/a — axis-aligned block | both world-space corners — no translate needed to place it | `from` to `to`, inclusive, on every axis |
+| `plate({ size, thickness, normal })` | `normal` default `"+Z"` | near face AT origin on the `normal` axis; centered on the two in-plane axes | `"+Z"` → body Z ∈ [0, t]; `"-Z"` → Z ∈ [-t, 0]; `"+Y"` → Y ∈ [0, t]; `"-Y"` → Y ∈ [-t, 0]; `"+X"` → X ∈ [0, t]; `"-X"` → X ∈ [-t, 0] |
+| `wall({ axis, thickness, width, height, baseAtZero? })` | `axis` (required) | delegates to `plate`: near face AT origin on `axis`. `baseAtZero: true` lifts the wall's Z span to [0, height] (only for side-facing axes ±X/±Y; no-op on ±Z) | same thickness-axis span as `plate`; `baseAtZero: false` centers height on Z=0 (Z ∈ [-h/2, +h/2]), `true` → Z ∈ [0, h] |
+| `prism({ profile, along, length, from? })` | `along` default `"+Z"` | in-plane profile centered on the two non-along axes (via `drawRectangle`/`drawCircle` default); `from` shifts the whole interval along `along` | positive `along` → [from, from + length]; negative `along` → [from - length, from] |
+| `cylinder({ bottom \| top, length, diameter, direction })` | `direction` default `"+Z"` | `bottom`/`top` names the exact end-cap point (mutually exclusive); radial center is on `direction` through that point | `bottom: [0,0,0], direction: "+Z"` → Z ∈ [0, L]; `top: [0,0,0], direction: "+Z"` → Z ∈ [-L, 0] |
+| `holes.through` / `holes.tapped` / `holes.threaded` / `holes.clearance` | `axis` default `"+Z"` | opening at local origin on the `axis` face; body extends OPPOSITE the axis name | `"+Z"` → Z ∈ [-depth, 0]; `"-Z"` → [0, depth]; `"+X"` → X ∈ [-depth, 0]; `"-X"` → [0, depth]; `"+Y"` → Y ∈ [-depth, 0]; `"-Y"` → [0, depth] (±CUT_EPSILON on each end unless `strict: true`) |
+| `holes.counterbore` / `holes.countersink` | `axis` default `"+Z"` | pocket/flare opening at local origin on the `axis` face; shaft + pocket extend OPPOSITE | `"+Z"` default: pocket Z ∈ [-pocketH, 0], shaft Z ∈ [-plateThickness, 0]; other axes follow the same "opens on / penetrates opposite" rotation |
+| `bearings.seat(designation, { axis })` | `axis` default `"+Z"` | pocket top at local origin on the `axis` face; cavity extends OPPOSITE the axis name | `"+Z"` default: pocket Z ∈ [-width-0.2, 0]; relief bore extends further into -Z (same sign flip per `axis` as `holes.*`) |
+| `motors.nema17()` (and `nema14` / `nema23`) | shaft defaults to `"+Z"` (override via `{ direction }`) | mountFace joint at world origin (axis `-Z`); body occupies Z ∈ [0, spec.height]; shaft extends Z ∈ [spec.height, spec.height + shaftLength] with shaftTip joint on top | default: body Z ∈ [0, H], shaft Z ∈ [H, H+SL]. Rotating via `direction` carries both joints along so `mate()` stays consistent. |
+
+Notes:
+- Every `holes.*` / `bearings.seat` / `inserts.pocket` cutter follows the same "opens on the named axis face, body penetrates opposite" rule. Translate the opening point onto the face you're cutting through — forgetting this leaves the cutter on the wrong side of the plate and the cut silently removes nothing.
+- `plate` / `wall` / `prism` anchor ONE face at the origin (the face named by the normal/along axis); the other two axes are centered by default. `box` is the only primitive anchored by explicit corners on all three axes.
+- `motors.nema17_mountPlate({ axis })` (the cut tool, not the Part) uses the same `+Z` default as the hole cutters — opening on +Z, body into -Z — so `plate.cut(motors.nema17_mountPlate({ thickness: t }))` on a plate whose top sits at Z=0 needs no translate.
+
 **Cut-tool orientation convention** — every hole/seat/pocket helper returns a Shape3D with axis +Z, top at Z=0, extending into -Z. The ergonomic shortcut is to hand the tool factory to `patterns.cutTop` (infers plate-top Z from the plate's bbox, wraps the translate + cut into one call):
 
 ```typescript
@@ -776,6 +863,8 @@ Every cut-tool helper below takes an optional `axis: "+X" | "-X" | "+Y" | "-Y" |
 For 3D-shape positioning (not cuts): `box({ from, to })`, `prism({ profile, along, length })` — see the Plane-orientation cheat sheet above.
 
 ### holes — cut tools
+
+**Reminder:** axis NAMES the face the hole opens on; body extends OPPOSITE.
 
 ```typescript
 holes.through("M3", { depth?, fit?, axis? })              // clearance hole; or raw number for plain cylinder
@@ -844,7 +933,7 @@ Full parameter tables for every stdlib namespace are available via `get_api_refe
 - `standards.SPORTS_BALLS` — ITF tennis, pingpong, golf, baseball, soccer diameters
 - `part` / `faceAt` / `shaftAt` / `boreAt` / `mate` / `assemble` / `entries` — declarative joint-based assembly. Each joint helper accepts `xy?: [number, number]` — e.g. `faceAt(50, { axis: "+X", xy: [-30, 10] })` positions the joint at (x, y, z) instead of (0, 0, z) when joints share a Z plane or sit on vertical walls.
 - `symmetricPair` — mirror a Part across a plane to get a matched left/right pair
-- `subassembly` — compose Parts of Parts; `stackOnZ` for simple coaxial stacks
+- `subassembly` — compose Parts of Parts; `stack(parts, { axis?, gap?, align? })` for simple stacks along any principal axis (`stackOnZ` is now a thin +Z wrapper)
 - `motors` / `couplers` — NEMA14/17/23 motor + flexible coupler Part builders with joints
 - `threads` — helical metric + trapezoidal threads (`metric`, `metricMesh`, `tapInto`, `leadscrew`, …)
 - `cylinder` / `rod` — orientation-explicit cylinder with named top/bottom anchor
