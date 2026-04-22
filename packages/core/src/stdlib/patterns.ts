@@ -744,13 +744,30 @@ export function cutBottom(
  *   a bare warning forces the engineer to search; the tag identifies the
  *   offender directly. If omitted, the call's 1-based ordinal is shown
  *   instead (`"patterns.cutAt call #3: …"`).
+ * @param opts.strictMiss How to react when one or more placements land
+ *   outside the target's bounding box:
+ *   - `"error"` — throw; the call fails the whole render (this is the
+ *     default for hand-authored placement arrays, since a miss there
+ *     typically signals a typo).
+ *   - `"warn"` — push a runtime warning and continue; the shape returned
+ *     reflects whatever cuts did land (this is the default for generator-
+ *     produced arrays from `polar` / `grid` / `linear` / ...).
+ *   - `"skip"` — silently drop the misses (no warning); the shape reflects
+ *     the hits only. Use when you know the placement math will legitimately
+ *     produce some off-target copies (e.g. parametric bolt fields that
+ *     overflow under certain param values).
+ *   When unset the per-array default described above applies — explicit
+ *   wins as `"error"`, generator-produced as `"warn"` — preserving backward
+ *   compatibility. Set explicitly to iterate: `strictMiss: "warn"` lets
+ *   you see partial hits during iterative design without blocking the
+ *   render.
  * @returns New Shape3D with all N cuts applied in sequence.
  */
 export function cutAt(
   target: Shape3D,
   makeTool: () => Shape3D,
   placements: Placement[],
-  opts: { name?: string } = {}
+  opts: { name?: string; strictMiss?: "error" | "warn" | "skip" } = {}
 ): Shape3D {
   // P3-7 runtime guard: users sometimes pass a Shape3D directly instead of a
   // factory. The type-level contract (() => Shape3D) catches the common case,
@@ -850,7 +867,19 @@ export function cutAt(
   // rather than silently warn. Generator misses stay warnings because users
   // often compute placements from live params and a warning is the right
   // severity for "your math puts some copies outside the target".
+  //
+  // `opts.strictMiss`, when explicitly set, OVERRIDES this heuristic for
+  // the current call — users iterating on an explicit placement list who
+  // want to see partial hits pass `strictMiss: "warn"`; batch/tolerant
+  // callers pass `"skip"` to silence the warning entirely. Unset preserves
+  // backward-compatible per-array behavior.
   const isExplicit = !(placements as any).__generated__;
+  const missPolicy: "error" | "warn" | "skip" =
+    opts.strictMiss !== undefined
+      ? opts.strictMiss
+      : isExplicit
+        ? "error"
+        : "warn";
 
   if (checkedCount > 0 && disjointCount === checkedCount) {
     // When every placement fails, the index list is largely redundant
@@ -862,23 +891,24 @@ export function cutAt(
       `${label}: all ${checkedCount} tool placement${checkedCount === 1 ? "" : "s"} ` +
       `${checkedCount === 1 ? "was" : "were"} outside the target's bounding box — no material removed. ` +
       `Check placement coordinates against the target's position.`;
-    if (isExplicit) {
+    if (missPolicy === "error") {
       // Record the outcome BEFORE throwing so aggregate reporting still
       // includes the failed call (cutAt never returned a shape).
       pushCutAtOutcome(false);
       throw new Error(`[patterns.cutAt] ${msg}`);
     }
-    pushRuntimeWarning(msg);
+    if (missPolicy === "warn") pushRuntimeWarning(msg);
+    // "skip" emits no warning — silent drop.
     pushCutAtOutcome(false);
   } else if (disjointCount > 0) {
     const msg =
       `${label}: ${disjointCount} of ${checkedCount} tool placements were outside the target's bounding box — ` +
       `those cuts removed no material. Failed placement indices: ${formatFailedIndices(failedIndices)}.`;
-    if (isExplicit) {
+    if (missPolicy === "error") {
       pushCutAtOutcome(false);
       throw new Error(`[patterns.cutAt] ${msg}`);
     }
-    pushRuntimeWarning(msg);
+    if (missPolicy === "warn") pushRuntimeWarning(msg);
     pushCutAtOutcome(false);
   }
 

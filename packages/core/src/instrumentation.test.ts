@@ -74,12 +74,27 @@ describe("instrumentation — free-function validators (Bug #7)", () => {
     );
   });
 
-  it("drawRoundedRectangle rejects radius == half min side (rectangle — degenerates to stadium)", () => {
-    const exports: any = { drawRoundedRectangle: makeStub() };
+  it("drawRoundedRectangle clamps radius == half min side (rectangle — nudges into OCCT's valid range)", () => {
+    // The stadium-limit case (r == min(w,h)/2 on a non-square rectangle) is
+    // mathematically the natural stadium shape. Rather than throw and force
+    // the user to compose `drawRectangle + drawCircle`, the wrapper clamps r
+    // to `limit - 1e-6` so OCCT accepts it; the resulting wire is visually
+    // indistinguishable from a stadium. Verified: no throw, and the
+    // underlying replicad call received the nudged radius.
+    const calls: any[] = [];
+    const exports: any = {
+      drawRoundedRectangle: (...args: any[]) => {
+        calls.push(args);
+        return {};
+      },
+    };
     instrumentReplicadExports(exports);
-    expect(() => exports.drawRoundedRectangle(10, 20, 5)).toThrow(
-      /stadium/,
-    );
+    expect(() => exports.drawRoundedRectangle(10, 20, 5)).not.toThrow();
+    expect(calls).toHaveLength(1);
+    // args[2] was clamped below the exact limit (5.0) — OCCT would have
+    // rejected r === 5 outright.
+    expect(calls[0][2]).toBeLessThan(5);
+    expect(calls[0][2]).toBeGreaterThan(4.999);
   });
 
   it("drawRoundedRectangle accepts radius just below half min side (not degenerate)", () => {

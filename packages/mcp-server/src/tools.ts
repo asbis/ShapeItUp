@@ -6,6 +6,7 @@ import { extractExpectedContactsStatic } from "@shapeitup/core";
 import { homedir } from "os";
 import {
   appendScreenshotMetadata,
+  bundleDepsAreStale,
   canonicalParamsKey,
   executeShapeFile,
   exportLastToFile,
@@ -2396,10 +2397,23 @@ async function executeWithPersistedParams(
     if (head) {
       const hit = lookupMeshCache(absPath, head.sourceHash, paramsKey, meshQuality);
       if (hit) {
-        process.stderr.write(
-          `[mesh-cache] hit absPath=${absPath} hits=${hit.hitCount}\n`,
-        );
-        return hit.result;
+        // The mesh cache is keyed on the ENTRY file's source hash, which
+        // doesn't move when only a transitively-imported module (e.g. a
+        // shared `constants.ts`) was edited. Without this check, editing a
+        // dep and then calling `modify_shape` with no args would silently
+        // serve the stale tessellation — even though the bundle cache would
+        // correctly detect the change on a full execute. Consult the bundle
+        // cache's dep mtimes here so both caches invalidate together.
+        if (bundleDepsAreStale(absPath)) {
+          process.stderr.write(
+            `[mesh-cache] skip absPath=${absPath} reason=transitive-dep-newer-than-bundle\n`,
+          );
+        } else {
+          process.stderr.write(
+            `[mesh-cache] hit absPath=${absPath} hits=${hit.hitCount}\n`,
+          );
+          return hit.result;
+        }
       }
     }
   }

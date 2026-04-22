@@ -312,6 +312,39 @@ export function bundleCacheReasonToWarning(reason: string | null): string | null
 }
 
 /**
+ * True when a bundle cache entry for `absPath` exists AND any of its
+ * transitively-imported files has an on-disk mtime newer than the bundle's
+ * `builtAtMs`. Returns false on cold cache, stat failures, or when every dep
+ * is still current.
+ *
+ * Narrow companion to {@link checkBundleCache} used by the mesh-cache hit
+ * path (`executeWithPersistedParams` in tools.ts): the mesh cache is keyed on
+ * the ENTRY file's source hash and can't notice when only a shared module
+ * (e.g. `constants.ts`) was edited — so without this check, a stale
+ * tessellation would ship back even though the bundle cache itself would
+ * correctly invalidate on the next full execute. Consulting this before
+ * returning a mesh-cache hit keeps the two caches coherent.
+ */
+export function bundleDepsAreStale(absPath: string): boolean {
+  const entry = bundleCache.get(absPath);
+  if (!entry) return false;
+  try {
+    for (const [inputPath, recordedMtime] of Object.entries(entry.inputMtimes)) {
+      const stat = statSync(inputPath);
+      if (stat.mtimeMs > entry.builtAtMs) return true;
+      if (Math.abs(stat.mtimeMs - recordedMtime) > 1) return true;
+    }
+  } catch {
+    // Stat failure (deleted dep, permission change) — fall back to "not
+    // stale". The next full execute will hit the same error path and surface
+    // a real diagnostic; we don't want to spuriously invalidate mesh caches
+    // on every transient stat failure.
+    return false;
+  }
+  return false;
+}
+
+/**
  * Evict the oldest entry when the cache exceeds MAX_BUNDLE_CACHE_SIZE.
  * Map insertion order == LRU order for our access pattern (we re-insert on
  * hit below, so the oldest entry is always the first one).

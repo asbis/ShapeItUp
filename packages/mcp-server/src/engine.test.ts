@@ -7,6 +7,7 @@ import {
   checkBundleCache,
   extractLocalImportSpecifiers,
   clearBundleCache,
+  bundleDepsAreStale,
   canonicalParamsKey,
   clearMeshCache,
   getMeshCacheSize,
@@ -1230,6 +1231,67 @@ describe("mesh cache + executeShapeFile (real OCCT)", () => {
     },
     60_000,
   );
+});
+
+// ---------------------------------------------------------------------------
+// bundleDepsAreStale — P1.1 guard consulted by the mesh-cache hit path.
+//
+// Pins the contract: after a successful execute that populates the bundle
+// cache, `bundleDepsAreStale` returns false; after a downstream dep's mtime
+// advances past `builtAtMs`, it returns true. This is the signal that lets
+// `executeWithPersistedParams` skip a mesh-cache hit when a shared
+// `constants.ts` was edited between renders (the bug reported in the
+// knitting-printer v7 feedback).
+// ---------------------------------------------------------------------------
+describe("bundleDepsAreStale — mesh-cache coherence guard", () => {
+  it(
+    "returns false after fresh execute, true after a transitive dep's mtime advances",
+    async () => {
+      clearBundleCache();
+      const workdir = mkdtempSync(join(tmpdir(), "siu-deps-stale-"));
+      const storage = mkdtempSync(join(tmpdir(), "siu-deps-stale-storage-"));
+      try {
+        const constPath = join(workdir, "constants.ts");
+        writeFileSync(constPath, `export const SIZE = 10;\n`);
+
+        const entryPath = join(workdir, "box.shape.ts");
+        writeFileSync(
+          entryPath,
+          [
+            `import { drawRectangle } from "replicad";`,
+            `import { SIZE } from "./constants";`,
+            `export default function main() {`,
+            `  return drawRectangle(SIZE, SIZE).sketchOnPlane("XY").extrude(5);`,
+            `}`,
+            "",
+          ].join("\n"),
+        );
+
+        const first = await executeShapeFile(entryPath, storage);
+        expect(first.status.success).toBe(true);
+
+        // Fresh bundle: no dep has moved, so this must be false.
+        expect(bundleDepsAreStale(entryPath)).toBe(false);
+
+        // Advance the dep's mtime beyond `builtAtMs` (add 5s to cover any
+        // filesystem-tick rounding). Same pattern as the existing
+        // "cache miss after dependency mtime change" test.
+        const now = new Date();
+        utimesSync(constPath, now, new Date(now.getTime() + 5000));
+
+        expect(bundleDepsAreStale(entryPath)).toBe(true);
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it("returns false for paths that were never bundled (cold cache)", () => {
+    clearBundleCache();
+    expect(bundleDepsAreStale(join(tmpdir(), "siu-never-bundled-xyz.shape.ts"))).toBe(false);
+  });
 });
 
 // ---------------------------------------------------------------------------

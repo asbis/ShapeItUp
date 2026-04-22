@@ -175,23 +175,16 @@ const VALIDATORS: Record<string, (...args: any[]) => void> = {
       const wNum = w as number;
       const hNum = h as number;
       const limit = Math.min(wNum, hNum) / 2;
-      if (r === limit) {
-        if (wNum === hNum) {
-          // Square case: r = w/2 = h/2 — shape degenerates to a circle.
-          throw new TypeError(
-            `drawRoundedRectangle: with width=${wNum} height=${hNum} radius=${r}, radius equals half the side — this degenerates to a circle. Use drawCircle(${r}) instead.`,
-          );
-        } else {
-          // Rectangle case: r = min(w,h)/2 — shape degenerates to a "stadium"
-          // (rectangle with fully-rounded semicircular ends), which
-          // drawRoundedRectangle does not support.
-          const [shorter, longer] = wNum < hNum ? [wNum, hNum] : [hNum, wNum];
-          const halfSlot = (longer - shorter) / 2;
-          throw new TypeError(
-            `drawRoundedRectangle: with width=${wNum} height=${hNum} radius=${r}, radius equals half the shorter side — this degenerates to a stadium shape. ` +
-              `Use the composition pattern instead: drawRectangle(${longer - shorter}, ${shorter}).fuse(drawCircle(${r}).translate(${halfSlot}, 0)).fuse(drawCircle(${r}).translate(-${halfSlot}, 0))`,
-          );
-        }
+      // Square-to-circle degeneracy still throws: that's a genuinely
+      // different primitive and `drawCircle(r)` is the right call, not a
+      // tolerance-nudged rounded rectangle. Stadium (rectangle-with-semicircle-
+      // ends, r == min(w,h)/2 on a non-square) is handled by the arg
+      // transform below — it clamps r to just under the limit so OCCT
+      // produces the visually-identical shape without rejecting it.
+      if (r === limit && wNum === hNum) {
+        throw new TypeError(
+          `drawRoundedRectangle: with width=${wNum} height=${hNum} radius=${r}, radius equals half the side — this degenerates to a circle. Use drawCircle(${r}) instead.`,
+        );
       }
       if (r > limit) {
         throw new TypeError(
@@ -255,6 +248,63 @@ const VALIDATORS: Record<string, (...args: any[]) => void> = {
     assertPositiveFinite("sketchHelix", "pitch", pitch);
     assertPositiveFinite("sketchHelix", "height", height);
     assertPositiveFinite("sketchHelix", "radius", radius);
+  },
+};
+
+/**
+ * In-place arg rewrites applied AFTER the matching {@link VALIDATORS} entry
+ * (if any) accepted the input. Used when a particular arg combination is
+ * mathematically well-defined but rejected by the underlying OCCT call, and
+ * we want to nudge it into the valid range rather than throw.
+ *
+ * Each transform receives the live `args` array from the wrapper call-site
+ * (see {@link wrap}) and may mutate positions in place. Return value is
+ * ignored. Use {@link pushRuntimeWarning} to leave an audit trail when the
+ * input was rewritten, so anyone inspecting the resulting geometry in the
+ * viewer knows the call didn't run verbatim.
+ *
+ * Currently only used to clamp `drawRoundedRectangle(w, h, min(w,h)/2)` —
+ * the stadium-limit case that OCCT's rounded-rectangle builder rejects but
+ * users expect to produce a stadium shape (a common intentional primitive
+ * for slots, oval cut-outs, track segments).
+ */
+const VALIDATOR_TRANSFORMS: Record<string, (args: any[]) => void> = {
+  drawRoundedRectangle: (args: any[]) => {
+    if (args.length < 3) return;
+    const w = args[0];
+    const h = args[1];
+    const r = args[2];
+    if (
+      typeof w !== "number" ||
+      typeof h !== "number" ||
+      typeof r !== "number"
+    ) {
+      return;
+    }
+    if (!Number.isFinite(w) || !Number.isFinite(h) || !Number.isFinite(r)) {
+      return;
+    }
+    // Only touch the exact stadium limit on a non-square. Everything else is
+    // already accepted by OCCT. The square case (w == h at r == w/2) is still
+    // rejected by the validator with a "use drawCircle" hint.
+    if (w === h) return;
+    const limit = Math.min(w, h) / 2;
+    if (r !== limit) return;
+    // Nudge r just under the limit so OCCT's rounded-rectangle builder
+    // accepts it. 1e-6 mm is far below any tessellation tolerance, so the
+    // resulting wire is visually indistinguishable from the stadium the user
+    // asked for. The shorter-axis straight segments end up ~2e-6 mm long —
+    // harmless but non-zero.
+    const nudged = limit - 1e-6;
+    args[2] = nudged;
+    pushRuntimeWarning(
+      `drawRoundedRectangle(${w}, ${h}, ${r}): radius equals half the shorter side (stadium limit). ` +
+        `Clamped to ${nudged} so OCCT accepts the wire — the resulting shape is visually a stadium. ` +
+        `If you want an exact stadium, compose it instead: ` +
+        `drawRectangle(${Math.max(w, h) - Math.min(w, h)}, ${Math.min(w, h)})` +
+        `.fuse(drawCircle(${r}).translate(${(Math.max(w, h) - Math.min(w, h)) / 2}, 0))` +
+        `.fuse(drawCircle(${r}).translate(-${(Math.max(w, h) - Math.min(w, h)) / 2}, 0)).`,
+    );
   },
 };
 
@@ -1051,6 +1101,7 @@ function instrumentPrototype(
 
 function wrap(name: string, original: Function): Function {
   const validator = VALIDATORS[name];
+  const transform = VALIDATOR_TRANSFORMS[name];
   const protoValidator = PROTO_VALIDATORS[name];
   const postHook = PROTO_POST_HOOKS[name];
   return function wrapped(this: any, ...args: any[]) {
@@ -1058,6 +1109,10 @@ function wrap(name: string, original: Function): Function {
     // Validator throws are user errors, not performance events, so keep them
     // out of the timings record.
     if (validator) validator(...args);
+    // Post-validator arg rewrites (e.g. stadium clamp on drawRoundedRectangle).
+    // Runs AFTER the validator so genuinely bad input still throws, but
+    // accepted-yet-degenerate input gets nudged into OCCT's valid range.
+    if (transform) transform(args);
     if (protoValidator) protoValidator(this, ...args);
     stack.push(name);
     const start = performance.now();

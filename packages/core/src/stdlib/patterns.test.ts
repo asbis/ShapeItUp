@@ -539,6 +539,74 @@ describe("patterns.cutAt — silent no-op guards", () => {
   });
 
   // -------------------------------------------------------------------------
+  // strictMiss — per-call override of the explicit/generator miss policy.
+  //
+  // The feedback: hard-failing on an explicit placement array blocks the
+  // "let me SEE 2-of-4 holes first, then fix the geometry" iterative flow.
+  // `strictMiss: "warn"` preserves the miss report without blocking;
+  // `"skip"` silences it entirely; `"error"` pins the current loud default.
+  // -------------------------------------------------------------------------
+  it("strictMiss='warn' downgrades an explicit-array miss from throw to warning", () => {
+    const target = mockShape([[-10, -10, 0], [10, 10, 5]], 1000, "noop");
+    const tool = mockShape([[100, 100, 0], [110, 110, 5]], 10);
+    expect(() =>
+      patterns.cutAt(target, () => tool, [{ translate: [0, 0, 0] }], {
+        strictMiss: "warn",
+      }),
+    ).not.toThrow();
+    const warnings = drainRuntimeWarnings();
+    expect(warnings.some((w) => /outside the target's bounding box/.test(w))).toBe(true);
+  });
+
+  it("strictMiss='skip' suppresses the miss warning entirely on an explicit array", () => {
+    const target = mockShape([[-10, -10, 0], [10, 10, 5]], 1000, "noop");
+    const tool = mockShape([[100, 100, 0], [110, 110, 5]], 10);
+    expect(() =>
+      patterns.cutAt(target, () => tool, [{ translate: [0, 0, 0] }], {
+        strictMiss: "skip",
+      }),
+    ).not.toThrow();
+    const warnings = drainRuntimeWarnings();
+    // No miss warning — skip is a silent drop.
+    expect(warnings.some((w) => /outside the target's bounding box/.test(w))).toBe(false);
+  });
+
+  it("strictMiss='error' promotes a generator-array miss from warning to throw", () => {
+    // Inverse of the default: generators normally warn, but an iteration-
+    // complete build can pin strict semantics with strictMiss: "error".
+    const target = mockShape([[-10, -10, 0], [10, 10, 5]], 1000, "noop");
+    const tool = mockShape([[100, 100, 0], [110, 110, 5]], 10);
+    expect(() =>
+      patterns.cutAt(target, () => tool, patterns.linear(2, [0, 0, 0]), {
+        strictMiss: "error",
+      }),
+    ).toThrow(/\[patterns\.cutAt\]/);
+  });
+
+  it("strictMiss='warn' downgrades a partial (some-miss) explicit-array failure too", () => {
+    const target = mockShape([[-10, -10, 0], [10, 10, 5]], 1000, "noop");
+    const farTool = mockShape([[100, 100, 0], [110, 110, 5]], 10);
+    const nearTool = mockShape([[-1, -1, 0], [1, 1, 5]], 10);
+    let callN = 0;
+    const factory = () => (callN++ === 0 ? nearTool : farTool);
+    expect(() =>
+      patterns.cutAt(
+        target,
+        factory,
+        [
+          { translate: [0, 0, 0] },
+          { translate: [0, 0, 0] },
+        ],
+        { strictMiss: "warn" },
+      ),
+    ).not.toThrow();
+    const warnings = drainRuntimeWarnings();
+    // Partial-miss message includes "N of M ... were outside" and the
+    // failed indices list.
+    expect(warnings.some((w) => /of 2 tool placements were outside/.test(w))).toBe(true);
+  });
+
+  // -------------------------------------------------------------------------
   // P9 — `__generated__` brand preservation through helper pipelines.
   //
   // Pattern-building helpers (`onPlane`, `rectOnPlane`) post-process
