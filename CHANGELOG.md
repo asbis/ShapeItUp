@@ -6,6 +6,60 @@ its own versions in `packages/mcp-server/CHANGELOG.md`.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project follows semantic versioning at the extension level.
 
+## [1.10.0] - 2026-04-22
+
+Extension `1.10.0` / mcp-server `1.9.0` — warning signal-to-noise overhaul
+and acceptedPairs UX from the 98-part knitting-printer field report.
+
+### Fixed
+- **False-positive warning when `sketchOnPlane("YZ"/"XZ")` is explicitly
+  offset.** The bbox-off-origin hint now skips when the user passed a
+  non-zero origin tuple — that's the affirmative opt-in that says "I know
+  where this slab lands." Previously fired ~10×/build on correct code.
+- **"Extends N mm below z=0" fires a `0.0 mm` warning.** Threshold raised
+  from `minZ < 0` to `minZ < -0.05` so float-dust from CUT_EPSILON no longer
+  triggers it. Horizontal-axis cylinders (bbox symmetric about z=0) are now
+  silenced — a Ø8 shaft centerlined on z=0 isn't falling through.
+- **"Pen hLine/vLine maps to different world axes" warning fires even
+  without hLine/vLine.** Scoped to Draw chains that actually used pen-axis
+  methods (`hLine`, `vLine`, `vhLine`, `polarLine`, `polarLineTo`,
+  `tangentArc`, `hSagittaArc`, `vSagittaArc`). Pure `.lineTo([x,z])` draws
+  on non-XY planes no longer warn.
+- **Stale "Last screenshot" footer leaks across shapes.** The footer now
+  requires the screenshot's `fileName` to match the current response's
+  shape; otherwise it's suppressed. Also includes `file=<shape>` in the
+  emitted line so agents can see which shape a screenshot belongs to.
+
+### Changed
+- **Negative `.extrude(-L)` is now allowed.** Replicad accepts it natively
+  (reverses the direction vector) — the previous ShapeItUp guard was based
+  on a false "WASM pointer exception" premise and our own stdlib already
+  relied on negative extrude. The suggested workaround (flipping `XZ↔ZX`)
+  silently corrupts `hLine`/`vLine`/`lineTo([x,z])` coords, so the
+  workaround was unsafe.
+- **`check_collisions.acceptedPairs` schema description now documents `*`
+  glob syntax.** The matcher has always supported `*` — it was just
+  undiscoverable. `[["needle-body-*", "needle-bed"]]` replaces 20 literal
+  entries in a 98-part build.
+- **`render_preview` part-list cap raised 10 → 25**, and auto-expands up
+  to 200 when every part has a meaningful name (not `part_0`…`part_N`).
+  Removes a `get_render_status` round trip for multi-part review.
+
+### Added
+- **`export const expectedContacts = [...]`** in a shape file is now
+  automatically picked up by `check_collisions` as implicit `acceptedPairs`.
+  Rules live next to the code that produces the contact — no arg needed.
+  Supports `*` globs on both sides of each pair. Exposed as
+  `extractExpectedContactsStatic` from `@shapeitup/core`.
+- **Canonical through-cut idiom** documented in `SKILL.md`: sketch on the
+  far face and extrude through in the plane's natural direction, instead
+  of negative-offset + negative-extrude tricks that tangle pen-axis
+  semantics.
+- **Axis-convention reminder** prepended to every hole-helper's JSDoc
+  (`holes.through`/`clearance`/`counterbore`/`countersink`/`tapped`/
+  `threaded`/`teardrop`/`keyhole`/`slot` and the `*At` convenience
+  wrappers): "axis names the FACE the hole opens on; body extends OPPOSITE."
+
 ## [1.7.0] - 2026-04-21
 
 Extension `1.7.0` / mcp-server `1.6.0` — MCP-first standalone architecture.

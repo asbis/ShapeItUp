@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.9.0 (2026-04-22)
+
+Warning signal-to-noise overhaul and acceptedPairs UX from the 98-part
+knitting-printer field report. Ships in lockstep with extension 1.10.0.
+
+### Fixed
+- `check_collisions` footer no longer leaks the previous shape's screenshot
+  path onto `modify_shape`/`validate_syntax`/etc responses for a different
+  shape. Emitted line now includes `file=<shape>` for disambiguation.
+- `minZ < -0.05` float-dust threshold eliminates the `"extends 0.0 mm below
+  z=0"` false-fire when a cutter uses `CUT_EPSILON` padding.
+- Symmetric-about-z=0 bboxes (horizontal shafts/cylinders) no longer trigger
+  the "extends below z=0" warning.
+- Non-XY-plane pen-axis warning no longer fires on draws that only use
+  absolute `.lineTo()` — scoped to drawings that actually called `hLine`,
+  `vLine`, `vhLine`, `polarLine`, `polarLineTo`, `tangentArc`,
+  `hSagittaArc`, or `vSagittaArc`.
+- `sketchOnPlane("YZ"/"XZ", [non-zero…]).extrude(N)` no longer fires a
+  "bbox off-origin" hint — passing a non-trivial origin is the opt-in.
+
+### Changed
+- `.extrude(-L)` is allowed. Removed the "distance must be positive" guard
+  in `validateSketchExtrude`: replicad accepts it natively, and the old
+  "flip the plane name" workaround silently swapped pen-axis semantics.
+- `acceptedPairs` schema `.describe()` now documents the pre-existing `*`
+  glob support — [`["needle-body-*", "needle-bed"]`] matches 20 literal
+  pairs in one entry.
+- `render_preview` part list: summary cap raised 10 → 25; auto-expands to
+  200 when every part has a meaningful (non-`part_N`) name.
+
+### Added
+- `extractExpectedContactsStatic` in `@shapeitup/core` parses
+  `export const expectedContacts = [["a","b"], ...]` from shape source.
+  `check_collisions` merges these with user-supplied `acceptedPairs` so
+  acceptance rules can live next to the code that produces the contact.
+
 ## 1.6.3 (2026-04-21)
 
 Patch: unblock Claude Code after the 1.6.2 Gemini fix. 1.6.2's sanitizer
