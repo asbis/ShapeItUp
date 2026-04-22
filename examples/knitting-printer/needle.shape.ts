@@ -1,72 +1,48 @@
-// Latch needle — simplified geometry for visualization.
-// Real latch needles are wire-formed steel; here we model the features that
-// matter for assembly fit: stem sliding in groove, butt for cam engagement,
-// hook + closed latch at the working end.
-//
-// Local frame: needle lies along +Y. Hook end at +Y, butt at -Y.
-// Stem cross-section: stemWid (X) × stemThk (Z). Top face at Z=0.
+// Latch needle (simplified) — straight stem along +Y, butt upstand near back end,
+// shallow hook taper at front. Origin: needle back end at Y=0, stem resting
+// in bed slot so stem-bottom at Z = -SLOT_DEPTH + 0.5 (floats 0.5 mm above slot floor).
+// Built at origin — the assembly translates per-needle along X and Y.
 
-import { drawRectangle } from "replicad";
-import { shape3d, cylinder } from "shapeitup";
-import { SPEC, COLORS } from "./constants";
+import { drawRectangle, type Shape3D } from "replicad";
+import { shape3d } from "shapeitup";
+import {
+  NEEDLE_LENGTH, NEEDLE_STEM_W, NEEDLE_STEM_H,
+  BUTT_W, BUTT_H, BUTT_L, BUTT_Y_OFFSET,
+  SLOT_DEPTH, C_NEEDLE,
+} from "./constants";
 
-export const params = {
-  length: SPEC.needleLength,
-  stemThk: SPEC.needleStemThk,
-  stemWid: SPEC.needleStemWid,
-  hookDia: SPEC.needleHookDia,
-  hookWire: SPEC.needleHookWire,
-  butt_h: SPEC.needleButtH,
-  butt_l: SPEC.needleButtL,
-};
+export function makeNeedle(): Shape3D {
+  // Stem rests inside the bed slot; its top face sits at Z = -(SLOT_DEPTH - NEEDLE_STEM_H)/2
+  // Simpler: align stem top at Z = -0.5 (0.5 mm below bed top so butt upstand protrudes above).
+  const stemTopZ = -0.5;
+  const stemBottomZ = stemTopZ - NEEDLE_STEM_H;
 
-export function makeNeedle(p: typeof params = params) {
-  // Stem — centered on origin, extends -Z by stemThk so top face is Z=0.
-  const stem = shape3d(
-    drawRectangle(p.stemWid, p.length)
-      .sketchOnPlane("XY")
-      .extrude(-p.stemThk)
+  // Stem: extrude along +Y from Y=0 to Y=NEEDLE_LENGTH
+  let stem = shape3d(
+    drawRectangle(NEEDLE_STEM_W, NEEDLE_LENGTH)
+      .sketchOnPlane("XY", [0, NEEDLE_LENGTH / 2, stemBottomZ])
+      .extrude(NEEDLE_STEM_H)
   );
 
-  // Butt — raised square above the stem at the rear (-Y) end, fires up into cam.
-  const buttY = -p.length / 2 + p.butt_l / 2 + 2;
+  // Butt: rectangular block standing UP from stem top, near back end (-Y side)
+  const buttY = NEEDLE_LENGTH / 2 + BUTT_Y_OFFSET;  // still inside needle length
   const butt = shape3d(
-    drawRectangle(p.stemWid, p.butt_l)
-      .sketchOnPlane("XY")
-      .extrude(p.butt_h)
-      .translate(0, buttY, 0)
+    drawRectangle(BUTT_W, BUTT_L)
+      .sketchOnPlane("XY", [0, buttY, stemTopZ])
+      .extrude(BUTT_H)
   );
 
-  // Hook — a short cylinder across the needle axis at the +Y tip (approximation
-  // of the hooked wire). Use a ring by subtracting an inner cylinder.
-  const hookCenterY = p.length / 2 - p.hookDia / 2;
-  const outer = cylinder({
-    diameter: p.hookDia + p.hookWire,
-    length: p.hookWire * 2,
-    bottom: -p.hookWire,
-    direction: "+X",
-  }).translate(0, hookCenterY, -p.stemThk / 2);
-  const inner = cylinder({
-    diameter: p.hookDia - p.hookWire,
-    length: p.hookWire * 3,
-    bottom: -p.hookWire * 1.5,
-    direction: "+X",
-  }).translate(0, hookCenterY, -p.stemThk / 2);
-  const hook = shape3d(outer).cut(inner);
-
-  // Latch — flat tab shown half-open above the stem (idle/raised state).
-  const latch = shape3d(
-    drawRectangle(p.stemWid * 0.7, SPEC.needleLatchLen)
-      .sketchOnPlane("XY")
-      .extrude(p.stemThk * 0.4)
-      .translate(0, hookCenterY - SPEC.needleLatchLen / 2 - 1, 0)
+  // Hook: small round-ended bump at front end (Y = NEEDLE_LENGTH)
+  const hookY = NEEDLE_LENGTH - 2;
+  const hook = shape3d(
+    drawRectangle(NEEDLE_STEM_W, 2)
+      .sketchOnPlane("XY", [0, hookY + 1, stemTopZ])
+      .extrude(NEEDLE_STEM_H * 0.8)
   );
 
-  return shape3d(stem).fuse(butt).fuse(hook).fuse(latch);
+  return stem.fuse(butt).fuse(hook);
 }
 
 export default function main() {
-  return [
-    { shape: makeNeedle(), name: "needle", color: COLORS.steel },
-  ];
+  return [{ shape: makeNeedle(), name: "needle", color: C_NEEDLE }];
 }

@@ -1,82 +1,53 @@
-// Carriage body — slides along X on twin 8mm rails. Holds the cam plate
-// underneath (which engages needle butts) and a belt clamp on top.
+// Carriage — block that rides on the two parallel rails, holds the cam plate
+// underneath (assembly responsibility) and the yarn-carrier in front. Two
+// LM8UU-sized through-bores run along +X at the rail Y positions, and two
+// cam-plate mounting holes open on the underside.
 //
-// Local frame: carriage centered on origin. Top face at Z=carriageHeight,
-// bottom face at Z=0. X is travel axis, Y is across the bed.
+// Origin at carriage's geometric center; bottom at Z=CARRIAGE_Z_BOTTOM.
 
-import { drawRoundedRectangle } from "replicad";
-import { shape3d, holes, patterns, bearings } from "shapeitup";
-import { SPEC, COLORS } from "./constants";
+import { drawRoundedRectangle, type Shape3D } from "replicad";
+import { shape3d, holes, patterns } from "shapeitup";
+import {
+  CARRIAGE_LENGTH, CARRIAGE_WIDTH, CARRIAGE_THICKNESS, CARRIAGE_Z_BOTTOM,
+  RAIL_DIAMETER, RAIL_Z, RAIL_Y_FRONT, RAIL_Y_BACK,
+  C_CARRIAGE,
+} from "./constants";
 
-export const params = {
-  length: SPEC.carriageLength,
-  width: SPEC.carriageWidth,
-  height: SPEC.carriageHeight,
-  wallThk: SPEC.carriageWallThk,
-};
-
-export function makeCarriage(p: typeof params = params) {
-  // Solid body — bracket-like shape, hollow in middle to save mass.
+export function makeCarriage(): Shape3D {
+  const cZ = CARRIAGE_Z_BOTTOM + CARRIAGE_THICKNESS / 2;
   let body = shape3d(
-    drawRoundedRectangle(p.length, p.width, 4)
-      .sketchOnPlane("XY")
-      .extrude(p.height)
+    drawRoundedRectangle(CARRIAGE_LENGTH, CARRIAGE_WIDTH, 4)
+      .sketchOnPlane("XY", [0, 0, cZ])
+      .extrude(CARRIAGE_THICKNESS)
   );
 
-  // Hollow the centre (leave 4mm bottom + 4mm top + walls all around).
-  const hollow = shape3d(
-    drawRoundedRectangle(p.length - 2 * p.wallThk, p.width - 2 * p.wallThk, 2)
-      .sketchOnPlane("XY")
-      .extrude(p.height - 8)
-      .translate(0, 0, 4)
-  );
-  body = body.cut(hollow);
+  // Two rail through-bores running +X all the way through the carriage, at
+  // the rail Y/Z positions. Clearance diameter = rail + 1 mm so an LM8UU
+  // cartridge bearing can be pressed in from each end later. The hole opens
+  // on the +X face (translate X = +CARRIAGE_LENGTH/2) with axis "+X", so the
+  // cutter body extends in -X through the entire carriage thickness.
+  const bore = (y: number) =>
+    holes.through(RAIL_DIAMETER + 1, {
+      depth: CARRIAGE_LENGTH + 2,
+      axis: "+X",
+      raw: true,
+    }).translate(CARRIAGE_LENGTH / 2, y, RAIL_Z);
+  body = body.cut(bore(RAIL_Y_FRONT));
+  body = body.cut(bore(RAIL_Y_BACK));
 
-  // Rail clearance — through-holes along X for the two 8mm rods to pass.
-  // axis: "+X" cutters extend in -X from their translate point, so put the
-  // translate at +length/2 + 1 to make the body cover the whole carriage.
-  const bushingCenterZ = p.height / 2;
-  const railThruHoleFront = holes.through(SPEC.railDia + SPEC.carriageRailGap, {
-    depth: p.length + 2,
-    axis: "+X",
-  }).translate(p.length / 2 + 1, SPEC.railSpacingY / 2, bushingCenterZ);
-  const railThruHoleRear = holes.through(SPEC.railDia + SPEC.carriageRailGap, {
-    depth: p.length + 2,
-    axis: "+X",
-  }).translate(p.length / 2 + 1, -SPEC.railSpacingY / 2, bushingCenterZ);
-
-  body = body.cut(railThruHoleFront).cut(railThruHoleRear);
-
-  // Belt-clamp slot on top — two parallel ribs to pinch the GT2 belt.
-  // Modeled here as a single rectangular slot through the top plate.
-  const beltSlot = shape3d(
-    drawRoundedRectangle(p.length - 12, SPEC.beltWidth + 1, 0.5)
-      .sketchOnPlane("XY")
-      .extrude(-3)
-      .translate(0, 0, p.height + 0.1)
-  );
-  body = body.cut(beltSlot);
-
-  // 4× M3 bolt holes on top plate to fasten cam-plate from below
-  const camBoltX = (SPEC.camPlateLength / 2) - 6;
-  const camBoltY = (SPEC.camPlateWidth / 2) - 6;
-  const camBoltPlacements = [
-    [ camBoltX,  camBoltY],
-    [ camBoltX, -camBoltY],
-    [-camBoltX,  camBoltY],
-    [-camBoltX, -camBoltY],
-  ].map(([x, y]) => ({ translate: [x, y, p.height] as [number, number, number] }));
+  // Two M3 counterbored mounting holes on top — belt clamp / sensor flag mount.
   body = patterns.cutAt(
     body,
-    () => holes.through("M3", { depth: 6 }),
-    camBoltPlacements
+    () => holes.counterbore("M3", { plateThickness: CARRIAGE_THICKNESS }),
+    patterns.grid(2, 1, 30, 0).map(p => ({
+      ...p,
+      translate: [p.translate[0], p.translate[1], CARRIAGE_Z_BOTTOM + CARRIAGE_THICKNESS] as [number, number, number],
+    })),
   );
 
   return body;
 }
 
 export default function main() {
-  return [
-    { shape: makeCarriage(), name: "carriage", color: COLORS.printedAccent },
-  ];
+  return [{ shape: makeCarriage(), name: "carriage", color: C_CARRIAGE }];
 }

@@ -1,76 +1,53 @@
-// Base chassis — flat plate that everything mounts to. The bed sits on top
-// (centered), end-caps bolt at each end, motor mount at -X end, fabric
-// take-down brackets at -Y face (not modeled here; just bolt holes).
-//
-// Local frame: chassis centered on origin, top face at Z=0,
-// body Z∈[-chassisHeight, 0]. Bed footprint is centered on origin.
+// Base chassis — the machine's bottom plate. Everything attaches to this.
+// Simple rounded-rectangle plate, top face at Z=CHASSIS_TOP_Z.
 
-import { drawRoundedRectangle } from "replicad";
+import { drawRoundedRectangle, type Shape3D } from "replicad";
 import { shape3d, holes, patterns } from "shapeitup";
-import { SPEC, COLORS } from "./constants";
+import {
+  CHASSIS_LENGTH, CHASSIS_WIDTH, CHASSIS_THICKNESS, CHASSIS_TOP_Z,
+  BED_LENGTH, BED_WIDTH,
+  MOTOR_FACE_X, IDLER_FACE_X,
+  C_CHASSIS,
+} from "./constants";
 
-export const params = {
-  length: SPEC.chassisLength,
-  width: SPEC.chassisWidth,
-  height: SPEC.chassisHeight,
-};
-
-export function makeBaseChassis(p: typeof params = params) {
-  let chassis = shape3d(
-    drawRoundedRectangle(p.length, p.width, 6)
-      .sketchOnPlane("XY")
-      .extrude(-p.height)
+export function makeChassis(): Shape3D {
+  const zMid = CHASSIS_TOP_Z - CHASSIS_THICKNESS / 2;
+  let plate = shape3d(
+    drawRoundedRectangle(CHASSIS_LENGTH, CHASSIS_WIDTH, 4)
+      .sketchOnPlane("XY", [0, 0, zMid])
+      .extrude(CHASSIS_THICKNESS)
   );
 
-  // 4× M4 bolt holes for needle bed (matching needle-bed bolt pattern,
-  // but cut all the way through chassis from top)
-  const bedBoltPlacements = [
-    [-(SPEC.bedLength / 2) + SPEC.bedMountInsetX,  (SPEC.bedWidth / 2) - SPEC.bedMountInsetY],
-    [ (SPEC.bedLength / 2) - SPEC.bedMountInsetX,  (SPEC.bedWidth / 2) - SPEC.bedMountInsetY],
-    [-(SPEC.bedLength / 2) + SPEC.bedMountInsetX, -(SPEC.bedWidth / 2) + SPEC.bedMountInsetY],
-    [ (SPEC.bedLength / 2) - SPEC.bedMountInsetX, -(SPEC.bedWidth / 2) + SPEC.bedMountInsetY],
-  ].map(([x, y]) => ({ translate: [x, y, 0] as [number, number, number] }));
-  chassis = patterns.cutAt(
-    chassis,
-    () => holes.through("M4", { depth: p.height + 1 }),
-    bedBoltPlacements
+  // 4 × M3 bed mounting holes at bed-corner positions (match needle-bed holes).
+  const inset = 6;
+  const bedCorners: [number, number][] = [
+    [-BED_LENGTH / 2 + inset, -BED_WIDTH / 2 + inset],
+    [ BED_LENGTH / 2 - inset, -BED_WIDTH / 2 + inset],
+    [-BED_LENGTH / 2 + inset,  BED_WIDTH / 2 - inset],
+    [ BED_LENGTH / 2 - inset,  BED_WIDTH / 2 - inset],
+  ];
+  plate = patterns.cutAt(
+    plate,
+    () => holes.through("M3", { depth: CHASSIS_THICKNESS + 2 }),
+    bedCorners.map(([x, y]) => ({ translate: [x, y, CHASSIS_TOP_Z] as [number, number, number] })),
   );
 
-  // 4× M5 bolt holes for end caps (one cluster at each end)
-  const endCapInsetX = SPEC.endCapThk / 2 + 5;
-  const endCapBoltPlacements = [
-    [-(p.length / 2) + endCapInsetX,  (p.width / 2) - 12],
-    [-(p.length / 2) + endCapInsetX, -(p.width / 2) + 12],
-    [ (p.length / 2) - endCapInsetX,  (p.width / 2) - 12],
-    [ (p.length / 2) - endCapInsetX, -(p.width / 2) + 12],
-  ].map(([x, y]) => ({ translate: [x, y, 0] as [number, number, number] }));
-  chassis = patterns.cutAt(
-    chassis,
-    () => holes.through("M5", { depth: p.height + 1 }),
-    endCapBoltPlacements
+  // 4 × M3 end-cap mounting holes (2 per end-cap, at the mid of each end).
+  const endcapHoles: [number, number][] = [
+    [MOTOR_FACE_X + 10,  20],
+    [MOTOR_FACE_X + 10, -20],
+    [IDLER_FACE_X - 10,  20],
+    [IDLER_FACE_X - 10, -20],
+  ];
+  plate = patterns.cutAt(
+    plate,
+    () => holes.through("M3", { depth: CHASSIS_THICKNESS + 2 }),
+    endcapHoles.map(([x, y]) => ({ translate: [x, y, CHASSIS_TOP_Z] as [number, number, number] })),
   );
 
-  // 4× M3 bolt holes for solenoid bank plate (behind the bed, -Y side).
-  // Two rows tight against the rear edge so they fit on the 120mm-wide chassis.
-  const solBoltYFront = -(SPEC.bedWidth / 2) - 8;
-  const solBoltYBack  = -(p.width / 2) + 8;
-  const solBoltPlacements = [
-    [-SPEC.bedKnitLength / 2 + 5, solBoltYFront],
-    [ SPEC.bedKnitLength / 2 - 5, solBoltYFront],
-    [-SPEC.bedKnitLength / 2 + 5, solBoltYBack],
-    [ SPEC.bedKnitLength / 2 - 5, solBoltYBack],
-  ].map(([x, y]) => ({ translate: [x, y, 0] as [number, number, number] }));
-  chassis = patterns.cutAt(
-    chassis,
-    () => holes.through("M3", { depth: p.height + 1 }),
-    solBoltPlacements
-  );
-
-  return chassis;
+  return plate;
 }
 
 export default function main() {
-  return [
-    { shape: makeBaseChassis(), name: "chassis", color: COLORS.aluminum },
-  ];
+  return [{ shape: makeChassis(), name: "chassis", color: C_CHASSIS }];
 }

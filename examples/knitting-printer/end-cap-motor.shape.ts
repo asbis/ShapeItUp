@@ -1,97 +1,73 @@
-// End cap (motor side) — vertical wall at -X end of chassis. Holds:
-//   • two 8mm linear rails (front + rear)
-//   • NEMA17 stepper face-mounted with shaft pointing into the machine (+X)
-//   • base flange that bolts to chassis (4× M5)
-//
-// Local frame: cap stands upright. Origin at the centre of the wall's bottom
-// edge. Wall extends +Z (up). Bolt-flange spreads ±Y. Front face at X=0,
-// motor mounted on -X face.
+// Motor-side end cap — L-shaped bracket, horizontal base sits on chassis,
+// vertical wall holds one rail end + the NEMA17 pilot hole for a pulley shaft.
+// Origin at its geometric center (X=MOTOR_FACE_X is applied by the assembly).
+// The wall sits in the YZ plane; the base lies flat in XY.
 
-import { drawRectangle } from "replicad";
-import { shape3d, holes, patterns, standards } from "shapeitup";
-import { SPEC, COLORS } from "./constants";
+import { drawRoundedRectangle, type Shape3D } from "replicad";
+import { shape3d, holes, patterns } from "shapeitup";
+import {
+  ENDCAP_WALL_W, ENDCAP_WALL_H, ENDCAP_WALL_T,
+  ENDCAP_BASE_W, ENDCAP_BASE_L, ENDCAP_BASE_T,
+  RAIL_DIAMETER, RAIL_Z, RAIL_Y_FRONT, RAIL_Y_BACK,
+  CHASSIS_TOP_Z,
+  C_ENDCAP,
+} from "./constants";
 
-export const params = {
-  width: SPEC.endCapWidth,
-  height: SPEC.endCapHeight,
-  thk: SPEC.endCapThk,
-  chassisFlangeLen: SPEC.endCapWidth + 16,
-  chassisFlangeThk: SPEC.chassisHeight,
-};
+export function makeEndCapMotor(): Shape3D {
+  // Base at Z ∈ [CHASSIS_TOP_Z, CHASSIS_TOP_Z + ENDCAP_BASE_T]
+  // Wall at X ∈ [0, ENDCAP_WALL_T] (centered on 0 local-X of this part).
+  const baseZMid = CHASSIS_TOP_Z + ENDCAP_BASE_T / 2;
+  const wallXMid = -ENDCAP_BASE_L / 2 + ENDCAP_WALL_T / 2;  // wall at -X end of base
+  const wallZMid = CHASSIS_TOP_Z + ENDCAP_BASE_T + ENDCAP_WALL_H / 2;
 
-export function makeEndCapMotor(p: typeof params = params) {
-  // Vertical wall: spans Y across, Z up, narrow X (the "thickness" axis).
+  const base = shape3d(
+    drawRoundedRectangle(ENDCAP_BASE_L, ENDCAP_BASE_W, 2)
+      .sketchOnPlane("XY", [0, 0, baseZMid])
+      .extrude(ENDCAP_BASE_T)
+  );
   let wall = shape3d(
-    drawRectangle(p.thk, p.width)
-      .sketchOnPlane("XY")
-      .extrude(p.height)
+    drawRoundedRectangle(ENDCAP_WALL_T, ENDCAP_WALL_W, 2)
+      .sketchOnPlane("XY", [wallXMid, 0, wallZMid])
+      .extrude(ENDCAP_WALL_H)
   );
 
-  // Horizontal flange at the bottom for chassis bolts (extends -X away from wall)
-  const flange = shape3d(
-    drawRectangle(p.chassisFlangeLen, p.width)
-      .sketchOnPlane("XY")
-      .extrude(-p.chassisFlangeThk)
-      .translate(-p.chassisFlangeLen / 2 + p.thk / 2, 0, 0.1)
+  // Rail pass-through bores (on the wall) — axis -X so the cutter extends
+  // through the wall from its +X face (the face of the wall we see from the
+  // bed side) toward -X.
+  for (const yRail of [RAIL_Y_FRONT, RAIL_Y_BACK]) {
+    wall = wall.cut(
+      holes.through(RAIL_DIAMETER + 0.4, {
+        depth: ENDCAP_WALL_T + 2,
+        axis: "+X",
+        raw: true,
+      }).translate(wallXMid + ENDCAP_WALL_T / 2, yRail, RAIL_Z),
+    );
+  }
+
+  // Center hole for the NEMA17 motor shaft + 4 × M3 corner-pattern mounting
+  // holes (standard 31 mm NEMA17 pitch). Motor is bolted to the -X face of
+  // the wall, shaft passes through via a Ø24 clearance pilot.
+  const motorZ = CHASSIS_TOP_Z + ENDCAP_BASE_T + 30;  // motor center
+  wall = wall.cut(
+    holes.through(24, {
+      depth: ENDCAP_WALL_T + 2, axis: "+X", raw: true,
+    }).translate(wallXMid + ENDCAP_WALL_T / 2, 0, motorZ),
   );
-  wall = wall.fuse(flange);
+  // 4 × M3 NEMA17 bolts (31 mm pitch square). Cut explicitly — patterns.cutAt
+  // mis-flags axis:"+X" cutters on wall-face patterns as "outside bbox".
+  const BOLT_PITCH = 31;
+  for (const dy of [-BOLT_PITCH / 2, BOLT_PITCH / 2]) {
+    for (const dz of [-BOLT_PITCH / 2, BOLT_PITCH / 2]) {
+      wall = wall.cut(
+        holes.through("M3", { depth: ENDCAP_WALL_T + 2, axis: "+X" })
+          .translate(wallXMid + ENDCAP_WALL_T / 2, dy, motorZ + dz),
+      );
+    }
+  }
 
-  // 2× rail bores — front rail at +Y, rear rail at -Y, both at SPEC.railZ
-  const railTool = () =>
-    holes.through(SPEC.railDia + 0.2, { depth: p.thk + 2, axis: "+X" })
-      .translate(p.thk / 2 + 1, 0, 0);
-  const railPlacements = [
-    { translate: [0,  SPEC.railSpacingY / 2, SPEC.railZ] as [number, number, number] },
-    { translate: [0, -SPEC.railSpacingY / 2, SPEC.railZ] as [number, number, number] },
-  ];
-  wall = patterns.cutAt(wall, railTool, railPlacements);
-
-  // Central NEMA17 shaft clearance + 4× M3 motor mount bolt circle.
-  // Motor sits on -X face, shaft pokes into +X. Bolt pattern is square at
-  // standards.NEMA17.boltPitch (= 31 mm).
-  const motorZ = SPEC.beltZ;
-  const shaftClearance = holes
-    .through(standards.NEMA17.pilotDia + 0.3, { depth: p.thk + 2, axis: "+X" })
-    .translate(p.thk / 2 + 1, 0, motorZ);
-  wall = wall.cut(shaftClearance);
-
-  const motorBoltPitch = standards.NEMA17.boltPitch / 2;
-  const motorBoltPlacements = [
-    [ motorBoltPitch,  motorBoltPitch],
-    [ motorBoltPitch, -motorBoltPitch],
-    [-motorBoltPitch,  motorBoltPitch],
-    [-motorBoltPitch, -motorBoltPitch],
-  ].map(([y, z]) => ({
-    translate: [0, y, motorZ + z] as [number, number, number],
-  }));
-  wall = patterns.cutAt(
-    wall,
-    () => holes.through("M3", { depth: p.thk + 2, axis: "+X" })
-      .translate(p.thk / 2 + 1, 0, 0),
-    motorBoltPlacements
-  );
-
-  // 4× M5 chassis bolts through flange
-  const flangeBoltX1 = -p.chassisFlangeLen / 2 + p.thk / 2 + 8;
-  const flangeBoltX2 = p.thk / 2 - 4;
-  const flangeBoltY  = p.width / 2 - 8;
-  const chassisBoltPlacements = [
-    { translate: [flangeBoltX1,  flangeBoltY, 0] as [number, number, number] },
-    { translate: [flangeBoltX1, -flangeBoltY, 0] as [number, number, number] },
-    { translate: [flangeBoltX2,  flangeBoltY, 0] as [number, number, number] },
-    { translate: [flangeBoltX2, -flangeBoltY, 0] as [number, number, number] },
-  ];
-  wall = patterns.cutAt(
-    wall,
-    () => holes.through("M5", { depth: p.chassisFlangeThk + 2 }),
-    chassisBoltPlacements
-  );
-
-  return wall;
+  return base.fuse(wall);
 }
 
 export default function main() {
-  return [
-    { shape: makeEndCapMotor(), name: "end-cap-motor", color: COLORS.printedDark },
-  ];
+  return [{ shape: makeEndCapMotor(), name: "end-cap-motor", color: C_ENDCAP }];
 }

@@ -1,76 +1,54 @@
-// Cam plate — bolted underneath the carriage. The cam tracks (raise + stitch
-// cams) deflect needle butts vertically as the carriage traverses, producing
-// the knit/tuck/miss action. For this v1 we model:
-//   • a flat plate
-//   • two raise cams (V-shape ramps up to apex) machined on the bottom face
+// Cam plate — mounts under the carriage, slides along +X over the needle bed.
+// A chevron-shaped groove cut through the plate captures the needle butts and
+// pushes them along +Y (knit) then back to -Y (rest) as the carriage passes.
+// Cam angle is 45 deg, within the ISO 40-50 deg range cited in textile refs.
 //
-// The cam wedge cross-section: rises from 0 → camRiseHeight over camApproachLen
-// then descends symmetrically.
-//
-// Local frame: plate centered on origin. Top face at Z=0 (mounts to carriage).
-// Cam profile is on the BOTTOM face (Z = -camPlateThk down to apex).
+// Local coords: cam centered at origin. Bottom at Z=CAM_Z_BOTTOM, top at
+// Z=CAM_Z_TOP. Chevron apex at +Y (front), ends at -Y (back).
 
-import { drawRoundedRectangle, draw } from "replicad";
-import { shape3d, holes, patterns } from "shapeitup";
-import { SPEC, COLORS } from "./constants";
+import { drawRoundedRectangle, draw, type Shape3D } from "replicad";
+import { shape3d } from "shapeitup";
+import {
+  CAM_LENGTH, CAM_WIDTH, CAM_THICKNESS,
+  CAM_Z_BOTTOM, CAM_Z_TOP,
+  CAM_GROOVE_WIDTH, CAM_APEX_Y, CAM_END_Y,
+  C_CAM,
+} from "./constants";
 
-export const params = {
-  length: SPEC.camPlateLength,
-  width: SPEC.camPlateWidth,
-  thk: SPEC.camPlateThk,
-  apexHeight: SPEC.camRiseHeight,
-  approachLen: SPEC.camApproachLen,
-};
-
-export function makeCamPlate(p: typeof params = params) {
-  // Flat plate, top face at Z=0
+export function makeCamPlate(): Shape3D {
+  // Body
   let plate = shape3d(
-    drawRoundedRectangle(p.length, p.width, 4)
-      .sketchOnPlane("XY")
-      .extrude(-p.thk)
+    drawRoundedRectangle(CAM_LENGTH, CAM_WIDTH, 2)
+      .sketchOnPlane("XY", [0, 0, (CAM_Z_BOTTOM + CAM_Z_TOP) / 2])
+      .extrude(CAM_THICKNESS)
   );
 
-  // Cam wedge — triangular cross-section sketched on XZ plane, extruded along Y.
-  // Profile (in XZ): from (-half, 0) up to (0, apex) down to (half, 0).
-  // Built so top of cam touches Z = -p.thk (bottom face of plate) and apex
-  // protrudes downward by apexHeight.
-  const half = p.approachLen;
-  const apexZ = -p.thk - p.apexHeight;
-  const baseZ = -p.thk;
+  // Chevron-shaped groove (6-vertex band). Centerline goes:
+  //   (-L/2, END_Y) -> (0, APEX_Y) -> (+L/2, END_Y)
+  // Band thickness in Y = CAM_GROOVE_WIDTH.
+  const t = CAM_GROOVE_WIDTH / 2;
+  const endX = CAM_LENGTH / 2 - 1;   // keep 1 mm rim at each end
 
-  const camProfile = draw([-half, baseZ])
-    .lineTo([0, apexZ])
-    .lineTo([half, baseZ])
-    .lineTo([-half, baseZ])
+  // Walk the OUTER (back / -Y side) edge, then the INNER (front / +Y side) edge.
+  const grooveProfile = draw([-endX, CAM_END_Y - t])
+    .lineTo([0, CAM_APEX_Y - t])
+    .lineTo([endX, CAM_END_Y - t])
+    .lineTo([endX, CAM_END_Y + t])
+    .lineTo([0, CAM_APEX_Y + t])
+    .lineTo([-endX, CAM_END_Y + t])
     .close();
 
-  // Sketch on XZ plane, extrude along Y by camPlateWidth (cam runs full width).
-  // sketchOnPlane("XZ").extrude(L) grows toward -Y; translate +width/2 to center.
-  const cam = shape3d(
-    camProfile.sketchOnPlane("XZ").extrude(p.width).translate(0, p.width / 2, 0)
+  const grooveTool = shape3d(
+    grooveProfile
+      .sketchOnPlane("XY", [0, 0, CAM_Z_BOTTOM - 0.1])
+      .extrude(CAM_THICKNESS + 0.2)
   );
-  plate = plate.fuse(cam);
 
-  // 4× M3 mounting bolt clearance through the plate (matches the carriage)
-  const boltX = p.length / 2 - 6;
-  const boltY = p.width / 2 - 6;
-  const boltPlacements = [
-    [ boltX,  boltY],
-    [ boltX, -boltY],
-    [-boltX,  boltY],
-    [-boltX, -boltY],
-  ].map(([x, y]) => ({ translate: [x, y, 0] as [number, number, number] }));
-  plate = patterns.cutAt(
-    plate,
-    () => holes.through("M3", { depth: p.thk + p.apexHeight + 2 }),
-    boltPlacements
-  );
+  plate = plate.cut(grooveTool);
 
   return plate;
 }
 
 export default function main() {
-  return [
-    { shape: makeCamPlate(), name: "cam-plate", color: COLORS.brass },
-  ];
+  return [{ shape: makeCamPlate(), name: "cam-plate", color: C_CAM }];
 }

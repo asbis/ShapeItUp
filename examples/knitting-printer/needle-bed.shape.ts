@@ -1,67 +1,52 @@
-// Needle bed — block of plastic/metal with 20 parallel grooves ("tricks") that
-// each capture one needle. Grooves are open on top and at the +Y end (where the
-// hooks emerge). Mounted to chassis with 4× M4 bolts.
-//
-// Local frame: bed centered on X=0, Y=0. Top face at Z=0, body at Z∈[-bedHeight, 0].
-// Grooves run along +Y, distributed along X at SPEC.needlePitch.
+// Needle bed — rectangular plate with 20 parallel slots running along +Y.
+// Centered on origin, top face at Z=0, bottom at Z=-BED_THICKNESS.
+// Slots run the full Y-length of the bed so the needle can slide back and forth.
 
-import { drawRectangle } from "replicad";
+import { drawRectangle, type Shape3D } from "replicad";
 import { shape3d, holes, patterns } from "shapeitup";
-import { SPEC, COLORS, X_NEEDLE_OFFSET } from "./constants";
+import {
+  BED_LENGTH, BED_WIDTH, BED_THICKNESS,
+  SLOT_WIDTH, SLOT_DEPTH,
+  N_NEEDLES, NEEDLE_PITCH, FIRST_NEEDLE_X,
+  C_BED,
+} from "./constants";
 
-export const params = {
-  length: SPEC.bedLength,
-  width: SPEC.bedWidth,
-  height: SPEC.bedHeight,
-  trickWidth: SPEC.trickWidth,
-  trickDepth: SPEC.trickDepth,
-  trickLength: SPEC.trickLength,
-  needleCount: SPEC.needleCount,
-};
-
-export function makeNeedleBed(p: typeof params = params) {
+export function makeNeedleBed(): Shape3D {
   let bed = shape3d(
-    drawRectangle(p.length, p.width)
-      .sketchOnPlane("XY")
-      .extrude(-p.height)
+    drawRectangle(BED_LENGTH, BED_WIDTH)
+      .sketchOnPlane("XY", [0, 0, -BED_THICKNESS / 2])
+      .extrude(BED_THICKNESS)
   );
 
-  // Cut needle tricks (grooves) — open at +Y end, sized to fit needle stem
-  // with 0.2mm clearance per side.
-  const trickToolFactory = () =>
-    shape3d(
-      drawRectangle(p.trickWidth, p.trickLength)
-        .sketchOnPlane("XY")
-        .extrude(-p.trickDepth)
-    ).translate(0, p.width / 2 - p.trickLength / 2 + 5, 0);
-  // ↑ groove pushed slightly past +Y face so needle hook can emerge
+  // 20 needle slots — each a thin rectangular pocket cut downward from the top face.
+  // The slot runs the full BED_WIDTH (Y axis) so the needle can slide freely.
+  for (let i = 0; i < N_NEEDLES; i++) {
+    const x = FIRST_NEEDLE_X + i * NEEDLE_PITCH;
+    const slot = shape3d(
+      drawRectangle(SLOT_WIDTH, BED_WIDTH + 2)
+        .sketchOnPlane("XY", [x, 0, -SLOT_DEPTH / 2])
+        .extrude(SLOT_DEPTH)
+    );
+    bed = bed.cut(slot);
+  }
 
-  // 20 grooves at the right pitch. Build placements explicitly using the
-  // X_NEEDLE_OFFSET helper so we know exactly where every needle sits.
-  const placements = Array.from({ length: p.needleCount }, (_, i) => ({
-    translate: [X_NEEDLE_OFFSET(i), 0, 0] as [number, number, number],
-  }));
-  bed = patterns.cutAt(bed, trickToolFactory, placements);
-
-  // 4× M4 mounting bolts to chassis (countersunk from top to keep needles flat)
-  const boltPlacements = [
-    [-(p.length / 2) + SPEC.bedMountInsetX,  (p.width / 2) - SPEC.bedMountInsetY],
-    [ (p.length / 2) - SPEC.bedMountInsetX,  (p.width / 2) - SPEC.bedMountInsetY],
-    [-(p.length / 2) + SPEC.bedMountInsetX, -(p.width / 2) + SPEC.bedMountInsetY],
-    [ (p.length / 2) - SPEC.bedMountInsetX, -(p.width / 2) + SPEC.bedMountInsetY],
-  ].map(([x, y]) => ({ translate: [x, y, 0] as [number, number, number] }));
-
+  // 4 mounting holes (M3 clearance) at the corners — tie bed to chassis later.
+  const inset = 6;
+  const positions: [number, number][] = [
+    [-BED_LENGTH / 2 + inset, -BED_WIDTH / 2 + inset],
+    [ BED_LENGTH / 2 - inset, -BED_WIDTH / 2 + inset],
+    [-BED_LENGTH / 2 + inset,  BED_WIDTH / 2 - inset],
+    [ BED_LENGTH / 2 - inset,  BED_WIDTH / 2 - inset],
+  ];
   bed = patterns.cutAt(
     bed,
-    () => holes.countersink(SPEC.bedMountBolt, { plateThickness: p.height }).translate(0, 0, 0),
-    boltPlacements
+    () => holes.through("M3", { depth: BED_THICKNESS + 2 }).translate(0, 0, 0),
+    positions.map(([x, y]) => ({ translate: [x, y, 0] as [number, number, number] })),
   );
 
   return bed;
 }
 
 export default function main() {
-  return [
-    { shape: makeNeedleBed(), name: "needle-bed", color: COLORS.aluminum },
-  ];
+  return [{ shape: makeNeedleBed(), name: "needle-bed", color: C_BED }];
 }
