@@ -7,6 +7,7 @@ import { homedir } from "os";
 import {
   appendScreenshotMetadata,
   bundleDepsAreStale,
+  bundleStaleDepDetail,
   canonicalParamsKey,
   executeShapeFile,
   exportLastToFile,
@@ -3134,11 +3135,31 @@ export function registerTools(server: McpServer) {
         actionLabel = "Re-executed (no code/params — equivalent to open_shape)";
       }
 
+      // Capture dep-staleness BEFORE executing — `executeWithPersistedParams`
+      // (via the engine's bundle/mesh cache path) will refresh `builtAtMs`,
+      // so reading the detail after the call would always come back null.
+      // When a transitive dep was edited between renders we surface the
+      // specific file + its age so the iterator sees a positive "this
+      // re-render picked up your edit" signal instead of wondering whether
+      // modify_shape served a cache.
+      const staleDep = bundleStaleDepDetail(absPath);
+
       const callOverrides = code === undefined ? params : undefined;
       const { status } = await executeWithPersistedParams(absPath, callOverrides);
       notifyExtensionOfShape(absPath);
 
-      const prefix = `${actionLabel} ${absPath}${paramsIgnoredNote}\n`;
+      let rebuildNote = "";
+      if (staleDep) {
+        const ageStr =
+          staleDep.ageSeconds < 1
+            ? "<1s ago"
+            : staleDep.ageSeconds < 60
+              ? `${Math.round(staleDep.ageSeconds)}s ago`
+              : `${Math.round(staleDep.ageSeconds / 60)}m ago`;
+        rebuildNote = `\nBundle rebuilt: ${basename(staleDep.depPath)} changed ${ageStr}.`;
+      }
+
+      const prefix = `${actionLabel} ${absPath}${paramsIgnoredNote}${rebuildNote}\n`;
       return {
         content: [{ type: "text" as const, text: prefix + formatStatusText(status, verbosity ?? "summary") }],
         isError: !status.success,
@@ -4984,7 +5005,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "check_collisions",
-    "Detects pairwise intersections between named parts in a multi-part assembly. AABB prefilter skips obviously-disjoint pairs; the rest run Replicad's 3D intersect (failures are surfaced as 'intersect failed' rather than ignored). `tolerance` filters numerical-noise contacts (default 0.001 mm³); 100+ parts scale as N². Pass `acceptedPairs` to suppress EXPECTED intersections (needles in grooves, bolts in through-holes) — accepted pairs collapse into a summary count so real bugs surface first. Volumes at or below `pressFitThreshold` list under 'Nominal contact'. Main block sorts by volume descending. Pass either `filePath` OR `code` — mutually exclusive. `params` overrides numeric parameters for this single check without persisting. `format: 'full'` adds per-pair geometry. See `get_api_reference('verification')` for examples.",
+    "Detects pairwise intersections between named parts in a multi-part assembly. AABB prefilter skips obviously-disjoint pairs; the rest run Replicad's 3D intersect (failures are surfaced as 'intersect failed' rather than ignored). `tolerance` filters numerical-noise contacts (default 0.001 mm³); 100+ parts scale as N². Pass `acceptedPairs` to suppress EXPECTED intersections (needles in grooves, bolts in through-holes) — accepted pairs collapse into a summary count so real bugs surface first. `acceptedPairs` syntax: `[['needle-*', 'needle-bed']]` where `*` matches any run of chars; a pattern without `*` is matched exactly; the pair order is symmetric (`['a','b']` also covers `['b','a']`). Volumes at or below `pressFitThreshold` list under 'Nominal contact'. Main block sorts by volume descending. Pass either `filePath` OR `code` — mutually exclusive. `params` overrides numeric parameters for this single check without persisting. `format: 'full'` adds per-pair geometry. See `get_api_reference('verification')` for examples.",
     {
       filePath: z.string().optional().describe("Path to the .shape.ts file to check for part collisions. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first existing match wins), else anchor to process.cwd(). Mutually exclusive with `code`."),
       code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning an array of parts. Written to a throwaway temp file, executed, and deleted afterwards. Use `workingDir` to make local `./` imports resolve. Mutually exclusive with `filePath`."),
@@ -5353,6 +5374,139 @@ export function registerTools(server: McpServer) {
         content: [{ type: "text" as const, text }],
       };
       }); // close withShapeFile callback
+    })
+  );
+
+  server.tool(
+    "check_stack",
+    "Reports each part's world-space range along one axis (X, Y, or Z), sorted by ascending min. Shows the gap between consecutive parts so mating Z-levels / bolt-circle heights / carriage clearances can be audited at a glance. For a flatbed machine, `check_stack({ axis: 'Z' })` answers 'does my rail sit inside my carriage body?' before you burn a render cycle hunting a cut-no-material warning. Pass either `filePath` OR `code` — mutually exclusive. `params` overrides numeric params for this one check (does not persist). Scales linearly with part count.",
+    {
+      filePath: z.string().optional().describe("Path to the .shape.ts file to analyze. Absolute paths pass through; relative paths probe workspace roots. Mutually exclusive with `code`."),
+      code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning an array of parts. Mutually exclusive with `filePath`."),
+      workingDir: z.string().optional().describe("Directory for the temp snippet when `code` is provided. Makes local `./foo.shape` imports resolve."),
+      axis: z.enum(["X", "Y", "Z"]).describe("World axis to stack parts along. 'Z' is the typical vertical-stack audit; 'X'/'Y' for horizontal layouts (needle bed pitch, rail spans)."),
+      params: z.record(z.string(), z.number()).optional().describe("Numeric param overrides applied for this single check. Does NOT persist — merged with tune_params values for this execution only."),
+    },
+    safeHandler("check_stack", async ({ filePath, code, workingDir, axis, params }) => {
+      if (filePath !== undefined && code !== undefined) {
+        return {
+          content: [{ type: "text" as const, text: "check_stack: pass either `filePath` OR `code`, not both." }],
+          isError: true,
+        };
+      }
+      if (filePath === undefined && code === undefined) {
+        return {
+          content: [{ type: "text" as const, text: "check_stack: provide either `filePath` (existing shape) or `code` (inline snippet)." }],
+          isError: true,
+        };
+      }
+
+      return withShapeFile({ filePath, code, workingDir }, async (absPath) => {
+        if (!existsSync(absPath)) {
+          return {
+            content: [{ type: "text" as const, text: `File not found: ${absPath}` }],
+            isError: true,
+          };
+        }
+
+        // Mesh cache is fine here — we only read vertex arrays, not live OCCT
+        // handles. Cached entries retain their mesh; `.shape` is scrubbed but
+        // that's not what we need.
+        const { status, parts } = await executeWithPersistedParams(absPath, params);
+        if (!status.success || !parts) {
+          return {
+            content: [{ type: "text" as const, text: `Cannot audit stack — script failed to render.\n${formatStatusText(status)}` }],
+            isError: true,
+          };
+        }
+        if (parts.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: "check_stack: script rendered successfully but returned no parts." }],
+          };
+        }
+
+        // Per-part min/max on the requested axis from the tessellated vertex
+        // stream (vertices are flat [x0,y0,z0,x1,y1,z1,...]). Parts with
+        // empty mesh arrays yield `null` so the report can list them as
+        // "(empty)" rather than collapse to 0.
+        const axisIdx = axis === "X" ? 0 : axis === "Y" ? 1 : 2;
+        type Row = { name: string; min: number; max: number } | { name: string; empty: true };
+        const rows: Row[] = parts.map((p) => {
+          const v = p.vertices;
+          if (!v || v.length < 3) return { name: p.name, empty: true };
+          let lo = Infinity;
+          let hi = -Infinity;
+          for (let i = axisIdx; i < v.length; i += 3) {
+            const c = v[i];
+            if (c < lo) lo = c;
+            if (c > hi) hi = c;
+          }
+          if (!Number.isFinite(lo) || !Number.isFinite(hi)) {
+            return { name: p.name, empty: true };
+          }
+          return { name: p.name, min: lo, max: hi };
+        });
+
+        // Sort by min ascending, putting empty rows at the end (they have
+        // no meaningful position).
+        const nonEmpty = rows.filter((r): r is { name: string; min: number; max: number } => !("empty" in r));
+        const empty = rows.filter((r): r is { name: string; empty: true } => "empty" in r);
+        nonEmpty.sort((a, b) => a.min - b.min || a.max - b.max);
+
+        const fmt = (n: number): string => {
+          // Three-decimal fixed — consistent with describe_geometry's
+          // `round3` + compact enough to scan at a glance.
+          return (Math.round(n * 1000) / 1000).toFixed(3);
+        };
+        const maxNameLen = Math.max(4, ...rows.map((r) => r.name.length));
+        const pad = (s: string): string => s.padEnd(maxNameLen, " ");
+
+        const lines: string[] = [];
+        lines.push(`Stack along ${axis}-axis — ${parts.length} part${parts.length === 1 ? "" : "s"}, sorted by ${axis}_min ascending`);
+        lines.push("");
+        lines.push(`${pad("part")}  ${axis}_min      ${axis}_max      size       gap to next`);
+
+        for (let i = 0; i < nonEmpty.length; i += 1) {
+          const r = nonEmpty[i];
+          const size = r.max - r.min;
+          let gapCell: string;
+          if (i === nonEmpty.length - 1) {
+            gapCell = "—";
+          } else {
+            const next = nonEmpty[i + 1];
+            const gap = next.min - r.max;
+            // Negative gap = parts overlap on this axis (not necessarily a
+            // collision — the check_collisions tool verifies that — but for
+            // stack audits it's often the signal the user wants.)
+            if (gap < -0.001) {
+              gapCell = `${fmt(gap)} (overlap)`;
+            } else if (Math.abs(gap) <= 0.001) {
+              gapCell = `${fmt(gap)} (flush)`;
+            } else {
+              gapCell = fmt(gap);
+            }
+          }
+          lines.push(
+            `${pad(r.name)}  ${fmt(r.min).padStart(9, " ")}  ${fmt(r.max).padStart(9, " ")}  ${fmt(size).padStart(8, " ")}  ${gapCell}`,
+          );
+        }
+        for (const r of empty) {
+          lines.push(`${pad(r.name)}  (empty mesh — skipped)`);
+        }
+
+        if (nonEmpty.length >= 2) {
+          lines.push("");
+          const first = nonEmpty[0];
+          const last = nonEmpty[nonEmpty.length - 1];
+          lines.push(
+            `Total extent: ${axis} ∈ [${fmt(first.min)}, ${fmt(last.max)}] — span ${fmt(last.max - first.min)} mm`,
+          );
+        }
+
+        return {
+          content: [{ type: "text" as const, text: lines.join("\n") }],
+        };
+      });
     })
   );
 

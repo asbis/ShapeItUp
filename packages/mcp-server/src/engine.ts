@@ -374,22 +374,49 @@ export function bundleCacheReasonToWarning(reason: string | null): string | null
  * returning a mesh-cache hit keeps the two caches coherent.
  */
 export function bundleDepsAreStale(absPath: string): boolean {
+  return bundleStaleDepDetail(absPath) !== null;
+}
+
+/**
+ * Richer companion to {@link bundleDepsAreStale}: when the cached bundle's
+ * transitive deps are stale, returns the most-recently-modified one along
+ * with its age in seconds (vs `builtAtMs`). When nothing is stale or the
+ * cache is cold, returns null. Used by the MCP modify_shape tool to surface
+ * a changelog-style note ("Bundle rebuilt: constants.ts changed 12s ago")
+ * at the top of the re-execute response so iterators can tell whether the
+ * render reflects a transitive edit.
+ *
+ * "Most recent" is picked via largest `mtimeMs` across the stale set — if
+ * the user edited several files before calling modify_shape, the latest is
+ * the one most likely to be "the one I just saved". Ignores the entry file
+ * itself since that's tracked separately via entryContent comparison.
+ *
+ * Best-effort: stat failures collapse the entire check to null rather than
+ * report a misleading "stale: X" when we couldn't actually read X.
+ */
+export function bundleStaleDepDetail(
+  absPath: string,
+): { depPath: string; ageSeconds: number } | null {
   const entry = bundleCache.get(absPath);
-  if (!entry) return false;
+  if (!entry) return null;
   try {
+    let latest: { path: string; mtimeMs: number } | null = null;
     for (const [inputPath, recordedMtime] of Object.entries(entry.inputMtimes)) {
       const stat = statSync(inputPath);
-      if (stat.mtimeMs > entry.builtAtMs) return true;
-      if (Math.abs(stat.mtimeMs - recordedMtime) > 1) return true;
+      const isStale =
+        stat.mtimeMs > entry.builtAtMs ||
+        Math.abs(stat.mtimeMs - recordedMtime) > 1;
+      if (!isStale) continue;
+      if (!latest || stat.mtimeMs > latest.mtimeMs) {
+        latest = { path: inputPath, mtimeMs: stat.mtimeMs };
+      }
     }
+    if (!latest) return null;
+    const ageSeconds = Math.max(0, (Date.now() - entry.builtAtMs) / 1000);
+    return { depPath: latest.path, ageSeconds };
   } catch {
-    // Stat failure (deleted dep, permission change) — fall back to "not
-    // stale". The next full execute will hit the same error path and surface
-    // a real diagnostic; we don't want to spuriously invalidate mesh caches
-    // on every transient stat failure.
-    return false;
+    return null;
   }
-  return false;
 }
 
 /**
@@ -2124,6 +2151,28 @@ export function inferErrorHint(
     // Otherwise: fall through. A "reading '0'" or "reading 'translate'" error
     // almost always means a type mismatch (wrong shape of argument) — the
     // stdlib-typo hint would be actively misleading.
+  }
+
+  // "Cannot access 'X' before initialization" — V8's error shape for a
+  // temporal-dead-zone reference (const/let used before its declaration
+  // is reached in the module's top-level evaluation order). The common
+  // footgun: a shared `constants.ts` where one const references another
+  // declared later in the file, e.g.
+  //     export const B = A + 5;
+  //     export const A = 10;                     // declared AFTER B uses it
+  // Hoisting only applies to `var` / function declarations; const hits
+  // the TDZ and the runtime throws this exact message. Naming the
+  // offending binding in the hint saves the user from grepping.
+  const tdz = msg.match(/Cannot access ['"]?(\w+)['"]? before initialization/);
+  if (tdz) {
+    const symbol = tdz[1];
+    return (
+      `Const-ordering bug: '${symbol}' is referenced before its declaration ` +
+      `is reached. This hits when a top-level const at the top of a file ` +
+      `reads another const declared lower down (usually in a shared ` +
+      `constants module like constants.ts). Fix: reorder so '${symbol}' is ` +
+      `declared BEFORE its first use, or inline the value at the usage site.`
+    );
   }
 
   // "X is not defined" — ReferenceError thrown by the JS runtime when a

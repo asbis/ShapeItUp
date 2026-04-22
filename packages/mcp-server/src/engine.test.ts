@@ -128,6 +128,54 @@ describe("inferErrorHint — typo-hint gating", () => {
 // should fire BEFORE the generic loft topology hint so the agent gets the
 // reuse-is-the-bug answer, not the "profiles must match" red herring.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// P3.4 — TDZ (Temporal Dead Zone) hint for const-ordering bugs in shared
+// constants modules.
+//
+// Common failure mode: `constants.ts` has `export const B = A + 5;` above
+// `export const A = 10;` — const doesn't hoist, so reading `A` inside the
+// `B` initialiser hits the TDZ and the runtime throws a ReferenceError with
+// the distinctive "Cannot access 'X' before initialization" message. Prior
+// to the hint, that error bubbled up as a generic render failure and the
+// user had to grep their constants file. The hint names the offending
+// symbol and explains the reorder.
+// ---------------------------------------------------------------------------
+describe("inferErrorHint — TDZ const-ordering hint (P3.4)", () => {
+  it("names the offending const in a TDZ ReferenceError", () => {
+    const hint = inferErrorHint(
+      `Cannot access 'RAIL_Z' before initialization`,
+      "execute",
+      undefined,
+    );
+    expect(hint).toBeDefined();
+    expect(hint).toMatch(/'RAIL_Z'/);
+    expect(hint).toMatch(/Const-ordering bug/i);
+    expect(hint).toMatch(/reorder/i);
+  });
+
+  it("handles the double-quote variant V8 sometimes emits", () => {
+    const hint = inferErrorHint(
+      `ReferenceError: Cannot access "FOO_BAR" before initialization`,
+      "execute",
+      undefined,
+    );
+    expect(hint).toBeDefined();
+    expect(hint).toMatch(/'FOO_BAR'/);
+  });
+
+  it("does not fire on unrelated ReferenceErrors", () => {
+    // "X is not defined" is a different failure mode with its own hint.
+    // The TDZ branch must NOT hijack that path.
+    const hint = inferErrorHint(
+      `FOO is not defined`,
+      "execute",
+      undefined,
+    );
+    // The generic "not defined" hint does fire — just check it isn't the TDZ one.
+    expect(hint).not.toMatch(/Const-ordering bug/);
+  });
+});
+
 describe("inferErrorHint — loft-after-consume", () => {
   it("detects the Replicad ObjectCache deletion error on a loft operation", () => {
     const hint = inferErrorHint(

@@ -349,12 +349,25 @@ Pass `{ strict: true }` on those helpers to opt out (precise mating surfaces). H
 
 ### Canonical through-cut idiom
 
-For a cutter that must pass through a part of thickness D along world Y, sketch on the far face and extrude through in the plane's natural direction:
+**Prefer `cylinder()` for axis-aligned circular cutters** — the direction is an explicit named argument (`"+X"`, `"-Y"`, `"+Z"`...), so there's no "which plane grows which way" puzzle to solve at every call site:
 
     const EPS = standards.CUT_EPSILON;
-    const cutter = drawCircle(r)
+    const cutter = cylinder({
+      bottom: [0, -D/2 - EPS, 0],       // near face, padded
+      length: D + 2 * EPS,               // through-length with EPS on both ends
+      diameter: 2 * r,
+      direction: "+Y",                   // explicit — grows toward +Y face
+    });
+
+`rod({...})` is the positive-material twin with the same API.
+
+`sketchCircle(r, { plane: "XZ" }).extrude(L)` also works but grows along -Y (not +Y as the plane name suggests), so a cutter placed at positive Y silently removes no material. Every session where an agent reaches for `sketchCircle+extrude` on a non-XY plane costs a few minutes to the "which direction?" detour. Reach for it only when the profile is non-circular and can't be built from `cylinder` / `rod` / `prism`.
+
+For non-circular through-cuts (slots, racetracks, irregular profiles), sketch on the far face and extrude through in the plane's natural direction:
+
+    const cutter = drawRoundedRectangle(8, 3, 1.5)
       .sketchOnPlane("XZ", [0, +D/2 + EPS, 0])  // start on +Y face
-      .extrude(D + 2 * EPS);                     // XZ grows -Y, so cuts through to -Y face
+      .extrude(D + 2 * EPS);                     // XZ grows -Y, cuts through to -Y face
 
 This is safer than `.extrude(-L)` + negative-offset or than flipping `XZ`↔`ZX`:
 - The pen axes stay on their documented mapping (hLine → +X, vLine → +Z), so `hLine`/`vLine`/`lineTo([x,z])` keep their intuitive meaning.
