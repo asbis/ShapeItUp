@@ -75,8 +75,18 @@ describe("classifyFailure — picks a single most-likely cause", () => {
     expect(r.shellCount).toBe(3);
   });
 
-  it("falls back to 'self-intersection' otherwise", () => {
+  it("falls back to 'unknown' when no heuristic matches and no exception string", () => {
     const r = classifyFailure(500, bbox, 1);
+    expect(r.cls).toBe("unknown");
+  });
+
+  it("promotes to 'self-intersection' when exception string names it", () => {
+    const r = classifyFailure(500, bbox, 1, "Self-intersecting wire detected");
+    expect(r.cls).toBe("self-intersection");
+  });
+
+  it("promotes to 'self-intersection' on 'BRep_API' evidence", () => {
+    const r = classifyFailure(500, bbox, 1, "BRep_API: command not done");
     expect(r.cls).toBe("self-intersection");
   });
 });
@@ -131,11 +141,35 @@ describe("validateParts — emits narrowed error messages", () => {
     expect(issues[0].message).toContain("3 shells");
   });
 
-  it("emits 'self-intersection' when volume is healthy and shells == 1", () => {
+  it("emits 'unknown' with raw probe values when no heuristic fires", () => {
+    // IsValid_2()→false but volume healthy, one shell, no exception string.
+    // Used to mis-label as "self-intersection"; must now surface the three
+    // probe numbers and steer at verify_shape instead of guessing.
     const rep = mockReplicad({ volume: 500, shellCount: 1, isValid: false });
     const issues = validateParts([makePart()], rep);
     expect(issues).toHaveLength(1);
-    expect(issues[0].message).toMatch(/self-intersection/i);
+    expect(issues[0].message).not.toMatch(/self-intersection/i);
+    expect(issues[0].message).toMatch(/could not auto-classify/i);
+    expect(issues[0].message).toContain("shellCount=1");
+    expect(issues[0].message).toContain("volume=500.0");
+    expect(issues[0].message).toContain("bboxVolume=1000.0");
+    expect(issues[0].message).toMatch(/verify_shape/);
+    expect(issues[0].diagnostics).toEqual({
+      volume: 500,
+      bboxVolume: 1000,
+      shellCount: 1,
+    });
+  });
+
+  it("attaches diagnostics to every error-severity issue", () => {
+    const rep = mockReplicad({ volume: 0, shellCount: 1, isValid: false });
+    const issues = validateParts([makePart()], rep);
+    expect(issues).toHaveLength(1);
+    expect(issues[0].diagnostics).toEqual({
+      volume: 0,
+      bboxVolume: 1000,
+      shellCount: 1,
+    });
   });
 
   it("does not emit anything for a valid part", () => {

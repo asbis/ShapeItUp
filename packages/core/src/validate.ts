@@ -18,15 +18,45 @@ export interface GeometryIssue {
   severity: "error" | "warning";
   reason: "non-manifold" | "check-threw";
   message: string;
+  /**
+   * Raw heuristic probe values used to classify the failure. Present on every
+   * "error"-severity issue so agents can reason about *why* a particular
+   * classification was picked rather than trusting an opaque label.
+   *
+   *   - `volume`      – `measureShapeVolumeProperties(shape).volume`, or NaN if
+   *                     the measurement itself failed.
+   *   - `bboxVolume`  – product of bounding-box extents (0 if no bbox).
+   *   - `shellCount`  – TopAbs_SHELL count, or -1 if OCCT primitives were
+   *                     missing from the kernel handle.
+   *
+   * Absent on "warning"/check-threw issues — those never ran the probes.
+   */
+  diagnostics?: {
+    volume: number;
+    bboxVolume: number;
+    shellCount: number;
+  };
 }
 
 /**
- * The three failure modes we try to distinguish in the error message. The
- * analyzer itself only returns a single boolean, so we use cheap heuristics
- * (volume relative to bbox volume, shell count) to pick the single MOST
- * LIKELY cause rather than making the LLM guess between all three.
+ * The failure modes we try to distinguish in the error message. The analyzer
+ * itself only returns a single boolean, so we use cheap heuristics (volume
+ * relative to bbox volume, shell count) to pick the single MOST LIKELY cause
+ * when we have concrete evidence — and deliberately fall back to `"unknown"`
+ * rather than guessing when no evidence fits, because a wrong classification
+ * (previously: bare "self-intersection" fallback) sends agents chasing
+ * non-existent sketch self-intersections when the real issue is something
+ * else OCCT doesn't give us visibility into.
+ *
+ * `"self-intersection"` is only used when OCCT itself surfaced an exception
+ * string that names it (or a closely-related `BRep_API` failure) — never as a
+ * guess.
  */
-type FailureClass = "open-shell" | "non-manifold" | "self-intersection";
+export type FailureKind =
+  | "open-shell"
+  | "non-manifold"
+  | "self-intersection"
+  | "unknown";
 
 /** Relative-volume threshold below which we flag "likely open shell". */
 const OPEN_SHELL_VOLUME_FRACTION = 1e-4;
@@ -124,22 +154,45 @@ function safeVolume(shape: any, replicad: any): number {
 }
 
 /**
+ * Compute bounding-box volume from an optional bbox. Returns 0 when the bbox
+ * is unavailable or degenerate — callers treat 0 as "no usable bbox signal".
+ */
+function bboxVolumeOf(
+  bbox: { min: [number, number, number]; max: [number, number, number] } | null,
+): number {
+  if (!bbox) return 0;
+  const bx = Math.max(bbox.max[0] - bbox.min[0], 0);
+  const by = Math.max(bbox.max[1] - bbox.min[1], 0);
+  const bz = Math.max(bbox.max[2] - bbox.min[2], 0);
+  return bx * by * bz;
+}
+
+/**
  * Decide the single most-likely failure mode given what we can cheaply
  * observe. Ordered so the strongest signal wins:
  *   1. Volume ≈ 0 relative to bbox volume → open shell / missing face.
  *   2. Shell count > 1                    → non-manifold / disconnected.
- *   3. Otherwise                          → self-intersection.
+ *   3. Exception string names it          → self-intersection.
+ *   4. Otherwise                          → "unknown" (no evidence).
+ *
+ * The final branch intentionally returns `"unknown"` instead of guessing —
+ * historically this fell through to a bare `"self-intersection"` label which
+ * sent agents chasing the wrong bug whenever OCCT failed for any other
+ * reason (bad curves, tolerance issues, internal wires, ...).
+ *
+ * `exceptionMessage` is the message from the catch branch in `validateParts`
+ * — when present and it contains concrete self-intersection evidence we
+ * promote the classification accordingly. When absent (the IsValid_2()→false
+ * path) the fallback MUST stay `"unknown"`.
  */
 function classifyFailure(
   volume: number,
   bbox: { min: [number, number, number]; max: [number, number, number] } | null,
   shellCount: number,
-): { cls: FailureClass; shellCount: number } {
+  exceptionMessage?: string,
+): { cls: FailureKind; shellCount: number } {
   if (bbox) {
-    const bx = Math.max(bbox.max[0] - bbox.min[0], 0);
-    const by = Math.max(bbox.max[1] - bbox.min[1], 0);
-    const bz = Math.max(bbox.max[2] - bbox.min[2], 0);
-    const bboxVol = bx * by * bz;
+    const bboxVol = bboxVolumeOf(bbox);
     if (bboxVol > 0) {
       if (!Number.isFinite(volume) || Math.abs(volume) / bboxVol < OPEN_SHELL_VOLUME_FRACTION) {
         return { cls: "open-shell", shellCount };
@@ -152,7 +205,25 @@ function classifyFailure(
   }
 
   if (shellCount > 1) return { cls: "non-manifold", shellCount };
-  return { cls: "self-intersection", shellCount };
+
+  if (exceptionMessage && hasSelfIntersectionEvidence(exceptionMessage)) {
+    return { cls: "self-intersection", shellCount };
+  }
+
+  return { cls: "unknown", shellCount };
+}
+
+/**
+ * True iff the exception string carries concrete evidence that OCCT itself
+ * detected a self-intersection / BRep-API failure. Matching is case-insensitive
+ * and handles the common spellings OCCT emits ("self-intersect", "self
+ * intersecting", "BRep_API", "BRepAPI").
+ */
+function hasSelfIntersectionEvidence(msg: string): boolean {
+  if (!msg) return false;
+  if (/self[- ]?intersect/i.test(msg)) return true;
+  if (/brep[_]?api/i.test(msg)) return true;
+  return false;
 }
 
 /** Format a bbox suffix for error messages, or "" if no bbox is available. */
@@ -164,7 +235,16 @@ function formatLocation(
   return ` at bbox (${f(bbox.min[0])}..${f(bbox.max[0])}, ${f(bbox.min[1])}..${f(bbox.max[1])}, ${f(bbox.min[2])}..${f(bbox.max[2])})`;
 }
 
-function describeFailure(cls: FailureClass, shellCount: number): string {
+/**
+ * Format the classification into a human sentence. `diagnostics` is only
+ * consulted for the "unknown" arm — it's what lets the agent reason about
+ * *why* we couldn't classify, so the message has to carry it verbatim.
+ */
+function describeFailure(
+  cls: FailureKind,
+  shellCount: number,
+  diagnostics?: { volume: number; bboxVolume: number; shellCount: number },
+): string {
   switch (cls) {
     case "open-shell":
       return "likely open shell or missing face (volume near zero relative to bounding box)";
@@ -172,6 +252,16 @@ function describeFailure(cls: FailureClass, shellCount: number): string {
       return `likely disconnected/non-manifold geometry: ${shellCount} shells detected`;
     case "self-intersection":
       return "likely self-intersection — try reducing sketch complexity or filleting sharp concavities";
+    case "unknown": {
+      const volStr = diagnostics && Number.isFinite(diagnostics.volume)
+        ? diagnostics.volume.toFixed(1)
+        : "NaN";
+      const bboxStr = diagnostics && Number.isFinite(diagnostics.bboxVolume)
+        ? diagnostics.bboxVolume.toFixed(1)
+        : "0";
+      const shellStr = diagnostics ? String(diagnostics.shellCount) : String(shellCount);
+      return `OCCT validation failed (BRepCheck). shellCount=${shellStr}, volume=${volStr}, bboxVolume=${bboxStr} — could not auto-classify. Check verify_shape output for specific failing faces/edges`;
+    }
   }
 }
 
@@ -187,7 +277,8 @@ function describeFailure(cls: FailureClass, shellCount: number): string {
  * When a part fails, we attempt to NARROW the diagnosis — instead of the old
  * "likely A, B, or C" grab-bag message we pick the single most-probable cause
  * from volume-vs-bbox and shell-count heuristics and attach the part's bbox
- * so the LLM has a location hint to work with.
+ * so the LLM has a location hint to work with. When none of the heuristics
+ * fire we report `"unknown"` with the raw probe values rather than guessing.
  */
 export function validateParts(
   parts: PartInput[],
@@ -223,18 +314,28 @@ export function validateParts(
       if (valid === false || valid === 0) {
         // Narrow the diagnosis. All three probes are best-effort — if any
         // throws or returns unusable data we fall back to the more generic
-        // branch in classifyFailure().
+        // branch in classifyFailure(). No exception string is available on
+        // this path (IsValid_2 just returned false), so the classifier will
+        // yield "unknown" whenever neither heuristic fires.
         const bbox = readBoundingBox(part.shape);
         const volume = safeVolume(part.shape, replicad);
         const shellCount = countShells(wrapped, oc);
-        const { cls, shellCount: shells } = classifyFailure(volume, bbox, shellCount);
+        const bboxVolume = bboxVolumeOf(bbox);
+        const { cls, shellCount: shells } = classifyFailure(
+          volume,
+          bbox,
+          shellCount,
+          undefined,
+        );
+        const diagnostics = { volume, bboxVolume, shellCount };
         const location = formatLocation(bbox);
-        const cause = describeFailure(cls, shells);
+        const cause = describeFailure(cls, shells, diagnostics);
         issues.push({
           part: part.name,
           severity: "error",
           reason: "non-manifold",
           message: `Part "${part.name}" fails geometry validation — ${cause}${location}. STEP/STL export may fail or produce incorrect geometry. Volume/area/mass have been omitted because OCCT measurements on invalid solids return inflated or nonsensical numbers.`,
+          diagnostics,
         });
       }
     } catch (err: any) {
@@ -277,4 +378,6 @@ export const __test__ = {
   readBoundingBox,
   countShells,
   safeVolume,
+  bboxVolumeOf,
+  hasSelfIntersectionEvidence,
 };

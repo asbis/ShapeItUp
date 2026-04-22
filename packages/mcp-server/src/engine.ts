@@ -1659,7 +1659,13 @@ function aggregateProperties(
     const minEdge = minTriangleEdgeMm(p.vertices, p.triangles, p.normals);
     const issues: string[] = [];
     if (!geometryValid) {
-      issues.push("Non-manifold geometry — OCCT validation failed");
+      // Keep this label generic — the per-part BRepCheck failure may be
+      // non-manifold, open-shell, a real self-intersection, or an "unknown"
+      // classification (see validate.ts::classifyFailure). Pinning the label
+      // to "Non-manifold" misled agents when the real cause was one of the
+      // others; refer to the structured `geometryIssues[].message` /
+      // `diagnostics` for the specific classification.
+      issues.push("Geometry validation failed — OCCT BRepCheck rejected this part (see geometryIssues for classification + diagnostics)");
     }
     // Boolean operations routinely leave sub-mm sliver edges at cut/fuse
     // boundaries — firing a printability warning on every part that ever
