@@ -145,17 +145,33 @@ jobs:
       - name: Publish @shapeitup/mcp-server to npm
         # Publishes the standalone server so `npx -y @shapeitup/mcp-server`
         # works for every MCP client without the VS Code extension installed.
+        #
         # Auth is via OIDC trusted publishing (configured on npmjs.com for this
         # package + the asbis/ShapeItUp `publish.yml` workflow) — no token env.
-        # Requires pnpm >= 10.12 (action-setup `version: 10` resolves the
-        # latest 10.x, which supports it) and the `id-token: write` permission
-        # declared on the job above.
-        # Uses --no-git-checks because pnpm otherwise refuses to publish from
-        # a workspace with uncommitted lockfile tweaks on CI.
+        # OIDC trusted publishing is an npm-CLI feature (npm >= 11.5.1); pnpm
+        # does NOT perform the OIDC token exchange, so we publish with `npm`.
+        #
+        # We publish the tarball that `pnpm pack` produced in the smoke-test
+        # step above: pnpm rewrites the `workspace:*` devDeps to real versions,
+        # so the manifest is registry-valid (a bare `npm publish` from the dir
+        # would choke on `workspace:`). `npm install -g npm@latest` guarantees
+        # an OIDC-capable npm on the Node 22 runner (ships npm 10.x).
+        #
         # NOTE: no `continue-on-error` here — a failed npm publish MUST abort
         # the workflow so the VSIX below never ships referencing a server
         # version that wasn't actually released.
-        run: pnpm --filter @shapeitup/mcp-server publish --no-git-checks --access public
+        run: |
+          set -euo pipefail
+          npm install -g npm@latest
+          echo "npm version: $(npm --version)"
+          cd packages/mcp-server
+          TGZ="$(ls shapeitup-mcp-server-*.tgz | head -n1)"
+          if [ -z "$TGZ" ]; then
+            echo "::error::no pnpm-pack tarball found in packages/mcp-server" >&2
+            exit 1
+          fi
+          echo "Publishing $TGZ via OIDC trusted publishing"
+          npm publish "$TGZ" --access public
 
       - name: Publish to VS Marketplace
         run: cd packages/extension && npx @vscode/vsce publish
