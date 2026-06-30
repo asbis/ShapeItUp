@@ -1072,7 +1072,7 @@ document.getElementById("btn-measure")!.addEventListener("click", () => {
 });
 
 // --- Export dropdown ---
-type InstalledApp = { id: string; name: string; preferredFormat: "step" | "stl" };
+type InstalledApp = { id: string; name: string; preferredFormat: "step" | "stl" | "3mf" };
 
 const exportWrapper = document.getElementById("export-menu-wrapper")!;
 const exportMenu = document.getElementById("export-menu")!;
@@ -1119,6 +1119,9 @@ exportMenu.addEventListener("click", (e) => {
   } else if (action === "export-stl") {
     exportWrapper.classList.remove("open");
     postToExtension({ type: "toolbar-export", format: "stl" });
+  } else if (action === "export-3mf") {
+    exportWrapper.classList.remove("open");
+    postToExtension({ type: "toolbar-export", format: "3mf" });
   }
 });
 

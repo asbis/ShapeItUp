@@ -18,6 +18,10 @@ export function registerCommands(
       await exportToFile(viewer, "stl");
     }),
 
+    vscode.commands.registerCommand("shapeitup.export3MF", async () => {
+      await exportToFile(viewer, "3mf");
+    }),
+
     vscode.commands.registerCommand(
       "shapeitup.openInApp",
       async (appId?: AppId) => {

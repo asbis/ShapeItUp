@@ -3515,9 +3515,9 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "export_shape",
-    "Export the last executed shape to STEP or STL. Optionally pass `filePath` to execute and export a specific file in one call. For multi-part assemblies, pass `partName` to export a single named part instead of the whole assembly. Pass `bom: true` to write a `*.bom.json` sidecar next to the exported file with per-part volume, mass, qty, material, and bounding box.",
+    "Export the last executed shape to STEP, STL, or 3MF. Optionally pass `filePath` to execute and export a specific file in one call. For multi-part assemblies, pass `partName` to export a single named part instead of the whole assembly. Pass `bom: true` to write a `*.bom.json` sidecar next to the exported file with per-part volume, mass, qty, material, and bounding box.",
     {
-      format: z.enum(["step", "stl"]).describe("'step' for CNC/manufacturing or CAD, 'stl' for 3D printing"),
+      format: z.enum(["step", "stl", "3mf"]).describe("'step' for CNC/manufacturing or CAD, 'stl' for generic 3D printing, '3mf' for Bambu Studio/OrcaSlicer (native format — preserves each part as a separate object with its color)"),
       outputPath: z.string().optional().describe("Output file path. Auto-derived from the source .shape.ts filename if omitted."),
       filePath: z.string().optional().describe("Optional .shape.ts path to execute first. Defaults to the last-executed shape."),
       partName: z.string().optional().describe("For multi-part assemblies: export only the part whose name matches exactly (e.g., 'bolt'). If omitted, the full assembly is exported."),
@@ -3583,7 +3583,7 @@ export function registerTools(server: McpServer) {
       // Single-part exports stay binary for compactness.
       let multiPartWarning = "";
       if (format === "stl" && !partName && availablePartNames.length > 1) {
-        multiPartWarning = `\n\nNote: multi-part assembly (${availablePartNames.length} parts: ${availablePartNames.join(", ")}) written as ASCII multi-solid STL — PrusaSlicer/Cura/Bambu/Orca will recognize each part as a separate object. Colors are not preserved (STL format limitation). For full fidelity incl. assembly hierarchy + colors, use STEP format instead.`;
+        multiPartWarning = `\n\nNote: multi-part assembly (${availablePartNames.length} parts: ${availablePartNames.join(", ")}) written as ASCII multi-solid STL — PrusaSlicer/Cura/Bambu/Orca will recognize each part as a separate object. Colors are not preserved (STL format limitation). For 3D printing on Bambu/Orca with per-part colors preserved, use format "3mf". For full CAD fidelity incl. assembly hierarchy, use STEP.`;
       }
 
       // Default output path: include the part name in the file name so

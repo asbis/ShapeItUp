@@ -11,7 +11,7 @@ export type AppId =
   | "freecad"
   | "fusion360";
 
-export type ExportFormatForApp = "step" | "stl";
+export type ExportFormatForApp = "step" | "stl" | "3mf";
 
 export interface DetectedApp {
   id: AppId;
@@ -36,8 +36,10 @@ const APP_NAMES: Record<AppId, string> = {
 const PREFERRED_FORMAT: Record<AppId, ExportFormatForApp> = {
   prusaslicer: "step",
   cura: "stl",
-  bambustudio: "step",
-  orcaslicer: "step",
+  // 3MF is Bambu/Orca's native container — preserves per-part color + treats
+  // each part as a separate object, ideal for the print-and-send workflow.
+  bambustudio: "3mf",
+  orcaslicer: "3mf",
   freecad: "step",
   fusion360: "step",
 };

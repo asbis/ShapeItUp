@@ -1,14 +1,17 @@
 import type { PartInput } from "./tessellate";
+import { generate3MF } from "./3mf";
 
 export async function exportShapes(
   parts: PartInput[],
-  format: "step" | "stl",
+  format: "step" | "stl" | "3mf",
   replicadModule: any
 ): Promise<ArrayBuffer> {
   if (format === "step") {
     const stepParts = parts.map((p) => ({ shape: p.shape, name: p.name }));
     const blob: Blob = replicadModule.exportSTEP(stepParts);
     return blob.arrayBuffer();
+  } else if (format === "3mf") {
+    return generate3MF(parts);
   } else {
     return generateCombinedSTL(parts);
   }

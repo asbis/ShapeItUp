@@ -8,7 +8,7 @@ export interface EdgeMesh {
   vertices: Float32Array;
 }
 
-export type ExportFormat = "step" | "stl";
+export type ExportFormat = "step" | "stl" | "3mf";
 
 // --- Installed-app detection ------------------------------------------------
 // Canonical types for the `list_installed_apps` MCP tool and the extension's
@@ -26,7 +26,7 @@ export type AppId =
   | "freecad"
   | "fusion360";
 
-export type ExportFormatForApp = "step" | "stl";
+export type ExportFormatForApp = "step" | "stl" | "3mf";
 
 export interface DetectedApp {
   id: AppId;

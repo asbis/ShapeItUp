@@ -523,6 +523,7 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           <div id="export-menu" class="dropdown-menu">
             <button data-action="export-step">Save as STEP…</button>
             <button data-action="export-stl">Save as STL…</button>
+            <button data-action="export-3mf">Save as 3MF (Bambu / Orca)…</button>
             <div id="export-menu-apps"></div>
           </div>
         </div>

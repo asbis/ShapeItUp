@@ -14,8 +14,9 @@ export async function exportToFile(
     return;
   }
 
-  const ext = format === "step" ? "step" : "stl";
-  const filterLabel = format === "step" ? "STEP files" : "STL files";
+  const ext = format;
+  const filterLabel =
+    format === "step" ? "STEP files" : format === "3mf" ? "3MF files" : "STL files";
 
   // Default to same directory as the active editor
   const defaultUri = vscode.window.activeTextEditor?.document.uri;

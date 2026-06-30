@@ -727,7 +727,7 @@ export interface Core {
    * provided, export only the part whose name matches (exact match). Throws
    * if no part matches — the error lists available names.
    */
-  exportLast(format: "step" | "stl", partName?: string): Promise<ArrayBuffer>;
+  exportLast(format: "step" | "stl" | "3mf", partName?: string): Promise<ArrayBuffer>;
   /** Access the raw replicad module (for advanced callers — validate, getOC, etc.). */
   replicad(): any;
   /**
@@ -1094,7 +1094,7 @@ export async function initCore(
   }
 
   async function exportLast(
-    format: "step" | "stl",
+    format: "step" | "stl" | "3mf",
     partName?: string
   ): Promise<ArrayBuffer> {
     if (lastParts.length === 0) {

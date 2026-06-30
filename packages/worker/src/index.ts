@@ -175,7 +175,7 @@ async function executeUserScript(
   }
 }
 
-async function handleExport(format: "step" | "stl") {
+async function handleExport(format: "step" | "stl" | "3mf") {
   if (!core) throw new Error("Worker received 'export' before 'init' completed");
   const data = await core.exportLast(format);
   self.postMessage({ type: "export-result", format, data }, [data] as any);

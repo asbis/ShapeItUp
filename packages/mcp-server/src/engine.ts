@@ -1476,7 +1476,7 @@ export async function executeShapeFile(
 }
 
 export async function exportLastToFile(
-  format: "step" | "stl",
+  format: "step" | "stl" | "3mf",
   outputPath: string,
   partName?: string
 ): Promise<void> {

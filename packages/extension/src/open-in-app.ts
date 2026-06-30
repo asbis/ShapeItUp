@@ -154,7 +154,7 @@ export async function exportAndOpen(
 }
 
 function chooseExportPath(
-  format: "step" | "stl",
+  format: "step" | "stl" | "3mf",
   context: vscode.ExtensionContext
 ): string {
   const active = vscode.window.activeTextEditor?.document.uri.fsPath;
