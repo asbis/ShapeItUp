@@ -789,16 +789,34 @@ export function keyhole(opts: {
  * // pocket penetrates into -Y).
  * flange.cut(holes.slot({ length: 20, width: 5, depth: 4, axis: "+Y" }).translate(x, thickness, z))
  *
- * @param opts.length Overall length (tip to tip) in mm — must be >= `width`.
+ * ## Input forms (pick one)
+ *
+ * The slot can be described two ways — choose whichever matches how you think
+ * about the shape. Exactly one of \`length\` / \`travel\` is required.
+ *
+ * **\`{ length, width, depth }\`** — \`length\` is the OVERALL tip-to-tip
+ * distance (including the two rounded ends). Must be \`>= width\`. Matches
+ * datasheet / engineering-drawing convention where "length" is the bounding
+ * extent.
+ *
+ * **\`{ travel, width, depth }\`** — \`travel\` is the FREE TRAVEL a bolt can
+ * slide (centre-to-centre of the end caps). No constraint against width:
+ * just say "I want 10 mm of travel for an M4-clearance head". Equivalent
+ * to \`length = travel + width\` internally. Recommended for adjustment /
+ * mounting slots where travel is the physical requirement.
+ *
+ * @param opts.length Overall length (tip to tip) in mm. Mutually exclusive with \`travel\`. Must be >= \`width\`.
+ * @param opts.travel Free travel distance in mm (centre-to-centre of the rounded ends). Mutually exclusive with \`length\`. Any positive value accepted; overall length = travel + width.
  * @param opts.width Slot width in mm (diameter of the rounded ends).
  * @param opts.depth Hole depth in mm.
- * @param opts.axis Entry-face spec (default `"+Z"`). Names the face the slot OPENS ON; the pocket penetrates in the OPPOSITE direction. See `HoleAxis` docstring for full semantics and the AXIS SEMANTICS table above for per-axis world-dimension mapping.
- * @param opts.drillDirection Inverse alias of `axis`: names the direction the drill bit points. `drillDirection: "+X"` is equivalent to `axis: "-X"`.
- * @param opts.strict When true, skip the `CUT_EPSILON` extend-past-both-faces nudge. Default false.
+ * @param opts.axis Entry-face spec (default \`"+Z"\`). Names the face the slot OPENS ON; the pocket penetrates in the OPPOSITE direction. See \`HoleAxis\` docstring for full semantics and the AXIS SEMANTICS table above for per-axis world-dimension mapping.
+ * @param opts.drillDirection Inverse alias of \`axis\`: names the direction the drill bit points. \`drillDirection: "+X"\` is equivalent to \`axis: "-X"\`.
+ * @param opts.strict When true, skip the \`CUT_EPSILON\` extend-past-both-faces nudge. Default false.
  * @returns Cut-tool Shape3D, top at Z=0.
  */
 export function slot(opts: {
-  length: number;
+  length?: number;
+  travel?: number;
   width: number;
   depth: number;
   axis?: HoleAxis;
@@ -807,11 +825,36 @@ export function slot(opts: {
   strict?: boolean;
 }): Shape3D {
   const axis = resolveHoleAxis("holes.slot", opts.axis, opts.drillDirection);
-  const { length, width, depth } = opts;
-  assertPositiveFinite("holes.slot", "opts.length", length);
+  const { width, depth } = opts;
   assertPositiveFinite("holes.slot", "opts.width", width);
   assertPositiveFinite("holes.slot", "opts.depth", depth);
+
+  // Resolve length from the (length | travel) pair.
+  const hasLength = opts.length !== undefined;
+  const hasTravel = opts.travel !== undefined;
+  if (hasLength && hasTravel) {
+    throw new Error(
+      `holes.slot: pass exactly one of \`length\` or \`travel\`, not both. ` +
+        `\`length\` = tip-to-tip overall length; \`travel\` = free slide distance. ` +
+        `Received length=${opts.length}, travel=${opts.travel}.`
+    );
+  }
+  if (!hasLength && !hasTravel) {
+    throw new Error(
+      `holes.slot: pass either \`length\` (overall tip-to-tip) or \`travel\` (free slide distance). Neither was provided.`
+    );
+  }
+  let length: number;
+  if (hasTravel) {
+    assertPositiveFinite("holes.slot", "opts.travel", opts.travel as number);
+    length = (opts.travel as number) + width;
+  } else {
+    assertPositiveFinite("holes.slot", "opts.length", opts.length as number);
+    length = opts.length as number;
+  }
   if (length < width) {
+    // Only reachable via the `length` form (the `travel` form guarantees
+    // length >= width by construction).
     const travelExample = Math.max(3, Math.round(width));
     throw new Error(
       `holes.slot: length (${length}) must be >= width (${width}). ` +
@@ -819,7 +862,8 @@ export function slot(opts: {
         `not the extra travel beyond the round ends. ` +
         `For an M${Math.round(width - 0.4)}-ish bolt with ${travelExample}mm of travel, ` +
         `use length=${width + travelExample}, width=${width} ` +
-        `(length = bolt_clearance_diameter + desired_travel).`
+        `(length = bolt_clearance_diameter + desired_travel). ` +
+        `Or just write \`holes.slot({ travel: ${travelExample}, width: ${width}, depth: ... })\` — travel semantics avoid the inequality entirely.`
     );
   }
   const r = width / 2;

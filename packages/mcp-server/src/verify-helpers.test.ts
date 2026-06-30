@@ -274,6 +274,69 @@ describe("extractCollisions", () => {
     const text = formatCollisionReport(report);
     expect(text).toContain("Overlap depth: X=2.00mm, Y=3.00mm, Z=5.00mm");
   });
+
+  // P2-4 design-class hint clustering — synthesize a CollisionReport and
+  // format it directly. These tests don't go through extractCollisions
+  // (which requires real/fake meshes); they verify the grouper + formatter
+  // pathway.
+  const mkRecord = (a: string, b: string, volume: number, depths = { x: 2, y: 3, z: 1 }): any => ({
+    a, b, rawA: a, rawB: b, volume,
+    region: { min: [0, 0, 0], max: [depths.x, depths.y, depths.z], depths },
+    center: [depths.x / 2, depths.y / 2, depths.z / 2],
+  });
+  const mkReport = (real: any[]): any => ({
+    totalParts: 10, totalPairs: 45, testedPairs: real.length, skippedByAABB: 0,
+    tolerance: 0.01, pressFitThreshold: 1,
+    real, pressFit: [], accepted: [], failures: [], degenerateWarnings: [],
+    ok: false, skipped: false,
+  });
+
+  it("cross-prefix group fires when N≥3 pairs span two different indexed prefixes with identical overlap", () => {
+    // knitting-printer v8 canonical repro: needle-* ↔ solenoid-* mirror pairs.
+    const real = [
+      mkRecord("needle-1", "solenoid-20", 100),
+      mkRecord("needle-2", "solenoid-19", 100),
+      mkRecord("needle-3", "solenoid-18", 100),
+      mkRecord("needle-4", "solenoid-17", 100),
+    ];
+    const text = formatCollisionReport(mkReport(real));
+    expect(text).toMatch(/Cross-pattern overlap: 4 needle-\* ↔ solenoid-\* pairs/);
+    expect(text).toMatch(/two linear \/ grid patterns that share an axis but are misaligned/);
+    // Each raw pair should have been GROUPED (not listed individually).
+    expect(text).not.toMatch(/- needle-1 ↔ solenoid-20/);
+  });
+
+  it("one-to-many group fires when a singleton collides with N≥3 instances of a prefix", () => {
+    // Typical repro: chassis colliding with every solenoid-* foot.
+    const real = [
+      mkRecord("base-chassis", "solenoid-1", 50),
+      mkRecord("base-chassis", "solenoid-2", 50),
+      mkRecord("base-chassis", "solenoid-3", 50),
+      mkRecord("base-chassis", "solenoid-4", 50),
+    ];
+    const text = formatCollisionReport(mkReport(real));
+    expect(text).toMatch(/Shared-surface overlap: base-chassis ↔ 4 solenoid-\* parts/);
+    expect(text).toMatch(/every solenoid-\* instance dips into base-chassis/);
+    expect(text).toMatch(/the whole solenoid array is offset, not just one instance/);
+  });
+
+  it("same-prefix pitch mismatch still fires first, and the rest go to other groupers", () => {
+    // Mix both cases in one report: ensure same-prefix wins on its members,
+    // cross-prefix wins on its members, both emit design-class hints.
+    const real = [
+      // Same-prefix (solenoid-* colliding with itself due to pitch overlap)
+      mkRecord("solenoid-1", "solenoid-2", 120, { x: 4, y: 60, z: 1 }),
+      mkRecord("solenoid-2", "solenoid-3", 120, { x: 4, y: 60, z: 1 }),
+      mkRecord("solenoid-3", "solenoid-4", 120, { x: 4, y: 60, z: 1 }),
+      // Cross-prefix (needle-* ↔ rail-*)
+      mkRecord("needle-1", "rail-1", 10, { x: 2, y: 2, z: 2 }),
+      mkRecord("needle-2", "rail-2", 10, { x: 2, y: 2, z: 2 }),
+      mkRecord("needle-3", "rail-3", 10, { x: 2, y: 2, z: 2 }),
+    ];
+    const text = formatCollisionReport(mkReport(real));
+    expect(text).toMatch(/Systematic overlap: 3 solenoid-\* pairs/);
+    expect(text).toMatch(/Cross-pattern overlap: 3 needle-\* ↔ rail-\* pairs/);
+  });
 });
 
 describe("extractJoints", () => {

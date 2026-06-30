@@ -51,8 +51,11 @@ export function normalizeAxis(a: Axis): Vec3 {
     throw new Error(
       `Axis vector cannot be [0, 0, 0] — the direction is undefined. ` +
         `Use a string shorthand like "+Z" / "-X", or pass a non-zero vector. ` +
-        `(Common cause: computing an axis from two identical points, or calling .rotate()/.translate() on a Part ` +
-        `with an unset axis variable.)`
+        `Common causes: (a) computing an axis from two identical points; ` +
+        `(b) calling a Part's .rotate() / .translate() with an unset axis variable; ` +
+        `(c) calling Part.rotate with the Shape3D signature '(angle, position, direction)' ` +
+        `but omitting the third argument — the zero "position" is being read as the axis. ` +
+        `Either use the 2-arg form '(angle, axis)' or include the direction argument.`
     );
   }
   return [x / mag, y / mag, z / mag];
@@ -309,10 +312,46 @@ export class Part {
     );
   }
 
-  /** Rotate the part about the world origin. Returns a new Part. */
-  rotate(angleDeg: number, axis: Axis): Part {
+  /**
+   * Rotate the part. Two call signatures, both matching what users reach for
+   * when they forget which transform API they're on:
+   *
+   *   1. `part.rotate(angleDeg, axis)` — canonical Part form. `axis` is a
+   *      string shorthand (`"+Z"` / `"-X"` / …) or a raw `Vec3` direction.
+   *      Rotation is around an axis through the WORLD ORIGIN.
+   *
+   *   2. `part.rotate(angleDeg, position, direction)` — Shape3D-style form.
+   *      `position` is a point the rotation axis passes through; `direction`
+   *      is the axis direction. Implemented as
+   *      `translate(-pos) → rotate(dir) → translate(+pos)` so it works even
+   *      when `pos ≠ [0,0,0]`. Passing a degenerate direction (e.g.
+   *      `[0,0,0]`) still throws — that's a genuine user error — but the
+   *      thrown message now also names the 3-arg form explicitly so the
+   *      fix is obvious.
+   *
+   * Returns a new Part.
+   */
+  rotate(angleDeg: number, axis: Axis): Part;
+  rotate(angleDeg: number, position: Point3, direction: Axis): Part;
+  rotate(angleDeg: number, axisOrPosition: Axis | Point3, direction?: Axis): Part {
+    if (direction !== undefined) {
+      // 3-arg Shape3D-style: rotate around an axis through `position`.
+      const pos = axisOrPosition as Point3;
+      const [px, py, pz] = pos;
+      if (!Number.isFinite(px) || !Number.isFinite(py) || !Number.isFinite(pz)) {
+        throw new Error(
+          `Part.rotate: position must be a 3-element [x,y,z] of finite numbers. ` +
+            `Received: ${JSON.stringify(pos)}.`
+        );
+      }
+      const x = composeTransforms(this._xform, translateTransform([-px, -py, -pz]));
+      const xr = composeTransforms(x, rotateTransform(angleDeg, direction));
+      const xrt = composeTransforms(xr, translateTransform([px, py, pz]));
+      return this.withTransform(xrt);
+    }
+    // 2-arg canonical form.
     return this.withTransform(
-      composeTransforms(this._xform, rotateTransform(angleDeg, axis))
+      composeTransforms(this._xform, rotateTransform(angleDeg, axisOrPosition as Axis))
     );
   }
 
@@ -445,19 +484,41 @@ export class Part {
   }
 
   /**
-   * Convert to the `{ shape, name, color }` entry format used in `main()`'s
-   * multi-part return. Applies the accumulated transform.
+   * Convert to the `{ shape, name, color, joints? }` entry format used in
+   * `main()`'s multi-part return. Applies the accumulated transform.
+   *
+   * Joints are emitted in WORLD coordinates (post-transform) so downstream
+   * tools like `validate_joints` can verify each joint sits on the owning
+   * part's tessellated surface. When the part has no joints declared the
+   * field is omitted so existing consumers that didn't expect it stay
+   * unaffected.
    *
    * For SUBASSEMBLIES, this returns the compound shape as a single entry —
    * use `toEntries()` instead if you want each child rendered as its own
    * part in the viewer (typical case).
    */
-  toEntry(): { shape: Shape3D; name?: string; color?: string; group?: string } {
+  toEntry(): {
+    shape: Shape3D;
+    name?: string;
+    color?: string;
+    group?: string;
+    joints?: Record<string, JointSpec>;
+  } {
+    const worldJoints: Record<string, JointSpec> = {};
+    for (const [name, j] of Object.entries(this.joints)) {
+      worldJoints[name] = {
+        position: j.position,
+        axis: j.axis,
+        ...(j.role !== undefined ? { role: j.role } : {}),
+        ...(j.diameter !== undefined ? { diameter: j.diameter } : {}),
+      };
+    }
     return {
       shape: this.worldShape(),
       name: this.name,
       color: this.color,
       ...(this.group !== undefined ? { group: this.group } : {}),
+      ...(Object.keys(worldJoints).length > 0 ? { joints: worldJoints } : {}),
     };
   }
 
@@ -475,14 +536,26 @@ export class Part {
    *   Each child keeps its own name and color (fall back to the
    *   subassembly's color if a child has none).
    */
-  toEntries(): Array<{ shape: Shape3D; name?: string; color?: string; group?: string }> {
+  toEntries(): Array<{
+    shape: Shape3D;
+    name?: string;
+    color?: string;
+    group?: string;
+    joints?: Record<string, JointSpec>;
+  }> {
     if (this._children.length === 0) {
       return [this.toEntry()];
     }
     const outerXform = this._xform;
     const inheritColor = this.color;
     const inheritGroup = this.group;
-    const out: Array<{ shape: Shape3D; name?: string; color?: string; group?: string }> = [];
+    const out: Array<{
+      shape: Shape3D;
+      name?: string;
+      color?: string;
+      group?: string;
+      joints?: Record<string, JointSpec>;
+    }> = [];
     for (const child of this._children) {
       // Child's `_xform` is its position within THIS subassembly (local frame).
       // Compose with the subassembly's outer xform to get the child's world pose.

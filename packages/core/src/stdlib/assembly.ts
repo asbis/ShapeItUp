@@ -420,7 +420,12 @@ export function stackOnZ(parts: Part[], opts: StackOptions = {}): Part[] {
  */
 export function entries(
   parts: Part[]
-): Array<{ shape: Shape3D; name?: string; color?: string }> {
+): Array<{
+  shape: Shape3D;
+  name?: string;
+  color?: string;
+  joints?: Record<string, JointSpec>;
+}> {
   return parts.flatMap((p) => p.toEntries());
 }
 

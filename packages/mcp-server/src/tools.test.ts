@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { validateSyntaxPure, detectPathDoubling, detectPathDoublingInfo, extractSignatures, safeHandler, computePartsLine, computeEffectiveMeshQuality, formatCollisionPairs, formatSweepCollisions, formatLastScreenshotLine, registerTools, getVersionTag, getViewerStatus, formatViewerBlock, type CollisionEntry, type SweepCollisionEntry } from "./tools.js";
+import { validateSyntaxPure, detectPathDoubling, detectPathDoublingInfo, extractSignatures, safeHandler, computePartsLine, computeEffectiveMeshQuality, formatCollisionPairs, formatSweepCollisions, formatLastScreenshotLine, registerTools, getVersionTag, getViewerStatus, formatViewerBlock, partExtendsBelowBed, formatStatusText, workspaceMismatchWarning, type CollisionEntry, type SweepCollisionEntry } from "./tools.js";
 import type { EngineStatus } from "./engine.js";
 
 // ---------------------------------------------------------------------------
@@ -789,6 +789,23 @@ describe("formatCollisionPairs — check_collisions format param", () => {
     expect(depthLines[0]).toContain("Z=6.00mm");
     expect(depthLines[1]).toContain("X=1.00mm");
   });
+
+  it("appends an acceptedPairs/pressFitThreshold tip when there are real collisions", () => {
+    const out = formatCollisionPairs(realC, [], [], 0.5, "summary", accounting);
+    expect(out).toMatch(/acceptedPairs/);
+    expect(out).toContain("pressFitThreshold");
+  });
+
+  it("does NOT append the tip when there are no real collisions", () => {
+    const pressOnly: CollisionEntry[] = [makeCollision("cam", "spline", 0.3)];
+    const out = formatCollisionPairs([], pressOnly, [], 0.5, "summary", accounting);
+    expect(out).not.toMatch(/acceptedPairs/);
+  });
+
+  it("does NOT append the tip in ids format", () => {
+    const out = formatCollisionPairs(realC, [], [], 0.5, "ids", accounting);
+    expect(out).not.toMatch(/acceptedPairs/);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1418,5 +1435,104 @@ describe("getApiReference — stdlib surface area bumps", () => {
     expect(ref).toMatch(/axis\?/);
     // And reminds callers that the factory is nullary.
     expect(ref).toMatch(/factory\s*`?\(\)\s*=>\s*Shape3D`?\s*takes\s*NO\s*args/);
+  });
+});
+
+describe("partExtendsBelowBed — below-z=0 rotation hint gating", () => {
+  // Real bug it should still catch: a part meant to rest on the bed, mostly
+  // above z=0 but rotated so an asymmetric chunk sinks below.
+  it("warns on a genuine rotation/pivot mistake (asymmetric dip below z=0)", () => {
+    // Not a shaft centred on z=0: bottom 4 mm sinks below an 18 mm-tall part.
+    expect(partExtendsBelowBed({ minZ: -4, maxZ: 14, comZ: 5 })).toBe(true);
+  });
+
+  // The wall-organizer tool-holder: 57 mm tall, a Ø8.5 keyhole-stud head dips
+  // 1.3 mm below z=0 (2.3% of height). z=0 is the WALL, not the print bed.
+  it("does NOT warn on a tiny incidental feature dipping below z=0", () => {
+    expect(partExtendsBelowBed({ minZ: -1.3, maxZ: 56, comZ: 19.8 })).toBe(false);
+  });
+
+  it("suppresses suspended-above-zero parts (top at/under origin)", () => {
+    expect(partExtendsBelowBed({ minZ: -30, maxZ: 0.5, comZ: -15 })).toBe(false);
+  });
+
+  it("suppresses centre-of-mass-below-zero parts", () => {
+    expect(partExtendsBelowBed({ minZ: -8, maxZ: 4, comZ: -1 })).toBe(false);
+  });
+
+  it("suppresses horizontal shafts symmetric about z=0", () => {
+    expect(partExtendsBelowBed({ minZ: -4, maxZ: 4, comZ: 0 })).toBe(false);
+  });
+
+  it("respects the localFrame opt-out", () => {
+    expect(partExtendsBelowBed({ minZ: -3, maxZ: 7, comZ: 2, localFrame: true })).toBe(false);
+  });
+
+  it("ignores numerical dust and large intentional excursions", () => {
+    expect(partExtendsBelowBed({ minZ: -0.01, maxZ: 10, comZ: 5 })).toBe(false); // dust
+    expect(partExtendsBelowBed({ minZ: -20, maxZ: 5, comZ: -5 })).toBe(false);   // > 5mm
+  });
+});
+
+describe("formatStatusText — geometry warning dedup", () => {
+  const baseStatus = {
+    success: true,
+    fileName: "x.shape.ts",
+    stats: "1 verts, 1 tris",
+    geometryValid: true,
+    timestamp: "t",
+    properties: { parts: [] },
+  };
+
+  it("collapses identical geometry warnings to one (xN) line", () => {
+    const w = "sketchOnPlane('XZ').extrude(7): shape bounding box will be Y in [-7, 0].";
+    const out = formatStatusText({ ...baseStatus, warnings: [w, w, w] } as unknown as EngineStatus);
+    expect(out).toContain("Geometry warnings:");
+    expect(out).toContain(`${w} (×3)`);
+    // The raw warning text must appear exactly once (inside the (x3) line).
+    expect(out.split(w).length - 1).toBe(1);
+  });
+
+  it("keeps distinct warnings separate", () => {
+    const out = formatStatusText(
+      { ...baseStatus, warnings: ["Alpha warn", "Beta warn"] } as unknown as EngineStatus,
+    );
+    expect(out).toContain("Alpha warn");
+    expect(out).toContain("Beta warn");
+  });
+});
+
+describe("workspaceMismatchWarning — relative-dir routed to wrong workspace", () => {
+  const base = {
+    directory: "examples/wall-organizer",
+    wsRoots: ["c:/Users/x/code/gresscnc"],
+    dirMatchesCwd: false,
+    cwd: "c:/Users/x/code/ShapeItUp",
+    filePath: "c:/Users/x/code/gresscnc/examples/wall-organizer/wall.shape.ts",
+  };
+
+  it("warns when the relative dir did NOT pre-exist in any workspace", () => {
+    const out = workspaceMismatchWarning({ ...base, relDirPreexisted: false });
+    expect(out).toContain("Workspace mismatch");
+    expect(out).toContain("gresscnc");
+    expect(out).toContain("ShapeItUp");
+  });
+
+  it("stays silent when the dir already existed (true match, not a misroute)", () => {
+    expect(workspaceMismatchWarning({ ...base, relDirPreexisted: true })).toBe("");
+  });
+
+  it("stays silent for absolute directories", () => {
+    expect(
+      workspaceMismatchWarning({ ...base, directory: "c:/abs/path", relDirPreexisted: false }),
+    ).toBe("");
+  });
+
+  it("stays silent when the resolved dir IS the shell cwd", () => {
+    expect(workspaceMismatchWarning({ ...base, relDirPreexisted: false, dirMatchesCwd: true })).toBe("");
+  });
+
+  it("stays silent when there are no workspace roots", () => {
+    expect(workspaceMismatchWarning({ ...base, relDirPreexisted: false, wsRoots: [] })).toBe("");
   });
 });

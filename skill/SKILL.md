@@ -80,7 +80,7 @@ All 20 tools. Dense reference — use this table to find the right tool fast.
 | `set_render_mode` | Switch live viewer ai/dark (UI only) | `mode` |
 | `toggle_dimensions` | Show/hide dims on live viewer (UI only) | `show?` |
 | `preview_finder` | Count + locate edge/face matches; pink-sphere preview in viewer | `filePath`, `finder`, `partName?`, `partIndex?` |
-| `check_collisions` | Pairwise part intersection test on assemblies | `filePath`, `tolerance?` |
+| `check_collisions` | Pairwise part intersection test on assemblies | `filePath`, `tolerance?`, `acceptedPairs?`, `pressFitThreshold?` |
 | `export_shape` | Export to STEP or STL; optional single-part | `format`, `filePath?`, `outputPath?`, `partName?`, `openIn?` |
 | `list_installed_apps` | Detect PrusaSlicer/Cura/FreeCAD/Fusion360/etc. | — |
 | `get_api_reference` | Replicad docs; omit category to list; `search` to grep | `category?`, `search?`, `signaturesOnly?` |
@@ -176,7 +176,7 @@ Concrete footgun: `draw().hLine(60).sketchOnPlane("ZX")` moves the pen 60 mm alo
 ## Top Best Practices
 
 1. **Always `export const params = { ... }`** so the user gets live sliders and `tune_params` works.
-2. **Add `export const material = "PLA"`** (or any preset name) so `get_render_status` returns mass per part. Named presets: `"PLA"` (1.24), `"ABS"` (1.04), `"PETG"` (1.27), `"Nylon"` (1.15), `"Aluminum"` (2.70), `"Steel"` (7.85), `"Stainless"` (8.00), `"Brass"` (8.47), `"Titanium"` (4.50), `"Copper"` (8.96), `"Wood"` (0.60). Densities in g/cm³. For custom materials: `export const material = { density: 1.5, name: "custom" }`.
+2. **Add `export const material = "PLA"`** (or any preset name) so `get_render_status` returns mass per part. Named presets: `"PLA"` (1.24), `"ABS"` (1.04), `"PETG"` (1.27), `"Nylon"` (1.15), `"Aluminum"` (2.70), `"Steel"` (7.85), `"Stainless"` (8.00), `"Brass"` (8.47), `"Titanium"` (4.50), `"Copper"` (8.96), `"Wood"` (0.60). Densities in g/cm³. For custom materials: `export const material = { density: 1.5, name: "custom" }`. In a multi-part assembly the script-level export is global — set `material` **per part** in the returned array for mixed-material masses (see [main() return types](#main-return-types)).
 3. **Use `tune_params` to scan values** before committing with `modify_shape` — binary-search fit tolerance, target volume, target mass without touching the file.
 4. **Trust the `Hint:` line** on render failures — it's operation-specific and usually correct.
 5. **Preview finders before applying them** — `preview_finder({ filePath, finder })` catches zero-match or over-match selections before a fillet/chamfer/shell crashes.
@@ -268,7 +268,7 @@ Signatures only — full reference: `get_api_reference({ category: "drawing" })`
 |----------|-------------|
 | `draw(origin?)` | Freeform 2D pen-builder (returns DrawingPen) |
 | `drawRectangle(w, h)` | Rectangle centered at origin |
-| `drawRoundedRectangle(w, h, r)` | Rounded rectangle. `r` is either a uniform number or `{ rx, ry }` for elliptical corners. Per-corner radii (`{ tl, tr, bl, br }`) are NOT supported — if you need per-corner rounding, build the outline with `draw()` + `sagittaArcTo` instead. Examples: `drawRoundedRectangle(80, 50, 5)` (uniform 5 mm) or `drawRoundedRectangle(80, 50, { rx: 8, ry: 3 })` (wider horizontal fillets). |
+| `drawRoundedRectangle(w, h, r)` | Rounded rectangle. `r` is either a uniform number or `{ rx, ry }` for elliptical corners. Per-corner radii (`{ tl, tr, bl, br }`) are NOT supported — if you need per-corner rounding, build the outline with `draw()` + `sagittaArcTo` instead. Examples: `drawRoundedRectangle(80, 50, 5)` (uniform 5 mm) or `drawRoundedRectangle(80, 50, { rx: 8, ry: 3 })` (wider horizontal fillets). The four vertical corner edges are ALREADY rounded after extrude — don't add a `.fillet(r, e => e.containsPoint([corner]))` afterward; the corner is an arc (not a straight edge at that point) so the selector matches 0 edges and warns. |
 | `drawCircle(r)` | Circle |
 | `drawEllipse(majorR, minorR)` | Ellipse (majorR along X) |
 | `drawPolysides(radius, nSides)` | Regular polygon |
@@ -664,9 +664,32 @@ The `transform` hook clones the shape before running (Replicad's translate/rotat
 - Array (auto-colored): `return [shape1, shape2];`
 - Array with metadata: `return [{ shape, name, color }, ...];`
 
+**Per-part metadata** — each entry accepts more than `shape`/`name`/`color`. Add `material` (string preset or `{density, name?}`) and/or `qty` so `get_render_status` reports mass per part in a multi-part assembly. The script-level `export const material` is global; a per-part `material` overrides it for that one part (PLA shell + TPU gasket, etc.). Re-use a part file's own material instead of hardcoding density:
+
+```typescript
+import partMain, { material as partMaterial } from "./part.shape";
+return [
+  { shape: partMain(), name: "part", color: "#8899aa", material: partMaterial }, // inherits part.shape's material
+  { shape: gasket,      name: "gasket", color: "#222",   material: "PETG" },
+  { shape: bolt,        name: "bolt",   color: "#aaa",   material: "Steel", qty: 4 },
+];
+```
+
 ### Assemblies: check for collisions
 
 For multi-part designs where parts should fit together without overlapping, call `check_collisions({ filePath })` — pairwise intersection test with AABB prefilter.
+
+**Suppress intentional overlaps** — press-fits (bearing in pocket, undersized spline bore), touching mating faces and cam/follower contacts all show up as collisions. Two knobs keep the report focused on REAL problems:
+
+- `pressFitThreshold` (default `0.5` mm³) — overlaps at or below this volume are listed in a compact "Nominal contact" section instead of the main block. Raise it (e.g. `6`) when a deliberate press-fit or contact has a larger overlap.
+- `acceptedPairs: [["a","b"], ...]` — pre-declare pairs whose overlap is EXPECTED; they collapse to one summary line. Each side accepts a `*` glob (`["bearing-*","plate"]`), and order is symmetric.
+
+```typescript
+// cam grips the spline (0.1mm interference) and touches the follower — both expected:
+check_collisions({ filePath, acceptedPairs: [["cam","servo*"], ["cam","slider"]] })
+```
+
+Both args also exist on `verify_shape` (as `acceptedPairs` / `pressFitThreshold`) and `sweep_check` (`acceptedOverlaps`).
 
 ### `preview_shape` with local imports
 
@@ -849,6 +872,16 @@ plate.cut(holes.counterbore("M3", { plateThickness: t }).translate(10, 10, t))
 
 **Positive-shape convention** (screws, nuts, bearing bodies — where "nut" is `screws.nut`/`bolts.nut`, not a separate `nuts.*` namespace) — top at Z=0, body/shaft extends into -Z.
 
+**`seatedOnPlate(fastener, plate, axis?)`** — places a freshly-built fastener so its head-top face sits flush on a chosen plate face. Reads `plate.boundingBox` to find the seating Z (or X / Y for non-Z axes); for non-Z axes the fastener is rotated to align its central axis with the target world axis BEFORE translating. The fastener is **consumed** (Replicad's destructive transforms); pass a fresh shape or `.clone()` first.
+
+```typescript
+import { seatedOnPlate, screws } from "shapeitup";
+seatedOnPlate(screws.socket("M3x10"), plate);             // default "+Z" (top face)
+seatedOnPlate(screws.socket("M3x10"), wall, "-Y");        // through the -Y face of a wall
+```
+
+`axis: "+Z"|"-Z"|"+X"|"-X"|"+Y"|"-Y"`. Plate must be a Shape3D with a non-degenerate bbox (a Drawing or zero-thickness slab throws with a readable error).
+
 **Back-face cuts** — wrap a cut tool in `fromBack()` to flip it so it opens upward from Z=0. Useful for heat-set insert pockets / through-features on the bottom face of a plate whose underside sits at Z=0:
 
 ```typescript
@@ -901,7 +934,7 @@ holes.countersink("M4", { plateThickness, fit?, axis? })  // 90° flat-head flar
 holes.tapped("M3", { depth, axis? })                      // tap-drill sized
 holes.threaded("M3", { depth, axis? })                    // FDM: threaded hole — screw self-taps into tap-drill hole (preferred over modeled threads at M2–M5)
 holes.teardrop("M3", { depth, axis?: "+X" | "+Y" })       // FDM-printable horizontal hole (own +X/+Y axis set)
-holes.keyhole({ largeD, smallD, slot, depth, axis? })     // hang-on-screw mount
+holes.keyhole({ largeD, smallD, slot, depth, axis? })     // hang-on-screw mount (CUTS a keyhole into a wall)
 holes.slot({ length, width, depth, axis? })               // elongated adjustment slot
 
 // Preferred single-call wrappers — translate + cut in one line, with a
@@ -912,7 +945,37 @@ holes.tappedAt(plate, "M3",  { at: [x, y, topZ], depth, axis? })
 holes.counterboreAt(plate, "M3", { at: [x, y, topZ], plateThickness, fit?, axis? })
 ```
 
+### mounts — POSITIVE pegboard/keyhole studs (inverse of `holes.keyhole`)
+
+For accessories that HANG ON a steel tool-wall / pegboard. `holes.keyhole` cuts
+the keyhole into the wall; `mounts.keyhole` builds the stud that hangs in it.
+The stud is built neck-base-at-origin pointing along `axis` (the direction it
+penetrates the wall); `.fuse()` it onto your part's back face.
+
+```typescript
+mounts.keyhole({ largeD, smallD, plateThickness, headThick?, headClear?, neckClear?, backGap?, axis? })
+mounts.peg({ holeD, plateThickness, clear?, backGap?, axis? })   // headless anti-rotation peg
+
+// Backplate (XZ plane, wall behind in +Y) with two studs 45 mm apart:
+let bp = drawRoundedRectangle(24, 60, 5).sketchOnPlane("XZ").extrude(6);
+bp = bp.fuse(mounts.keyhole({ largeD: 9, smallD: 4, plateThickness: 2, axis: "+Y" }))
+       .fuse(mounts.keyhole({ largeD: 9, smallD: 4, plateThickness: 2, axis: "+Y" }).translate(0, 0, 45));
+```
+
+Mating: insert the head through the wall's Ø`largeD` hole, slide DOWN one
+keyhole pitch — the neck locks in the Ø`smallD` slot, the head sits trapped
+behind the plate. Pass the SAME `largeD`/`smallD` you give `holes.keyhole`.
+
 ### Patterns — placements on any plane
+
+Signatures — `plane?: "XY"|"YZ"|"XZ"` defaults to `"XY"`. Forgetting it on a non-XY plate is the #1 friction point with patterns: placements stay in XY, cut tools end up outside the target, and the "no material removal" warning fires.
+
+```typescript
+patterns.polar(n, radius, { startAngle?, axis?: "X"|"Y"|"Z", orientOutward?, plane? })
+patterns.grid(nx, ny, dx, dy?, { plane?, origin?: [x,y,z] })       // centered on origin
+patterns.linear(n, [dx, dy, dz], { centered?, plane? })
+patterns.onPlane(placements, plane, origin?)                       // post-hoc remap
+```
 
 ```typescript
 patterns.grid(3, 4, 10)                  // 3×4, centered on origin — no `centered` flag needed
@@ -959,7 +1022,8 @@ Full parameter tables for every stdlib namespace are available via `get_api_refe
 - `bearings` — ball-bearing and linear-bearing seats + visualization bodies
 - `extrusions` — T-slot aluminum profiles (2020/3030/4040)
 - `patterns` — polar/grid/linear placement arrays; `spread`, `cutAt`, `cutTop`, `cutBottom` helpers
-- `printHints` — `elephantFootChamfer`, `overhangChamfer`, `firstLayerPad`, `flatForPrint`, `layoutOnBed`
+- `printHints` — `elephantFootChamfer`, `firstLayerPad`, `flatForPrint`, `layoutOnBed`
+- `cosmetic` — generic fillet/chamfer recipes (`softenVerticalEdges`, `softenTopEdges`, `bottomChamfer`, `softenAllEdges`, `softenCircularEdges`)
 - `pins` — `pin`, `pivot`, `teeBar` (shafts and hinge axles)
 - `cradles` — `cradle` (ball cup) and `band_post` (rubber-band anchor)
 - `standards.SPORTS_BALLS` — ITF tennis, pingpong, golf, baseball, soccer diameters

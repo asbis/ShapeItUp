@@ -21,6 +21,7 @@ import { createHash } from "node:crypto";
 import {
   BUNDLE_EXTERNALS,
   extractParamsStatic,
+  extractConfigStatic,
   initCore,
   hasSucceededBefore,
   resetWedgeTracking,
@@ -531,6 +532,15 @@ export interface EngineStatus {
    * it includes the actual values, not just the names.
    */
   declaredParams?: string[];
+  /**
+   * Static readout of the script's `export const config` declaration.
+   * Populated before execution (same as declaredParams) so the formatter
+   * can consult it even when the render fails. Consumers:
+   *   - `localFrame: true` → suppress the rotation-direction "extends
+   *     below z=0" hint, because the file defines an intermediate part in
+   *     its own local frame and is placed by a parent assembly.
+   */
+  scriptConfig?: { strict?: boolean; meshQuality?: "preview" | "final"; localFrame?: boolean };
   timings?: Record<string, number>;
   warnings?: string[];
   /**
@@ -744,11 +754,13 @@ const MESH_CACHE_MAX = 16;
  * or empty so the cache key stays stable across the undefined / empty-object
  * boundary.
  */
-export function canonicalParamsKey(params?: Record<string, number>): string {
+export function canonicalParamsKey(
+  params?: Record<string, number | boolean | string>,
+): string {
   if (!params) return "{}";
   const keys = Object.keys(params).sort();
   if (keys.length === 0) return "{}";
-  const out: Record<string, number> = {};
+  const out: Record<string, number | boolean | string> = {};
   for (const k of keys) out[k] = params[k];
   return JSON.stringify(out);
 }
@@ -996,7 +1008,7 @@ export function getLastFileName(): string | undefined {
 export async function executeShapeFile(
   filePath: string,
   globalStorageDir: string,
-  paramOverrides?: Record<string, number>,
+  paramOverrides?: Record<string, number | boolean | string>,
   /**
    * Tessellation-time policy override. Used by `export_shape` when the caller
    * asks for a BOM sidecar — BOM rows need real volume / mass, which cost the
@@ -1036,6 +1048,7 @@ export async function executeShapeFile(
   try {
     code = readFileSync(absPath, "utf-8");
     status.declaredParams = extractParamsStatic(code);
+    status.scriptConfig = extractConfigStatic(code);
   } catch (e: any) {
     status.error = `Failed to read file: ${e.message}`;
     writeStatusFile(status, globalStorageDir);
@@ -1108,6 +1121,15 @@ export async function executeShapeFile(
       `import * as __shapeitup_entry__ from ${JSON.stringify(entryImportPath)};\n` +
       `try { globalThis.__SHAPEITUP_ENTRY_MAIN__ = __shapeitup_entry__.default; } catch (e) {}\n` +
       `try { globalThis.__SHAPEITUP_ENTRY_PARAMS__ = __shapeitup_entry__.params; } catch (e) {}\n` +
+      // Material + config also need the dedicated entry binding: in a multi-file
+      // bundle a child's `export const material` can keep the bare name
+      // `material` in module scope, which the executor's ambient `typeof
+      // material` lookup would otherwise pick up — leaking the child's material
+      // onto the whole assembly (wrong BOM mass). Route them through the same
+      // sentinel-gated global as MAIN/PARAMS so the ENTRY's value always wins
+      // (even when it's undefined — i.e. the assembly declared none).
+      `try { globalThis.__SHAPEITUP_ENTRY_MATERIAL__ = __shapeitup_entry__.material; } catch (e) {}\n` +
+      `try { globalThis.__SHAPEITUP_ENTRY_CONFIG__ = __shapeitup_entry__.config; } catch (e) {}\n` +
       // Sentinel: tells the executor this marker was set by a trusted wrapper
       // (vs leaked from a prior execution in the long-lived MCP-server process).
       // The executor reads and clears it together with MAIN/PARAMS.
@@ -1143,6 +1165,12 @@ export async function executeShapeFile(
       // trailing `.ts`, common in the skill docs) resolve via esbuild's
       // module resolver and also need the loader override.
       loader: { ".shape.ts": "ts", ".shape": "ts" },
+      // Let a bare local import resolve to a sibling `.shape.ts`. Defaults come
+      // FIRST so existing behavior is unchanged (`./needle-spec` → needle-spec.ts,
+      // `./foo.shape` → foo.shape.ts via `.ts`); `.shape.ts` / `.shape` are
+      // appended as fallbacks so `import { makeBed } from "./needle-bed"`
+      // resolves to `needle-bed.shape.ts` too — one import rule, not two.
+      resolveExtensions: [".tsx", ".ts", ".jsx", ".js", ".shape.ts", ".shape", ".css", ".json"],
       // Inline sourcemap (base64 data URL appended as
       // `//# sourceMappingURL=data:...`). V8 reads it automatically when the
       // `sourceURL` directive is present. No extra runtime deps — the
@@ -1385,6 +1413,12 @@ export async function executeShapeFile(
       // that read the status file shouldn't have to choose between the two
       // sources depending on the success bit.
       declaredParams: status.declaredParams,
+      // Preserve the statically-extracted `export const config` (strict,
+      // meshQuality, localFrame) on the success status so formatStatusText
+      // can consult it — e.g. to suppress the "extends below z=0"
+      // rotation-direction hint on intermediate parts authored in their own
+      // local frame.
+      scriptConfig: status.scriptConfig,
       timings: result.timings,
       // Merge runtime warnings from core.execute with any bundle-phase
       // warnings (preflight + esbuild) accumulated in `status.warnings`.
@@ -1759,6 +1793,33 @@ function minTriangleEdgeMm(
   return Math.sqrt(minSqFeature);
 }
 
+/**
+ * Generic default part names that are NOT distinctive identifiers. A
+ * single-part `return shape;` lands as the name "shape", which also appears as
+ * a plain English word inside generic geometry hints (e.g. the sketchOnPlane
+ * bbox warning: `...extrude(7): shape bounding box will be Y ∈ [-7, 0]`). The
+ * old `w.includes(p.name)` attribution then mis-filed that placement hint as a
+ * printability *issue*, which flagged the part and surfaced a spurious
+ * "minFeature 0.00 mm" concern on export. Skip attribution for these.
+ */
+const GENERIC_PART_NAMES = new Set(["shape", "part", "solid", "result", "model"]);
+
+/** Escape a string for safe use inside a RegExp (part names may contain `.`, `-`, etc.). */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * True only when warning `w` references part `name` as a distinct, word-bounded
+ * token — not a bare substring. Guards against generic-word collisions ("shape"
+ * inside "shape bounding box", "bin" inside "binding"). Generic default names
+ * are never treated as part references.
+ */
+export function warningNamesPart(w: string, name: string | undefined): boolean {
+  if (!name || GENERIC_PART_NAMES.has(name)) return false;
+  return new RegExp(`\\b${escapeRegExp(name)}\\b`).test(w);
+}
+
 function aggregateProperties(
   parts: ExecutedPart[],
   opts?: { geometryValid?: boolean; runtimeWarnings?: string[] },
@@ -1840,7 +1901,7 @@ function aggregateProperties(
     // hints the user already sees in the top-level warnings block.
     for (const w of runtimeWarnings) {
       if (typeof w !== "string") continue;
-      const mentionsPart = p.name && w.includes(p.name);
+      const mentionsPart = warningNamesPart(w, p.name);
       const mentionsThreads = w.includes("threads.");
       if (mentionsPart || mentionsThreads) {
         issues.push(w);
@@ -2118,6 +2179,16 @@ export function inferErrorHint(
       return `\`.sketchOnPlane\` is not a method on a DrawingPen — you need to close the pen chain first. Add \`.close()\` (for a closed profile) or \`.done()\` (for an open path) before \`.sketchOnPlane()\`: e.g. \`draw().hLine(20).vLine(10).hLine(-20).close().sketchOnPlane("XY")\`.`;
     }
     return `\`.sketchOnPlane\` is not a method on this receiver. Likely causes: (1) you wrote \`draw().hLine(...).vLine(...).sketchOnPlane(...)\` without closing — add \`.close()\` or \`.done()\` before \`.sketchOnPlane()\`; (2) you wrote \`sketchCircle(r).sketchOnPlane(...)\` — sketch* functions already return a Sketch, so drop the redundant \`.sketchOnPlane()\` call or pass the plane as a config arg (e.g. \`sketchCircle(r, { plane: "XY" })\`). Check which applies.`;
+  }
+
+  // `reading 'getPath'` — drawText() needs a font, and this build's worker
+  // has no font loaded, so replicad's text-path builder dereferences an
+  // undefined font object (`font.getPath(...)`). This is NOT a standards-lookup
+  // typo or a divide-by-zero — the generic "reading 'X'" hint below would be
+  // actively misleading (getPath passes its looksLikeLookup filter). Catch it
+  // first and name the real cause.
+  if (/reading ['"]getPath['"]/i.test(msg)) {
+    return `drawText failed because no font is loaded in this build: text rendering needs a font, and the worker has none, so replicad's path builder hit \`undefined.getPath(...)\`. Avoid drawText here — emboss labels with geometry instead (e.g. cut or raise small rectangles / tally marks for identifiers).`;
   }
 
   // Bug #4 fallout (standards typo). The Proxy guard in standards.ts now

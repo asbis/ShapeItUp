@@ -803,6 +803,198 @@ function formatSystematicGroupLines(g: SystematicGroup): string[] {
 }
 
 /**
+ * Cross-prefix systematic group — N≥3 pairs where the `a` side shares one
+ * prefix and the `b` side shares a DIFFERENT prefix, with identical overlap
+ * volume + per-axis depth across all pairs. Complements {@link SystematicGroup}
+ * (same-prefix), catching the "two linear patterns don't line up" class.
+ *
+ * Canonical repro from the knitting-printer v8 session: `needle-1` collides
+ * with `solenoid-20`, `needle-2` with `solenoid-19`, … `needle-20` with
+ * `solenoid-1` — 20 pairs, same overlap volume each, because the needle bed
+ * and solenoid bank were pitched on the same 9 mm spacing but the bank was
+ * rotated 180° so each needle ran into its mirror-indexed solenoid. The same
+ * single hint would've named the root cause in one line.
+ */
+type CrossPrefixGroup = {
+  prefixA: string;
+  prefixB: string;
+  count: number;
+  volume: number;
+  depths: { x: number; y: number; z: number };
+  dominantAxis: "X" | "Y" | "Z";
+  dominantDepth: number;
+  memberIndices: number[];
+};
+
+function groupCrossPrefixRecords(
+  real: CollisionRecord[],
+  excluded: Set<number>,
+): { groups: CrossPrefixGroup[]; groupedIndices: Set<number> } {
+  const groups: CrossPrefixGroup[] = [];
+  const groupedIndices = new Set<number>();
+  if (real.length < 3) return { groups, groupedIndices };
+
+  for (let i = 0; i < real.length; i++) {
+    if (excluded.has(i) || groupedIndices.has(i)) continue;
+    const seed = real[i];
+    if (!seed.region) continue;
+    const pA = stripIndexSuffix(seed.a);
+    const pB = stripIndexSuffix(seed.b);
+    // Distinct prefixes — this is the cross-prefix branch. Same-prefix pairs
+    // are handled by groupSystematicRecords.
+    if (pA === pB) continue;
+    // Require BOTH sides to be clearly an indexed instance. If either side
+    // came back unchanged from stripIndexSuffix, that side is a singleton
+    // (e.g. `base-chassis`) and we're in the one-to-many pattern, not the
+    // many-to-many pattern. Handle that case separately.
+    const aWasIndexed = seed.a !== pA;
+    const bWasIndexed = seed.b !== pB;
+    if (!aWasIndexed || !bWasIndexed) continue;
+
+    const bucket: number[] = [i];
+    for (let j = i + 1; j < real.length; j++) {
+      if (excluded.has(j) || groupedIndices.has(j)) continue;
+      const cand = real[j];
+      if (!cand.region) continue;
+      const cA = stripIndexSuffix(cand.a);
+      const cB = stripIndexSuffix(cand.b);
+      // Allow either order — (cA, cB) or (cB, cA) matches the seed.
+      const matchAB = cA === pA && cB === pB;
+      const matchBA = cA === pB && cB === pA;
+      if (!matchAB && !matchBA) continue;
+      if (cand.a === stripIndexSuffix(cand.a) || cand.b === stripIndexSuffix(cand.b)) continue;
+      if (!withinOnePercent(cand.volume, seed.volume)) continue;
+      if (!withinOnePercent(cand.region.depths.x, seed.region.depths.x)) continue;
+      if (!withinOnePercent(cand.region.depths.y, seed.region.depths.y)) continue;
+      if (!withinOnePercent(cand.region.depths.z, seed.region.depths.z)) continue;
+      bucket.push(j);
+    }
+
+    if (bucket.length < 3) continue;
+    const d = seed.region.depths;
+    let dominantAxis: "X" | "Y" | "Z" = "X";
+    let dominantDepth = d.x;
+    if (d.y > dominantDepth) { dominantAxis = "Y"; dominantDepth = d.y; }
+    if (d.z > dominantDepth) { dominantAxis = "Z"; dominantDepth = d.z; }
+
+    groups.push({
+      prefixA: pA,
+      prefixB: pB,
+      count: bucket.length,
+      volume: seed.volume,
+      depths: { ...d },
+      dominantAxis,
+      dominantDepth,
+      memberIndices: bucket,
+    });
+    for (const idx of bucket) groupedIndices.add(idx);
+  }
+  return { groups, groupedIndices };
+}
+
+function formatCrossPrefixGroupLines(g: CrossPrefixGroup): string[] {
+  return [
+    `  - Cross-pattern overlap: ${g.count} ${g.prefixA}-* \u2194 ${g.prefixB}-* pairs, each ${fmtNum(g.volume)} mm\u00b3, ` +
+      `overlap depth X=${fmtNum(g.depths.x)}mm Y=${fmtNum(g.depths.y)}mm Z=${fmtNum(g.depths.z)}mm (dominant axis: ${g.dominantAxis}).`,
+    `    Design-class hint: identical overlap across ${g.count} cross-pattern pairs "${g.prefixA}-*" \u2194 "${g.prefixB}-*" points to ` +
+      `two linear / grid patterns that share an axis but are misaligned on ${g.dominantAxis} by ${fmtNum(g.dominantDepth)}mm. ` +
+      `Fix by translating the ${g.prefixB} pattern by \u00b1${fmtNum(g.dominantDepth)}mm on ${g.dominantAxis}, flipping one pattern's indexing, or nudging ${g.prefixA}/${g.prefixB} pitch apart.`,
+  ];
+}
+
+/**
+ * One-to-many systematic group — one SINGLE part on the `a` side colliding
+ * with N≥3 instances of a `b` prefix with identical overlap. Catches the
+ * "N parts in a grid all dip into the same shared surface" class.
+ *
+ * Typical repro: a chassis plate colliding with every solenoid bracket foot
+ * because the foot heights weren't lifted, or a cam rail colliding with
+ * every needle butt because the rail Z sits 1 mm too low.
+ */
+type OneToManyGroup = {
+  singleton: string;
+  prefix: string;
+  count: number;
+  volume: number;
+  depths: { x: number; y: number; z: number };
+  dominantAxis: "X" | "Y" | "Z";
+  dominantDepth: number;
+  memberIndices: number[];
+};
+
+function groupOneToManyRecords(
+  real: CollisionRecord[],
+  excluded: Set<number>,
+): { groups: OneToManyGroup[]; groupedIndices: Set<number> } {
+  const groups: OneToManyGroup[] = [];
+  const groupedIndices = new Set<number>();
+  if (real.length < 3) return { groups, groupedIndices };
+
+  for (let i = 0; i < real.length; i++) {
+    if (excluded.has(i) || groupedIndices.has(i)) continue;
+    const seed = real[i];
+    if (!seed.region) continue;
+    // Identify which side is the singleton (not an indexed instance) and
+    // which is the indexed prefix. Exactly one must be true for each side.
+    const aIndexed = seed.a !== stripIndexSuffix(seed.a);
+    const bIndexed = seed.b !== stripIndexSuffix(seed.b);
+    if (aIndexed === bIndexed) continue;
+    const singleton = aIndexed ? seed.b : seed.a;
+    const indexedPrefix = aIndexed ? stripIndexSuffix(seed.a) : stripIndexSuffix(seed.b);
+
+    const bucket: number[] = [i];
+    for (let j = i + 1; j < real.length; j++) {
+      if (excluded.has(j) || groupedIndices.has(j)) continue;
+      const cand = real[j];
+      if (!cand.region) continue;
+      const candASingle = cand.a === singleton;
+      const candBSingle = cand.b === singleton;
+      if (!candASingle && !candBSingle) continue;
+      const other = candASingle ? cand.b : cand.a;
+      const otherPrefix = stripIndexSuffix(other);
+      if (otherPrefix !== indexedPrefix) continue;
+      if (other === otherPrefix) continue; // other side must be an indexed instance
+      if (!withinOnePercent(cand.volume, seed.volume)) continue;
+      if (!withinOnePercent(cand.region.depths.x, seed.region.depths.x)) continue;
+      if (!withinOnePercent(cand.region.depths.y, seed.region.depths.y)) continue;
+      if (!withinOnePercent(cand.region.depths.z, seed.region.depths.z)) continue;
+      bucket.push(j);
+    }
+
+    if (bucket.length < 3) continue;
+    const d = seed.region.depths;
+    let dominantAxis: "X" | "Y" | "Z" = "X";
+    let dominantDepth = d.x;
+    if (d.y > dominantDepth) { dominantAxis = "Y"; dominantDepth = d.y; }
+    if (d.z > dominantDepth) { dominantAxis = "Z"; dominantDepth = d.z; }
+
+    groups.push({
+      singleton,
+      prefix: indexedPrefix,
+      count: bucket.length,
+      volume: seed.volume,
+      depths: { ...d },
+      dominantAxis,
+      dominantDepth,
+      memberIndices: bucket,
+    });
+    for (const idx of bucket) groupedIndices.add(idx);
+  }
+  return { groups, groupedIndices };
+}
+
+function formatOneToManyGroupLines(g: OneToManyGroup): string[] {
+  return [
+    `  - Shared-surface overlap: ${g.singleton} \u2194 ${g.count} ${g.prefix}-* parts, each ${fmtNum(g.volume)} mm\u00b3, ` +
+      `overlap depth X=${fmtNum(g.depths.x)}mm Y=${fmtNum(g.depths.y)}mm Z=${fmtNum(g.depths.z)}mm (dominant axis: ${g.dominantAxis}).`,
+    `    Design-class hint: every ${g.prefix}-* instance dips into ${g.singleton} by the same ${fmtNum(g.dominantDepth)}mm on ${g.dominantAxis} — ` +
+      `the whole ${g.prefix} array is offset, not just one instance. ` +
+      `Fix by translating the ${g.prefix} pattern by \u00b1${fmtNum(g.dominantDepth)}mm on ${g.dominantAxis}, ` +
+      `or raising ${g.singleton} on the same axis by the same amount.`,
+  ];
+}
+
+/**
  * Render the `CollisionReport` to the same text payload `check_collisions`
  * produced before the refactor.
  */
@@ -835,10 +1027,27 @@ export function formatCollisionReport(report: CollisionReport): string {
 
     if (report.real.length > 0) {
       const lines: string[] = [];
-      const { groups, groupedIndices } = groupSystematicRecords(report.real);
-      for (const g of groups) lines.push(...formatSystematicGroupLines(g));
+      // Three-layer clustering: same-prefix pitch mismatch, cross-prefix
+      // two-pattern misalignment, then one-to-many shared-surface. Each
+      // layer excludes what the previous one already grouped, so every
+      // pair surfaces at most once.
+      const same = groupSystematicRecords(report.real);
+      const cross = groupCrossPrefixRecords(report.real, same.groupedIndices);
+      const excludedAfterCross = new Set<number>([
+        ...same.groupedIndices,
+        ...cross.groupedIndices,
+      ]);
+      const oneToMany = groupOneToManyRecords(report.real, excludedAfterCross);
+      for (const g of same.groups) lines.push(...formatSystematicGroupLines(g));
+      for (const g of cross.groups) lines.push(...formatCrossPrefixGroupLines(g));
+      for (const g of oneToMany.groups) lines.push(...formatOneToManyGroupLines(g));
+      const allGroupedIndices = new Set<number>([
+        ...same.groupedIndices,
+        ...cross.groupedIndices,
+        ...oneToMany.groupedIndices,
+      ]);
       for (let idx = 0; idx < report.real.length; idx++) {
-        if (groupedIndices.has(idx)) continue;
+        if (allGroupedIndices.has(idx)) continue;
         const c = report.real[idx];
         lines.push(`  - ${c.a} \u2194 ${c.b}: ${fmtNum(c.volume)} mm\u00b3 overlap`);
         if (c.region) {

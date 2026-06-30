@@ -1,8 +1,14 @@
 {
   "mcpServers": {
     "shapeitup": {
-      "command": "node",
-      "args": ["./packages/mcp-server/dist/index.js"]
+      "command": "bunx",
+      "args": [
+        "mcpmon",
+        "--watch", "packages/mcp-server/dist",
+        "--ext", "js",
+        "--",
+        "node", "./packages/mcp-server/dist/index.js"
+      ]
     }
   }
 }

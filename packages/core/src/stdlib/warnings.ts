@@ -155,12 +155,18 @@ export function emitExtrudePlaneHint(
   const flippedLength = -length;
 
   extrudePlaneHintFired = true;
+  // placeOn is the preferred fix (explicit half-space, fails loudly at call
+  // time on a sign mismatch) — listed first so the user's eye lands on it
+  // when the warning appears 60× in a single complex-assembly render.
+  // The mechanical translate / extrude-sign alternatives follow for cases
+  // where the shape has already been built and only the placement needs a
+  // patch.
   return (
     `sketchOnPlane('${plane}').extrude(${length}): shape bounding box will be ` +
     `${entry.axis} ∈ [${lo}, ${hi}]. ` +
-    `Option 1: .translate(${dx},${dy},${dz}) to center on origin. ` +
-    `Option 2: .extrude(${flippedLength}) to flip toward ${flippedAxisLabel}. ` +
-    `Option 3: placeOn(drawing, '${plane}', { into: '${flippedAxisLabel}', distance: ${mag} }) for explicit half-space control.`
+    `Fix (preferred): placeOn(drawing, '${plane}', { into: '${flippedAxisLabel}', distance: ${mag} }) — explicit half-space, no sign guessing. ` +
+    `Or: .extrude(${flippedLength}) to flip toward ${flippedAxisLabel}. ` +
+    `Or: .translate(${dx},${dy},${dz}) to center on origin.`
   );
 }
 

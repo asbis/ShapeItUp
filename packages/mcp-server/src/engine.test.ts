@@ -17,6 +17,7 @@ import {
   scanImportBindings,
   anyLocalImportExportsParams,
   collectBundleInputsRecursive,
+  warningNamesPart,
   type EngineStatus,
   type BundleCacheEntry,
 } from "./engine.js";
@@ -288,6 +289,28 @@ export default function main() {
     );
     expect(hint).toBeDefined();
     expect(hint).toMatch(/sketchCircle/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// drawText missing-font — `Cannot read properties of undefined (reading
+// 'getPath')`. drawText needs a font the worker doesn't load, so replicad's
+// text-path builder dereferences an undefined font. `getPath` passes the
+// generic looksLikeLookup filter, so without a dedicated rule the standards-
+// typo hint fires and is actively misleading. The dedicated rule must win.
+// ---------------------------------------------------------------------------
+describe("inferErrorHint — drawText missing-font (getPath)", () => {
+  it("names the missing font, not a standards typo, for reading 'getPath'", () => {
+    const hint = inferErrorHint(
+      `TypeError: Cannot read properties of undefined (reading 'getPath')`,
+      undefined,
+      undefined,
+    );
+    expect(hint).toBeDefined();
+    expect(hint).toMatch(/drawText/i);
+    expect(hint).toMatch(/font/i);
+    // Must NOT fire the misleading standards-lookup / divide-by-zero hint.
+    expect(hint).not.toMatch(/standards lookup|pilotDia|divided by zero/i);
   });
 });
 
@@ -1015,6 +1038,127 @@ describe("executeShapeFile — multifile params import (regression for issue #3)
         expect(status.warnings ?? []).toEqual(
           expect.arrayContaining([expect.stringMatching(/Importing 'params'/)]),
         );
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// F4 — a bare local import (no `.shape` suffix) must resolve to a sibling
+// `.shape.ts`. Previously `./needle-spec` (a plain .ts) resolved but
+// `./needle-bed` (a .shape.ts) did NOT — two import rules in one folder.
+// resolveExtensions now appends `.shape.ts` / `.shape` as fallbacks.
+// ---------------------------------------------------------------------------
+describe("executeShapeFile — bare sibling import resolves to .shape.ts (F4)", () => {
+  it(
+    "resolves `import ... from './helper'` to helper.shape.ts (no .shape suffix)",
+    async () => {
+      const workdir = mkdtempSync(join(tmpdir(), "siu-bareimport-"));
+      const storage = mkdtempSync(join(tmpdir(), "siu-bareimport-storage-"));
+      try {
+        writeFileSync(
+          join(workdir, "helper.shape.ts"),
+          [
+            `import { drawRectangle } from "replicad";`,
+            `export function makeBox() {`,
+            `  return drawRectangle(10, 10).sketchOnPlane("XY").extrude(5);`,
+            `}`,
+          ].join("\n"),
+        );
+        const entryPath = join(workdir, "entry.shape.ts");
+        writeFileSync(
+          entryPath,
+          [
+            // bare specifier, no `.shape` suffix — must resolve to helper.shape.ts
+            `import { makeBox } from "./helper";`,
+            `export default function main() { return makeBox(); }`,
+          ].join("\n"),
+        );
+        const { status } = await executeShapeFile(entryPath, storage);
+        expect(status.error).toBeUndefined();
+        expect(status.success).toBe(true);
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// F6 — a bundled child's `export const material` must NOT leak onto an
+// assembly that declares no material of its own. Before the fix, the executor's
+// ambient `typeof material` lookup picked up a child binding esbuild kept named
+// `material`, so every part got costed with the child's material (wrong BOM
+// mass). material/config now flow through the same entry marker as main/params.
+// ---------------------------------------------------------------------------
+describe("executeShapeFile — entry material wins over bundled child (F6 leak)", () => {
+  it(
+    "does NOT inherit a child's `export const material` when the entry declares none",
+    async () => {
+      const workdir = mkdtempSync(join(tmpdir(), "siu-matleak-"));
+      const storage = mkdtempSync(join(tmpdir(), "siu-matleak-storage-"));
+      try {
+        writeFileSync(
+          join(workdir, "child.shape.ts"),
+          [
+            `import { drawRectangle } from "replicad";`,
+            `export const material = "PETG";`,
+            `export function makeBox() {`,
+            `  return drawRectangle(10, 10).sketchOnPlane("XY").extrude(5);`,
+            `}`,
+          ].join("\n"),
+        );
+        const entryPath = join(workdir, "entry.shape.ts");
+        writeFileSync(
+          entryPath,
+          [
+            // entry imports the child but declares NO material of its own
+            `import { makeBox } from "./child.shape";`,
+            `export default function main() {`,
+            `  return [{ shape: makeBox(), name: "box", color: "#888" }];`,
+            `}`,
+          ].join("\n"),
+        );
+        const { status } = await executeShapeFile(entryPath, storage);
+        expect(status.error).toBeUndefined();
+        expect(status.success).toBe(true);
+        // The child's PETG must NOT leak onto the assembly.
+        expect((status as any).material).toBeUndefined();
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  it(
+    "still honors the ENTRY's own `export const material`",
+    async () => {
+      const workdir = mkdtempSync(join(tmpdir(), "siu-matentry-"));
+      const storage = mkdtempSync(join(tmpdir(), "siu-matentry-storage-"));
+      try {
+        const entryPath = join(workdir, "entry.shape.ts");
+        writeFileSync(
+          entryPath,
+          [
+            `import { drawRectangle } from "replicad";`,
+            `export const material = "Steel";`,
+            `export default function main() {`,
+            `  return drawRectangle(10, 10).sketchOnPlane("XY").extrude(5);`,
+            `}`,
+          ].join("\n"),
+        );
+        const { status } = await executeShapeFile(entryPath, storage);
+        expect(status.error).toBeUndefined();
+        expect(status.success).toBe(true);
+        expect((status as any).material?.name).toBe("Steel");
       } finally {
         rmSync(workdir, { recursive: true, force: true });
         rmSync(storage, { recursive: true, force: true });
@@ -1824,5 +1968,47 @@ describe("inferErrorHint — 'X is not defined' enrichment (Fix 5)", () => {
     );
     expect(hint).toBeDefined();
     expect(hint).toMatch(/not defined/i);
+  });
+});
+
+describe("warningNamesPart — part-name attribution (printability mis-flag fix)", () => {
+  // Root cause: a single-part `return shape;` is named "shape", and the
+  // generic sketchOnPlane bbox hint contains the English word "shape"
+  // ("...extrude(7): shape bounding box will be Y ∈ [-7, 0]"). The old
+  // `w.includes(p.name)` then mis-filed that placement hint as a printability
+  // issue, which surfaced a spurious "minFeature 0.00 mm" concern on export.
+  const bboxHint =
+    "sketchOnPlane('XZ').extrude(7): shape bounding box will be Y ∈ [-7, 0].";
+
+  it("does NOT attribute the generic bbox hint to a default-named 'shape' part", () => {
+    expect(warningNamesPart(bboxHint, "shape")).toBe(false);
+  });
+
+  it("ignores all generic default names", () => {
+    for (const name of ["shape", "part", "solid", "result", "model"]) {
+      expect(warningNamesPart(`the ${name} bounding box is off`, name)).toBe(false);
+    }
+  });
+
+  it("still attributes a warning that names a distinctive part", () => {
+    expect(warningNamesPart("part 'needle-bed' is non-manifold", "needle-bed")).toBe(true);
+    expect(warningNamesPart("bearing 608 press-fit is tight", "608")).toBe(true);
+  });
+
+  it("requires a word boundary — no substring collisions", () => {
+    // "bin" must not match inside "binding"; the bbox hint must not match a
+    // part literally named "bounding".
+    expect(warningNamesPart("the binding torque is high", "bin")).toBe(false);
+    expect(warningNamesPart("bin 'bin' overflow", "bin")).toBe(true);
+  });
+
+  it("handles regex-special characters in part names", () => {
+    expect(warningNamesPart("part 'M3.5-stud' too thin", "M3.5-stud")).toBe(true);
+    expect(warningNamesPart("unrelated message", "M3.5-stud")).toBe(false);
+  });
+
+  it("returns false for empty/undefined names", () => {
+    expect(warningNamesPart(bboxHint, undefined)).toBe(false);
+    expect(warningNamesPart(bboxHint, "")).toBe(false);
   });
 });

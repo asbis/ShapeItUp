@@ -1,10 +1,13 @@
 import { describe, it, expect } from "vitest";
 import {
+  MATERIAL_PRESETS,
   normalizeParts,
+  resolveMaterial,
   tessellatePart,
   type MeshQuality,
   type PartInput,
 } from "./tessellate";
+import { drainRuntimeWarnings, resetRuntimeWarnings } from "./stdlib/warnings";
 
 // ---------------------------------------------------------------------------
 // P3-10 — meshQuality option.
@@ -130,5 +133,138 @@ describe("analyze flag — pipeline propagation", () => {
     const part: PartInput = { shape, name: "bracket", color: null };
     const out = tessellatePart(part);
     expect(out.analyze).toBeUndefined();
+  });
+});
+
+describe("joints — pipeline propagation", () => {
+  it("normalizeParts preserves a well-formed joints map", () => {
+    const shape = makeMockShape(10);
+    const out = normalizeParts([{
+      shape,
+      name: "plate",
+      color: null,
+      joints: {
+        mount: { position: [0, 0, 5], axis: [0, 0, 1], role: "face" },
+      },
+    }]);
+    expect(out[0].joints).toBeDefined();
+    expect(out[0].joints!.mount.position).toEqual([0, 0, 5]);
+    expect(out[0].joints!.mount.role).toBe("face");
+  });
+
+  it("normalizeParts drops malformed joint entries silently", () => {
+    const shape = makeMockShape(10);
+    const out = normalizeParts([{
+      shape,
+      name: "p",
+      color: null,
+      joints: {
+        good: { position: [1, 2, 3], axis: [0, 0, 1] },
+        // axis missing — skipped
+        bad: { position: [0, 0, 0] } as any,
+        // position has NaN — skipped
+        worse: { position: [NaN, 0, 0], axis: [0, 0, 1] },
+      },
+    }]);
+    expect(Object.keys(out[0].joints ?? {})).toEqual(["good"]);
+  });
+
+  it("normalizeParts omits joints field when none declared", () => {
+    const shape = makeMockShape(10);
+    const out = normalizeParts([{ shape, name: "p", color: null }]);
+    expect(out[0].joints).toBeUndefined();
+  });
+
+  it("tessellatePart carries joints through to TessellatedPart", () => {
+    const shape = makeMockShape(10);
+    const part: PartInput = {
+      shape, name: "p", color: null,
+      joints: { mount: { position: [0, 0, 5], axis: [0, 0, 1] } },
+    };
+    const out = tessellatePart(part);
+    expect(out.joints).toBeDefined();
+    expect(out.joints!.mount.position).toEqual([0, 0, 5]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-part material resolution — strings + objects both flow through the
+// shared resolver. Backs the BOM fix: assemblies can now write
+// `{ shape, name, material: "Aluminum" }` (string preset) without computing
+// densities by hand, matching the script-level `export const material = "X"`.
+// ---------------------------------------------------------------------------
+describe("resolveMaterial — shared preset resolver", () => {
+  it("string preset matching a known density resolves to {density, name}", () => {
+    const r = resolveMaterial("Aluminum");
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.material).toEqual({ density: MATERIAL_PRESETS.Aluminum, name: "Aluminum" });
+    }
+  });
+  it("unknown preset flagged with the given string for the caller's warning", () => {
+    const r = resolveMaterial("Unobtanium");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r).toEqual({ ok: false, reason: "unknown-preset", given: "Unobtanium" });
+  });
+  it("raw object with positive finite density passes through unchanged", () => {
+    const r = resolveMaterial({ density: 1.5, name: "custom" });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.material).toEqual({ density: 1.5, name: "custom" });
+  });
+  it("null / undefined / missing → ok:true with material: undefined (absent)", () => {
+    for (const raw of [null, undefined]) {
+      const r = resolveMaterial(raw);
+      expect(r.ok).toBe(true);
+      if (r.ok) expect(r.material).toBeUndefined();
+    }
+  });
+  it("malformed object (NaN density, missing density) → invalid", () => {
+    for (const raw of [{ density: NaN }, { density: 0 }, { density: -1 }, { density: "1" }, {}]) {
+      const r = resolveMaterial(raw);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.reason).toBe("invalid");
+    }
+  });
+});
+
+describe("normalizeParts — per-part material (string + object)", () => {
+  it("accepts a string preset on a part entry and resolves to {density, name}", () => {
+    resetRuntimeWarnings();
+    const shape = makeMockShape(10);
+    const out = normalizeParts([{ shape, name: "frame", color: null, material: "Aluminum" }]);
+    expect(out[0].material).toEqual({ density: MATERIAL_PRESETS.Aluminum, name: "Aluminum" });
+    expect(drainRuntimeWarnings()).toEqual([]);
+  });
+  it("accepts an object material as before (no warning, no resolution change)", () => {
+    resetRuntimeWarnings();
+    const shape = makeMockShape(10);
+    const out = normalizeParts([
+      { shape, name: "gasket", color: null, material: { density: 1.2, name: "TPU" } },
+    ]);
+    expect(out[0].material).toEqual({ density: 1.2, name: "TPU" });
+    expect(drainRuntimeWarnings()).toEqual([]);
+  });
+  it("unknown string preset on a part pushes a runtime warning naming the part + presets", () => {
+    resetRuntimeWarnings();
+    const shape = makeMockShape(10);
+    const out = normalizeParts([{ shape, name: "mystery", color: null, material: "Unobtanium" }]);
+    expect(out[0].material).toBeUndefined();
+    const warnings = drainRuntimeWarnings();
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]).toContain("Unknown material preset 'Unobtanium'");
+    expect(warnings[0]).toContain("mystery");
+  });
+  it("mixed assembly: a TPU gasket entry overrides the script-level material", () => {
+    // This is the multi-material scenario: assembly default is one material,
+    // one part overrides via per-part material. The BOM consumer then reads
+    // p.material (per-part) before falling back to status.material (script).
+    resetRuntimeWarnings();
+    const shape = makeMockShape(10);
+    const out = normalizeParts([
+      { shape, name: "shell", color: null }, // inherits script-level
+      { shape, name: "gasket", color: null, material: "TPU" === "TPU" ? "PETG" : "" },
+    ]);
+    expect(out[0].material).toBeUndefined();
+    expect(out[1].material).toEqual({ density: MATERIAL_PRESETS.PETG, name: "PETG" });
   });
 });

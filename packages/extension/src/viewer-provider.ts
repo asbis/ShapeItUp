@@ -1030,6 +1030,11 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           `import * as __shapeitup_entry__ from ${JSON.stringify(entryImportPath)};\n` +
           `try { globalThis.__SHAPEITUP_ENTRY_MAIN__ = __shapeitup_entry__.default; } catch (e) {}\n` +
           `try { globalThis.__SHAPEITUP_ENTRY_PARAMS__ = __shapeitup_entry__.params; } catch (e) {}\n` +
+          // See engine.ts: route material/config through the same entry marker
+          // so a bundled child's `export const material` can't leak onto the
+          // assembly (wrong BOM mass in the viewer's per-part stats).
+          `try { globalThis.__SHAPEITUP_ENTRY_MATERIAL__ = __shapeitup_entry__.material; } catch (e) {}\n` +
+          `try { globalThis.__SHAPEITUP_ENTRY_CONFIG__ = __shapeitup_entry__.config; } catch (e) {}\n` +
           `try { globalThis.__SHAPEITUP_ENTRY_SENTINEL__ = true; } catch (e) {}\n` +
           `export default __shapeitup_entry__.default;\n` +
           `export const params = __shapeitup_entry__.params;\n` +

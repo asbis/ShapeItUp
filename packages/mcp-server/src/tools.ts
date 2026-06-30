@@ -28,6 +28,7 @@ import {
   extractGeometry,
   extractCollisions,
   extractJoints,
+  formatJointReport,
   matchesAnyAcceptedPair,
   type GeometryFormat,
   type GeometryFacesFilter,
@@ -764,7 +765,72 @@ function dedupLines(lines: string[]): string[] {
   });
 }
 
-function formatStatusText(status: EngineStatus, verbosity: "summary" | "full" = "summary"): string {
+/**
+ * Build the "workspace mismatch" warning for create_shape when a RELATIVE
+ * `directory` was routed to a VSCode workspace root that is not the shell cwd.
+ * Pure + exported for unit-testing. `relDirPreexisted` MUST be sampled BEFORE
+ * the directory is created (otherwise the freshly-made dir hides the mismatch).
+ */
+export function workspaceMismatchWarning(opts: {
+  directory?: string;
+  relDirPreexisted: boolean;
+  wsRoots: string[];
+  dirMatchesCwd: boolean;
+  cwd: string;
+  filePath: string;
+}): string {
+  const { directory, relDirPreexisted, wsRoots, dirMatchesCwd, cwd, filePath } = opts;
+  if (!directory || isAbsolute(directory)) return "";
+  if (relDirPreexisted || wsRoots.length === 0 || dirMatchesCwd) return "";
+  return (
+    `\n⚠ Workspace mismatch: no open VSCode workspace contained a pre-existing '${directory}' directory, so the resolver fell back to the first workspace root — which is NOT your shell cwd.\n` +
+    `  chosen workspace: ${wsRoots[0]}\n` +
+    `  shell cwd:        ${cwd}\n` +
+    `  final path:       ${filePath}\n` +
+    `If that wasn't your intent, pass an absolute 'directory' or set 'directory: "."' to anchor to shell cwd.`
+  );
+}
+
+/**
+ * Decide whether a single part's dip below z=0 is a rotation/pivot mistake
+ * worth warning about, vs. a legitimate convention. Pure + exported so the
+ * exact gating is unit-testable without a full EngineStatus.
+ *
+ * Cry-wolf history: this fired on parts that merely have a small feature
+ * poking below z=0 — e.g. a wall-mounted bracket whose keyhole-stud head (a
+ * Ø8.5 cylinder) dips 1.3 mm below the origin on a 57 mm-tall part. z=0 isn't a
+ * print bed for such parts. We now also require the dip to be a MEANINGFUL
+ * FRACTION of the part's height; a tiny incidental feature is suppressed while
+ * a genuinely mis-rotated part (large fraction below) still warns.
+ */
+const BELOW_BED_MIN_FRACTION = 0.1; // dip must be ≥10% of part height to warn
+
+export function partExtendsBelowBed(opts: {
+  minZ?: number;
+  maxZ?: number;
+  comZ?: number;
+  localFrame?: boolean;
+}): boolean {
+  const { minZ, maxZ, comZ, localFrame } = opts;
+  if (localFrame === true) return false;
+  if (typeof minZ !== "number" || typeof maxZ !== "number") return false;
+  // "Suspended above Z=0" convention: top edge at/above the origin → hung part.
+  if (maxZ <= 1) return false;
+  // Centre of mass below Z=0 → the part clearly lives there on purpose.
+  if (typeof comZ === "number" && comZ < 0) return false;
+  // Symmetric-about-zero (horizontal shaft/cylinder centred on z=0): the ±r
+  // excursion is required geometry, not a fall-through.
+  if (maxZ > 0 && minZ < 0 && Math.abs(maxZ + minZ) < 0.5 * (maxZ - minZ)) return false;
+  // Tiny incidental dips and large intentional excursions are both not bugs.
+  if (!(minZ < -0.05 && minZ > -5)) return false;
+  // NEW: require the dip to be a meaningful fraction of the part height. A
+  // 1.3 mm dip on a 57 mm part (2.3%) is an incidental feature, not a flip.
+  const height = maxZ - minZ;
+  if (height > 0 && -minZ < BELOW_BED_MIN_FRACTION * height) return false;
+  return true;
+}
+
+export function formatStatusText(status: EngineStatus, verbosity: "summary" | "full" = "summary"): string {
   const lastShot = formatLastScreenshotLine(status);
   if (!status.success) {
     const hint = status.hint ? `\nHint: ${status.hint}` : "";
@@ -821,10 +887,19 @@ function formatStatusText(status: EngineStatus, verbosity: "summary" | "full" = 
   // faces were counted twice). Flip the headline and hoist the warning
   // block above the stats so agents see the problem first.
   const geomInvalid = status.geometryValid === false;
-  const warnings = Array.isArray(status.warnings) && status.warnings.length
+  // Dedup identical warnings (collapsed to "… (×N)"). A part that calls the
+  // same op on many features — e.g. N `sketchOnPlane('XZ').extrude(...)` slabs
+  // — otherwise emits the same multi-line hint N times and drowns the panel,
+  // which is exactly the "warning spam erodes trust" feedback.
+  const dedupedWarnings = dedupLines(
+    (Array.isArray(status.warnings) ? status.warnings : []).filter(
+      (w): w is string => typeof w === "string",
+    ),
+  );
+  const warnings = dedupedWarnings.length
     ? (geomInvalid
-        ? `\nGeometry errors (part validation failed):\n - ${status.warnings.join("\n - ")}\nNote: Volume/area/mass omitted for invalid parts.`
-        : `\nGeometry warnings:\n - ${status.warnings.join("\n - ")}`)
+        ? `\nGeometry errors (part validation failed):\n - ${dedupedWarnings.join("\n - ")}\nNote: Volume/area/mass omitted for invalid parts.`
+        : `\nGeometry warnings:\n - ${dedupedWarnings.join("\n - ")}`)
     : "";
   // P9: aggregate `patterns.cutAt` material-removal summary. Only rendered
   // when the script actually called cutAt (undefined → omitted entirely).
@@ -865,37 +940,24 @@ function formatStatusText(status: EngineStatus, verbosity: "summary" | "full" = 
   // the author's convention and skip the check.
   let belowZeroWarn = "";
   const partsList = status.properties?.parts;
+  // Opt-out: `export const config = { localFrame: true }` says this file
+  // authors an intermediate part in its own local frame (e.g. a
+  // needle.shape.ts imported into an assembly). Positioning is the
+  // parent's responsibility, so rotation-direction hints are noise.
+  const isLocalFrameAuthored = status.scriptConfig?.localFrame === true;
   if (Array.isArray(partsList) && partsList.length === 1) {
     const p = partsList[0];
     const minZ = p.boundingBox?.min?.[2];
     const maxZ = p.boundingBox?.max?.[2];
-    // "Suspended above Z=0" convention bypass: when a part's TOP edge sits
-    // at-or-near the origin (bbox.max.z ≤ 1 mm), it's a legitimately hung
-    // component — a chassis with top-at-Z=0 datum, an end cap that drops
-    // below its mount face, a solenoid housing hanging from a rail — NOT
-    // a rotation-direction bug. Suppress the warning in that case;
-    // otherwise fall through to the original "extends below z=0" check.
-    const isSuspendedConvention = typeof maxZ === "number" && maxZ <= 1;
-    // Cry-wolf fix: only warn on tiny incidental dips (-5 < minZ < 0).
-    // Substantial excursions below Z=0 are almost always intentional
-    // (centred parts, floor-anchored frames, etc.). Also bail when the
-    // centre-of-mass sits below Z=0 — the part is clearly meant to live there.
     const comZ = status.properties?.centerOfMass?.[2];
-    const comBelowZero = typeof comZ === "number" && comZ < 0;
-    // Skip symmetric-about-z=0 bboxes: horizontal shafts/cylinders with centerline on z=0 are not "falling through" — their geometry requires ±r clearance.
-    const isSymmetricAboutZero =
-      typeof minZ === "number" &&
-      typeof maxZ === "number" &&
-      maxZ > 0 &&
-      minZ < 0 &&
-      Math.abs(maxZ + minZ) < 0.5 * (maxZ - minZ);
+    // Gating extracted to the pure, unit-tested `partExtendsBelowBed` helper:
+    // suspended-above-zero convention, com-below-zero, symmetric-about-zero
+    // shafts, the (-5, -0.05) window, AND a height-fraction floor so a small
+    // incidental feature poking below z=0 (e.g. a wall-bracket stud head)
+    // doesn't cry wolf on parts where z=0 isn't the print bed.
     if (
-      !isSuspendedConvention &&
-      !comBelowZero &&
-      !isSymmetricAboutZero &&
-      typeof minZ === "number" &&
-      minZ < -0.05 &&
-      minZ > -5
+      partExtendsBelowBed({ minZ, maxZ, comZ, localFrame: isLocalFrameAuthored }) &&
+      typeof minZ === "number"
     ) {
       const depth = (-minZ).toFixed(1);
       belowZeroWarn =
@@ -2283,7 +2345,8 @@ export function computePartsLine(
 
 const SIDECAR_FILENAME = ".shapeitup-params.json";
 
-type SidecarMap = Record<string, Record<string, number>>;
+type SidecarValue = number | boolean | string;
+type SidecarMap = Record<string, Record<string, SidecarValue>>;
 
 function readSidecar(dir: string): SidecarMap {
   try {
@@ -2311,22 +2374,24 @@ function writeSidecar(dir: string, map: SidecarMap): void {
  */
 function mergeSidecarOverrides(
   absPath: string,
-  callOverrides?: Record<string, number>,
-): Record<string, number> | undefined {
+  callOverrides?: Record<string, SidecarValue>,
+): Record<string, SidecarValue> | undefined {
   const dir = dirname(absPath);
   const base = basename(absPath);
   const sidecar = readSidecar(dir);
   const persisted = sidecar[base];
   if (!persisted && !callOverrides) return undefined;
-  const merged: Record<string, number> = {};
+  const merged: Record<string, SidecarValue> = {};
+  const isSidecarValue = (v: unknown): v is SidecarValue =>
+    typeof v === "number" || typeof v === "boolean" || typeof v === "string";
   if (persisted) {
     for (const [k, v] of Object.entries(persisted)) {
-      if (typeof v === "number") merged[k] = v;
+      if (isSidecarValue(v)) merged[k] = v;
     }
   }
   if (callOverrides) {
     for (const [k, v] of Object.entries(callOverrides)) {
-      if (typeof v === "number") merged[k] = v;
+      if (isSidecarValue(v)) merged[k] = v;
     }
   }
   return Object.keys(merged).length > 0 ? merged : undefined;
@@ -2353,7 +2418,7 @@ function mergeSidecarOverrides(
  */
 async function executeWithPersistedParams(
   absPath: string,
-  callOverrides?: Record<string, number>,
+  callOverrides?: Record<string, SidecarValue>,
   /**
    * Forwarded to {@link executeShapeFile}. Only `export_shape`'s BOM sidecar
    * currently opts in to `"full"` — every other caller omits the arg so the
@@ -2609,6 +2674,185 @@ function formatSystematicGroup(
   return lines.join("\n");
 }
 
+/**
+ * P2-4: cross-prefix systematic group — N≥3 pairs where the `a` side shares
+ * one prefix and the `b` side shares a DIFFERENT prefix, with identical
+ * overlap volume + per-axis depth across all pairs. Complements
+ * {@link SystematicCollisionGroup} (same-prefix) for the "two linear
+ * patterns don't line up" class.
+ *
+ * Canonical repro from the knitting-printer session: needle-1 ↔ solenoid-20,
+ * needle-2 ↔ solenoid-19, … needle-N ↔ solenoid-1 — 20 pairs at the same
+ * overlap depth. One design-class line beats 20 "likely misplaced" lines.
+ */
+type CrossPrefixCollisionGroup = {
+  prefixA: string;
+  prefixB: string;
+  count: number;
+  volume: number;
+  depths: { x: number; y: number; z: number };
+  dominantAxis: "X" | "Y" | "Z";
+  dominantDepth: number;
+  memberIndices: number[];
+};
+
+function groupCrossPrefixCollisions(
+  realC: CollisionEntry[],
+  excluded: Set<number>,
+): { groups: CrossPrefixCollisionGroup[]; groupedIndices: Set<number> } {
+  const groups: CrossPrefixCollisionGroup[] = [];
+  const groupedIndices = new Set<number>();
+  if (realC.length < 3) return { groups, groupedIndices };
+
+  for (let i = 0; i < realC.length; i++) {
+    if (excluded.has(i) || groupedIndices.has(i)) continue;
+    const seed = realC[i];
+    if (!seed.region) continue;
+    const pA = stripIndexSuffix(seed.a);
+    const pB = stripIndexSuffix(seed.b);
+    if (pA === pB) continue;
+    const aIndexed = seed.a !== pA;
+    const bIndexed = seed.b !== pB;
+    if (!aIndexed || !bIndexed) continue;
+
+    const bucket: number[] = [i];
+    for (let j = i + 1; j < realC.length; j++) {
+      if (excluded.has(j) || groupedIndices.has(j)) continue;
+      const cand = realC[j];
+      if (!cand.region) continue;
+      const cA = stripIndexSuffix(cand.a);
+      const cB = stripIndexSuffix(cand.b);
+      const matchAB = cA === pA && cB === pB;
+      const matchBA = cA === pB && cB === pA;
+      if (!matchAB && !matchBA) continue;
+      if (cand.a === cA || cand.b === cB) continue;
+      if (!withinOnePercent(cand.volume, seed.volume)) continue;
+      if (!withinOnePercent(cand.region.depths.x, seed.region.depths.x)) continue;
+      if (!withinOnePercent(cand.region.depths.y, seed.region.depths.y)) continue;
+      if (!withinOnePercent(cand.region.depths.z, seed.region.depths.z)) continue;
+      bucket.push(j);
+    }
+
+    if (bucket.length < 3) continue;
+
+    const d = seed.region.depths;
+    let dominantAxis: "X" | "Y" | "Z" = "X";
+    let dominantDepth = d.x;
+    if (d.y > dominantDepth) { dominantAxis = "Y"; dominantDepth = d.y; }
+    if (d.z > dominantDepth) { dominantAxis = "Z"; dominantDepth = d.z; }
+
+    groups.push({
+      prefixA: pA,
+      prefixB: pB,
+      count: bucket.length,
+      volume: seed.volume,
+      depths: { ...d },
+      dominantAxis,
+      dominantDepth,
+      memberIndices: bucket,
+    });
+    for (const idx of bucket) groupedIndices.add(idx);
+  }
+  return { groups, groupedIndices };
+}
+
+function formatCrossPrefixGroup(g: CrossPrefixCollisionGroup, fmt: (n: number) => string): string {
+  return [
+    `  - Cross-pattern overlap: ${g.count} ${g.prefixA}-* \u2194 ${g.prefixB}-* pairs, each ${fmt(g.volume)} mm\u00b3, ` +
+      `overlap depth X=${fmt(g.depths.x)}mm Y=${fmt(g.depths.y)}mm Z=${fmt(g.depths.z)}mm (dominant axis: ${g.dominantAxis}).`,
+    `    Design-class hint: identical overlap across ${g.count} cross-pattern pairs "${g.prefixA}-*" \u2194 "${g.prefixB}-*" points to ` +
+      `two linear / grid patterns that share an axis but are misaligned on ${g.dominantAxis} by ${fmt(g.dominantDepth)}mm. ` +
+      `Fix by translating the ${g.prefixB} pattern by \u00b1${fmt(g.dominantDepth)}mm on ${g.dominantAxis}, flipping one pattern's indexing, or nudging ${g.prefixA}/${g.prefixB} pitch apart.`,
+  ].join("\n");
+}
+
+/**
+ * P2-4: one-to-many group — one SINGLE part on one side colliding with N≥3
+ * instances of a prefix on the other side, all at identical overlap. Catches
+ * the "entire indexed array dips into the same shared surface" class.
+ */
+type OneToManyCollisionGroup = {
+  singleton: string;
+  prefix: string;
+  count: number;
+  volume: number;
+  depths: { x: number; y: number; z: number };
+  dominantAxis: "X" | "Y" | "Z";
+  dominantDepth: number;
+  memberIndices: number[];
+};
+
+function groupOneToManyCollisions(
+  realC: CollisionEntry[],
+  excluded: Set<number>,
+): { groups: OneToManyCollisionGroup[]; groupedIndices: Set<number> } {
+  const groups: OneToManyCollisionGroup[] = [];
+  const groupedIndices = new Set<number>();
+  if (realC.length < 3) return { groups, groupedIndices };
+
+  for (let i = 0; i < realC.length; i++) {
+    if (excluded.has(i) || groupedIndices.has(i)) continue;
+    const seed = realC[i];
+    if (!seed.region) continue;
+    const aIndexed = seed.a !== stripIndexSuffix(seed.a);
+    const bIndexed = seed.b !== stripIndexSuffix(seed.b);
+    if (aIndexed === bIndexed) continue;
+    const singleton = aIndexed ? seed.b : seed.a;
+    const indexedPrefix = aIndexed ? stripIndexSuffix(seed.a) : stripIndexSuffix(seed.b);
+
+    const bucket: number[] = [i];
+    for (let j = i + 1; j < realC.length; j++) {
+      if (excluded.has(j) || groupedIndices.has(j)) continue;
+      const cand = realC[j];
+      if (!cand.region) continue;
+      const candASingle = cand.a === singleton;
+      const candBSingle = cand.b === singleton;
+      if (!candASingle && !candBSingle) continue;
+      const other = candASingle ? cand.b : cand.a;
+      const otherPrefix = stripIndexSuffix(other);
+      if (otherPrefix !== indexedPrefix) continue;
+      if (other === otherPrefix) continue;
+      if (!withinOnePercent(cand.volume, seed.volume)) continue;
+      if (!withinOnePercent(cand.region.depths.x, seed.region.depths.x)) continue;
+      if (!withinOnePercent(cand.region.depths.y, seed.region.depths.y)) continue;
+      if (!withinOnePercent(cand.region.depths.z, seed.region.depths.z)) continue;
+      bucket.push(j);
+    }
+
+    if (bucket.length < 3) continue;
+
+    const d = seed.region.depths;
+    let dominantAxis: "X" | "Y" | "Z" = "X";
+    let dominantDepth = d.x;
+    if (d.y > dominantDepth) { dominantAxis = "Y"; dominantDepth = d.y; }
+    if (d.z > dominantDepth) { dominantAxis = "Z"; dominantDepth = d.z; }
+
+    groups.push({
+      singleton,
+      prefix: indexedPrefix,
+      count: bucket.length,
+      volume: seed.volume,
+      depths: { ...d },
+      dominantAxis,
+      dominantDepth,
+      memberIndices: bucket,
+    });
+    for (const idx of bucket) groupedIndices.add(idx);
+  }
+  return { groups, groupedIndices };
+}
+
+function formatOneToManyGroup(g: OneToManyCollisionGroup, fmt: (n: number) => string): string {
+  return [
+    `  - Shared-surface overlap: ${g.singleton} \u2194 ${g.count} ${g.prefix}-* parts, each ${fmt(g.volume)} mm\u00b3, ` +
+      `overlap depth X=${fmt(g.depths.x)}mm Y=${fmt(g.depths.y)}mm Z=${fmt(g.depths.z)}mm (dominant axis: ${g.dominantAxis}).`,
+    `    Design-class hint: every ${g.prefix}-* instance dips into ${g.singleton} by the same ${fmt(g.dominantDepth)}mm on ${g.dominantAxis} — ` +
+      `the whole ${g.prefix} array is offset, not just one instance. ` +
+      `Fix by translating the ${g.prefix} pattern by \u00b1${fmt(g.dominantDepth)}mm on ${g.dominantAxis}, ` +
+      `or raising ${g.singleton} on the same axis by the same amount.`,
+  ].join("\n");
+}
+
 /** Render the per-pair collision block for check_collisions. */
 export function formatCollisionPairs(
   realC: CollisionEntry[],
@@ -2632,17 +2876,31 @@ export function formatCollisionPairs(
 
   if (realC.length > 0 || pressFitC.length > 0 || acceptedC.length > 0) {
     if (realC.length > 0) {
-      // Pre-pass: fold N≥3 "same prefix, same overlap volume+depth" pairs
-      // into one "systematic size/spacing mismatch" line. Ungrouped
-      // collisions keep their per-pair detail (region box, depth hint,
-      // "likely misplaced" tag). This is additive — a purely heterogenous
-      // collision list renders unchanged.
-      const { groups, groupedIndices } = groupSystematicCollisions(realC);
+      // Three-layer clustering (P2-4 from knitting-printer v8): same-prefix
+      // pitch mismatch (solenoid-1 ↔ solenoid-2 …), cross-prefix
+      // two-pattern misalignment (needle-* ↔ solenoid-*), then one-to-many
+      // shared-surface (chassis ↔ solenoid-*). Each layer excludes what the
+      // previous already grouped so every pair lands in at most one bucket.
+      const sameGroups = groupSystematicCollisions(realC);
+      const crossGroups = groupCrossPrefixCollisions(realC, sameGroups.groupedIndices);
+      const excludedAfterCross = new Set<number>([
+        ...sameGroups.groupedIndices,
+        ...crossGroups.groupedIndices,
+      ]);
+      const oneToManyGroups = groupOneToManyCollisions(realC, excludedAfterCross);
+      const groupedIndices = new Set<number>([
+        ...sameGroups.groupedIndices,
+        ...crossGroups.groupedIndices,
+        ...oneToManyGroups.groupedIndices,
+      ]);
+      const groups = sameGroups.groups; // kept for backward-compat in fallthrough below
       const ungroupedC = realC.filter((_, idx) => !groupedIndices.has(idx));
 
       if (reportFormat === "full") {
         const lines: string[] = [];
-        for (const g of groups) lines.push(formatSystematicGroup(g, fmt));
+        for (const g of sameGroups.groups) lines.push(formatSystematicGroup(g, fmt));
+        for (const g of crossGroups.groups) lines.push(formatCrossPrefixGroup(g, fmt));
+        for (const g of oneToManyGroups.groups) lines.push(formatOneToManyGroup(g, fmt));
         for (const c of ungroupedC) {
           lines.push(`  - ${c.a} \u2194 ${c.b}: ${fmt(c.volume)} mm\u00b3 overlap${misplacedHint(c)}`);
           if (c.region) {
@@ -2661,7 +2919,9 @@ export function formatCollisionPairs(
         sections.push(`\nCollisions (sorted by volume desc):\n${lines.join("\n")}`);
       } else {
         const lines: string[] = [];
-        for (const g of groups) lines.push(formatSystematicGroup(g, fmt));
+        for (const g of sameGroups.groups) lines.push(formatSystematicGroup(g, fmt));
+        for (const g of crossGroups.groups) lines.push(formatCrossPrefixGroup(g, fmt));
+        for (const g of oneToManyGroups.groups) lines.push(formatOneToManyGroup(g, fmt));
         if (ungroupedC.length > 0) {
           const [worst, ...rest] = ungroupedC;
           lines.push(`  - ${worst.a} \u2194 ${worst.b}: ${fmt(worst.volume)} mm\u00b3 overlap${misplacedHint(worst)}`);
@@ -2700,6 +2960,19 @@ export function formatCollisionPairs(
       const maxV = Math.max(...volumes);
       sections.push(
         `\nAccepted (pre-declared expected): ${acceptedC.length} pair${acceptedC.length === 1 ? "" : "s"}, volume ${fmt(minV)}\u2013${fmt(maxV)} mm\u00b3.`,
+      );
+    }
+
+    // Discoverability nudge: small "real" overlaps are usually deliberate
+    // press-fits / mating contacts that sit just above the threshold. Point
+    // the caller at the two knobs that reclassify them, so the next run's
+    // report shows only genuine problems. (The "ids" format already returned
+    // early above, so this only reaches "summary"/"full".)
+    if (realC.length > 0) {
+      sections.push(
+        `\nIntentional press-fit or mating contact above? Re-classify with ` +
+          `acceptedPairs: [["partA","partB"]] (\`*\` glob ok) or raise ` +
+          `pressFitThreshold (now ${fmt(pressFit)} mm\u00b3).`,
       );
     }
   }
@@ -2950,6 +3223,18 @@ export function registerTools(server: McpServer) {
         }
       }
 
+      // Capture whether a workspace root ALREADY contained this relative
+      // directory BEFORE we create it. The post-write mismatch check below
+      // uses existsSync, and once mkdirSync has run the directory we just made
+      // would make it look like the workspace "already had" the path —
+      // suppressing the very warning the user needs. (Exact bug hit in the
+      // wall-organizer test: a relative dir routed into the wrong workspace
+      // and the fallback warning never fired because the dir now existed.)
+      const relDirPreexisted =
+        !!directory && !isAbsolute(directory)
+          ? getHeartbeatWorkspaceRoots().some((r) => existsSync(resolve(r, directory)))
+          : false;
+
       mkdirSync(dirname(filePath), { recursive: true });
       // Skip the write when nothing would change — still execute below so the
       // caller gets stats back and the viewer stays in sync.
@@ -2982,21 +3267,16 @@ export function registerTools(server: McpServer) {
       // should double-check" case. The user's saved memory about silent
       // workspace routing surprises (workspace_mismatch.md) is exactly what
       // this warning targets.
-      let fallbackWarning = "";
-      if (directory && !isAbsolute(directory)) {
-        const wsRoots = getHeartbeatWorkspaceRoots();
-        const probedMatch = wsRoots.some(
-          (r) => existsSync(resolve(r, directory)),
-        );
-        if (!probedMatch && wsRoots.length > 0 && !dirMatchesCwd) {
-          fallbackWarning =
-            `\nNote: no VSCode workspace contained a pre-existing '${directory}' directory, so the resolver fell back to the first workspace root.\n` +
-            `  chosen workspace: ${wsRoots[0]}\n` +
-            `  shell cwd:        ${cwd}\n` +
-            `  final path:       ${filePath}\n` +
-            `If that wasn't your intent, pass an absolute 'directory' or set 'directory: "."' to anchor to shell cwd.`;
-        }
-      }
+      // Use the PRE-mkdirSync probe snapshot (relDirPreexisted), not a fresh
+      // existsSync — which would now see the directory we just created.
+      const fallbackWarning = workspaceMismatchWarning({
+        directory,
+        relDirPreexisted,
+        wsRoots: getHeartbeatWorkspaceRoots(),
+        dirMatchesCwd,
+        cwd,
+        filePath,
+      });
 
       const doubledWarning = directory ? detectPathDoubling(dir) : "";
       const actionWord = contentIdenticalNoOp
@@ -3103,7 +3383,7 @@ export function registerTools(server: McpServer) {
     {
       filePath: z.string().describe("Path to the .shape.ts file. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
       code: z.string().optional().describe("New TypeScript source code. Omit when you only want to re-run with different `params`."),
-      params: z.record(z.string(), z.number()).optional().describe("Optional ephemeral param overrides. If `code` is NOT provided, the file on disk is untouched and only the overrides are applied for this execution. If `code` IS provided, `params` is ignored (note appears in response)."),
+      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Optional ephemeral param overrides. Values can be numbers, booleans, or strings — pass whatever shape your `export const params` uses (e.g. `{ useHeatSet: true, finish: \"satin\", count: 4 }`). If `code` is NOT provided, the file on disk is untouched and only the overrides are applied for this execution. If `code` IS provided, `params` is ignored (note appears in response)."),
       verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats. 'summary' (default) caps at 10 parts. 'full' dumps every part."),
     },
     safeHandler("modify_shape", async ({ filePath, code, params, verbosity }) => {
@@ -3234,7 +3514,7 @@ export function registerTools(server: McpServer) {
         .enum(["prusaslicer", "cura", "bambustudio", "orcaslicer", "freecad", "fusion360"])
         .optional()
         .describe("If set, open the exported file in this app after saving. Requires VSCode + the extension."),
-      bom: z.boolean().optional().describe("When true, also write a `*.bom.json` sidecar next to the exported file describing each part's volume_mm3, mass_g (if material declared), qty, material, and min/max bounding box. Basename tracks the source `.shape.ts` (one sidecar per export call, even when per-part STL files are written)."),
+      bom: z.boolean().optional().describe("When true, also write a `*.bom.json` sidecar next to the exported file describing each part's qty, material (or null), mass_g (or null), volume_mm3, and min/max bounding box. `material` and `mass_g` are always present (explicit null when no material was declared) so downstream consumers get a predictable schema. Basename tracks the source `.shape.ts` (one sidecar per export call, even when per-part STL files are written)."),
     },
     safeHandler("export_shape", async ({ format, outputPath, filePath, partName, openIn, bom }) => {
       // Figure out which file we're exporting. Precedence: explicit arg →
@@ -3351,9 +3631,20 @@ export function registerTools(server: McpServer) {
              * address individual instances. Omitted on singletons.
              */
             instances?: string[];
-            material?: { density: number; name?: string };
+            /**
+             * Always present (null when the script didn't declare a material).
+             * Explicit null over absence keeps the JSON schema predictable for
+             * downstream consumers — they can read `entry.material?.density`
+             * without first checking whether the key exists.
+             */
+            material: { density: number; name?: string } | null;
             volume_mm3?: number;
-            mass_g?: number;
+            /**
+             * Always present (null when mass can't be derived — no material,
+             * or volume measurement failed). Same predictability rationale as
+             * `material` above.
+             */
+            mass_g: number | null;
             boundingBox?: { min: [number, number, number]; max: [number, number, number] };
           };
 
@@ -3384,7 +3675,10 @@ export function registerTools(server: McpServer) {
             ? propsParts.filter((p) => p.name === partName)
             : propsParts;
 
-          // First pass: build per-part rows exactly as before.
+          // First pass: build per-part rows. `material` and `mass_g` are ALWAYS
+          // emitted (null when absent) so downstream consumers get a predictable
+          // schema — `entry.material?.density` and `entry.mass_g ?? 0` both
+          // work without first asking "does this key exist?".
           const perPartRows: BomPartEntry[] = filtered.map((p, idx) => {
             const origIdx = partName
               ? propsParts.findIndex((q) => q.name === p.name)
@@ -3392,22 +3686,25 @@ export function registerTools(server: McpServer) {
             // Resolve effective material per the spec: per-part override wins,
             // otherwise inherit the script-level material from status.
             const effectiveMaterial = p.material ?? (status as any).material;
+            const material =
+              effectiveMaterial && typeof effectiveMaterial.density === "number"
+                ? {
+                    density: effectiveMaterial.density,
+                    ...(effectiveMaterial.name ? { name: effectiveMaterial.name } : {}),
+                  }
+                : null;
             const entry: BomPartEntry = {
               name: p.name,
               qty: typeof p.qty === "number" && p.qty > 0 ? p.qty : 1,
+              material,
+              mass_g: null,
             };
-            if (effectiveMaterial && typeof effectiveMaterial.density === "number") {
-              entry.material = {
-                density: effectiveMaterial.density,
-                ...(effectiveMaterial.name ? { name: effectiveMaterial.name } : {}),
-              };
-            }
             if (typeof p.volume === "number" && Number.isFinite(p.volume)) {
               entry.volume_mm3 = Math.round(p.volume * 100) / 100;
-              if (entry.material) {
+              if (material) {
                 // mass_g = density(g/cm³) * volume(mm³) / 1000. Round to 0.01g
                 // so slicer-bound JSON doesn't carry phoney precision.
-                const raw = (entry.material.density * p.volume) / 1000;
+                const raw = (material.density * p.volume) / 1000;
                 entry.mass_g = Math.round(raw * 100) / 100;
               }
             }
@@ -3692,15 +3989,16 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "preview_shape",
-    "Execute a .shape.ts snippet WITHOUT writing it to the user's workspace — ideal for trying boolean-chain variations, sketch tweaks, or debugging steps while iterating. The snippet must have an `export default` main() returning a Shape3D or an array of parts (same contract as create_shape). The code is written to a throwaway temp file, executed through the same engine as create_shape, and deleted afterwards. By default the temp file lives in an isolated globalStorage path — local `./` imports cannot resolve from there. Pass `workingDir` (usually `.` or the workspace root) to have the temp file written there instead, which enables relative imports like `./bolt.shape` to resolve against your workspace. Set captureScreenshot:true to also render a PNG through the bundled headless SVG pipeline (runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the render in its interactive viewer).",
+    "Execute a .shape.ts snippet WITHOUT writing it to the user's workspace — ideal for trying boolean-chain variations, sketch tweaks, or debugging steps while iterating. The snippet must have an `export default` main() returning a Shape3D or an array of parts (same contract as create_shape). The code is written to a throwaway temp file, executed through the same engine as create_shape, and deleted afterwards. By default the temp file lives in an isolated globalStorage path — local `./` imports cannot resolve from there. Pass `workingDir` (usually `.` or the workspace root) to have the temp file written there instead, which enables relative imports like `./bolt.shape` to resolve against your workspace. Set captureScreenshot:true to also render a PNG through the bundled headless SVG pipeline (runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the render in its interactive viewer). When a screenshot is rendered, the PNG is returned INLINE by default — the agent sees the image directly, no extra `get_preview` round trip needed; pass `inline: false` to skip the base64 payload.",
     {
       code: z.string().describe("Full .shape.ts source — must include an `export default` main() function returning a Shape3D or array of parts. Pair with `workingDir` to enable local `./` imports."),
       workingDir: z.string().optional().describe("Directory to write the temp snippet file in. When set, relative imports (`./foo.shape`) resolve against this directory. Defaults to a private globalStorage path (isolated; relative imports won't work). Pass the workspace root — usually `.` or an absolute path — to make `./foo.shape` imports from your assembly work."),
       captureScreenshot: z.boolean().optional().describe("If true, also render a PNG screenshot through the bundled headless SVG pipeline. Default: false. Runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the render in its interactive viewer."),
+      inline: z.boolean().optional().describe("When captureScreenshot is true, also return the PNG as an inline image content block (base64) so the agent sees it without a follow-up `get_preview` round trip. Default: true — matches `render_preview`'s behaviour. Skipped silently if the PNG exceeds 10 MB. Pass false to skip the base64 payload (saves ~30% response size) when you only need the path."),
       focusPart: z.string().optional().describe("For multi-part assemblies only: name of a single part to display exclusively in the screenshot — all other parts are hidden. No-op on single-part shapes. Takes precedence over hideParts when both are supplied."),
       hideParts: z.array(z.string()).optional().describe("For multi-part assemblies only: list of part names to hide in the screenshot. Other parts remain visible. Ignored if focusPart is also set."),
     },
-    safeHandler("preview_shape", async ({ code, workingDir, captureScreenshot, focusPart, hideParts }) => {
+    safeHandler("preview_shape", async ({ code, workingDir, captureScreenshot, inline, focusPart, hideParts }) => {
       // Cheap pre-flight: reject obvious non-starters before touching the engine.
       // Matches the lightweight check create_shape does — full parse happens in esbuild.
       if (!code || !code.trim()) {
@@ -3794,6 +4092,7 @@ export function registerTools(server: McpServer) {
       const wantScreenshot = captureScreenshot === true;
       let screenshotLine = "";
       let screenshotWarning = "";
+      let inlineImage: { type: "image"; data: string; mimeType: string } | null = null;
 
       try {
         try {
@@ -3875,6 +4174,22 @@ export function registerTools(server: McpServer) {
                 } catch {
                   // Best effort.
                 }
+                // Inline by default — mirrors render_preview's behaviour so
+                // an agent that calls preview_shape with captureScreenshot:true
+                // sees the image directly, no follow-up get_preview needed.
+                // Skipped when caller explicitly passes inline:false, or when
+                // the PNG exceeds the 10 MB MCP content limit.
+                if (inline !== false) {
+                  if (rendered.pngBuf.length <= 10 * 1024 * 1024) {
+                    inlineImage = {
+                      type: "image",
+                      data: rendered.pngBuf.toString("base64"),
+                      mimeType: "image/png",
+                    };
+                  } else {
+                    screenshotWarning += `\n(inline=true requested but PNG is ${(rendered.pngBuf.length / 1024 / 1024).toFixed(1)} MB, exceeding the 10 MB inline limit. Read the saved path instead.)`;
+                  }
+                }
               } else {
                 screenshotWarning = `\n(Screenshot: SVG at ${rendered.svgPath}; PNG rasterization failed — ${rendered.rasterError ?? "unknown"}.)`;
               }
@@ -3888,8 +4203,13 @@ export function registerTools(server: McpServer) {
           ? `Snippet executed (not saved to disk)\nSnippet written to: ${tempPath}\n`
           : "Snippet executed (not saved to disk)\n";
         const body = formatStatusText(status) + screenshotLine + screenshotWarning;
+        const textBlock = { type: "text" as const, text: header + body };
+        const content: Array<
+          | { type: "text"; text: string }
+          | { type: "image"; data: string; mimeType: string }
+        > = inlineImage ? [textBlock, inlineImage] : [textBlock];
         return {
-          content: [{ type: "text" as const, text: header + body }],
+          content,
           // A failed render is a tool error (the snippet didn't work). A missing
           // screenshot when render succeeded is just a warning — not isError.
           isError: !status.success,
@@ -3907,7 +4227,7 @@ export function registerTools(server: McpServer) {
     "Re-execute an existing .shape.ts with ephemeral `params` overrides WITHOUT modifying the file — the file on disk is untouched. Returns the same stats as get_render_status (volume, surface area, bounding box, timings, warnings) so agents can binary-search a design constraint (target volume, bounding box, mass, fit tolerance) before committing the winning value with modify_shape. Pass `captureScreenshot: true` to also render a PNG of the tuned configuration through the bundled headless SVG pipeline (runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the render in its interactive viewer). Pass `persist: true` to also write the override map to a `.shapeitup-params.json` sidecar next to the file so every later execution (render_preview, open_shape, export_shape, etc.) picks them up automatically; clear with `clear_params`.",
     {
       filePath: z.string().describe("Path to the .shape.ts file. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
-      params: z.record(z.string(), z.number()).describe("Map of param name → override value. Only listed params are overridden; others fall back to the file's declared defaults. Values must be numbers."),
+      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).describe("Map of param name → override value. Only listed params are overridden; others fall back to the file's declared defaults. Accepts numbers, booleans, and strings so enum-style switches (`{ finish: \"satin\" }`) and feature flags (`{ useHeatSet: true }`) work alongside the usual numeric dimensions."),
       captureScreenshot: z.boolean().optional().describe("If true, also render a PNG screenshot of the tuned configuration through the bundled headless SVG pipeline. Default: false. Runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the render in its interactive viewer."),
       inline: z.boolean().optional().describe("When used with captureScreenshot, also return the PNG as an inline image content block (base64) so the agent can see it without a second get_preview call. Skipped silently if the PNG exceeds 10 MB. Default: false."),
       persist: z.boolean().optional().describe("If true AND the render succeeds, write the override map to `.shapeitup-params.json` next to the file so subsequent render_preview/open_shape/export_shape/etc. calls pick them up automatically. Default: false (stateless, legacy behavior). Precedence: script defaults < sidecar < call-time params. Clear with `clear_params`."),
@@ -3983,12 +4303,13 @@ export function registerTools(server: McpServer) {
           const base = basename(absPath);
           const existing = readSidecar(dir);
           const declaredSet = new Set(declaredKeys);
-          const toPersist: Record<string, number> = { ...(existing[base] ?? {}) };
+          const toPersist: Record<string, SidecarValue> = { ...(existing[base] ?? {}) };
           for (const [k, v] of entries) {
             // Only persist declared keys — unknown keys were already flagged
             // as ignored; saving them would create phantom overrides that
-            // never take effect.
-            if (declaredSet.has(k) && typeof v === "number") {
+            // never take effect. Numbers/booleans/strings all persist; other
+            // types (objects, arrays, null) get dropped.
+            if (declaredSet.has(k) && (typeof v === "number" || typeof v === "boolean" || typeof v === "string")) {
               toPersist[k] = v;
             }
           }
@@ -5010,7 +5331,7 @@ export function registerTools(server: McpServer) {
       filePath: z.string().optional().describe("Path to the .shape.ts file to check for part collisions. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first existing match wins), else anchor to process.cwd(). Mutually exclusive with `code`."),
       code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning an array of parts. Written to a throwaway temp file, executed, and deleted afterwards. Use `workingDir` to make local `./` imports resolve. Mutually exclusive with `filePath`."),
       workingDir: z.string().optional().describe("Directory to write the temp snippet file in when `code` is provided. When set, relative imports (`./foo.shape`) resolve against this directory. Defaults to a private globalStorage path (isolated; relative imports won't work)."),
-      params: z.record(z.string(), z.number()).optional().describe("Numeric param overrides applied to the shape's `export const params` for this single check. Same shape as tune_params accepts. Does NOT persist — merged with tune_params values for this execution only, so you can collision-check an articulation angle (e.g. `{ cam_angle_deg: 180 }`) without editing the shape."),
+      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Param overrides applied to the shape's `export const params` for this single check. Accepts numbers, booleans, and strings — same shape as tune_params accepts. Does NOT persist — merged with tune_params values for this execution only, so you can collision-check an articulation angle (e.g. `{ cam_angle_deg: 180 }`) without editing the shape."),
       tolerance: z.number().optional().describe("Minimum intersection volume in mm³ to count as a collision. Defaults to 0.001 — filters out numerical-noise overlaps on touching-but-not-overlapping parts. Negative values are clamped to 0."),
       acceptedPairs: z.array(z.tuple([z.string(), z.string()])).optional().describe("Pairs of part names whose intersection is EXPECTED and should not be flagged. Each side accepts `*` as a glob wildcard matching any run of chars, e.g. [['needle-body-*','needle-bed'], ['bolt-*','plate-*']]. A pattern without `*` is matched exactly (back-compat). Order is symmetric: ['a','b'] also covers ['b','a']. Accepted pairs collapse into a single summary line."),
       pressFitThreshold: z.number().optional().describe("Volume threshold (mm³) at or below which a collision is classified as 'nominal contact' (press fit / touching interface) and listed in a compact section instead of the main Collisions block. Default 0.5 mm³. Set to 0 to disable the tag (every non-accepted collision is treated as real)."),
@@ -5379,15 +5700,16 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "check_stack",
-    "Reports each part's world-space range along one axis (X, Y, or Z), sorted by ascending min. Shows the gap between consecutive parts so mating Z-levels / bolt-circle heights / carriage clearances can be audited at a glance. For a flatbed machine, `check_stack({ axis: 'Z' })` answers 'does my rail sit inside my carriage body?' before you burn a render cycle hunting a cut-no-material warning. Pass either `filePath` OR `code` — mutually exclusive. `params` overrides numeric params for this one check (does not persist). Scales linearly with part count.",
+    "Reports each part's world-space range along one axis (X, Y, or Z), sorted by ascending min. Shows the gap between consecutive parts so mating Z-levels / bolt-circle heights / carriage clearances can be audited at a glance. For a flatbed machine, `check_stack({ axis: 'Z' })` answers 'does my rail sit inside my carriage body?' before you burn a render cycle hunting a cut-no-material warning. Pass `acceptedOverlaps` to whitelist designed press-fits (e.g. `[['bearing', 'plate']]`) — overlaps between matching pairs collapse into a footnote instead of polluting the main report. Same `*` glob syntax as `check_collisions.acceptedPairs`. Pass either `filePath` OR `code` — mutually exclusive. `params` overrides numeric params for this one check (does not persist). Scales linearly with part count.",
     {
       filePath: z.string().optional().describe("Path to the .shape.ts file to analyze. Absolute paths pass through; relative paths probe workspace roots. Mutually exclusive with `code`."),
       code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning an array of parts. Mutually exclusive with `filePath`."),
       workingDir: z.string().optional().describe("Directory for the temp snippet when `code` is provided. Makes local `./foo.shape` imports resolve."),
       axis: z.enum(["X", "Y", "Z"]).describe("World axis to stack parts along. 'Z' is the typical vertical-stack audit; 'X'/'Y' for horizontal layouts (needle bed pitch, rail spans)."),
-      params: z.record(z.string(), z.number()).optional().describe("Numeric param overrides applied for this single check. Does NOT persist — merged with tune_params values for this execution only."),
+      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Param overrides applied for this single check (numbers, booleans, or strings). Does NOT persist — merged with tune_params values for this execution only."),
+      acceptedOverlaps: z.array(z.tuple([z.string(), z.string()])).optional().describe("Pairs of part names whose AXIAL overlap on this axis is EXPECTED (press-fit bearings, dowels in blind holes, nested press-fits). Same `*` wildcard + symmetric semantics as `check_collisions.acceptedPairs`. Accepted overlaps collapse into a single 'Accepted overlaps' footer line and don't appear in the main `(overlap)` annotations."),
     },
-    safeHandler("check_stack", async ({ filePath, code, workingDir, axis, params }) => {
+    safeHandler("check_stack", async ({ filePath, code, workingDir, axis, params, acceptedOverlaps }) => {
       if (filePath !== undefined && code !== undefined) {
         return {
           content: [{ type: "text" as const, text: "check_stack: pass either `filePath` OR `code`, not both." }],
@@ -5461,6 +5783,26 @@ export function registerTools(server: McpServer) {
         const maxNameLen = Math.max(4, ...rows.map((r) => r.name.length));
         const pad = (s: string): string => s.padEnd(maxNameLen, " ");
 
+        // Normalize acceptedOverlaps for the wildcard-aware matcher. Accept
+        // the same `*` glob semantics + symmetric pair handling as
+        // check_collisions.acceptedPairs so users don't have to learn two
+        // syntaxes for the same idea.
+        const acceptedPatterns: Array<[string, string]> = [];
+        for (const pair of acceptedOverlaps ?? []) {
+          if (
+            Array.isArray(pair) &&
+            pair.length === 2 &&
+            typeof pair[0] === "string" &&
+            typeof pair[1] === "string"
+          ) {
+            acceptedPatterns.push([pair[0], pair[1]]);
+          }
+        }
+        const isAcceptedOverlap = (a: string, b: string): boolean =>
+          acceptedPatterns.length > 0 && matchesAnyAcceptedPair(a, b, acceptedPatterns);
+
+        const acceptedOverlapPairs: Array<{ a: string; b: string; gap: number }> = [];
+
         const lines: string[] = [];
         lines.push(`Stack along ${axis}-axis — ${parts.length} part${parts.length === 1 ? "" : "s"}, sorted by ${axis}_min ascending`);
         lines.push("");
@@ -5477,9 +5819,17 @@ export function registerTools(server: McpServer) {
             const gap = next.min - r.max;
             // Negative gap = parts overlap on this axis (not necessarily a
             // collision — the check_collisions tool verifies that — but for
-            // stack audits it's often the signal the user wants.)
+            // stack audits it's often the signal the user wants.) When the
+            // pair matches an `acceptedOverlaps` pattern, downgrade the cell
+            // to "(press-fit)" so designed overlaps (bearing in plate, dowel
+            // in blind hole) don't pollute the main report.
             if (gap < -0.001) {
-              gapCell = `${fmt(gap)} (overlap)`;
+              if (isAcceptedOverlap(r.name, next.name)) {
+                gapCell = `${fmt(gap)} (press-fit)`;
+                acceptedOverlapPairs.push({ a: r.name, b: next.name, gap });
+              } else {
+                gapCell = `${fmt(gap)} (overlap)`;
+              }
             } else if (Math.abs(gap) <= 0.001) {
               gapCell = `${fmt(gap)} (flush)`;
             } else {
@@ -5503,6 +5853,17 @@ export function registerTools(server: McpServer) {
           );
         }
 
+        if (acceptedOverlapPairs.length > 0) {
+          lines.push("");
+          const wordPair = acceptedOverlapPairs.length === 1 ? "pair" : "pairs";
+          lines.push(
+            `Accepted overlaps (${acceptedOverlapPairs.length} ${wordPair} matched acceptedOverlaps — not flagged):`,
+          );
+          for (const p of acceptedOverlapPairs) {
+            lines.push(`  - ${p.a} ↔ ${p.b}: ${fmt(p.gap)}`);
+          }
+        }
+
         return {
           content: [{ type: "text" as const, text: lines.join("\n") }],
         };
@@ -5512,7 +5873,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "validate_joints",
-    "Best-effort validator for declared mate joints: executes the shape, looks for a `joints` map on each rendered part (the shape returned `{ shape, name, joints }` objects, or the stdlib `Part.joints` field survived to the render result), and measures each joint point's distance to the owning part's tessellated surface. Reports joints that float above the surface (> tolerance) or are buried inside the body. Returns a plain OK summary when no issues are found. NOTE: joint introspection depends on the executor passing `.joints` through — when it doesn't, the tool reports that cleanly rather than failing.",
+    "Validates declared mate joints: executes the shape, reads the `joints` map on each rendered part (world coordinates — auto-populated by the stdlib `Part`/`entries()` API, or supplied directly via `{shape, name, joints}` returns), and measures each joint point's distance to the owning part's tessellated surface. Reports joints that float above the surface (> tolerance) or are buried inside the body. Returns a plain OK summary when no issues are found.",
     {
       path: z.string().describe("Path to the .shape.ts file to validate."),
       tolerance: z.number().optional().describe("Max acceptable joint-to-surface distance in mm. Default 0.1."),
@@ -5525,7 +5886,6 @@ export function registerTools(server: McpServer) {
           isError: true,
         };
       }
-      const tol = typeof tolerance === "number" && tolerance > 0 ? tolerance : 0.1;
 
       const { status, parts } = await executeWithPersistedParams(absPath);
       if (!status.success || !parts) {
@@ -5535,96 +5895,9 @@ export function registerTools(server: McpServer) {
         };
       }
 
-      // TODO: this relies on the executor/engine preserving `.joints` on the
-      // returned part objects. The current engine returns render-oriented
-      // `{ name, shape, vertices, ... }` only — if user scripts return
-      // `Part` instances (stdlib convention) and the executor passes them
-      // through, `.joints` will be present here. When it isn't, report
-      // cleanly rather than pretending validation ran.
-      type JointInfo = { part: string; name: string; point: [number, number, number] };
-      const joints: JointInfo[] = [];
-      for (const p of parts) {
-        const anyP = p as any;
-        const jmap = anyP.joints;
-        if (!jmap || typeof jmap !== "object") continue;
-        for (const [jname, spec] of Object.entries(jmap)) {
-          const s = spec as any;
-          const pos = s?.position ?? s?.point ?? s?.origin;
-          if (Array.isArray(pos) && pos.length >= 3 && pos.every((n: any) => typeof n === "number" && isFinite(n))) {
-            joints.push({ part: p.name, name: jname, point: [pos[0], pos[1], pos[2]] });
-          }
-        }
-      }
-
-      if (joints.length === 0) {
-        return {
-          content: [{ type: "text" as const, text: `validate_joints: no introspectable joints found on any part. Either the assembly declares none, or the executor did not preserve .joints on the render result. Parts scanned: ${parts.map((p) => p.name).join(", ")}` }],
-        };
-      }
-
-      // Compute per-part AABB + closest-vertex distance. Closest-vertex on a
-      // tessellated mesh is a conservative UPPER bound on the true surface
-      // distance (real OCCT distance would need BRepExtrema_DistShapeShape);
-      // for the floating/buried detection we ALSO use the AABB
-      // inside/outside test to distinguish the two cases. This is a heuristic
-      // — a point inside the AABB but outside the solid reads as "buried"
-      // here. Acceptable per the spec's "best-effort" allowance.
-      type Box = { minX: number; minY: number; minZ: number; maxX: number; maxY: number; maxZ: number };
-      const boxByName = new Map<string, Box>();
-      const vertsByName = new Map<string, ArrayLike<number>>();
-      for (const p of parts) {
-        const v = (p as any).vertices;
-        if (!v || v.length < 3) continue;
-        let minX = Infinity, minY = Infinity, minZ = Infinity;
-        let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
-        for (let i = 0; i < v.length; i += 3) {
-          if (v[i] < minX) minX = v[i]; if (v[i] > maxX) maxX = v[i];
-          if (v[i + 1] < minY) minY = v[i + 1]; if (v[i + 1] > maxY) maxY = v[i + 1];
-          if (v[i + 2] < minZ) minZ = v[i + 2]; if (v[i + 2] > maxZ) maxZ = v[i + 2];
-        }
-        boxByName.set(p.name, { minX, minY, minZ, maxX, maxY, maxZ });
-        vertsByName.set(p.name, v);
-      }
-
-      const warnings: string[] = [];
-      for (const j of joints) {
-        const verts = vertsByName.get(j.part);
-        const box = boxByName.get(j.part);
-        if (!verts || !box) {
-          warnings.push(`joint "${j.name}" on "${j.part}": owning part has no tessellated geometry — cannot validate.`);
-          continue;
-        }
-        // Min vertex-distance².
-        let best = Infinity;
-        for (let i = 0; i < verts.length; i += 3) {
-          const dx = verts[i] - j.point[0];
-          const dy = verts[i + 1] - j.point[1];
-          const dz = verts[i + 2] - j.point[2];
-          const d2 = dx * dx + dy * dy + dz * dz;
-          if (d2 < best) best = d2;
-        }
-        const dist = Math.sqrt(best);
-        if (dist <= tol) continue;
-        const inside =
-          j.point[0] > box.minX && j.point[0] < box.maxX &&
-          j.point[1] > box.minY && j.point[1] < box.maxY &&
-          j.point[2] > box.minZ && j.point[2] < box.maxZ;
-        const kind = inside ? "buried" : "floats";
-        const prep = inside ? "inside body" : "off surface";
-        warnings.push(`joint "${j.name}" on "${j.part}" ${kind} ${dist.toFixed(3)}mm ${prep}`);
-      }
-
-      const summary = `validate_joints: checked ${joints.length} joint${joints.length === 1 ? "" : "s"} across ${parts.length} part${parts.length === 1 ? "" : "s"} (tolerance=${tol}mm).`;
-      if (warnings.length === 0) {
-        return {
-          content: [{ type: "text" as const, text: `${summary}\nOK — all joints are within tolerance of their owning part's surface.` }],
-        };
-      }
+      const report = extractJoints(parts, { tolerance });
       return {
-        content: [{
-          type: "text" as const,
-          text: `${summary}\nWarnings (${warnings.length}):\n${warnings.map((w) => `  - ${w}`).join("\n")}`,
-        }],
+        content: [{ type: "text" as const, text: formatJointReport(report) }],
       };
     })
   );
@@ -5636,7 +5909,7 @@ export function registerTools(server: McpServer) {
       filePath: z.string().optional().describe("Path to the .shape.ts file. Mutually exclusive with `code`."),
       code: z.string().optional().describe("Inline .shape.ts source — written to a temp file, executed, then deleted. Use `workingDir` for relative-import resolution. Mutually exclusive with `filePath`."),
       workingDir: z.string().optional().describe("Directory to host the inline snippet when `code` is provided. Defaults to a private globalStorage path."),
-      params: z.record(z.string(), z.number()).optional().describe("Numeric param overrides applied to the shape's `export const params`. Same shape as tune_params accepts."),
+      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Param overrides applied to the shape's `export const params` (numbers, booleans, or strings). Same shape as tune_params accepts."),
       checks: z.array(z.enum(["geometry", "collisions", "joints"])).optional().describe("Which checks to run. Defaults to all three. Order doesn't matter; each runs against the same single execution."),
       // Geometry per-check options
       geometryFormat: z.enum(["summary", "full"]).optional().describe("Geometry report verbosity. summary (default): face/edge counts + bounding box. full: per-face / per-edge records (capped by geometryLimit)."),
@@ -7015,9 +7288,25 @@ export default function main({ finCount, finThickness, baseR, finR, height }: ty
 \`\`\``,
     stdlib: `# ShapeItUp stdlib (\`import from "shapeitup"\`)
 
-Mechanical / 3D-printing helpers layered on top of Replicad. Every function
-returns a Replicad Shape3D (or Drawing, where noted), so results mix with any
-other Replicad code. Dimensions come from ISO/DIN tables — don't hardcode.
+Mechanical / 3D-printing helpers layered on top of Replicad. Dimensions come
+from ISO/DIN tables — don't hardcode.
+
+## Return-type cheat sheet
+
+Most helpers return a \`Shape3D\` and mix directly with any Replicad code.
+A few return stdlib \`Part\` objects (joints + colour + name + accumulated
+transform) because they're intended for use with \`assemble()\`. Use the
+right positioning API for each:
+
+| Helper | Returns | How to position |
+|---|---|---|
+| \`holes.*\`, \`screws.*\`, \`bolts.*\`, \`washers.*\`, \`inserts.*\`, \`bearings.*\`, \`extrusions.*\`, \`threads.*\`, \`cylinder\`, \`pins.*\`, \`cradles.*\` | \`Shape3D\` | Replicad \`.translate(x,y,z)\` / \`.rotate(angleDeg, position, direction)\` |
+| \`motors.nema17() / nema23() / nema14()\`, \`couplers.flexible()\`, \`part({...})\`, \`subassembly({...})\` | **\`Part\`** | Either \`assemble()\` + \`mate()\` (recommended), OR Part's own \`.rotate\` / \`.translate\` — both the 2-arg \`(angleDeg, axis)\` and 3-arg \`(angleDeg, position, direction)\` signatures are supported. Unwrap via \`part.worldShape()\` to get the positioned \`Shape3D\` for the entries array. |
+| \`patterns.spread\`, \`patterns.cutAt\`, \`patterns.applyPlacement\` | \`Shape3D\` | Already-positioned output |
+| \`patterns.polar / grid / linear / onPlane\` | \`Placement[]\` | Not a shape — pass to \`spread\` / \`cutAt\` |
+| \`shape3d(x)\` | \`Shape3D\` | Type-narrowing utility |
+| \`placeOn(drawing, plane, {into,distance})\` | \`Shape3D\` | Preferred over \`sketchOnPlane().extrude()\` — explicit half-space, no sign guessing |
+
 
 \`\`\`typescript
 import { holes, screws, bolts, washers, inserts, bearings, extrusions, patterns, printHints, motors, couplers, threads, fromBack, seatedOnPlate, shape3d, part, faceAt, shaftAt, boreAt, mate, assemble, subassembly, stackOnZ, entries, debugJoints, highlightJoints, cylinder, standards } from "shapeitup";
@@ -7308,6 +7597,27 @@ coupler → leadscrew assembly using this API.
 
 ## Standard part builders — motors, couplers
 
+**⚠ Return type: \`Part\`, NOT \`Shape3D\`.** Unlike \`cylinder\` / \`screws.*\` /
+\`holes.*\` (which return \`Shape3D\`), the helpers in this section return
+stdlib \`Part\` objects with joints already declared. That has two practical
+consequences:
+
+1. **Place via \`assemble()\` + \`mate()\`** when you're building an assembly;
+   the joints are there so you don't have to compute transforms by hand.
+2. **If you go manual**, use Part's own \`.rotate\` / \`.translate\` — both
+   signatures are supported:
+   - \`.rotate(angleDeg, axis)\` — canonical form, axis through world origin.
+   - \`.rotate(angleDeg, position, direction)\` — Shape3D-compatible form,
+     rotation through \`position\` along \`direction\`.
+   Then pipe the positioned Part into your entries array via
+   \`part.worldShape()\`:
+   \`\`\`typescript
+   const stepper = motors.nema17().rotate(-90, [0,0,0], [0,1,0]).translate(150, 0, 30);
+   return [{ shape: stepper.worldShape(), name: "stepper", color: "#222" }];
+   \`\`\`
+   Do NOT unwrap \`.shape\` — that gives the local frame BEFORE the transform
+   and your part will appear unpositioned.
+
 Pre-assembled \`Part\` builders with joints already declared. Skip the
 manual body+shaft+joint boilerplate when a standard mechanical part will do:
 
@@ -7459,13 +7769,29 @@ far cheaper if you don't need actual thread geometry.
 
 \`\`\`typescript
 printHints.elephantFootChamfer(shape, 0.4)       // chamfer bottom edges (default 0.4 mm)
-printHints.overhangChamfer(shape, 45)            // best-effort overhang chamfer (warn on fail)
 printHints.firstLayerPad(shape, { padding?, thickness? })  // thin adhesion pad (manual brim)
 \`\`\`
 
-\`overhangChamfer\` is a v1 stub — returns the shape unchanged with a
-\`console.warn\` on complex geometry. For known-good cases (simple brackets,
-plates) it cuts a reasonable chamfer.
+> Looking for a more general fillet/chamfer recipe (vertical edges, top
+> rim, all circular edges)? Use the \`cosmetic\` namespace below — it's
+> the supported home for non-FDM-specific edge-softening helpers.
+
+---
+
+## cosmetic — common fillet / chamfer recipes
+
+\`\`\`typescript
+cosmetic.softenVerticalEdges(shape, 2)            // fillet every Z-aligned edge
+cosmetic.softenTopEdges(shape, topZ, 0.5)         // fillet edges on the plane z=topZ
+cosmetic.bottomChamfer(shape, 0.4, bottomZ?)      // chamfer edges on z=bottomZ (default 0)
+cosmetic.softenAllEdges(shape, 1)                 // fillet every outer edge (no finder)
+cosmetic.softenCircularEdges(shape, 0.3)          // fillet hole rims / cylinder caps
+\`\`\`
+
+Every helper returns a new \`Shape3D\` and swallows OCCT no-match errors
+(emitting a runtime warning instead) so a small radius on an oddly-shaped
+part never crashes the render. Pass \`opts.silent = true\` to mute the
+warning when a no-op is expected.
 
 **Print orientation helpers** — re-orient a part for FDM printing and pack
 multiple parts onto one build plate:

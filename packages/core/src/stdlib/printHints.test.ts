@@ -16,10 +16,15 @@ describe("printHints — API surface", () => {
   it("exports layoutOnBed", () => {
     expect(typeof printHints.layoutOnBed).toBe("function");
   });
-  it("preserves prior helpers (elephantFootChamfer / overhangChamfer / firstLayerPad)", () => {
+  it("preserves prior helpers (elephantFootChamfer / firstLayerPad)", () => {
     expect(typeof printHints.elephantFootChamfer).toBe("function");
-    expect(typeof printHints.overhangChamfer).toBe("function");
     expect(typeof printHints.firstLayerPad).toBe("function");
+  });
+  it("overhangChamfer is intentionally removed — use cosmetic.bottomChamfer", () => {
+    // The former overhangChamfer helper was a duplicate of elephantFootChamfer
+    // with a misleading name. Callers needing a generic chamfer recipe should
+    // reach for the `cosmetic` namespace instead. Guard against re-introduction.
+    expect((printHints as any).overhangChamfer).toBeUndefined();
   });
 });
 

@@ -3,11 +3,16 @@
  *
  *  - `elephantFootChamfer` — cuts the slight flare at the bottom of the first
  *     layers that happens when plastic squishes against the bed.
- *  - `overhangChamfer` — aims to chamfer 45° down-facing overhangs. Edge-face
- *    angle detection in OCCT is fragile on complex geometry, so this is a
- *    best-effort helper that falls back to a no-op with a warning.
  *  - `firstLayerPad` — adds a thin flat pad below the shape that acts as a
  *    manual brim for improved bed adhesion.
+ *
+ * Note: the former `overhangChamfer` helper was removed — its implementation
+ * was a duplicate of `elephantFootChamfer` with a misleading name (it
+ * chamfered the bottom-Z plane, not actual overhangs). For cosmetic fillets
+ * / chamfers driven by your own selector, use the `cosmetic` namespace
+ * (`cosmetic.softenVerticalEdges`, `cosmetic.bottomChamfer`, etc.) or
+ * Replicad's raw `shape.fillet(r, e => ...)` finder DSL — see
+ * `get_api_reference('finders')` for the recipe cookbook.
  *
  * ### Why pushRuntimeWarning (not console.warn)?
  *
@@ -110,74 +115,6 @@ export function elephantFootChamfer(
       } else {
         pushRuntimeWarning(
           `printHints.elephantFootChamfer: could not apply — ${errMsg(err)}. Returning shape unchanged.`
-        );
-      }
-    }
-    return shape;
-  }
-}
-
-/**
- * Best-effort overhang chamfer. Tries to find edges that sit between a
- * down-facing horizontal face and a vertical face, then chamfers them at
- * `angle` degrees (default 45). Edge-to-face-normal detection in OCCT is
- * fragile on non-trivial geometry — on failure this function emits a
- * runtime warning and returns the shape unchanged. Don't rely on it for
- * critical features; it's a convenience for simple brackets and plates.
- *
- * Warnings follow the same pattern as `elephantFootChamfer`: success gets
- * a positive confirmation, failure gets a structured diagnosis naming the
- * shape's Z bounds, and `opts.silent = true` suppresses both.
- *
- * @param shape Target Shape3D.
- * @param angle Chamfer angle in degrees (default 45). Currently used to size
- *   the chamfer distance (`tan(angle) × effective thickness`); the selector
- *   treats edges as candidates regardless.
- * @param opts.silent Suppress success/failure warnings (default false).
- * @returns Shape3D, chamfered if possible; otherwise original + warning.
- */
-export function overhangChamfer(
-  shape: Shape3D,
-  angle = 45,
-  opts: { silent?: boolean } = {}
-): Shape3D {
-  const silent = opts.silent ?? false;
-  let zMin: number | undefined;
-  let zMax: number | undefined;
-  try {
-    const bb = shape.boundingBox;
-    zMin = bb.bounds[0][2];
-    zMax = bb.bounds[1][2];
-    // Use a nominal chamfer distance sized to ~10% of the shape's Z extent
-    // (capped to 1 mm) — keeps the op stable on small features.
-    const bbDepth = zMax - zMin;
-    const distance = Math.min(Math.max(bbDepth * 0.1, 0.3), 1.0);
-    // Heuristic: target edges at the bottom that run along X or Y (edges of
-    // downward-facing overhangs). This is the simplest selector OCCT will
-    // apply reliably — more nuanced face-normal filtering needs per-shape
-    // work that we skip in v1.
-    const result = shape.chamfer(distance, (e) =>
-      e
-        .inPlane("XY", zMin!)
-        .not((e2) => e2.ofCurveType("CIRCLE"))
-    );
-    if (!silent) {
-      pushRuntimeWarning(
-        `printHints.overhangChamfer: chamfered bottom overhang edges at Z=${zMin.toFixed(3)} (distance ${distance.toFixed(3)}mm, angle ${angle}°).`
-      );
-    }
-    return result;
-  } catch (err) {
-    if (!silent) {
-      if (looksLikeNoEdgeMatch(err)) {
-        const lo = zMin !== undefined ? zMin.toFixed(3) : "?";
-        const hi = zMax !== undefined ? zMax.toFixed(3) : "?";
-        pushRuntimeWarning(
-          `printHints.overhangChamfer: no Z=${lo} edges found (shape bbox Z ∈ [${lo}, ${hi}]) — skipped.`
-        );
-      } else {
-        pushRuntimeWarning(
-          `printHints.overhangChamfer: could not apply — ${errMsg(err)}. Returning shape unchanged.`
         );
       }
     }

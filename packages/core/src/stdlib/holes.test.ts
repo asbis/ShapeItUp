@@ -300,3 +300,29 @@ describe("holes — axis is accepted on every directional helper", () => {
     }
   });
 });
+
+describe("holes.slot — length vs travel input forms", () => {
+  // Tests here avoid triggering OCCT — they exercise the argument-validation
+  // layer, not the geometry. End-to-end equivalence is covered by the MCP
+  // live-render suite.
+
+  it("throws when both length AND travel are passed", () => {
+    expect(() =>
+      holes.slot({ length: 15, travel: 10, width: 5, depth: 4 } as any),
+    ).toThrow(/exactly one of.*length.*or.*travel/);
+  });
+
+  it("throws when neither length nor travel is passed", () => {
+    expect(() =>
+      holes.slot({ width: 5, depth: 4 } as any),
+    ).toThrow(/either.*length.*or.*travel.*Neither was provided/);
+  });
+
+  it("length < width still throws the original hint, and now also names `travel` as an alternative", () => {
+    // The error message adds a suggestion to use travel semantics as a
+    // friendlier alternative to the length-vs-width gotcha.
+    expect(() =>
+      holes.slot({ length: 4, width: 8, depth: 4 }),
+    ).toThrow(/travel.*width.*avoid the inequality/);
+  });
+});

@@ -1,3 +1,77 @@
+import { pushRuntimeWarning } from "./stdlib/warnings";
+
+/**
+ * Named material presets — density in g/cm³, mapped to the same units the
+ * rest of the mass pipeline uses (`mass = density * volume / 1000` with
+ * volume in mm³). Lets users write `material: "PLA"` instead of looking up
+ * densities manually. Case-sensitive — "PLA", "ABS", etc. must match
+ * exactly; unknown strings are dropped at resolve time so the caller can
+ * warn instead of silently losing mass data.
+ *
+ * Lives here (not in executor.ts) so per-part materials in `normalizeParts`
+ * and script-level materials in the executor share the same source of truth.
+ */
+export const MATERIAL_PRESETS: Record<string, number> = {
+  PLA: 1.24,
+  ABS: 1.04,
+  PETG: 1.27,
+  Nylon: 1.15,
+  Aluminum: 2.7,
+  Steel: 7.85,
+  Stainless: 8.0,
+  Brass: 8.47,
+  Titanium: 4.5,
+  Copper: 8.96,
+  Wood: 0.6,
+  // Engineering-grade alloy variants — generic names above stay as back-compat
+  // defaults; prefer these when alloy-grade precision matters for mass budgets.
+  "Aluminum 6061": 2.7,
+  "Aluminum 7075": 2.81,
+  "Steel 304": 7.93,
+  "Steel 4140": 7.85,
+  "Brass 360": 8.5,
+  "Titanium Grade 5": 4.43,
+};
+
+/**
+ * Resolve a raw material value (string preset name or `{density, name?}`
+ * object) into a normalized `{density, name?}` shape. Returns a tagged
+ * union so callers can warn on unknown presets vs. silently drop invalid
+ * inputs.
+ *
+ *   - `string` matching a preset → `{ok: true, material: {density, name}}`
+ *   - `string` NOT matching any preset → `{ok: false, reason: "unknown-preset", given}`
+ *   - `{density: number > 0, name?: string}` → `{ok: true, material: {...}}`
+ *   - `null` / `undefined` → `{ok: true, material: undefined}` (caller treats as absent)
+ *   - anything else (malformed object, NaN density, etc.) → `{ok: false, reason: "invalid"}`
+ */
+export type MaterialResolution =
+  | { ok: true; material: { density: number; name?: string } | undefined }
+  | { ok: false; reason: "unknown-preset"; given: string }
+  | { ok: false; reason: "invalid" };
+
+export function resolveMaterial(raw: unknown): MaterialResolution {
+  if (raw === undefined || raw === null) {
+    return { ok: true, material: undefined };
+  }
+  if (typeof raw === "string") {
+    const preset = MATERIAL_PRESETS[raw];
+    if (preset !== undefined) {
+      return { ok: true, material: { density: preset, name: raw } };
+    }
+    return { ok: false, reason: "unknown-preset", given: raw };
+  }
+  if (typeof raw === "object") {
+    const r = raw as { density?: unknown; name?: unknown };
+    if (typeof r.density === "number" && Number.isFinite(r.density) && r.density > 0) {
+      const out: { density: number; name?: string } = { density: r.density };
+      if (typeof r.name === "string" && r.name.length > 0) out.name = r.name;
+      return { ok: true, material: out };
+    }
+  }
+  return { ok: false, reason: "invalid" };
+}
+
 export interface PartInput {
   shape: any;
   name: string;
@@ -15,6 +89,17 @@ export interface PartInput {
    * multi-material assemblies (e.g. a PLA shell with a TPU gasket) can carry
    * density + name through the pipeline. Absent → inherit the script-level
    * material (if any).
+   *
+   * Normalized form is `{density, name?}` — that's what every consumer
+   * after `normalizeParts` sees. Scripts can pass a string preset name at
+   * the array boundary (`{ material: "Aluminum" }`); `normalizeParts`
+   * resolves it via {@link resolveMaterial}, warns on unknown presets,
+   * and stores the resolved object here. The string form is most useful
+   * when re-using `export const material = "Foo"` from an imported part-
+   * factory file without writing density lookups by hand:
+   *
+   *   import partMain, { material as partMaterial } from "./part.shape";
+   *   return [{ shape: partMain(...), name: "part", material: partMaterial }];
    */
   material?: { density: number; name?: string };
   /**
@@ -27,6 +112,27 @@ export interface PartInput {
    * existing script's behaviour.
    */
   analyze?: boolean;
+  /**
+   * Optional named joints in WORLD coordinates. Used by `validate_joints`
+   * to verify each joint sits on the owning part's surface, and by future
+   * tooling (mate inspection, joint-based picking). The stdlib `Part`
+   * factory + `entries()` populate this automatically; users returning
+   * raw `{shape, name}` objects can supply it directly when they want
+   * post-render joint validation.
+   *
+   * `position` is the joint origin in world coords, `axis` is the
+   * normalized outward direction. `role` / `diameter` are optional
+   * metadata that mate() uses for pre-flight checks.
+   */
+  joints?: Record<
+    string,
+    {
+      position: [number, number, number];
+      axis: [number, number, number];
+      role?: "male" | "female" | "face";
+      diameter?: number;
+    }
+  >;
 }
 
 export interface TessellatedPart {
@@ -51,6 +157,16 @@ export interface TessellatedPart {
   material?: { density: number; name?: string };
   /** Propagated from PartInput — see {@link PartInput.analyze}. */
   analyze?: boolean;
+  /** Propagated from PartInput — see {@link PartInput.joints}. */
+  joints?: Record<
+    string,
+    {
+      position: [number, number, number];
+      axis: [number, number, number];
+      role?: "male" | "female" | "face";
+      diameter?: number;
+    }
+  >;
 }
 
 export function normalizeParts(result: any): PartInput[] {
@@ -86,19 +202,20 @@ export function normalizeParts(result: any): PartInput[] {
       if (typeof item.qty === "number" && Number.isFinite(item.qty) && item.qty > 0) {
         out.qty = item.qty;
       }
-      if (
-        item.material &&
-        typeof item.material === "object" &&
-        typeof item.material.density === "number" &&
-        Number.isFinite(item.material.density) &&
-        item.material.density > 0
-      ) {
-        out.material = {
-          density: item.material.density,
-          ...(typeof item.material.name === "string" && item.material.name
-            ? { name: item.material.name }
-            : {}),
-        };
+      // Per-part material: accepts string preset OR {density, name?} object.
+      // Unknown presets push a runtime warning so a typo is visible; invalid
+      // objects (NaN density etc.) are dropped silently to match prior
+      // permissive behaviour.
+      const matRes = resolveMaterial(item.material);
+      if (matRes.ok) {
+        if (matRes.material) out.material = matRes.material;
+      } else if (matRes.reason === "unknown-preset") {
+        pushRuntimeWarning(
+          `Unknown material preset '${matRes.given}' on part '${out.name}'. ` +
+            `Known presets: ${Object.keys(MATERIAL_PRESETS).join(", ")}. ` +
+            `Use { density: number } for custom densities. ` +
+            `Part will appear with no mass in the BOM.`,
+        );
       }
       // Preserve the analyze opt-out flag. Only `false` is meaningful (opt
       // out of printability / minFeature warnings); `true` is the default
@@ -106,6 +223,31 @@ export function normalizeParts(result: any): PartInput[] {
       // — keeps downstream serializers noise-free.
       if (item.analyze === false) {
         out.analyze = false;
+      }
+      // Preserve joints when present. Validate shape minimally — every value
+      // needs at least { position: [n,n,n], axis: [n,n,n] }; malformed entries
+      // are skipped silently rather than crashing the render. validate_joints
+      // is the consumer; if it sees nothing, it reports "no introspectable
+      // joints" rather than rejecting the part.
+      if (item.joints && typeof item.joints === "object" && !Array.isArray(item.joints)) {
+        const sanitized: NonNullable<PartInput["joints"]> = {};
+        for (const [name, spec] of Object.entries(item.joints)) {
+          const s = spec as any;
+          const pos = s?.position;
+          const ax = s?.axis;
+          if (
+            Array.isArray(pos) && pos.length >= 3 && pos.every((n: any) => typeof n === "number" && Number.isFinite(n)) &&
+            Array.isArray(ax) && ax.length >= 3 && ax.every((n: any) => typeof n === "number" && Number.isFinite(n))
+          ) {
+            sanitized[name] = {
+              position: [pos[0], pos[1], pos[2]],
+              axis: [ax[0], ax[1], ax[2]],
+              ...(s.role === "male" || s.role === "female" || s.role === "face" ? { role: s.role } : {}),
+              ...(typeof s.diameter === "number" && Number.isFinite(s.diameter) ? { diameter: s.diameter } : {}),
+            };
+          }
+        }
+        if (Object.keys(sanitized).length > 0) out.joints = sanitized;
       }
       return out;
     }
@@ -239,5 +381,6 @@ export function tessellatePart(part: PartInput, opts: TessellateOptions = {}): T
     ...(typeof part.qty === "number" ? { qty: part.qty } : {}),
     ...(part.material ? { material: part.material } : {}),
     ...(part.analyze === false ? { analyze: false as const } : {}),
+    ...(part.joints ? { joints: part.joints } : {}),
   };
 }

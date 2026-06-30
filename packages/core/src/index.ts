@@ -9,7 +9,7 @@
 
 import type { ParamDef } from "@shapeitup/shared";
 import { executeScript } from "./executor";
-export { extractParamsStatic, extractExpectedContactsStatic } from "./executor";
+export { extractParamsStatic, extractConfigStatic, extractExpectedContactsStatic } from "./executor";
 import { normalizeParts, tessellatePart, type MeshQuality, type PartInput, type PartStatsLevel, type TessellatedPart } from "./tessellate";
 import { exportShapes } from "./exporter";
 import {
@@ -300,6 +300,54 @@ function readBoundsSafe(
 }
 
 /**
+ * Build a "cutter fully contained inside the target's bbox" suffix for the
+ * plain-.cut() no-op warning. Fires only when:
+ *   - every axis overlaps (so `axisDisjointHint` returned ""), AND
+ *   - the cutter's bbox is FULLY INSIDE the target's bbox on every axis.
+ *
+ * That signature matches the most common cause of a "no material removal"
+ * warning that ISN'T a bug — a redundant cut whose region was already
+ * cleared by a previous .cut() (e.g. an M5 hole drilled inside an existing
+ * Ø23 pilot). We don't try to PROVE the previous cut exists (would need
+ * cut-history tracking through immutable shape rebuilds, which Replicad's
+ * chain semantics makes brittle). Instead we soften the message so users
+ * with an intentional overlap don't trust-erode on a "Common causes: wrong
+ * Y/Z sign" suggestion that doesn't apply to them.
+ *
+ * Returns "" when either bbox is unavailable, when an axis is disjoint
+ * (axisDisjointHint already handled it), or when the cutter is only
+ * partially inside (the existing generic message is still appropriate).
+ */
+function cutterContainedHint(
+  target: [[number, number, number], [number, number, number]] | undefined,
+  tool: [[number, number, number], [number, number, number]] | undefined,
+): string {
+  if (!target || !tool) return "";
+  // Tiny tolerance to allow the CUT_EPSILON nudge stdlib helpers add — cutters
+  // routinely extend ~CUT_EPSILON past the target's faces, which would
+  // otherwise fail strict containment.
+  const EPS = 0.01;
+  for (let i = 0; i < 3; i++) {
+    const tMin = target[0][i];
+    const tMax = target[1][i];
+    const cMin = tool[0][i];
+    const cMax = tool[1][i];
+    // Fully contained on this axis means cutter range sits inside target
+    // range (allowing the tolerance). Disjoint axes return "" via the
+    // companion hint, so this function's contract is "every axis overlaps";
+    // we only need to check FULL containment.
+    if (cMin < tMin - EPS || cMax > tMax + EPS) {
+      return "";
+    }
+  }
+  return (
+    " Cutter is fully inside the target's bounding box — most likely a previous .cut()" +
+    " already removed material in this region (intentional redundant cut; the warning is harmless)." +
+    " If you DIDN'T intend the overlap, check the cutter's dimensions/depth against the target's interior."
+  );
+}
+
+/**
  * Build an "X/Y/Z disjoint" suffix for the plain-.cut() no-op warning when
  * we can prove from the two AABBs that the cutter never touched the target.
  * Returns an empty string when the bboxes overlap on every axis (the cut is
@@ -531,13 +579,20 @@ export function patchShapeCutNoOpGuard(replicad: any): boolean {
         Math.abs(outputVolume - inputVolume) < CUT_VOLUME_EPSILON
       ) {
         const axisHint = axisDisjointHint(targetBounds, toolBounds);
+        // When the bboxes overlap on every axis, also check whether the
+        // cutter is FULLY CONTAINED in the target — that's the redundant-
+        // cut signature (an M5 inside an already-empty Ø23 pilot, etc.).
+        // Soften the message so users with intentional overlaps don't
+        // trust-erode on a "wrong Y/Z sign" suggestion that doesn't apply.
+        const containedHint = axisHint ? "" : cutterContainedHint(targetBounds, toolBounds);
         pushRuntimeWarning(
           `cut #${callIdx}: cut produced no material removal — ` +
             `input and output volumes are equal (V=${inputVolume.toFixed(2)} mm³). ` +
             `Common causes: cutter disjoint from target (wrong Y/Z sign), ` +
             `sketchOnPlane("XZ").extrude(L) grows toward -Y not +Y, ` +
             `cutter smaller than measurement tolerance.` +
-            axisHint,
+            axisHint +
+            containedHint,
         );
       }
     }
@@ -590,6 +645,13 @@ export function patchShapeFuseNoOpGuard(replicad: any): boolean {
     // impossible to locate.
     const callIdx = nextFuseCallIndex();
     const inputVolume = readVolumeSafe(this, replicad);
+    // Snapshot AABBs before the fuse so the axis-disjoint hint can describe
+    // WHICH operand sits where, WHICH axis is the problem, and WHAT shift
+    // would bring them into contact. Matches the same mechanic the cut
+    // guard uses — the P2-3 knitting-printer feedback asked for exactly
+    // this parity.
+    const thisBounds = readBoundsSafe(this);
+    const otherBounds = readBoundsSafe(other);
     const result = originalFuse.call(this, other, options);
     if (typeof inputVolume === "number" && inputVolume > 0) {
       const outputVolume = readVolumeSafe(result, replicad);
@@ -597,14 +659,27 @@ export function patchShapeFuseNoOpGuard(replicad: any): boolean {
         typeof outputVolume === "number" &&
         Math.abs(outputVolume - inputVolume) < CUT_VOLUME_EPSILON
       ) {
+        // axisDisjointHint was built for cut — the semantics map cleanly:
+        // "target" → the receiver of .fuse, "tool" → the added operand.
+        // When the bboxes ARE disjoint on some axis the message names the
+        // side and suggests a translate; when they overlap on all three
+        // axes (case 1 — operand fully inside) the helper returns "" and
+        // we fall back to the generic hint text below.
+        const axisHint = axisDisjointHint(thisBounds, otherBounds);
         pushRuntimeWarning(
           `fuse #${callIdx}: fuse produced no new material — ` +
             `input and output volumes are equal (V=${inputVolume.toFixed(2)} mm³). ` +
-            `Common causes: ` +
-            `the added solid is fully inside the target (union is a no-op), ` +
-            `the added solid is disjoint from the target but compound-shape semantics ` +
-            `hid the error (use .fuse for overlapping solids; for disjoint shapes, ` +
-            `return them as separate parts).`,
+            (axisHint
+              ? // Disjoint case: the axis hint already names the side and the
+                // shift, no need to guess "one of two things".
+                `The added solid does not overlap the target on at least one axis — ` +
+                  `for a meaningful fuse, translate the operands so they share material.` +
+                  axisHint
+              : // Overlap-but-contained case (case 1 in the doc comment above).
+                `The added solid appears fully contained in the target (union is a ` +
+                  `no-op). If you expected the added solid to stick out, check its ` +
+                  `position / dimensions; if the two shapes are meant to be kept as ` +
+                  `separate bodies, return them as separate parts instead of fusing.`),
         );
       }
     }
@@ -626,7 +701,7 @@ export interface Core {
    */
   execute(
     js: string,
-    paramOverrides?: Record<string, number>,
+    paramOverrides?: Record<string, number | boolean | string>,
     streaming?: {
       onStart?: (totalParts: number) => void;
       onPart?: (part: TessellatedPart, index: number, total: number) => void;
@@ -740,7 +815,7 @@ export async function initCore(
 
   async function execute(
     js: string,
-    paramOverrides?: Record<string, number>,
+    paramOverrides?: Record<string, number | boolean | string>,
     streaming?: {
       onStart?: (totalParts: number) => void;
       onPart?: (part: TessellatedPart, index: number, total: number) => void;
@@ -892,7 +967,18 @@ export async function initCore(
     // path. Default `"bbox"` skips both and derives centerOfMass from the
     // AABB centre — that's still a useful approximation for assembly
     // aggregation, and per-part volume/surfaceArea rarely gets consumed.
-    const partStats: PartStatsLevel = streaming?.partStats ?? "bbox";
+    // A declared material — script-level `export const material` OR a per-part
+    // `material` on any returned part — is an explicit opt-in to mass
+    // reporting, and mass needs the OCCT-measured volume that only "full"
+    // computes. Auto-upgrade from the default "bbox" so declaring a material
+    // actually yields a mass without the caller knowing to ask for full stats.
+    // An explicit caller override (export_shape's "full", or a deliberate
+    // "none") still wins. Cost is ~200 ms/part, paid only when the user asked
+    // for mass by declaring a material.
+    const hasMaterial =
+      !!material || parts.some((p) => !!(p as { material?: unknown }).material);
+    const partStats: PartStatsLevel =
+      streaming?.partStats ?? (hasMaterial ? "full" : "bbox");
     // Tessellate + measure + emit each part before moving to the next, so
     // `onPart` callers can stream to the viewer as the worker goes.
     for (let i = 0; i < parts.length; i++) {

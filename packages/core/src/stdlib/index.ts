@@ -7,6 +7,8 @@
  */
 
 import * as holes from "./holes";
+import * as mounts from "./mounts";
+import * as cosmetic from "./cosmetic";
 import * as printHints from "./printHints";
 import * as bearings from "./bearings";
 import * as extrusions from "./extrusions";
@@ -76,6 +78,8 @@ export { standards };
 // import to destructure from `shapeitupStdlib` below.
 export {
   holes,
+  mounts,
+  cosmetic,
   printHints,
   bearings,
   extrusions,
@@ -127,6 +131,8 @@ export {
  */
 export const shapeitupStdlib = {
   holes,
+  mounts,
+  cosmetic,
   screws,
   bolts,
   washers,

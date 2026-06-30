@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import {
   executeScript,
+  extractConfigStatic,
   extractExpectedContactsStatic,
   extractParamsStatic,
   rewriteImports,
@@ -631,13 +632,10 @@ describe("extractParamsStatic", () => {
     expect(extractParamsStatic(src)).toEqual([]);
   });
 
-  it("skips a comment-only line before the first real key (regex anchors on `{`/`,`, not inside a line-comment)", () => {
-    // The pair pattern anchors on `^`, `{`, or `,` before the key. A
-    // line-comment like `// width: 80` is neither preceded by nor followed
-    // by one of those inside the body, so `width` is correctly ignored.
-    // The important behavior is: a real key on a later line DOES still
-    // match, because its line is reached via the `,` or start-of-body
-    // anchor once we pass the comment noise.
+  it("skips a comment-only line before the first real key and still returns all real keys", () => {
+    // Comments are stripped before the pair regex runs, so every real key
+    // lands in the result — including keys that appear on a line right
+    // after a `// trailing comment` terminator.
     const src = `
       export const params = {
         // comment, not a key
@@ -645,10 +643,55 @@ describe("extractParamsStatic", () => {
         depth: 30
       };
     `;
-    const keys = extractParamsStatic(src);
-    // At minimum we want `depth` — it's anchored by the explicit `,`
-    // after `50`, which is the least fragile signal for the regex.
-    expect(keys).toContain("depth");
+    expect(extractParamsStatic(src)).toEqual(["height", "depth"]);
+  });
+
+  it("extracts keys that follow a line-comment on the previous line", () => {
+    // Real-world repro from knitting-printer v8: camRise on a line after
+    // `trackGap: 5.5, // channel width (butt Y-clearance)` was being lost
+    // because the `\s*` anchor in the pair regex couldn't skip over `//…`.
+    // Comments are now stripped before the pair regex runs so camRise
+    // lands in the result.
+    const src = `
+      export const params = {
+        length: 90,
+        trackGap: 5.5, // channel width (butt Y-clearance)
+        camRise: 9,
+        camRunX: 30, // cam triangle base along X
+      };
+    `;
+    expect(extractParamsStatic(src)).toEqual([
+      "length",
+      "trackGap",
+      "camRise",
+      "camRunX",
+    ]);
+  });
+
+  it("handles block comments interrupting the key list", () => {
+    const src = `
+      export const params = {
+        a: 1,
+        /* multi-line
+           block comment */
+        b: 2,
+      };
+    `;
+    expect(extractParamsStatic(src)).toEqual(["a", "b"]);
+  });
+
+  it("ignores keys inside nested object literals", () => {
+    // Previous implementation stopped at the first `}` so the nested object
+    // swallowed the real key `c`. Brace-balanced extraction + per-match
+    // depth filtering keeps only top-level keys.
+    const src = `
+      export const params = {
+        a: 1,
+        opts: { nestedA: 1, nestedB: 2 },
+        c: 3,
+      };
+    `;
+    expect(extractParamsStatic(src)).toEqual(["a", "opts", "c"]);
   });
 
   it("handles `as const` suffix (realistic esbuild-adjacent form)", () => {
@@ -669,6 +712,45 @@ describe("extractParamsStatic", () => {
       export default function main() { return 1; }
     `;
     expect(extractParamsStatic(src)).toEqual(["a", "b", "c"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractConfigStatic — shape-authored tool config (strict, meshQuality,
+// localFrame). Driven by the same regex shape as extractParamsStatic.
+// ---------------------------------------------------------------------------
+
+describe("extractConfigStatic", () => {
+  it("returns an empty object when no config is declared", () => {
+    const src = `export default function main() { return 1; }`;
+    expect(extractConfigStatic(src)).toEqual({});
+  });
+
+  it("extracts strict and meshQuality together", () => {
+    const src = `
+      export const config = { strict: true, meshQuality: "preview" };
+      export default function main() { return 1; }
+    `;
+    expect(extractConfigStatic(src)).toEqual({ strict: true, meshQuality: "preview" });
+  });
+
+  it("extracts localFrame: true (intermediate-part authoring mode)", () => {
+    // The knitting-printer v8 feedback surfaced needle.shape.ts etc. as
+    // routine triggers of the rotation-direction hint. `localFrame: true`
+    // is the opt-out for that case — files imported by an assembly and
+    // positioned at assembly time, rather than rendered as the top design.
+    const src = `
+      export const config = { localFrame: true };
+      export default function main() { return 1; }
+    `;
+    expect(extractConfigStatic(src)).toEqual({ localFrame: true });
+  });
+
+  it("ignores unknown boolean keys (forward-compat with future flags)", () => {
+    const src = `
+      export const config = { strict: true, futureFlag: true };
+    `;
+    expect(extractConfigStatic(src)).toEqual({ strict: true });
   });
 });
 
@@ -881,6 +963,54 @@ describe("patchShapeCutNoOpGuard — warns when cut removes zero material", () =
     expect(drainRuntimeWarnings()).toEqual([]);
   });
 
+  it("adds a 'cutter contained' hint when the cutter sits fully inside the target's bbox", () => {
+    // The redundant-cut scenario: M5 hole cut at the same location as an
+    // existing Ø23 pilot. The cutter is fully inside the target's bbox,
+    // every axis overlaps, and no material is removed because the region
+    // was already void. The original message blamed "wrong Y/Z sign" by
+    // default — that's misleading when the cause is intentional overlap.
+    const { replicad, volumeMap, _3DShape } = makeFakeReplicad();
+    patchShapeCutNoOpGuard(replicad);
+
+    const target: any = new _3DShape();
+    const tool: any = new _3DShape();
+    volumeMap.set(target, 1000);
+    target.boundingBox = { bounds: [[-20, -20, -10], [20, 20, 10]] };
+    // Tool centered inside the target on every axis.
+    tool.boundingBox = { bounds: [[-2, -2, -3], [2, 2, 3]] };
+    target.cut(tool);
+
+    const w = drainRuntimeWarnings();
+    expect(w).toHaveLength(1);
+    expect(w[0]).toMatch(/cut produced no material removal/);
+    // The new contained-cutter hint fires only on full overlap.
+    expect(w[0]).toMatch(/Cutter is fully inside the target's bounding box/);
+    expect(w[0]).toMatch(/intentional redundant cut/);
+    // The axis-disjoint hint should NOT appear (no axis is disjoint).
+    expect(w[0]).not.toMatch(/disjoint on/);
+  });
+
+  it("does NOT add the 'cutter contained' hint when the cutter pokes outside", () => {
+    // Partial overlap: cutter overlaps the target on every axis but extends
+    // past on at least one. The "fully contained" softening would be
+    // misleading here — keep the generic message so users still look at
+    // sign / dimension errors.
+    const { replicad, volumeMap, _3DShape } = makeFakeReplicad();
+    patchShapeCutNoOpGuard(replicad);
+
+    const target: any = new _3DShape();
+    const tool: any = new _3DShape();
+    volumeMap.set(target, 1000);
+    target.boundingBox = { bounds: [[-5, -5, -5], [5, 5, 5]] };
+    // Cutter extends past target on +X.
+    tool.boundingBox = { bounds: [[-2, -2, -2], [10, 2, 2]] };
+    target.cut(tool);
+
+    const w = drainRuntimeWarnings();
+    expect(w).toHaveLength(1);
+    expect(w[0]).not.toMatch(/fully inside the target/);
+  });
+
   it("is idempotent — a second call on the same replicad module is a no-op", () => {
     // The module-level cutPatched flag protects against double-wrapping,
     // which would otherwise double-measure every cut in the pipeline and
@@ -996,7 +1126,33 @@ describe("patchShapeFuseNoOpGuard — warns when fuse adds zero material", () =>
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toMatch(/fuse produced no new material/);
     expect(warnings[0]).toMatch(/V=2500\.00 mm³/);
-    expect(warnings[0]).toMatch(/fully inside the target/);
+    // The fake replicad in this suite doesn't back its `boundingBox` with a
+    // disjoint AABB, so the warning falls through to the contained-case hint.
+    expect(warnings[0]).toMatch(/fully contained in the target/);
+  });
+
+  it("names the disjoint axis and suggests a translate when the operands' AABBs don't touch", () => {
+    // P2-3 from knitting-printer v8: the cut guard's axis-disjoint hint
+    // (`Cutter is RIGHT-OF target, translate by N mm on X`) saved real
+    // minutes of debugging. Parity check: when .fuse sees operands whose
+    // AABBs are disjoint on an axis, the same diagnostic fires.
+    const { replicad, volumeMap, _3DShape } = makeFakeReplicad();
+    patchShapeFuseNoOpGuard(replicad);
+
+    const target: any = new _3DShape();
+    const added: any = new _3DShape();
+    volumeMap.set(target, 1000);
+    // Target at X ∈ [0, 10]; added at X ∈ [20, 30] — 10 mm disjoint on X.
+    target.boundingBox = { bounds: [[0, 0, 0], [10, 10, 10]] };
+    added.boundingBox = { bounds: [[20, 0, 0], [30, 10, 10]] };
+
+    target.fuse(added);
+    const warnings = drainRuntimeWarnings();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/fuse produced no new material/);
+    // The shared axisDisjointHint helper names the disjoint axis explicitly.
+    expect(warnings[0]).toMatch(/disjoint on X axis/);
+    expect(warnings[0]).toMatch(/does not overlap the target/);
   });
 
   it("is idempotent — a second patch call on the same replicad is a no-op", () => {

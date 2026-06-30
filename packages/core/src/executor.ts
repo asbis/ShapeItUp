@@ -1,41 +1,6 @@
 import type { ParamDef } from "@shapeitup/shared";
 import { pushRuntimeWarning } from "./stdlib/warnings";
-
-/**
- * Named material presets — density in g/cm³, mapped to the same units the rest
- * of the mass pipeline uses (`mass = density * volume / 1000` with volume in
- * mm³). Lets users write `export const material = "PLA"` instead of looking up
- * densities manually. Case-sensitive — "PLA", "ABS", etc. must match exactly;
- * unknown strings emit a runtime warning listing the known keys so the user
- * can correct the typo without silently losing mass data.
- *
- * For engineering work, specific alloys: "Aluminum 6061" (2.70), "Aluminum 7075"
- * (2.81), "Steel 304" (7.93), "Steel 4140" (7.85), "Brass 360" (8.50),
- * "Titanium Grade 5" (4.43). The generic "Aluminum"/"Steel"/"Brass"/"Titanium"
- * entries stay as back-compat defaults for scripts that don't need alloy-grade
- * precision.
- */
-const MATERIAL_PRESETS: Record<string, number> = {
-  PLA: 1.24,
-  ABS: 1.04,
-  PETG: 1.27,
-  Nylon: 1.15,
-  Aluminum: 2.70,
-  Steel: 7.85,
-  Stainless: 8.00,
-  Brass: 8.47,
-  Titanium: 4.50,
-  Copper: 8.96,
-  Wood: 0.60,
-  // Engineering-grade alloy variants — generic names above stay as back-compat
-  // defaults; prefer these when alloy-grade precision matters for mass budgets.
-  "Aluminum 6061": 2.70,
-  "Aluminum 7075": 2.81,
-  "Steel 304": 7.93,
-  "Steel 4140": 7.85,
-  "Brass 360": 8.50,
-  "Titanium Grade 5": 4.43,
-};
+import { MATERIAL_PRESETS, resolveMaterial } from "./tessellate";
 
 /**
  * Extract `export const params = {...}` names from source code without
@@ -50,9 +15,42 @@ const MATERIAL_PRESETS: Record<string, number> = {
  * stays useful instead of collapsing to "Declared: (none)".
  */
 export function extractParamsStatic(sourceCode: string): string[] {
-  const match = sourceCode.match(/export\s+const\s+params\s*=\s*\{([^}]*)\}/s);
-  if (!match) return [];
-  const body = match[1];
+  // Locate `export const params = {` and capture the brace-balanced body.
+  // The previous implementation used `\{([^}]*)\}` which stopped at the
+  // first `}` — that lost every key after a nested object literal AND, more
+  // commonly, every key sitting on a line AFTER a `//` line comment because
+  // the comment-aware anchoring in the pair regex wasn't reached (the pair
+  // regex's `\s*` doesn't skip over `//…\n` or `/*…*/`). We now:
+  //   1. Extract the balanced body by brace-counting (handles nested
+  //      objects without extra branches).
+  //   2. Strip line + block comments from the body before running the pair
+  //      regex — ensures a preceding `,` anchor is followed by whitespace,
+  //      not comment text.
+  const headRe = /export\s+const\s+params\s*=\s*\{/;
+  const head = sourceCode.match(headRe);
+  if (!head || head.index === undefined) return [];
+  const startBrace = head.index + head[0].length; // index AFTER the opening `{`
+  let depth = 1;
+  let i = startBrace;
+  while (i < sourceCode.length && depth > 0) {
+    const c = sourceCode[i];
+    if (c === "{") depth++;
+    else if (c === "}") depth--;
+    i++;
+  }
+  if (depth !== 0) return []; // unbalanced — bail rather than guess
+  const rawBody = sourceCode.slice(startBrace, i - 1);
+
+  // Strip `/* ... */` (non-greedy, spans newlines) and `// ... EOL` comments
+  // so a line-comment between two real keys doesn't break the pair anchor.
+  // Doing a textual strip is safe here because we only care about TOP-LEVEL
+  // keys — we don't need to preserve string-literal contents that happen to
+  // contain `//` (string scanning would be nice-to-have but overkill for
+  // parameter declarations).
+  const body = rawBody
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "");
+
   const keys: string[] = [];
   // Match key: value pairs — key is a plain identifier or quoted string.
   // Anchor on either start-of-body or a preceding `,` / `{` so we don't
@@ -61,15 +59,27 @@ export function extractParamsStatic(sourceCode: string): string[] {
   // Two trailing forms accepted:
   //   1. `key:` — the classic `key: value` form (including quoted keys).
   //   2. `key,` / `key}` / `key` at end-of-body — ES2015 shorthand
-  //      (`{ length, width }`) where the identifier IS the key. Without this
-  //      branch, `{ length, width, thickness }` extracts as zero keys and
-  //      every runtime param then looks "undeclared" to engine.ts.
+  //      (`{ length, width }`) where the identifier IS the key.
+  //
+  // Depth tracking in the scan skips keys inside nested braces — otherwise
+  // `{ a: 1, opts: { b: 2 }, c: 3 }` would surface `b` as a top-level key.
   const pairPattern =
     /(?:^|[,{])\s*(?:"([^"]+)"|'([^']+)'|(\w+))\s*(?::|(?=\s*[,}])|\s*$)/g;
   let m: RegExpExecArray | null;
   while ((m = pairPattern.exec(body)) !== null) {
     const name = m[1] || m[2] || m[3];
-    if (name) keys.push(name);
+    if (!name) continue;
+    // Count `{` / `}` up to AND INCLUDING the anchor character (the `{`
+    // that triggered a nested-object match lives at m.index when the
+    // anchor class matched `{`). Keys inside a nested object land with
+    // nestedDepth > 0 and are skipped.
+    const upToAnchor = body.slice(0, m.index + 1);
+    let nestedDepth = 0;
+    for (const c of upToAnchor) {
+      if (c === "{") nestedDepth++;
+      else if (c === "}") nestedDepth--;
+    }
+    if (nestedDepth <= 0) keys.push(name);
   }
   return keys;
 }
@@ -90,13 +100,19 @@ export function extractParamsStatic(sourceCode: string): string[] {
  *     heuristic (which only kicks in past 15 parts or 50k projected
  *     triangles) so users with a single sweep-heavy part can opt into the
  *     coarse mesh for faster iteration.
+ *   - `localFrame` (boolean) — this file defines an INTERMEDIATE part
+ *     authored in its own local frame (e.g. a `needle.shape.ts` imported by
+ *     an assembly) rather than a top-level design. Suppresses the
+ *     "extends below z=0" rotation-direction hint, which is routine noise
+ *     on such parts because they live in their local frame and are
+ *     positioned at assembly time.
  *
  * Other keys are extracted but ignored — space left so later issues can add
  * flags without changing the extractor's signature.
  */
 export function extractConfigStatic(
   sourceCode: string,
-): { strict?: boolean; meshQuality?: "preview" | "final" } {
+): { strict?: boolean; meshQuality?: "preview" | "final"; localFrame?: boolean } {
   const match = sourceCode.match(/export\s+const\s+config\s*=\s*\{([^}]*)\}/s);
   if (!match) return {};
   const body = match[1];
@@ -109,12 +125,13 @@ export function extractConfigStatic(
   // names or other future string keys.
   const stringPairPattern =
     /(?:^|[,{])\s*(?:"([^"]+)"|'([^']+)'|(\w+))\s*:\s*["'](preview|final)["']/g;
-  const config: { strict?: boolean; meshQuality?: "preview" | "final" } = {};
+  const config: { strict?: boolean; meshQuality?: "preview" | "final"; localFrame?: boolean } = {};
   let m: RegExpExecArray | null;
   while ((m = boolPairPattern.exec(body)) !== null) {
     const name = m[1] || m[2] || m[3];
     const value = m[4] === "true";
     if (name === "strict") config.strict = value;
+    else if (name === "localFrame") config.localFrame = value;
   }
   while ((m = stringPairPattern.exec(body)) !== null) {
     const name = m[1] || m[2] || m[3];
@@ -238,7 +255,7 @@ export function executeScript(
   js: string,
   replicadExports: Record<string, any>,
   shapeitupExports: Record<string, any>,
-  paramOverrides?: Record<string, number>,
+  paramOverrides?: Record<string, number | boolean | string>,
   /**
    * Absolute path (or file:// URL) of the user's entry `.shape.ts` file.
    *
@@ -366,10 +383,22 @@ export function executeScript(
       var __entryParams__ = __entrySentinel__
         ? (typeof globalThis !== "undefined" ? globalThis.__SHAPEITUP_ENTRY_PARAMS__ : undefined)
         : undefined;
+      // Material/config flow through the same gate so a bundled child's
+      // top-level material const can't leak onto the assembly. Captured so we
+      // can distinguish "entry declared none" (undefined) from "no synthetic
+      // wrapper" (fall back to the ambient lookup below).
+      var __entryMaterial__ = __entrySentinel__
+        ? (typeof globalThis !== "undefined" ? globalThis.__SHAPEITUP_ENTRY_MATERIAL__ : undefined)
+        : undefined;
+      var __entryConfig__ = __entrySentinel__
+        ? (typeof globalThis !== "undefined" ? globalThis.__SHAPEITUP_ENTRY_CONFIG__ : undefined)
+        : undefined;
       try {
         if (typeof globalThis !== "undefined") {
           globalThis.__SHAPEITUP_ENTRY_MAIN__ = undefined;
           globalThis.__SHAPEITUP_ENTRY_PARAMS__ = undefined;
+          globalThis.__SHAPEITUP_ENTRY_MATERIAL__ = undefined;
+          globalThis.__SHAPEITUP_ENTRY_CONFIG__ = undefined;
           globalThis.__SHAPEITUP_ENTRY_SENTINEL__ = undefined;
         }
       } catch (e) {}
@@ -400,8 +429,16 @@ export function executeScript(
         throw new Error("Script must export a default function named 'main'");
       }
 
-      var __material__ = typeof material !== "undefined" ? material : undefined;
-      var __config__ = typeof config !== "undefined" ? config : undefined;
+      // Under the synthetic wrapper, the entry marker is authoritative (even
+      // when undefined) — this is what stops a bundled child's material const
+      // from leaking onto the assembly. Without the wrapper (single-file
+      // ambient path), fall back to the in-scope material / config binding.
+      var __material__ = __entrySentinel__
+        ? __entryMaterial__
+        : (typeof material !== "undefined" ? material : undefined);
+      var __config__ = __entrySentinel__
+        ? __entryConfig__
+        : (typeof config !== "undefined" ? config : undefined);
 
       return { result: __result__, params: __params__, material: __material__, config: __config__ };
     })(__replicadExports__, __shapeitupExports__, __paramOverrides__);
@@ -433,33 +470,20 @@ export function executeScript(
     paramOverrides || null
   );
 
-  // Validate: only surface a material object when density is strictly a
-  // finite positive number. Strings matching a MATERIAL_PRESETS key are
-  // expanded to the preset's density + name. Unknown strings emit a runtime
-  // warning so the user can see the typo instead of silently losing mass
-  // data. 0, negatives, NaN, and malformed objects all get dropped so
-  // downstream code can treat `material` as "present ⇒ usable".
+  // Resolve the script-level `export const material = ...` via the shared
+  // resolver (also used per-part inside `normalizeParts`). Unknown strings
+  // emit a runtime warning so a typo is visible instead of silently losing
+  // mass data; malformed objects (NaN density, missing density, etc.) are
+  // dropped silently so downstream code can treat `material` as
+  // "present ⇒ usable".
+  const matRes = resolveMaterial(rawMaterial);
   let material: { density: number; name?: string } | undefined;
-  if (typeof rawMaterial === "string") {
-    const preset = MATERIAL_PRESETS[rawMaterial];
-    if (preset !== undefined) {
-      material = { density: preset, name: rawMaterial };
-    } else {
-      pushRuntimeWarning(
-        `Unknown material preset '${rawMaterial}'. Known presets: ${Object.keys(MATERIAL_PRESETS).join(", ")}. Use { density: number } for custom densities.`
-      );
-    }
-  } else if (
-    rawMaterial &&
-    typeof rawMaterial === "object" &&
-    typeof rawMaterial.density === "number" &&
-    Number.isFinite(rawMaterial.density) &&
-    rawMaterial.density > 0
-  ) {
-    material = { density: rawMaterial.density };
-    if (typeof rawMaterial.name === "string" && rawMaterial.name.length > 0) {
-      material.name = rawMaterial.name;
-    }
+  if (matRes.ok) {
+    material = matRes.material;
+  } else if (matRes.reason === "unknown-preset") {
+    pushRuntimeWarning(
+      `Unknown material preset '${matRes.given}'. Known presets: ${Object.keys(MATERIAL_PRESETS).join(", ")}. Use { density: number } for custom densities.`,
+    );
   }
 
   const paramDefs: ParamDef[] = Object.entries(params).map(([name, value]) => {
