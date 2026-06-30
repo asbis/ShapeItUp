@@ -771,6 +771,17 @@ function dedupLines(lines: string[]): string[] {
  * Pure + exported for unit-testing. `relDirPreexisted` MUST be sampled BEFORE
  * the directory is created (otherwise the freshly-made dir hides the mismatch).
  */
+/**
+ * Platform-agnostic "is this directory absolute?" for the mismatch warning.
+ * `path.isAbsolute` is host-OS-specific, so a Windows drive path like
+ * `c:/abs/path` reads as RELATIVE when the server (or CI) runs on POSIX — which
+ * would wrongly emit the warning for an explicit absolute dir. Recognise both
+ * POSIX-absolute and Windows drive/UNC forms regardless of the host OS.
+ */
+function isAbsoluteDirAnyOS(dir: string): boolean {
+  return isAbsolute(dir) || /^[a-zA-Z]:[\\/]/.test(dir) || /^[\\/]{2}/.test(dir);
+}
+
 export function workspaceMismatchWarning(opts: {
   directory?: string;
   relDirPreexisted: boolean;
@@ -780,7 +791,7 @@ export function workspaceMismatchWarning(opts: {
   filePath: string;
 }): string {
   const { directory, relDirPreexisted, wsRoots, dirMatchesCwd, cwd, filePath } = opts;
-  if (!directory || isAbsolute(directory)) return "";
+  if (!directory || isAbsoluteDirAnyOS(directory)) return "";
   if (relDirPreexisted || wsRoots.length === 0 || dirMatchesCwd) return "";
   return (
     `\n⚠ Workspace mismatch: no open VSCode workspace contained a pre-existing '${directory}' directory, so the resolver fell back to the first workspace root — which is NOT your shell cwd.\n` +
