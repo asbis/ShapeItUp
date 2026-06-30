@@ -8,6 +8,13 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # OIDC trusted publishing to npm: `id-token: write` lets pnpm mint a
+    # short-lived OIDC token and exchange it for a publish credential — no
+    # long-lived NPM_TOKEN secret. `contents: read` is needed for checkout
+    # once an explicit permissions block narrows the default GITHUB_TOKEN.
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v6
 
@@ -15,10 +22,13 @@ jobs:
         with:
           version: 10
 
+      # NOTE: no `registry-url` here on purpose. setup-node's registry-url
+      # writes an `_authToken=${NODE_AUTH_TOKEN}` line into .npmrc; with no
+      # token that empty entry can stop pnpm from falling back to OIDC
+      # trusted publishing. Default registry (registry.npmjs.org) is used.
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
           cache: 'pnpm'
 
       - name: Install dependencies
@@ -135,14 +145,17 @@ jobs:
       - name: Publish @shapeitup/mcp-server to npm
         # Publishes the standalone server so `npx -y @shapeitup/mcp-server`
         # works for every MCP client without the VS Code extension installed.
+        # Auth is via OIDC trusted publishing (configured on npmjs.com for this
+        # package + the asbis/ShapeItUp `publish.yml` workflow) — no token env.
+        # Requires pnpm >= 10.12 (action-setup `version: 10` resolves the
+        # latest 10.x, which supports it) and the `id-token: write` permission
+        # declared on the job above.
         # Uses --no-git-checks because pnpm otherwise refuses to publish from
         # a workspace with uncommitted lockfile tweaks on CI.
         # NOTE: no `continue-on-error` here — a failed npm publish MUST abort
         # the workflow so the VSIX below never ships referencing a server
         # version that wasn't actually released.
         run: pnpm --filter @shapeitup/mcp-server publish --no-git-checks --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish to VS Marketplace
         run: cd packages/extension && npx @vscode/vsce publish
