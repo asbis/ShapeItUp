@@ -114,12 +114,13 @@ Registered globally in `~/.claude/settings.json`. Provides 9 tools:
 - **GitHub**: https://github.com/asbis/ShapeItUp
 - **VS Marketplace**: Published as `shapeitup.shapeitup-vscode`
 - **npm**: `@shapeitup/mcp-server` — consumed by marketplace users via `npx -y @shapeitup/mcp-server` (the canonical install shape for Claude Code / Cursor / Desktop / Gemini).
-- **Auto-deploy**: `.github/workflows/publish.yml` triggers on GitHub release creation. It builds, then (a) `pnpm --filter @shapeitup/mcp-server publish` to npm, and (b) `vsce publish` to the Marketplace. Uses `NPM_TOKEN` and `VSCE_PAT` secrets.
-- **To release**: bump `packages/extension/package.json` version, commit, push, then `gh release create v0.x.x`.
+- **Auto-deploy**: `.github/workflows/publish.yml` triggers on GitHub release creation (and `workflow_dispatch`). It builds/tests, then (a) publishes `@shapeitup/mcp-server` to npm and (b) `vsce publish` to the Marketplace.
+- **npm auth = OIDC trusted publishing (no token).** The npm publish step runs `npm publish <tgz>` on `npm@latest` (needs ≥11.5.1) against the tarball `pnpm pack` produced, authenticating via OIDC — the job declares `permissions: id-token: write` and a Trusted Publisher (`asbis/ShapeItUp` + `publish.yml`) is configured on npmjs.com. There is **no `NPM_TOKEN` secret** (deleted 2026-06-30). Do NOT re-add `registry-url` to setup-node or a `NODE_AUTH_TOKEN` env — either blocks the OIDC path. `pnpm publish` can't do OIDC (it hits `ENEEDAUTH`), which is why the step uses `npm`. Marketplace still uses the `VSCE_PAT` secret. Full rationale: `~/.claude` memory `project_npm_oidc_publishing`.
+- **To release**: bump versions (see below), commit, push, then either `gh release create v0.x.x` OR `gh workflow run publish.yml --ref master` (dispatch skips the tag-verify step and publishes whatever version is in `package.json`).
 
 ### Any change under `packages/mcp-server/` MUST bump its own version
 
-The release workflow publishes `@shapeitup/mcp-server` on every GitHub release, but **npm rejects republishing an existing version and the workflow step has `continue-on-error: true`** — so forgetting to bump `packages/mcp-server/package.json` causes a *silent* skip. Marketplace users stay on the old npm version while getting a freshly-published VSIX → drift between the bundled extension and the server they load via `npx`.
+The release workflow publishes `@shapeitup/mcp-server` on every GitHub release. npm rejects republishing an existing version, and the publish step has **no `continue-on-error`** — so forgetting to bump `packages/mcp-server/package.json` makes the whole run **fail loudly** (and, critically, the VS Marketplace step after it never runs). Either way you end up with drift or a failed deploy, so keep both versions moving in lockstep.
 
 Checklist when touching anything under `packages/mcp-server/src/` or its deps (`packages/core/`, etc. that get bundled in):
 
