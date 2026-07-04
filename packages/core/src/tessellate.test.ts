@@ -267,4 +267,38 @@ describe("normalizeParts — per-part material (string + object)", () => {
     expect(out[0].material).toBeUndefined();
     expect(out[1].material).toEqual({ density: MATERIAL_PRESETS.PETG, name: "PETG" });
   });
+
+  it("warns when materials are mixed and NO script-level material exists", () => {
+    resetRuntimeWarnings();
+    const shape = makeMockShape(10);
+    normalizeParts([
+      { shape, name: "bracket", color: null, material: "Aluminum" },
+      { shape, name: "spacer", color: null },
+    ]);
+    const warnings = drainRuntimeWarnings();
+    expect(warnings.some((w) => /no material/i.test(w))).toBe(true);
+  });
+
+  it("stays silent on mixed materials when a script-level material provides the fallback", () => {
+    resetRuntimeWarnings();
+    const shape = makeMockShape(10);
+    normalizeParts(
+      [
+        { shape, name: "shell", color: null },
+        { shape, name: "gasket", color: null, material: "PETG" },
+      ],
+      { scriptHasMaterial: true },
+    );
+    expect(drainRuntimeWarnings()).toEqual([]);
+  });
+
+  it("stays silent when NO part carries a material (deliberate no-materials assembly)", () => {
+    resetRuntimeWarnings();
+    const shape = makeMockShape(10);
+    normalizeParts([
+      { shape, name: "a", color: null },
+      { shape, name: "b", color: null },
+    ]);
+    expect(drainRuntimeWarnings()).toEqual([]);
+  });
 });

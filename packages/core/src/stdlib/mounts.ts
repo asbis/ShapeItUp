@@ -143,3 +143,69 @@ export function peg(opts: MountPegOpts): Shape3D {
   }
   return makeCylinder(r, plateThickness + backGap, [0, 0, 0], vec) as Shape3D;
 }
+
+export interface PegboardGridOpts {
+  /** Number of studs across (integer ≥ 1). */
+  cols: number;
+  /** Number of studs up the wall (integer ≥ 1). */
+  rows: number;
+  /** Center-to-center hole spacing. Default 25.4 mm (1" imperial pegboard). */
+  pitch?: number;
+  /** Override the horizontal spacing (defaults to `pitch`). */
+  pitchX?: number;
+  /** Override the vertical spacing (defaults to `pitch`). */
+  pitchY?: number;
+  /** Wall plane the grid lies in. Default "XZ" (a vertical backplate). */
+  plane?: "XZ" | "XY" | "YZ";
+  /** Build the studs as keyhole mounts — pass one of `keyhole` or `peg`. */
+  keyhole?: KeyholeMountOpts;
+  /** Build the studs as plain anti-rotation pegs — pass one of `keyhole` or `peg`. */
+  peg?: MountPegOpts;
+}
+
+/**
+ * A centered rectangular GRID of identical mounting studs — the pegboard /
+ * tool-wall array primitive. Fuses `cols × rows` copies of a `mounts.keyhole`
+ * (or `mounts.peg`) stud at `pitch` spacing, laid out in the wall plane, and
+ * returns one Shape3D to `.fuse()` onto your backplate. Default pitch is
+ * 25.4 mm (1" imperial pegboard). The grid is centered on the origin so it
+ * lines up with a symmetric backplate.
+ *
+ * @example
+ * // 2×3 keyhole grid on a vertical (XZ) backplate, studs poking out the back:
+ * plate.fuse(mounts.pegboardGrid({
+ *   cols: 2, rows: 3, pitch: 25.4,
+ *   keyhole: { largeD: 9, smallD: 4, plateThickness: 2, axis: "-Y" },
+ * }));
+ */
+export function pegboardGrid(opts: PegboardGridOpts): Shape3D {
+  const { cols, rows, pitch = 25.4, plane = "XZ" } = opts;
+  const pitchX = opts.pitchX ?? pitch;
+  const pitchY = opts.pitchY ?? pitch;
+  const isPosInt = (n: number) => Number.isInteger(n) && n >= 1;
+  if (!isPosInt(cols) || !isPosInt(rows)) {
+    throw new RangeError(`mounts.pegboardGrid: cols (${cols}) and rows (${rows}) must be integers ≥ 1.`);
+  }
+  assertPositiveFinite("mounts.pegboardGrid", "opts.pitchX", pitchX);
+  assertPositiveFinite("mounts.pegboardGrid", "opts.pitchY", pitchY);
+  if ((opts.keyhole ? 1 : 0) + (opts.peg ? 1 : 0) !== 1) {
+    throw new RangeError(
+      "mounts.pegboardGrid: pass exactly one of `keyhole` or `peg` to describe the stud.",
+    );
+  }
+  const makeStud = (): Shape3D => (opts.keyhole ? keyhole(opts.keyhole) : peg(opts.peg!));
+  // Map an in-plane (a, b) offset to a world translate for the chosen wall plane.
+  const toWorld = (a: number, b: number): [number, number, number] =>
+    plane === "XY" ? [a, b, 0] : plane === "YZ" ? [0, a, b] : [a, 0, b];
+  const a0 = -((cols - 1) * pitchX) / 2;
+  const b0 = -((rows - 1) * pitchY) / 2;
+  let result: Shape3D | null = null;
+  for (let c = 0; c < cols; c++) {
+    for (let r = 0; r < rows; r++) {
+      const [tx, ty, tz] = toWorld(a0 + c * pitchX, b0 + r * pitchY);
+      const stud = makeStud().translate(tx, ty, tz) as Shape3D;
+      result = result ? (result.fuse(stud) as Shape3D) : stud;
+    }
+  }
+  return result as Shape3D;
+}

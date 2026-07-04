@@ -91,6 +91,9 @@ self.onmessage = async (event: MessageEvent) => {
       case "export":
         await handleExport(msg.format);
         break;
+      case "export-split":
+        await handleExportSplit(msg.format);
+        break;
     }
   } catch (err: any) {
     executing = false;
@@ -179,4 +182,15 @@ async function handleExport(format: "step" | "stl" | "3mf") {
   if (!core) throw new Error("Worker received 'export' before 'init' completed");
   const data = await core.exportLast(format);
   self.postMessage({ type: "export-result", format, data }, [data] as any);
+}
+
+async function handleExportSplit(format: "step" | "stl" | "3mf") {
+  if (!core) throw new Error("Worker received 'export-split' before 'init' completed");
+  // One buffer per part — the extension writes each to its own file in a
+  // user-chosen folder. Transfer every ArrayBuffer to avoid copying.
+  const items = await core.exportLastSplit(format);
+  self.postMessage(
+    { type: "export-split-result", format, items },
+    items.map((it) => it.data) as any,
+  );
 }

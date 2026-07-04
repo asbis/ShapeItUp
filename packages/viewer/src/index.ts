@@ -652,6 +652,14 @@ function handleWorkerMessage(msg: WorkerToWebview) {
       statusEl.textContent = `Exported ${msg.format.toUpperCase()}`;
       break;
 
+    case "export-split-result":
+      clearWorkerResponseTimer();
+      // Each item is { name, data: ArrayBuffer } — one file per part. The
+      // extension writes them into a user-chosen folder.
+      postToExtension({ type: "export-split-data", format: msg.format, items: msg.items });
+      statusEl.textContent = `Exported ${msg.items.length} parts (${msg.format.toUpperCase()})`;
+      break;
+
     case "error":
       clearWorkerResponseTimer();
       // Only respawn on actual WASM memory crashes — NOT on script errors like "X is not a function"
@@ -748,6 +756,13 @@ onMessage("request-export", (msg) => {
   if (worker) {
     statusEl.textContent = `Exporting ${msg.format.toUpperCase()}...`;
     worker.postMessage({ type: "export", format: msg.format });
+  }
+});
+
+onMessage("request-export-split", (msg) => {
+  if (worker) {
+    statusEl.textContent = `Exporting parts (${msg.format.toUpperCase()})...`;
+    worker.postMessage({ type: "export-split", format: msg.format });
   }
 });
 
@@ -1122,6 +1137,15 @@ exportMenu.addEventListener("click", (e) => {
   } else if (action === "export-3mf") {
     exportWrapper.classList.remove("open");
     postToExtension({ type: "toolbar-export", format: "3mf" });
+  } else if (action === "export-split-step") {
+    exportWrapper.classList.remove("open");
+    postToExtension({ type: "toolbar-export", format: "step", split: true });
+  } else if (action === "export-split-stl") {
+    exportWrapper.classList.remove("open");
+    postToExtension({ type: "toolbar-export", format: "stl", split: true });
+  } else if (action === "export-split-3mf") {
+    exportWrapper.classList.remove("open");
+    postToExtension({ type: "toolbar-export", format: "3mf", split: true });
   }
 });
 

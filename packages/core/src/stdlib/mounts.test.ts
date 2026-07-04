@@ -46,3 +46,23 @@ describe("mounts.peg — validation (pre-OCCT)", () => {
     ).toThrow(/unknown axis/);
   });
 });
+
+describe("mounts.pegboardGrid — API + validation (pre-OCCT)", () => {
+  const kh = { largeD: 9, smallD: 4, plateThickness: 2 };
+
+  it("is exported", () => {
+    expect(typeof mounts.pegboardGrid).toBe("function");
+  });
+
+  it("rejects non-integer or <1 cols/rows", () => {
+    expect(() => mounts.pegboardGrid({ cols: 0, rows: 2, keyhole: kh })).toThrow(/integers/);
+    expect(() => mounts.pegboardGrid({ cols: 2, rows: 1.5, keyhole: kh })).toThrow(/integers/);
+  });
+
+  it("requires exactly one of keyhole or peg", () => {
+    expect(() => mounts.pegboardGrid({ cols: 2, rows: 2 })).toThrow(/exactly one/);
+    expect(() =>
+      mounts.pegboardGrid({ cols: 2, rows: 2, keyhole: kh, peg: { holeD: 4, plateThickness: 2 } }),
+    ).toThrow(/exactly one/);
+  });
+});

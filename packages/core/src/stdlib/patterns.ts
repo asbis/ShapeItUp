@@ -168,7 +168,15 @@ export interface Placement {
  * then translate. Useful when composing patterns manually.
  */
 export function applyPlacement(shape: Shape3D, p: Placement): Shape3D {
-  let result = shape;
+  // Clone first: replicad's rotate/translate CONSUME (delete) their input
+  // handle. Without this, applyPlacement would silently destroy the caller's
+  // shape, so reusing it across manual placements throws "object has been
+  // deleted". patterns.spread() passes a fresh shape per placement so it never
+  // tripped this, but a direct caller reusing one shape would. Fall back to the
+  // raw shape for clone-less shape-likes (test doubles) so we don't hard-depend
+  // on `.clone()` — those don't have the WASM-deletion hazard anyway.
+  const cloneable = shape as unknown as { clone?: () => Shape3D };
+  let result = typeof cloneable.clone === "function" ? cloneable.clone() : shape;
   if (p.rotate !== undefined) {
     result = result.rotate(p.rotate, [0, 0, 0], p.axis ?? [0, 0, 1]);
   }
@@ -618,10 +626,23 @@ export function spread(makeShape: () => Shape3D, placements: Placement[]): Shape
   if (placements.length === 0) {
     throw new Error("patterns.spread: placements array is empty");
   }
+  // applyPlacement now CLONES its input (so external direct callers keep their
+  // shape). That means the fresh shape from makeShape() is no longer consumed
+  // by the transform — delete it after placing so we don't leak one OCCT handle
+  // per placement. Net behaviour matches the old consume-the-input path.
+  const place = (p: Placement): Shape3D => {
+    const src = makeShape();
+    const placed = applyPlacement(src, p);
+    // Only free the source when applyPlacement actually cloned it (placed is a
+    // distinct handle). For clone-less shape-likes placed may BE src — deleting
+    // then would destroy the result.
+    if (src !== placed) { try { (src as unknown as { delete?: () => void }).delete?.(); } catch { /* best effort */ } }
+    return placed;
+  };
   const [first, ...rest] = placements;
-  let result = applyPlacement(makeShape(), first);
+  let result = place(first);
   for (const p of rest) {
-    result = result.fuse(applyPlacement(makeShape(), p));
+    result = result.fuse(place(p));
   }
   return result;
 }
@@ -835,7 +856,13 @@ export function cutAt(
     // sometimes returns the pre-rotation local-frame extent for shapes with
     // an unapplied TopLoc_Location — biting `axis:"+X"` hole cutters in
     // particular, producing false "outside target bbox" warnings.
-    const placedTool = applyPlacement(makeTool(), p);
+    // applyPlacement clones its input; delete the fresh factory shape so the
+    // per-placement source handle isn't leaked (net behaviour matches the old
+    // consume path).
+    const rawTool = makeTool();
+    const placedTool = applyPlacement(rawTool, p);
+    // Free the source only when applyPlacement cloned it (see spread()).
+    if (rawTool !== placedTool) { try { (rawTool as unknown as { delete?: () => void }).delete?.(); } catch { /* best effort */ } }
     if (targetBounds) {
       const toolBounds = readToolBounds(placedTool);
       if (toolBounds) {

@@ -11,7 +11,7 @@ import type { ParamDef } from "@shapeitup/shared";
 import { executeScript } from "./executor";
 export { extractParamsStatic, extractConfigStatic, extractExpectedContactsStatic } from "./executor";
 import { normalizeParts, tessellatePart, type MeshQuality, type PartInput, type PartStatsLevel, type TessellatedPart } from "./tessellate";
-import { exportShapes } from "./exporter";
+import { exportShapes, exportShapesSplit } from "./exporter";
 import {
   validateParts,
   hasGeometryErrors,
@@ -39,7 +39,7 @@ import {
 } from "./stdlib/warnings";
 
 export type { PartInput, TessellatedPart, MeshQuality, PartStatsLevel } from "./tessellate";
-export { exportShapes } from "./exporter";
+export { exportShapes, exportShapesSplit, resolvePartFileNames } from "./exporter";
 
 // Re-export the shared externals list so MCP's engine (which already imports
 // from core) doesn't need a second import statement for this constant.
@@ -728,6 +728,14 @@ export interface Core {
    * if no part matches — the error lists available names.
    */
   exportLast(format: "step" | "stl" | "3mf", partName?: string): Promise<ArrayBuffer>;
+  /**
+   * Export the most recently executed parts to one buffer PER part, for
+   * writing a separate file per part (better for 3D printing). Returns
+   * positionally-stable {name, data} entries; names are deduped + sanitized.
+   */
+  exportLastSplit(
+    format: "step" | "stl" | "3mf",
+  ): Promise<Array<{ name: string; data: ArrayBuffer }>>;
   /** Access the raw replicad module (for advanced callers — validate, getOC, etc.). */
   replicad(): any;
   /**
@@ -863,7 +871,7 @@ export async function initCore(
       throw err;
     }
 
-    const parts = normalizeParts(result);
+    const parts = normalizeParts(result, { scriptHasMaterial: !!material });
     lastParts = parts;
     const execTime = performance.now() - execStart;
 
@@ -1113,9 +1121,19 @@ export async function initCore(
     return exportShapes(toExport, format, replicad);
   }
 
+  async function exportLastSplit(
+    format: "step" | "stl" | "3mf"
+  ): Promise<Array<{ name: string; data: ArrayBuffer }>> {
+    if (lastParts.length === 0) {
+      throw new Error("No shapes to export. Execute a script first.");
+    }
+    return exportShapesSplit(lastParts, format, replicad);
+  }
+
   return {
     execute,
     exportLast,
+    exportLastSplit,
     replicad: () => replicad,
     resolveError: (e: unknown) => resolveWasmException(e, oc),
     cleanup,

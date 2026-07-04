@@ -169,14 +169,17 @@ export interface TessellatedPart {
   >;
 }
 
-export function normalizeParts(result: any): PartInput[] {
+export function normalizeParts(
+  result: any,
+  opts?: { scriptHasMaterial?: boolean },
+): PartInput[] {
   if (!result) throw new Error("Script returned nothing");
 
   if (!Array.isArray(result)) {
     // Sugar: allow returning a single {shape, name, color} object without
     // wrapping it in an array. Reuse the array branch by wrapping it.
     if (result && result.shape && typeof result.shape.mesh === "function") {
-      return normalizeParts([result]);
+      return normalizeParts([result], opts);
     }
     if (typeof result.mesh === "function") {
       return [{ shape: result, name: "shape", color: null }];
@@ -188,7 +191,7 @@ export function normalizeParts(result: any): PartInput[] {
     );
   }
 
-  return result.map((item: any, i: number) => {
+  const parts: PartInput[] = result.map((item: any, i: number) => {
     if (item && item.shape && typeof item.shape.mesh === "function") {
       const out: PartInput = {
         shape: item.shape,
@@ -256,6 +259,34 @@ export function normalizeParts(result: any): PartInput[] {
     }
     throw new Error(`Item ${i} is not a valid Shape3D`);
   });
+
+  // Mixed-material warning. If SOME parts in a multi-part assembly carry a
+  // per-part material but OTHERS don't, the material-less ones show no mass in
+  // the BOM. That's the tell-tale of importing part factories and re-exporting
+  // the material for only some of them — a bundled child's `export const
+  // material` is deliberately gated out of the assembly (see executor.ts), so
+  // it only reaches the BOM when the author attaches it per-part.
+  //
+  // CRUCIAL GATE: suppress entirely when the script declares a top-level
+  // `export const material` (scriptHasMaterial). In that case a part WITHOUT a
+  // per-part material simply INHERITS the script default downstream — it is not
+  // material-less — so the "some have, some don't" shape is the legitimate
+  // multi-material override pattern (e.g. PLA shell + TPU gasket), not a bug.
+  // Only the no-script-default case leaves the bare parts genuinely mass-less.
+  if (!opts?.scriptHasMaterial && parts.length > 1) {
+    const withoutMat = parts.filter((p) => !p.material);
+    if (withoutMat.length > 0 && withoutMat.length < parts.length) {
+      const names = withoutMat.map((p) => p.name).slice(0, 6).join(", ");
+      const more = withoutMat.length > 6 ? ` (+${withoutMat.length - 6} more)` : "";
+      pushRuntimeWarning(
+        `${withoutMat.length} of ${parts.length} parts carry no material, so they show no mass in the BOM: ${names}${more}. ` +
+          `A bundled part file's \`export const material\` does NOT propagate to the assembly automatically — attach it per part: ` +
+          `\`import partMain, { material as m } from "./part.shape"\` then \`return [{ shape: partMain(...), name, material: m }]\`.`,
+      );
+    }
+  }
+
+  return parts;
 }
 
 /**

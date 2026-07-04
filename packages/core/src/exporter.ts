@@ -6,6 +6,14 @@ export async function exportShapes(
   format: "step" | "stl" | "3mf",
   replicadModule: any
 ): Promise<ArrayBuffer> {
+  return exportPartsCombined(parts, format, replicadModule);
+}
+
+async function exportPartsCombined(
+  parts: PartInput[],
+  format: "step" | "stl" | "3mf",
+  replicadModule: any
+): Promise<ArrayBuffer> {
   if (format === "step") {
     const stepParts = parts.map((p) => ({ shape: p.shape, name: p.name }));
     const blob: Blob = replicadModule.exportSTEP(stepParts);
@@ -15,6 +23,49 @@ export async function exportShapes(
   } else {
     return generateCombinedSTL(parts);
   }
+}
+
+/**
+ * Resolve a unique, filesystem-safe file base name for each part, mirroring
+ * the dedup+sanitize rules used for STL solid names. Returned names are
+ * positionally aligned with `parts` and carry no extension. Callers append
+ * `.${format}` themselves. Collisions get a `_2`, `_3`, … suffix; unnamed
+ * parts fall back to `part_<1-based-index>`.
+ */
+export function resolvePartFileNames(parts: PartInput[]): string[] {
+  const used = new Set<string>();
+  const names: string[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const base = sanitizeSolidName(parts[i].name, `part_${i + 1}`);
+    let name = base;
+    let suffix = 1;
+    while (used.has(name)) {
+      name = `${base}_${++suffix}`;
+    }
+    used.add(name);
+    names.push(name);
+  }
+  return names;
+}
+
+/**
+ * Export each part to its OWN buffer so callers can write one file per part
+ * (better for 3D printing — each part becomes an independent object the slicer
+ * can arrange freely). Names are deduped/sanitized via {@link resolvePartFileNames}.
+ * Single-part STL stays binary; single-part STEP/3MF carry just that one part.
+ */
+export async function exportShapesSplit(
+  parts: PartInput[],
+  format: "step" | "stl" | "3mf",
+  replicadModule: any
+): Promise<Array<{ name: string; data: ArrayBuffer }>> {
+  const names = resolvePartFileNames(parts);
+  const out: Array<{ name: string; data: ArrayBuffer }> = [];
+  for (let i = 0; i < parts.length; i++) {
+    const data = await exportPartsCombined([parts[i]], format, replicadModule);
+    out.push({ name: names[i], data });
+  }
+  return out;
 }
 
 interface StlTri {

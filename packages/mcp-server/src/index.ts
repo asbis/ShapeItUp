@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerTools } from "./tools.js";
+import { getCore } from "./engine.js";
 import { getSubscriberBus, defaultGlobalStorageDir } from "./subscriber-bus.js";
 
 /**
@@ -84,6 +85,18 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // P7 warm-up: kick off the OCCT/Manifold WASM load (~30 MB init) as a
+  // fire-and-forget as soon as we're connected, so it initializes concurrently
+  // with the client's first round-trips instead of blocking the FIRST geometry
+  // tool call on the whole cold-start stack. getCore() is idempotent (memoized
+  // promise), so the real first call just awaits the same in-flight init.
+  // Non-fatal: a warm-up failure is logged and the lazy path retries normally.
+  void getCore().catch((err) => {
+    process.stderr.write(
+      `[shapeitup-mcp] core warm-up failed (will retry lazily): ${err?.message ?? err}\n`,
+    );
+  });
 
   // MCP clients close stdin when they disconnect. The StdioServerTransport
   // handles protocol-level teardown, but the subscriber-bus WebSocket

@@ -11,6 +11,7 @@ import {
   canonicalParamsKey,
   executeShapeFile,
   exportLastToFile,
+  exportLastSplitToDir,
   getCore,
   getLastFileName,
   getLastParts,
@@ -886,7 +887,9 @@ export function formatStatusText(status: EngineStatus, verbosity: "summary" | "f
   const currentParams = paramEntries.length
     ? `\nCurrent params: ${paramEntries.map(([k, v]) => `${k}=${v}`).join(", ")}${importedParamsWarning}`
     : "";
-  const timingEntries = status.timings
+  // Timing dump is diagnostic noise on the happy path — gate it behind
+  // verbosity:"full" so ordinary create/modify/status responses stay lean.
+  const timingEntries = verbosity === "full" && status.timings
     ? Object.entries(status.timings).sort((a, b) => b[1] - a[1]).slice(0, 8)
     : [];
   const timings = timingEntries.length
@@ -1896,6 +1899,17 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
       if (astWarning) semanticWarnings.push(astWarning);
     }
 
+    // 2b. drawText is advertised by Replicad but UNAVAILABLE in this build —
+    // no font is bundled into the worker/MCP WASM, so it throws "no font is
+    // loaded" at runtime. Flag it statically so the failure surfaces before an
+    // execute round-trip. The fix is to emboss labels with geometry (extruded
+    // rectangles / cut grooves), not fonts.
+    if (/\bdrawText\s*\(/.test(code)) {
+      semanticWarnings.push(
+        "`drawText` is not available in this build (no font is bundled) and throws at runtime — emboss labels with geometry instead (e.g. extrude then cut thin rectangles), or drop the text."
+      );
+    }
+
     // 3. Non-uniform .scale(). Replicad's shape.scale is uniform-only.
     //    Flag array arg OR multiple numeric args (comma-separated).
     const scaleArrayPattern = /\.\s*scale\s*\(\s*\[/;
@@ -2072,12 +2086,20 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
           continue;
         }
         if (r === 0) continue; // zero radius is a no-op, not a bug
-        if (r > smallest * 0.5) {
+        // Only warn when the radius EXCEEDS the smallest observed literal
+        // outright (was: half of it). The baseline is scraped from every
+        // numeric literal in factory calls, which includes non-dimensions like
+        // a rounded-rectangle corner radius or a small wall thickness — so a
+        // `radius > 0.5 * smallest` rule cried wolf on perfectly valid fillets
+        // whenever any small literal was present. `radius > smallest` still
+        // catches the genuinely-too-large case (OCCT can usually fillet up to
+        // ~half an edge) with far fewer false positives.
+        if (r > smallest) {
           const key = `${fcMatch[1]}:${r}:${smallest}`;
           if (flagged.has(key)) continue;
           flagged.add(key);
           semanticWarnings.push(
-            `Fillet/chamfer radius ${r} may be too large for the smallest feature dimension (${smallest}) — OpenCascade often fails on radii larger than half the edge length.`
+            `Fillet/chamfer radius ${r} looks large for the smallest observed feature dimension (${smallest}) — OpenCascade tends to fail on radii approaching the edge length. If this renders cleanly, ignore.`
           );
         }
       }
@@ -2210,10 +2232,16 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
     //    (.translate, .rotate, etc.) so `x.cut(y).translate(...).fillet(...)`
     //    still triggers, while `x.cut(y); z.fillet(...)` (separate chain)
     //    does not.
-    const filletAfterBoolPattern = /\.(cut|fuse|intersect)\s*\([^)]*\)\s*(?:\.\s*\w+\s*\([^)]*\))*\s*\.\s*(fillet|chamfer)\s*\(/;
+    // Narrowed: only fire on an ALL-EDGES fillet/chamfer after a boolean —
+    // i.e. `.fillet(<number>)` with no finder. A TARGETED fillet
+    // (`.fillet(r, e => e.inDirection("Z"))`) selects specific, usually-safe
+    // edges and normally succeeds on boolean output, so warning about it was a
+    // frequent false positive. The trailing `\(\s*-?[\d.]+\s*\)` requires the
+    // radius to be the sole argument.
+    const filletAfterBoolPattern = /\.(cut|fuse|intersect)\s*\([^)]*\)\s*(?:\.\s*\w+\s*\([^)]*\))*\s*\.\s*(fillet|chamfer)\s*\(\s*-?[\d.]+\s*\)/;
     if (filletAfterBoolPattern.test(code)) {
       semanticWarnings.push(
-        "Applying .fillet() or .chamfer() after a boolean (.cut/.fuse/.intersect) often fails because boolean-generated faces are fragile. Apply fillets BEFORE the boolean when possible."
+        "Applying an all-edges .fillet()/.chamfer() after a boolean (.cut/.fuse/.intersect) can fail because boolean-generated faces are fragile. Prefer filleting BEFORE the boolean, or target specific edges with a finder (e.g. `.fillet(r, e => e.inDirection(\"Z\"))`). If it renders cleanly, ignore."
       );
     }
 
@@ -2427,6 +2455,32 @@ function mergeSidecarOverrides(
  * `partStats: "full"` also forces, since cached entries were tessellated under
  * the default `"bbox"` fast path and don't carry the OCCT-measured volumes.
  */
+// P1 live-parts reuse. Force-callers (check_collisions / verify_shape /
+// describe_geometry / preview_finder / sweep_check) need LIVE OCCT `.shape`
+// handles, which the mesh cache scrubs — so they normally force a full
+// re-execute (7–8 s on a big assembly) even when nothing changed. But the
+// engine keeps the previous execute's parts live until the NEXT execute. When
+// a force-caller asks for the identical (file, source, params) with no
+// intervening execute or reset, we hand back those still-live parts instead of
+// re-running the script.
+//
+// Safety hinges on array identity: getLastParts() returns a FRESH array on
+// every execute and an empty array on resetCore(), so `partsRef === getLastParts()`
+// proves the handles are the exact ones we recorded and haven't been superseded
+// or freed. The consuming ops (intersect / face+edge reads / highlight) are
+// non-destructive to their operands — the collision N² loop already reuses the
+// same operand across many pairs — so repeated reuse is safe; a stray freed
+// handle would trip resetCore(), which empties lastParts and self-heals.
+let liveForceCache:
+  | {
+      absPath: string;
+      sourceHash: string;
+      paramsKey: string;
+      partsRef: ReturnType<typeof getLastParts>;
+      outcome: Awaited<ReturnType<typeof executeShapeFile>>;
+    }
+  | null = null;
+
 async function executeWithPersistedParams(
   absPath: string,
   callOverrides?: Record<string, SidecarValue>,
@@ -2495,6 +2549,27 @@ async function executeWithPersistedParams(
     }
   }
 
+  // P1 fast path: a force-caller wants live `.shape` handles. If the previous
+  // execute's parts still match this exact (file, source, params) and nothing
+  // has executed or reset since (array identity), reuse them — no re-execute.
+  if (force && !forceBundleRebuild && !needsFreshMeasurement && liveForceCache) {
+    const head = readSourceForCacheKey(absPath);
+    const live = getLastParts();
+    if (
+      head &&
+      liveForceCache.partsRef === live &&
+      live.length > 0 &&
+      live.every((p) => (p as { shape?: unknown }).shape) &&
+      liveForceCache.absPath === absPath &&
+      liveForceCache.sourceHash === head.sourceHash &&
+      liveForceCache.paramsKey === paramsKey &&
+      !bundleDepsAreStale(absPath)
+    ) {
+      process.stderr.write(`[live-parts] reuse absPath=${absPath}\n`);
+      return liveForceCache.outcome;
+    }
+  }
+
   // Only forward fields the engine actually reads. `force` is a mesh-cache
   // concept local to this wrapper; `forceBundleRebuild` is the engine-side
   // knob for the bundle cache.
@@ -2502,6 +2577,22 @@ async function executeWithPersistedParams(
     partStats: opts?.partStats,
     forceBundleRebuild,
   });
+
+  // Record the freshly-executed live parts so the next matching force-caller
+  // can reuse them. outcome.parts === getLastParts() immediately after an
+  // execute; the identity guard above detects any later supersede/reset.
+  if (outcome.status.success && outcome.parts && outcome.parts.length > 0) {
+    const rec = readSourceForCacheKey(absPath);
+    if (rec) {
+      liveForceCache = {
+        absPath,
+        sourceHash: rec.sourceHash,
+        paramsKey,
+        partsRef: outcome.parts,
+        outcome,
+      };
+    }
+  }
 
   // Only cache successful outcomes. Re-read mtime/source AFTER execution so
   // the entry tracks what was actually rendered, not whatever the file looked
@@ -3120,7 +3211,7 @@ export function registerTools(server: McpServer) {
       directory: z.string().optional().describe("Directory to create the file in. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first match wins), falling back to process.cwd(). When omitted, defaults to the active VSCode workspace root."),
       overwrite: z.boolean().optional().describe("Set to true to overwrite an existing file (default: false)"),
       allowPathDuplication: z.boolean().optional().describe("Set to true to proceed (with a warning) when the resolved directory has a duplicated last-two segments (e.g. `.../examples/examples`). Default: false — the call refuses in that case and lists the recovery options. Absolute `directory` paths bypass this refusal regardless."),
-      verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats. 'summary' (default) caps at 10 parts then prints a '… and N more' line — keeps the response inside the MCP token budget on large assemblies. 'full' dumps every part (may be large for 20+ part assemblies)."),
+      verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats. 'summary' (default) caps at 25 parts then prints a '… and N more' line — keeps the response inside the MCP token budget on large assemblies. 'full' dumps every part (may be large for 25+ part assemblies)."),
     },
     safeHandler("create_shape", async ({ name, code, directory, overwrite, allowPathDuplication, verbosity }) => {
       // Resolve `directory` with the same unified precedence as resolveShapePath:
@@ -3308,7 +3399,7 @@ export function registerTools(server: McpServer) {
     {
       filePath: z.string().describe("Path to the .shape.ts file to execute. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
       capture: z.boolean().optional().describe("If true, after opening, also render a PNG screenshot through the bundled headless SVG pipeline. Runs standalone; the VSCode extension, when open, will continue to show the same file in its interactive viewer. Capture failures are reported as warnings; the handler still reports the execution status as success."),
-      verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats. 'summary' (default) caps at 10 parts. 'full' dumps every part."),
+      verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats. 'summary' (default) caps at 25 parts. 'full' dumps every part."),
       forceBundleRebuild: z.boolean().optional().describe("If true, bypasses the bundled-script cache and re-invokes esbuild. Use only when you suspect the cache is stale; the cache normally handles this correctly via mtime tracking."),
     },
     safeHandler("open_shape", async ({ filePath, capture, verbosity, forceBundleRebuild }) => {
@@ -3390,14 +3481,19 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "modify_shape",
-    "Overwrite an existing .shape.ts file with new code and execute it, OR (when `code` is omitted and `params` is provided) re-execute the file with ephemeral param overrides — skipping the disk write entirely. When BOTH are omitted, behaves like `open_shape` (re-executes the file from disk) — useful after editing a dependency like `constants.ts` that the target imports. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd(). If both `code` and `params` are provided, `code` wins and `params` is reported as ignored.",
+    "Change an existing .shape.ts file and execute it. Three write modes plus a re-run mode: (1) `code` — full overwrite; (2) `edits` — apply one or more exact-string patches in place (token-cheap for a few-line change — no need to resend the whole file); (3) `params` only (no `code`/`edits`) — re-execute with ephemeral param overrides, no disk write; (4) all omitted — behaves like `open_shape` (re-executes from disk), useful after editing an imported dependency like `constants.ts`. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd(). Precedence when several are supplied: `code` > `edits` > `params`; the losers are reported as ignored.",
     {
       filePath: z.string().describe("Path to the .shape.ts file. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
-      code: z.string().optional().describe("New TypeScript source code. Omit when you only want to re-run with different `params`."),
-      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Optional ephemeral param overrides. Values can be numbers, booleans, or strings — pass whatever shape your `export const params` uses (e.g. `{ useHeatSet: true, finish: \"satin\", count: 4 }`). If `code` is NOT provided, the file on disk is untouched and only the overrides are applied for this execution. If `code` IS provided, `params` is ignored (note appears in response)."),
-      verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats. 'summary' (default) caps at 10 parts. 'full' dumps every part."),
+      code: z.string().optional().describe("New TypeScript source code (FULL overwrite). Omit when you only want to patch a few lines (`edits`) or re-run with different `params`."),
+      edits: z.array(z.object({
+        oldString: z.string().describe("Exact substring to find in the current file. Must occur exactly once unless replaceAll is true."),
+        newString: z.string().describe("Text to replace it with."),
+        replaceAll: z.boolean().optional().describe("Replace every occurrence instead of requiring a unique match."),
+      })).optional().describe("Apply exact-string patches to the file in place, THEN execute — a token-cheap alternative to resending the whole file via `code` for a small change. Edits apply in array order; each oldString must match exactly once (unless replaceAll). Ignored when `code` is provided."),
+      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Optional ephemeral param overrides. Values can be numbers, booleans, or strings — pass whatever shape your `export const params` uses (e.g. `{ useHeatSet: true, finish: \"satin\", count: 4 }`). If neither `code` nor `edits` is provided, the file on disk is untouched and only the overrides are applied for this execution. Otherwise `params` is ignored (note appears in response)."),
+      verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats. 'summary' (default) caps at 25 parts. 'full' dumps every part."),
     },
-    safeHandler("modify_shape", async ({ filePath, code, params, verbosity }) => {
+    safeHandler("modify_shape", async ({ filePath, code, edits, params, verbosity }) => {
       const absPath = resolveShapePath(filePath);
       if (!existsSync(absPath)) {
         return {
@@ -3412,18 +3508,46 @@ export function registerTools(server: McpServer) {
       // this file imports — run it again"; rejecting that call with a
       // terminology error just burns an iteration. The re-exec still runs
       // the same bundler/cache invariants so transitive changes pick up.
+      const hasEdits = Array.isArray(edits) && edits.length > 0;
       let actionLabel: string;
       let paramsIgnoredNote = "";
       if (code !== undefined) {
         writeFileSync(absPath, code, "utf-8");
         actionLabel = "Updated";
+        const ignored: string[] = [];
+        if (hasEdits) ignored.push("`edits`");
+        if (params !== undefined) ignored.push("`params`");
+        if (ignored.length) {
+          paramsIgnoredNote = `\nNote: ${ignored.join(" and ")} ignored — \`code\` was provided, so the file was fully overwritten and executed with its declared param defaults.`;
+        }
+      } else if (hasEdits) {
+        // Apply exact-string patches in place, then execute. Fail loudly and
+        // atomically: if any edit doesn't match uniquely we write nothing and
+        // report which one, so a partial patch never lands on disk.
+        let content = readFileSync(absPath, "utf-8");
+        for (let i = 0; i < edits!.length; i++) {
+          const { oldString, newString, replaceAll } = edits![i];
+          if (oldString === newString) {
+            return { content: [{ type: "text" as const, text: `modify_shape: edit ${i + 1} has identical oldString and newString — nothing to do.` }], isError: true };
+          }
+          const occurrences = oldString.length ? content.split(oldString).length - 1 : 0;
+          if (occurrences === 0) {
+            return { content: [{ type: "text" as const, text: `modify_shape: edit ${i + 1} oldString not found in ${basename(absPath)}. No changes were written.` }], isError: true };
+          }
+          if (occurrences > 1 && replaceAll !== true) {
+            return { content: [{ type: "text" as const, text: `modify_shape: edit ${i + 1} oldString occurs ${occurrences}× — add surrounding context to make it unique, or set replaceAll:true. No changes were written.` }], isError: true };
+          }
+          content = replaceAll === true ? content.split(oldString).join(newString) : content.replace(oldString, newString);
+        }
+        writeFileSync(absPath, content, "utf-8");
+        actionLabel = `Patched (${edits!.length} edit${edits!.length === 1 ? "" : "s"})`;
         if (params !== undefined) {
-          paramsIgnoredNote = "\nNote: `params` ignored — `code` was provided, so the file was overwritten and executed with its declared param defaults.";
+          paramsIgnoredNote = "\nNote: `params` ignored — `edits` rewrote the file, so it executed with its declared param defaults.";
         }
       } else if (params !== undefined) {
         actionLabel = "Re-executed (file NOT modified) with params override";
       } else {
-        actionLabel = "Re-executed (no code/params — equivalent to open_shape)";
+        actionLabel = "Re-executed (no code/edits/params — equivalent to open_shape)";
       }
 
       // Capture dep-staleness BEFORE executing — `executeWithPersistedParams`
@@ -3435,7 +3559,7 @@ export function registerTools(server: McpServer) {
       // modify_shape served a cache.
       const staleDep = bundleStaleDepDetail(absPath);
 
-      const callOverrides = code === undefined ? params : undefined;
+      const callOverrides = code === undefined && !hasEdits ? params : undefined;
       const { status } = await executeWithPersistedParams(absPath, callOverrides);
       notifyExtensionOfShape(absPath);
 
@@ -3515,19 +3639,26 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "export_shape",
-    "Export the last executed shape to STEP, STL, or 3MF. Optionally pass `filePath` to execute and export a specific file in one call. For multi-part assemblies, pass `partName` to export a single named part instead of the whole assembly. Pass `bom: true` to write a `*.bom.json` sidecar next to the exported file with per-part volume, mass, qty, material, and bounding box.",
+    "Export the last executed shape to STEP, STL, or 3MF. Optionally pass `filePath` to execute and export a specific file in one call. For multi-part assemblies, pass `partName` to export a single named part instead of the whole assembly, or `splitParts: true` to write EACH part to its own file in a folder (best for 3D printing — every part becomes an independent file the slicer can arrange). Pass `bom: true` to write a `*.bom.json` sidecar next to the exported file with per-part volume, mass, qty, material, and bounding box.",
     {
       format: z.enum(["step", "stl", "3mf"]).describe("'step' for CNC/manufacturing or CAD, 'stl' for generic 3D printing, '3mf' for Bambu Studio/OrcaSlicer (native format — preserves each part as a separate object with its color)"),
       outputPath: z.string().optional().describe("Output file path. Auto-derived from the source .shape.ts filename if omitted."),
       filePath: z.string().optional().describe("Optional .shape.ts path to execute first. Defaults to the last-executed shape."),
-      partName: z.string().optional().describe("For multi-part assemblies: export only the part whose name matches exactly (e.g., 'bolt'). If omitted, the full assembly is exported."),
+      partName: z.string().optional().describe("For multi-part assemblies: export only the part whose name matches exactly (e.g., 'bolt'). If omitted, the full assembly is exported. Mutually exclusive with splitParts."),
+      splitParts: z.boolean().optional().describe("When true, write EACH part of the assembly to its own file (`<partName>.<format>`) inside a folder instead of one combined file. Best for 3D printing — each part becomes an independent object. The folder is `outputPath` if given (treated as a directory), else a folder named after the source file. Mutually exclusive with partName."),
       openIn: z
         .enum(["prusaslicer", "cura", "bambustudio", "orcaslicer", "freecad", "fusion360"])
         .optional()
         .describe("If set, open the exported file in this app after saving. Requires VSCode + the extension."),
       bom: z.boolean().optional().describe("When true, also write a `*.bom.json` sidecar next to the exported file describing each part's qty, material (or null), mass_g (or null), volume_mm3, and min/max bounding box. `material` and `mass_g` are always present (explicit null when no material was declared) so downstream consumers get a predictable schema. Basename tracks the source `.shape.ts` (one sidecar per export call, even when per-part STL files are written)."),
     },
-    safeHandler("export_shape", async ({ format, outputPath, filePath, partName, openIn, bom }) => {
+    safeHandler("export_shape", async ({ format, outputPath, filePath, partName, splitParts, openIn, bom }) => {
+      if (splitParts && partName) {
+        return {
+          content: [{ type: "text" as const, text: "`splitParts` and `partName` are mutually exclusive — splitParts writes every part to its own file, partName writes just one. Pick one." }],
+          isError: true,
+        };
+      }
       // Figure out which file we're exporting. Precedence: explicit arg →
       // in-process last file → status file's fileName (set by VSCode/prior runs).
       let source: string | undefined = filePath ? resolveShapePath(filePath) : getLastFileName();
@@ -3576,6 +3707,62 @@ export function registerTools(server: McpServer) {
           isError: true,
         };
       }
+
+      // --- Split-parts branch: one file per part inside a folder ------------
+      // Best for 3D printing — each part becomes its own STEP/STL/3MF the
+      // slicer can arrange independently. Reuses the in-memory parts from the
+      // execute above (no re-tessellation per part). BOM sidecar, if asked
+      // for, is written once into the same folder (matches the one-sidecar-
+      // per-call rule). `openIn` is skipped — there's no single file to open.
+      if (splitParts) {
+        // Resolve the target folder. An explicit outputPath is treated as a
+        // directory; otherwise derive a folder named after the source file
+        // (e.g. `assembly.shape.ts` → `assembly/`).
+        const outDir = outputPath || source.replace(/\.shape\.ts$/, "");
+        let written: string[];
+        try {
+          written = await exportLastSplitToDir(format, outDir);
+        } catch (e: any) {
+          const errMsg = e?.message ?? String(e);
+          if (/memory\s+access\s+out\s+of\s+bounds/i.test(errMsg)) {
+            resetCore();
+            return {
+              content: [{
+                type: "text" as const,
+                text: `Split export failed: ${errMsg}\n\nWASM state was reset due to a memory error; next call will re-initialize OCCT.`,
+              }],
+              isError: true,
+            };
+          }
+          return {
+            content: [{ type: "text" as const, text: `Split export failed: ${errMsg}` }],
+            isError: true,
+          };
+        }
+
+        const totalBytes = written.reduce((s, f) => s + statSync(f).size, 0);
+        const totalStr = totalBytes > 1024 * 1024
+          ? `${(totalBytes / 1024 / 1024).toFixed(1)}MB`
+          : `${Math.round(totalBytes / 1024)}KB`;
+        const fileList = written.map((f) => `  - ${basename(f)}`).join("\n");
+        let splitOpenNote = "";
+        if (openIn) {
+          splitOpenNote = `\nNote: openIn is ignored for splitParts — ${written.length} separate files were written. Open the folder in your slicer instead.`;
+        }
+        const splitColorNote = format === "stl"
+          ? "\nNote: STL carries no color. For per-part colors in Bambu/Orca, use format \"3mf\"."
+          : "";
+        const splitBomNote = bom
+          ? "\nNote: bom sidecar is not written in splitParts mode — run a normal (combined) export with bom:true for the BOM."
+          : "";
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Exported ${written.length} parts to folder: ${resolve(outDir)}\nFormat: ${format.toUpperCase()} (one file per part)\nTotal size: ${totalStr}\nSource: ${source}\nFiles:\n${fileList}${splitColorNote}${splitBomNote}${splitOpenNote}`,
+          }],
+        };
+      }
+      // ---------------------------------------------------------------------
 
       // Multi-part STL is emitted as ASCII multi-solid: one `solid <name>`
       // block per part so slicers (PrusaSlicer, Cura, Bambu, Orca) treat each
@@ -4526,8 +4713,9 @@ export function registerTools(server: McpServer) {
         .describe("API category. Omit to see the list of available categories."),
       search: z.string().optional().describe("Keyword / phrase to search for across all categories. Returns the most relevant sections instead of one full category. Can be combined with `category` to search within a single category."),
       signaturesOnly: z.boolean().optional().describe("Return only method signatures (lines with `→` or top-level function/method declarations) from the requested category. Strips examples and prose for a compact lookup. Requires `category`."),
+      full: z.boolean().optional().describe("Return the COMPLETE prose for the category. Large categories (e.g. `stdlib`, ~600 lines) default to a compact signatures-only view to save context; pass `full: true` for the whole thing, or use `search` to pull only the relevant sections."),
     },
-    safeHandler("get_api_reference", async ({ category, search, signaturesOnly }) => {
+    safeHandler("get_api_reference", async ({ category, search, signaturesOnly, full }) => {
       if (search && search.trim().length > 0) {
         return { content: [{ type: "text" as const, text: searchApiReference(search, category) }] };
       }
@@ -4542,6 +4730,20 @@ export function registerTools(server: McpServer) {
       const body = getApiReference(category);
       if (signaturesOnly) {
         return { content: [{ type: "text" as const, text: extractSignatures(body, category) }] };
+      }
+      // Large categories (stdlib is ~600 lines) default to a compact
+      // signatures view so a single lookup doesn't dump ~10K tokens of prose
+      // into context. `full: true` returns the whole body; `search` pulls
+      // just the relevant sections.
+      const LARGE_CATEGORY_LINE_THRESHOLD = 150;
+      if (!full && body.split("\n").length > LARGE_CATEGORY_LINE_THRESHOLD) {
+        const sigs = extractSignatures(body, category);
+        return {
+          content: [{
+            type: "text" as const,
+            text: `${sigs}\n\n(Compact view: '${category}' is large, so only signatures are shown. Pass \`full: true\` for the complete docs, or \`search: "…"\` to pull specific sections.)`,
+          }],
+        };
       }
       return { content: [{ type: "text" as const, text: body }] };
     })
@@ -4625,8 +4827,8 @@ export function registerTools(server: McpServer) {
         .enum(["preview", "final"])
         .optional()
         .describe("Tessellation-quality preset. `'final'` (default for <15-part assemblies) matches the pre-existing render quality. `'preview'` coarsens the mesh ~2.5× for faster first-render on large assemblies, at the cost of visibly chunkier facets — choose this for layout checks on 15+ part assemblies. If omitted, the extension auto-degrades to `'preview'` when the part count is >= 15 and uses `'final'` otherwise."),
-      inline: z.boolean().optional().describe("Return the rendered PNG inline as base64 image content on top of the usual text + file path. Default true — agents see the image directly without an extra `get_preview` round trip. Skipped inline if the file exceeds 10 MB. Pass false to skip the base64 payload (saves ~30% response size) when you only need the path."),
-      verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats in the status text. 'summary' (default) caps at 10 parts. 'full' dumps every part."),
+      inline: z.boolean().optional().describe("Return the rendered PNG inline as base64 image content. Default FALSE — the PNG is always saved to disk and the response gives its absolute path, so iterative render loops don't accumulate full-size images in the conversation context. Read the returned path to view it, or pass inline:true to ALSO embed the bytes in-band (subject to a 4 MB cap)."),
+      verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats in the status text. 'summary' (default) omits the per-part table entirely (the image conveys geometry — call get_render_status for numbers). 'full' dumps every part."),
       forceBundleRebuild: z.boolean().optional().describe("If true, bypasses the bundled-script cache and re-invokes esbuild. Use only when you suspect the cache is stale; the cache normally handles this correctly via mtime tracking."),
     },
     safeHandler("render_preview", async ({ filePath, cameraAngle, grid, showDimensions, showAxes, renderMode, width, height, timeoutMs, focusPart, hideParts, finder, partName, partIndex, meshQuality, inline, verbosity, forceBundleRebuild }) => {
@@ -4841,7 +5043,10 @@ export function registerTools(server: McpServer) {
       try {
         const status: EngineStatus = JSON.parse(readFileSync(join(GLOBAL_STORAGE, "shapeitup-status.json"), "utf-8"));
         if (status.success) {
-          statusText = `\nStats: ${status.stats}${formatProperties(status.properties, verbosity ?? "summary")}`;
+          // Per-part stats are dropped from render_preview by default — the
+          // image conveys the geometry, and the full per-part table is one
+          // get_render_status call away. verbosity:"full" restores the dump.
+          statusText = `\nStats: ${status.stats}${formatProperties(status.properties, verbosity ?? "summary", verbosity === "full")}`;
         }
         if (Array.isArray(status.partNames)) renderedPartNames = status.partNames;
       } catch {}
@@ -4881,17 +5086,18 @@ export function registerTools(server: McpServer) {
 
       const textBlock = {
         type: "text" as const,
-        text: `Screenshot saved to: ${screenshotPath}\nRender mode: ${renderMode || "ai"}, Camera: 4-pane (top/front/right/iso), Size: ${width ?? 1280}px\nFile: ${source}${partsLine}${finderLine}${statusText}${rasterNote}\nUse the Read tool to view this image.`,
+        text: `Screenshot saved to: ${screenshotPath}\nRender mode: ${renderMode || "ai"}, Camera: 4-pane (top/front/right/iso), Size: ${width ?? 1280}px\nFile: ${source}${partsLine}${finderLine}${statusText}${rasterNote}${inline === true ? "" : "\nRead the saved path (above) to view this image, or pass inline:true to embed it."}`,
       };
 
-      // Inline by default — mirrors the old behaviour so existing agent
-      // workflows keep seeing the bytes in-band. `inline: false` opts out.
-      if (inline !== false && rendered.pngBuf) {
-        if (rendered.pngBuf.length > 10 * 1024 * 1024) {
+      // Inline is OPT-IN: default off so iterative render loops don't stack
+      // full-size base64 images in the conversation context (the dominant
+      // felt-latency cost). Pass `inline: true` to embed the bytes in-band.
+      if (inline === true && rendered.pngBuf) {
+        if (rendered.pngBuf.length > 4 * 1024 * 1024) {
           return {
             content: [
               textBlock,
-              { type: "text" as const, text: `\n(inline=true requested but PNG is ${(rendered.pngBuf.length / 1024 / 1024).toFixed(1)} MB, exceeding the 10 MB inline limit. Reduce width or use the Read tool on the saved path.)` },
+              { type: "text" as const, text: `\n(inline=true requested but PNG is ${(rendered.pngBuf.length / 1024 / 1024).toFixed(1)} MB, exceeding the 4 MB inline limit. Reduce width or use the Read tool on the saved path.)` },
             ],
           };
         }
@@ -5337,14 +5543,14 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "check_collisions",
-    "Detects pairwise intersections between named parts in a multi-part assembly. AABB prefilter skips obviously-disjoint pairs; the rest run Replicad's 3D intersect (failures are surfaced as 'intersect failed' rather than ignored). `tolerance` filters numerical-noise contacts (default 0.001 mm³); 100+ parts scale as N². Pass `acceptedPairs` to suppress EXPECTED intersections (needles in grooves, bolts in through-holes) — accepted pairs collapse into a summary count so real bugs surface first. `acceptedPairs` syntax: `[['needle-*', 'needle-bed']]` where `*` matches any run of chars; a pattern without `*` is matched exactly; the pair order is symmetric (`['a','b']` also covers `['b','a']`). Volumes at or below `pressFitThreshold` list under 'Nominal contact'. Main block sorts by volume descending. Pass either `filePath` OR `code` — mutually exclusive. `params` overrides numeric parameters for this single check without persisting. `format: 'full'` adds per-pair geometry. See `get_api_reference('verification')` for examples.",
+    "Detects pairwise intersections between named parts in a multi-part assembly. AABB prefilter skips obviously-disjoint pairs; the rest run Replicad's 3D intersect (failures are surfaced as 'intersect failed' rather than ignored). `tolerance` filters numerical-noise contacts (default 0.001 mm³); 100+ parts scale as N². Pass `acceptedPairs` to suppress EXPECTED intersections (needles in grooves, bolts in through-holes) — accepted pairs collapse into a summary count so real bugs surface first. `acceptedPairs` syntax: `[['needle-*', 'needle-bed']]` where `*` matches any run of chars; a pattern without `*` is matched exactly; the pair order is symmetric (`['a','b']` also covers `['b','a']`). Volumes at or below `pressFitThreshold` list under 'Nominal contact'. Main block sorts by volume descending. TIP: instead of re-passing `acceptedPairs` on every call, COLOCATE them in the shape file as `export const expectedContacts = [['needle-*','needle-bed'], ['bolt-*','plate-*']]` — check_collisions reads that export and merges it with any call-time `acceptedPairs` (same `*`-glob + symmetric-order rules), so a design's known-good contacts travel with the file. Pass either `filePath` OR `code` — mutually exclusive. `params` overrides numeric parameters for this single check without persisting. `format: 'full'` adds per-pair geometry. See `get_api_reference('verification')` for examples.",
     {
       filePath: z.string().optional().describe("Path to the .shape.ts file to check for part collisions. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first existing match wins), else anchor to process.cwd(). Mutually exclusive with `code`."),
       code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning an array of parts. Written to a throwaway temp file, executed, and deleted afterwards. Use `workingDir` to make local `./` imports resolve. Mutually exclusive with `filePath`."),
       workingDir: z.string().optional().describe("Directory to write the temp snippet file in when `code` is provided. When set, relative imports (`./foo.shape`) resolve against this directory. Defaults to a private globalStorage path (isolated; relative imports won't work)."),
       params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Param overrides applied to the shape's `export const params` for this single check. Accepts numbers, booleans, and strings — same shape as tune_params accepts. Does NOT persist — merged with tune_params values for this execution only, so you can collision-check an articulation angle (e.g. `{ cam_angle_deg: 180 }`) without editing the shape."),
       tolerance: z.number().optional().describe("Minimum intersection volume in mm³ to count as a collision. Defaults to 0.001 — filters out numerical-noise overlaps on touching-but-not-overlapping parts. Negative values are clamped to 0."),
-      acceptedPairs: z.array(z.tuple([z.string(), z.string()])).optional().describe("Pairs of part names whose intersection is EXPECTED and should not be flagged. Each side accepts `*` as a glob wildcard matching any run of chars, e.g. [['needle-body-*','needle-bed'], ['bolt-*','plate-*']]. A pattern without `*` is matched exactly (back-compat). Order is symmetric: ['a','b'] also covers ['b','a']. Accepted pairs collapse into a single summary line."),
+      acceptedPairs: z.array(z.tuple([z.string(), z.string()])).optional().describe("Pairs of part names whose intersection is EXPECTED and should not be flagged. Each side accepts `*` as a glob wildcard matching any run of chars, e.g. [['needle-body-*','needle-bed'], ['bolt-*','plate-*']]. A pattern without `*` is matched exactly (back-compat). Order is symmetric: ['a','b'] also covers ['b','a']. Accepted pairs collapse into a single summary line. To persist these with the design instead of re-passing them each call, add `export const expectedContacts = [...]` to the shape file — it's merged with this list."),
       pressFitThreshold: z.number().optional().describe("Volume threshold (mm³) at or below which a collision is classified as 'nominal contact' (press fit / touching interface) and listed in a compact section instead of the main Collisions block. Default 0.5 mm³. Set to 0 to disable the tag (every non-accepted collision is treated as real)."),
       format: z.enum(["summary", "full", "ids"]).optional().describe("Report verbosity. summary (default): count + worst pair detail + per-pair {a,b,volume}. full: per-pair with region+center geometry. ids: minimal [a,b,vol] tuples."),
     },
@@ -5565,35 +5771,36 @@ export function registerTools(server: McpServer) {
             }
 
             if (volume > tol) {
-              // Compute the overlap region AABB by tessellating the
-              // intersection solid. Cheap quality (final factor is fine since
-              // the overlap is typically small) and wrapped so a tessellation
-              // throw doesn't kill the whole collision — we just omit the
-              // region field for that pair. We still emit the volume number
-              // because that came from a separate OCCT call.
+              // Compute the overlap region AABB from the intersection solid's
+              // OCCT bounding box (BRepBndLib) — NOT by tessellating it. The old
+              // path meshed the whole overlap solid just to min/max its vertices,
+              // which on a hot N² collision loop is a needless second OCCT
+              // tessellation per colliding pair. `.boundingBox.bounds` is a
+              // cheap Bnd_Box query. Wrapped so a throw just omits the region
+              // field; the volume number came from a separate measure call.
               let region: { min: [number, number, number]; max: [number, number, number]; depths: { x: number; y: number; z: number } } | undefined;
+              let bb: any = null;
               try {
-                const meshData: any = overlapShape.mesh?.({ tolerance: 0.1, angularTolerance: 0.3 });
-                const verts: ArrayLike<number> | undefined = meshData?.vertices;
-                if (verts && verts.length >= 3) {
-                  let mnx = Infinity, mny = Infinity, mnz = Infinity;
-                  let mxx = -Infinity, mxy = -Infinity, mxz = -Infinity;
-                  for (let k = 0; k < verts.length; k += 3) {
-                    const x = verts[k], y = verts[k + 1], z = verts[k + 2];
-                    if (x < mnx) mnx = x; if (x > mxx) mxx = x;
-                    if (y < mny) mny = y; if (y > mxy) mxy = y;
-                    if (z < mnz) mnz = z; if (z > mxz) mxz = z;
-                  }
-                  if (isFinite(mnx)) {
+                bb = overlapShape.boundingBox;
+                const bounds = bb?.bounds;
+                if (Array.isArray(bounds) && bounds.length === 2) {
+                  const [mn, mx] = bounds;
+                  if (
+                    Array.isArray(mn) && Array.isArray(mx) &&
+                    mn.length >= 3 && mx.length >= 3 &&
+                    [mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]].every((n: any) => typeof n === "number" && isFinite(n))
+                  ) {
                     region = {
-                      min: [mnx, mny, mnz],
-                      max: [mxx, mxy, mxz],
-                      depths: { x: mxx - mnx, y: mxy - mny, z: mxz - mnz },
+                      min: [mn[0], mn[1], mn[2]],
+                      max: [mx[0], mx[1], mx[2]],
+                      depths: { x: mx[0] - mn[0], y: mx[1] - mn[1], z: mx[2] - mn[2] },
                     };
                   }
                 }
               } catch {
                 // Non-fatal — volume is still reported, region just omitted.
+              } finally {
+                try { bb?.delete?.(); } catch {}
               }
               collisions.push({
                 a: labelFor(i),
@@ -6704,16 +6911,20 @@ function installGeminiSchemaShim(server: McpServer): void {
 
 // Fix #1: large assemblies (Asbjørn's 86-part build) blow the MCP token cap
 // when every part's per-row stats are emitted. Default to a 25-row cap;
-// callers can opt into the full list with verbosity: "full". When every
-// part has a meaningful author-chosen name (not `part_0` / `part 1`), auto-
-// expand up to FULL_LIST_HARD_CAP so named small-to-medium assemblies stay
-// fully visible without an explicit verbosity bump.
+// callers can opt into the full list with verbosity: "full".
+//
+// Context-economy note: the cap is now UNCONDITIONAL in summary mode. A prior
+// version auto-expanded up to 200 rows whenever every part had a meaningful
+// name — but real assemblies (14–98 named parts) hit that path and dumped a
+// 5-field row per part on EVERY render/status/create/modify, which is a large
+// recurring token cost. Named or not, summary mode caps at 25; use
+// verbosity:"full" (or get_render_status) for the complete table.
 const SUMMARY_PARTS_CAP = 25;
-const FULL_LIST_HARD_CAP = 200;
 
 function formatProperties(
   props: ShapeProperties | undefined,
   verbosity: "summary" | "full" = "summary",
+  includePerPart = true,
 ): string {
   if (!props) return "";
   const fmt = (n: number) =>
@@ -6734,16 +6945,10 @@ function formatProperties(
   if (props.centerOfMass) {
     lines.push(`  center of mass: ${fmtPt(props.centerOfMass)} mm`);
   }
-  if (props.parts && props.parts.length > 1) {
+  if (includePerPart && props.parts && props.parts.length > 1) {
     const allParts = props.parts;
     const n = allParts.length;
-    const allNamedMeaningfully = allParts.every((p) =>
-      typeof p.name === "string" && !/^part[_ ]?\d+$/i.test(p.name)
-    );
-    const capped =
-      verbosity === "summary" &&
-      n > SUMMARY_PARTS_CAP &&
-      !(allNamedMeaningfully && n <= FULL_LIST_HARD_CAP);
+    const capped = verbosity === "summary" && n > SUMMARY_PARTS_CAP;
     const visible = capped ? allParts.slice(0, SUMMARY_PARTS_CAP) : allParts;
     for (const p of visible) {
       const bits: string[] = [];
@@ -6986,7 +7191,7 @@ NOTE: replicad does NOT support "-XY"/"-XZ"/"-YZ" prefixes. Use the alternate pl
 To cut a hole downward through a base, pass a negative extrude depth: .extrude(-depth), or use "YX" plane.
 
 draw* vs sketch* — they look alike but return different things:
-- drawCircle/drawRectangle/drawRoundedRectangle/drawEllipse/drawPolysides/drawText/draw()
+- drawCircle/drawRectangle/drawRoundedRectangle/drawEllipse/drawPolysides/draw()
     return a Drawing (2D, not placed). You MUST call .sketchOnPlane() before extruding.
     e.g. drawCircle(10).sketchOnPlane("XY").extrude(5)
 - sketchCircle/sketchRectangle return a Sketch already placed via its config arg.
@@ -7016,7 +7221,7 @@ from the sketching category instead.)
 - drawCircle(radius) → Drawing
 - drawEllipse(xRadius, yRadius) → Drawing
 - drawPolysides(radius, numSides) → Drawing
-- drawText(text, { fontSize?, fontFamily? }) → Drawing
+- drawText — NOT AVAILABLE in this build (no font is bundled; it throws at runtime). Emboss labels with geometry instead: extrude a slab and cut thin rectangles, or raise ribs.
 
 ## DrawingPen Methods (chainable)
 Lines: .lineTo([x,y]), .line(dx,dy), .vLine(d), .hLine(d), .polarLine(d, angle)

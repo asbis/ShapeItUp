@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import type { ViewerProvider } from "./viewer-provider";
-import { exportToFile } from "./export";
+import { exportToFile, exportSplitToFolder } from "./export";
+import type { ExportFormat } from "@shapeitup/shared";
 import { exportAndOpen, findAppById, resetLaunchPrefs } from "./open-in-app";
 import { getDetectedApps, rescanApps, type AppId } from "./app-detector";
 import { outputChannel } from "./extension";
@@ -21,6 +22,13 @@ export function registerCommands(
     vscode.commands.registerCommand("shapeitup.export3MF", async () => {
       await exportToFile(viewer, "3mf");
     }),
+
+    vscode.commands.registerCommand(
+      "shapeitup.exportSplit",
+      async (format?: ExportFormat) => {
+        await exportSplitToFolder(viewer, format ?? "stl");
+      }
+    ),
 
     vscode.commands.registerCommand(
       "shapeitup.openInApp",

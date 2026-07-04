@@ -129,6 +129,7 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
   private context: vscode.ExtensionContext;
   private output: vscode.OutputChannel;
   private pendingExportResolve?: (data: ArrayBuffer) => void;
+  private pendingExportSplitResolve?: (items: Array<{ name: string; data: ArrayBuffer }> | undefined) => void;
   private pendingScreenshotResolve?: (dataUrl: string) => void;
   private isReady = false;
   private pendingScript?: { js: string; fileName: string; paramOverrides?: Record<string, number>; meshQuality?: "preview" | "final" };
@@ -249,6 +250,11 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       this.output.appendLine(`[viewer] Clearing pending export: ${reason}`);
       this.pendingExportResolve(undefined as any);
       this.pendingExportResolve = undefined;
+    }
+    if (this.pendingExportSplitResolve) {
+      this.output.appendLine(`[viewer] Clearing pending split export: ${reason}`);
+      this.pendingExportSplitResolve(undefined);
+      this.pendingExportSplitResolve = undefined;
     }
   }
 
@@ -524,6 +530,11 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
             <button data-action="export-step">Save as STEP…</button>
             <button data-action="export-stl">Save as STL…</button>
             <button data-action="export-3mf">Save as 3MF (Bambu / Orca)…</button>
+            <div class="menu-sep" role="separator"></div>
+            <div class="menu-heading">Separate file per part</div>
+            <button data-action="export-split-step">STEP — one file per part…</button>
+            <button data-action="export-split-stl">STL — one file per part…</button>
+            <button data-action="export-split-3mf">3MF — one file per part…</button>
             <div id="export-menu-apps"></div>
           </div>
         </div>
@@ -644,8 +655,13 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         break;
       case "toolbar-export":
         // Triggered from the in-viewer buttons
-        if (msg.format === "step") {
+        if (msg.split) {
+          // One file per part into a user-chosen folder.
+          vscode.commands.executeCommand("shapeitup.exportSplit", msg.format);
+        } else if (msg.format === "step") {
           vscode.commands.executeCommand("shapeitup.exportSTEP");
+        } else if (msg.format === "3mf") {
+          vscode.commands.executeCommand("shapeitup.export3MF");
         } else {
           vscode.commands.executeCommand("shapeitup.exportSTL");
         }
@@ -657,6 +673,12 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         if (this.pendingExportResolve) {
           this.pendingExportResolve(msg.data);
           this.pendingExportResolve = undefined;
+        }
+        break;
+      case "export-split-data":
+        if (this.pendingExportSplitResolve) {
+          this.pendingExportSplitResolve(msg.items);
+          this.pendingExportSplitResolve = undefined;
         }
         break;
       case "screenshot-data":
@@ -1259,6 +1281,38 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         if (this.pendingExportResolve === resolve) {
           this.pendingExportResolve = undefined;
           this.output.appendLine(`[export] Timeout after 30s — worker did not reply`);
+          resolve(undefined);
+        }
+      }, 30000);
+    });
+  }
+
+  /**
+   * Request a per-part (split) export. Resolves to one {name, data} entry per
+   * part, or undefined on timeout / no webview. The caller writes each entry
+   * to its own file. Mirrors requestExport's single-slot pending pattern.
+   */
+  async requestExportSplit(
+    format: ExportFormat
+  ): Promise<Array<{ name: string; data: ArrayBuffer }> | undefined> {
+    const webview = this.getActiveWebview();
+    if (!webview) {
+      this.output.appendLine("[export-split] No active webview — aborting");
+      return undefined;
+    }
+
+    if (this.pendingExportSplitResolve) {
+      this.pendingExportSplitResolve(undefined);
+      this.pendingExportSplitResolve = undefined;
+    }
+
+    return new Promise((resolve) => {
+      this.pendingExportSplitResolve = resolve;
+      webview.postMessage({ type: "request-export-split", format });
+      setTimeout(() => {
+        if (this.pendingExportSplitResolve === resolve) {
+          this.pendingExportSplitResolve = undefined;
+          this.output.appendLine(`[export-split] Timeout after 30s — worker did not reply`);
           resolve(undefined);
         }
       }, 30000);

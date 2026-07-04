@@ -2,7 +2,7 @@
   "name": "shapeitup-vscode",
   "displayName": "ShapeItUp",
   "description": "Scripted CAD for VS Code — write TypeScript, see 3D, export STEP/STL/3MF (Bambu Studio & OrcaSlicer ready). AI-powered with Claude Code MCP integration.",
-  "version": "1.17.0",
+  "version": "1.19.0",
   "publisher": "shapeitup",
   "license": "MIT",
   "icon": "icon.png",
@@ -63,6 +63,10 @@
       {
         "command": "shapeitup.export3MF",
         "title": "ShapeItUp: Export as 3MF (Bambu / Orca)"
+      },
+      {
+        "command": "shapeitup.exportSplit",
+        "title": "ShapeItUp: Export Parts to Folder (one file per part)"
       },
       {
         "command": "shapeitup.openInApp",

@@ -979,11 +979,15 @@ export function resetCore(): void {
   corePromise = null;
   lastParts = [];
   lastFileName = undefined;
-  // Drop every memoised mesh too: even though cached parts contain no WASM
-  // pointers, a reset usually means we just hit a poisoned-heap failure on
-  // the same script — the FIX (re-init + re-execute) needs to actually run
-  // again to land any user-side bug fix that motivated the reset.
-  clearMeshCache();
+  // NOTE: we deliberately do NOT clear the mesh cache here. Cached entries are
+  // sanitized (no WASM pointers — see sanitizeOutcomeForCache) and are keyed on
+  // the source-content hash, so:
+  //   • a poisoned-heap failure never cached anything (only successes cache), and
+  //   • once the user FIXES the offending script its hash changes, so the old
+  //     entry is never served anyway.
+  // Nuking ~16 tessellated assemblies on every reset just to re-pay OCCT on the
+  // next unrelated render was pure cost. If a genuine invalidation is ever
+  // needed, callers can invoke clearMeshCache() explicitly.
   // Bug #8: the wedge-detection heuristic treats a post-success pointer throw
   // as "heap corruption — retry". After we reset the core, the freshly-booted
   // OCCT instance hasn't succeeded yet, so a first-render failure on it
@@ -1462,7 +1466,14 @@ export async function executeShapeFile(
     // radius too large" as a JS Error) don't qualify — we only reset when the
     // signature matches something that could have corrupted the heap.
     const isRawPointerThrow = typeof e === "number" || typeof e === "bigint";
-    const wasmSignaturePattern = /OCCT exception|memory access out of bounds|pointer|null object/i;
+    // Narrowed (P4): only signatures that genuinely indicate a poisoned WASM
+    // heap. The raw numeric/bigint throw is the strongest signal (Emscripten's
+    // unhandled-C++-exception path). The remaining string patterns are
+    // definitive heap/table corruption. We deliberately DROPPED the old broad
+    // "pointer" / "null object" matches — those also appear in ordinary
+    // user-script errors (e.g. an empty/degenerate shape), and resetting the
+    // ~30 MB core on a recoverable user error was a needless latency spike.
+    const wasmSignaturePattern = /OCCT exception|memory access out of bounds|table index is out of bounds|unreachable executed/i;
     const looksWasmLevel = isRawPointerThrow ||
       (typeof status.error === "string" && wasmSignaturePattern.test(status.error));
     if (looksWasmLevel) {
@@ -1487,6 +1498,33 @@ export async function exportLastToFile(
   const data = await core.exportLast(format, partName);
   mkdirSync(dirname(resolve(outputPath)), { recursive: true });
   writeFileSync(outputPath, Buffer.from(data));
+}
+
+/**
+ * Export each part of the last-executed assembly to its OWN file inside
+ * `outputDir` (created if missing). One `<partName>.<format>` per part —
+ * the split-export path used for 3D printing where each part should be an
+ * independent file the slicer can arrange. Returns the absolute paths
+ * written, in part order.
+ */
+export async function exportLastSplitToDir(
+  format: "step" | "stl" | "3mf",
+  outputDir: string
+): Promise<string[]> {
+  if (lastParts.length === 0) {
+    throw new Error("No shape has been executed in this session — call open_shape, create_shape, or modify_shape first.");
+  }
+  const core = await getCore();
+  const items = await core.exportLastSplit(format);
+  const dir = resolve(outputDir);
+  mkdirSync(dir, { recursive: true });
+  const written: string[] = [];
+  for (const item of items) {
+    const filePath = join(dir, `${item.name}.${format}`);
+    writeFileSync(filePath, Buffer.from(item.data));
+    written.push(filePath);
+  }
+  return written;
 }
 
 function writeStatusFile(status: EngineStatus, dir: string) {
