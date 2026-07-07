@@ -691,6 +691,12 @@ export interface ExecuteOutcome {
   status: EngineStatus;
   /** Live OCCT shapes — valid until the next execute() call. */
   parts?: ExecutedPart[];
+  /**
+   * Raw `export const sim = {...}` motion-simulation block (or undefined). Plain
+   * serializable data, so it survives the outcome cache. `run_simulation`
+   * resolves it against `parts` via @shapeitup/sim.
+   */
+  sim?: unknown;
 }
 
 let corePromise: Promise<Core> | null = null;
@@ -793,7 +799,7 @@ function hashSource(source: string): string {
  * `.shape` goes missing.
  */
 function sanitizeOutcomeForCache(outcome: ExecuteOutcome): ExecuteOutcome {
-  if (!outcome.parts) return { status: outcome.status };
+  if (!outcome.parts) return { status: outcome.status, sim: outcome.sim };
   const safeParts = outcome.parts.map((p) => {
     // Discard `.shape` — every other field (vertices/normals/triangles/
     // edgeVertices/volume/surfaceArea/centerOfMass/mass/qty/material) is
@@ -804,7 +810,7 @@ function sanitizeOutcomeForCache(outcome: ExecuteOutcome): ExecuteOutcome {
     void _shape;
     return rest as Omit<ExecutedPart, "shape"> as ExecutedPart;
   });
-  return { status: outcome.status, parts: safeParts };
+  return { status: outcome.status, parts: safeParts, sim: outcome.sim };
 }
 
 /**
@@ -1134,6 +1140,7 @@ export async function executeShapeFile(
       // (even when it's undefined — i.e. the assembly declared none).
       `try { globalThis.__SHAPEITUP_ENTRY_MATERIAL__ = __shapeitup_entry__.material; } catch (e) {}\n` +
       `try { globalThis.__SHAPEITUP_ENTRY_CONFIG__ = __shapeitup_entry__.config; } catch (e) {}\n` +
+      `try { globalThis.__SHAPEITUP_ENTRY_SIM__ = __shapeitup_entry__.sim; } catch (e) {}\n` +
       // Sentinel: tells the executor this marker was set by a trusted wrapper
       // (vs leaked from a prior execution in the long-lived MCP-server process).
       // The executor reads and clears it together with MAIN/PARAMS.
@@ -1141,7 +1148,8 @@ export async function executeShapeFile(
       `export default __shapeitup_entry__.default;\n` +
       `export const params = __shapeitup_entry__.params;\n` +
       `export const material = __shapeitup_entry__.material;\n` +
-      `export const config = __shapeitup_entry__.config;\n`;
+      `export const config = __shapeitup_entry__.config;\n` +
+      `export const sim = __shapeitup_entry__.sim;\n`;
     const result = await esbuild.build({
       stdin: {
         contents: syntheticEntry,
@@ -1443,7 +1451,7 @@ export async function executeShapeFile(
       timestamp: new Date().toISOString(),
     };
     writeStatusFile(successStatus, globalStorageDir);
-    return { status: successStatus, parts: result.parts };
+    return { status: successStatus, parts: result.parts, sim: result.sim };
   } catch (e: any) {
     // Route through core.resolveError so raw WASM exception pointers get
     // resolved to readable text (or at least a useful fallback) instead of

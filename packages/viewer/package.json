@@ -4,6 +4,8 @@
   "private": true,
   "dependencies": {
     "@shapeitup/shared": "workspace:*",
+    "@shapeitup/sim": "workspace:*",
+    "@shapeitup/sim-dynamics": "workspace:*",
     "three": "^0.170.0"
   },
   "devDependencies": {

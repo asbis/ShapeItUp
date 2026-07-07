@@ -3,6 +3,15 @@ import { z } from "zod";
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, unlinkSync } from "fs";
 import { join, resolve, basename, dirname, isAbsolute, sep } from "path";
 import { extractExpectedContactsStatic } from "@shapeitup/core";
+import {
+  KinematicSim,
+  resolveSimSpec,
+  isSimSpecInput,
+  type Aabb,
+  type Profile,
+  type SimResult,
+} from "@shapeitup/sim";
+import { runDynamics, type MeshData } from "@shapeitup/sim-dynamics";
 import { homedir } from "os";
 import {
   appendScreenshotMetadata,
@@ -5539,6 +5548,197 @@ export function registerTools(server: McpServer) {
       };
       }); // close withShapeFile callback
     })
+  );
+
+  server.tool(
+    "run_simulation",
+    "Runs the Phase-1 kinematic MOTION simulation declared by a shape's `export const sim = {...}` block and returns collision events over time — headless, no viewer needed. Use this to test mechanism motion before building/printing: does a moving part hit another as it travels? Does an actuator (e.g. a solenoid with a response delay + finite ramp) reach its target before a colliding part arrives? Unlike `check_collisions` (a single static snapshot) and `sweep_check` (one part rotated through angles), this drives EVERY kinematic body along its actuator profile over the full run and reports the FIRST time each body pair overlaps (transformed-AABB test, mm). Returns: the run's duration/timestep, a list of actuators and what they drive, and each collision as `{tStart(ms), a, b, overlapVolume}`. `format:'full'` also samples a coarse position timeline for each moving body. The `sim` block is authored in the shape file (bodies as static/kinematic/dynamic by glob, joints with anchor+axis, actuators with velocity/position/keyframes/sine profiles, optional acceptedPairs to suppress expected resting contacts) — see docs/simulation-design.md and @shapeitup/sim's SimSpecInput. TWO ENGINES: the default KINEMATIC engine plays scripted motion and reports AABB-overlap collisions (fast, for pattern/interference testing). Declaring any `dynamic` body (or `mode: 'dynamic'` + `gravity`) switches to the DYNAMICS engine (Rapier physics): dynamic bodies fall under gravity and rest/tumble on contact while kinematic bodies still follow their profiles and can shove them — the report then adds each dynamic body's net displacement and whether it settled. Pass either `filePath` OR `code`. `params` overrides numeric parameters for this run without persisting.",
+    {
+      filePath: z.string().optional().describe("Path to the .shape.ts file to simulate. Absolute paths pass through; relative paths probe each VSCode workspace root, else process.cwd(). Mutually exclusive with `code`."),
+      code: z.string().optional().describe("Inline .shape.ts source including an `export default` main() AND an `export const sim = {...}` block. Written to a temp file, executed, deleted. Use `workingDir` for local `./` imports. Mutually exclusive with `filePath`."),
+      workingDir: z.string().optional().describe("Directory to write the temp snippet in when `code` is provided, so relative imports resolve. Defaults to an isolated globalStorage path."),
+      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Param overrides applied to the shape's `export const params` for this run only (not persisted). Lets you simulate one parameter configuration without editing the file."),
+      format: z.enum(["summary", "full"]).optional().describe("Report verbosity. summary (default): actuators + collision events. full: also samples a coarse per-body position timeline (10 frames) so you can reason about the motion."),
+    },
+    safeHandler("run_simulation", async ({ filePath, code, workingDir, params, format }) => {
+      if (filePath !== undefined && code !== undefined) {
+        return { content: [{ type: "text" as const, text: "run_simulation: pass either `filePath` OR `code`, not both." }], isError: true };
+      }
+      if (filePath === undefined && code === undefined) {
+        return { content: [{ type: "text" as const, text: "run_simulation: provide either `filePath` (existing shape) or `code` (inline snippet)." }], isError: true };
+      }
+
+      return withShapeFile({ filePath, code, workingDir }, async (absPath) => {
+        if (!existsSync(absPath)) {
+          return { content: [{ type: "text" as const, text: `File not found: ${absPath}` }], isError: true };
+        }
+
+        // Force-bypass the mesh cache so `parts[].vertices` are fresh world-space
+        // buffers (we derive each body's rest AABB from them). `sim` is the raw
+        // `export const sim` block threaded through the engine's ExecuteOutcome.
+        const { status, parts, sim } = await executeWithPersistedParams(absPath, params, { force: true });
+        if (!status.success || !parts) {
+          return { content: [{ type: "text" as const, text: `Cannot simulate — script failed to render.\n${formatStatusText(status)}` }], isError: true };
+        }
+
+        if (!isSimSpecInput(sim)) {
+          return {
+            content: [{ type: "text" as const, text: `No motion simulation declared. Add an \`export const sim = { bodies: { ... }, joints: [ ... ], actuators: [ ... ] }\` block to ${basename(absPath)}. See docs/simulation-design.md or the carriage-needles example. (The file rendered ${parts.length} part(s) fine — it just has no \`sim\` block.)` }],
+          };
+        }
+
+        // Rest-pose world AABB per part, from tessellated vertices (same method
+        // the viewer uses). Parts with no geometry are skipped — they can't
+        // move or collide.
+        const partAabbs: Array<{ name: string; aabb: Aabb }> = [];
+        for (const p of parts) {
+          const v = p.vertices;
+          if (!v || v.length < 3) continue;
+          let minX = Infinity, minY = Infinity, minZ = Infinity;
+          let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+          for (let i = 0; i < v.length; i += 3) {
+            if (v[i] < minX) minX = v[i];
+            if (v[i] > maxX) maxX = v[i];
+            if (v[i + 1] < minY) minY = v[i + 1];
+            if (v[i + 1] > maxY) maxY = v[i + 1];
+            if (v[i + 2] < minZ) minZ = v[i + 2];
+            if (v[i + 2] > maxZ) maxZ = v[i + 2];
+          }
+          partAabbs.push({ name: p.name, aabb: { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] } });
+        }
+
+        const { spec, warnings } = resolveSimSpec(sim, partAabbs);
+
+        // Engine selection: run the Rapier force solver when the block opts in
+        // (`mode: "dynamic"`) or declares any force-driven `dynamic` body;
+        // otherwise the fast analytic kinematic engine. Both emit a SimResult.
+        const wantsDynamics =
+          sim.mode === "dynamic" || spec.bodies.some((b) => b.kind === "dynamic");
+
+        let result: SimResult;
+        if (wantsDynamics) {
+          // Physics colliders need real geometry, not just AABBs.
+          const meshes = new Map<string, MeshData>();
+          for (const p of parts) {
+            if (p.vertices && p.triangles && p.vertices.length >= 9 && p.triangles.length >= 3) {
+              meshes.set(p.name, { vertices: p.vertices, indices: p.triangles });
+            }
+          }
+          result = await runDynamics(spec, meshes);
+        } else {
+          result = new KinematicSim(spec).run();
+        }
+
+        // ── Format the report ──────────────────────────────────────────────
+        const describeProfile = (profile: Profile): string => {
+          switch (profile.kind) {
+            case "velocity":
+              return `velocity v=${profile.v}${profile.delayMs ? ` delay=${profile.delayMs}ms` : ""}`;
+            case "position":
+              return `position target=${profile.target} ramp=${profile.rampMs}ms${profile.delayMs ? ` delay=${profile.delayMs}ms` : ""}${profile.easing === "smooth" ? " (smooth)" : ""}`;
+            case "keyframes":
+              return `keyframes (${profile.points.length} points)`;
+            case "sine":
+              return `sine amp=${profile.amplitude} freq=${profile.freq}Hz`;
+          }
+        };
+        const bodyOfJoint = new Map(spec.joints.map((j) => [j.id, j.body]));
+
+        const kinematicCount = spec.bodies.filter((b) => b.kind === "kinematic").length;
+        const dynamicBodies = spec.bodies.filter((b) => b.kind === "dynamic");
+        const lines: string[] = [];
+        const kindBits = [`${kinematicCount} kinematic`];
+        if (dynamicBodies.length) kindBits.push(`${dynamicBodies.length} dynamic`);
+        lines.push(
+          `Motion sim [${wantsDynamics ? "DYNAMICS (Rapier)" : "kinematic"}]: ` +
+            `${spec.duration}s @ ${(spec.timestep * 1000).toFixed(1)}ms step — ` +
+            `${spec.bodies.length} bodies (${kindBits.join(", ")}), ${spec.actuators.length} actuator(s).`,
+        );
+        if (wantsDynamics) {
+          const g = spec.gravity ?? [0, 0, -9810];
+          lines.push(`Gravity: [${g.join(", ")}] mm/s².`);
+        }
+
+        // Actuators.
+        if (spec.actuators.length > 0) {
+          lines.push("");
+          lines.push("Actuators:");
+          for (const a of spec.actuators) {
+            const body = bodyOfJoint.get(a.joint) ?? "?";
+            lines.push(`  ${a.id}: ${describeProfile(a.profile)} → ${body}`);
+          }
+        }
+
+        // Collisions (kinematic: AABB overlap) / contacts (dynamics: contact onset).
+        const noun = wantsDynamics ? "contact" : "collision";
+        lines.push("");
+        if (result.collisions.length === 0) {
+          lines.push(`✓ No ${noun}s over the ${spec.duration}s run.`);
+        } else {
+          lines.push(`⚠ ${result.collisions.length} ${noun}${result.collisions.length > 1 ? "s" : ""} (first onset):`);
+          for (const c of result.collisions) {
+            const detail = c.overlapVolume > 0 ? `  (overlap ${c.overlapVolume.toFixed(1)} mm³)` : "";
+            lines.push(`  ${(c.tStart * 1000).toFixed(0).padStart(5)} ms  ${c.a} ↔ ${c.b}${detail}`);
+          }
+        }
+
+        // Dynamics: per-dynamic-body net displacement + whether it came to rest.
+        if (wantsDynamics && dynamicBodies.length > 0) {
+          const frames = result.frames;
+          const first = frames[0];
+          const last = frames[frames.length - 1];
+          const lateStart = Math.max(0, frames.length - 10);
+          lines.push("");
+          lines.push("Dynamic bodies (net displacement → settle state):");
+          for (const b of dynamicBodies) {
+            const f0 = first.poses[b.id];
+            const l = last.poses[b.id];
+            if (!f0 || !l) continue;
+            const d = [l[0] - f0[0], l[1] - f0[1], l[2] - f0[2]];
+            let mn = [Infinity, Infinity, Infinity];
+            let mx = [-Infinity, -Infinity, -Infinity];
+            for (let i = lateStart; i < frames.length; i++) {
+              const p = frames[i].poses[b.id];
+              for (let k = 0; k < 3; k++) {
+                if (p[k] < mn[k]) mn[k] = p[k];
+                if (p[k] > mx[k]) mx[k] = p[k];
+              }
+            }
+            const range = Math.max(mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]);
+            const settle = range < 1 ? "settled ✓" : `still moving (Δ${range.toFixed(1)}mm)`;
+            lines.push(`  ${b.id}: moved (${d[0].toFixed(0)}, ${d[1].toFixed(0)}, ${d[2].toFixed(0)}) mm → ${settle}`);
+          }
+        }
+
+        // Full: coarse per-body position timeline (10 samples, read from frames).
+        if (format === "full") {
+          const movers = spec.bodies.filter((b) => b.kind !== "static");
+          if (movers.length > 0) {
+            lines.push("");
+            lines.push("Position timeline (x,y,z mm of each moving body):");
+            const N = 10;
+            for (let s = 0; s <= N; s++) {
+              const t = (spec.duration * s) / N;
+              const idx = Math.min(result.frames.length - 1, Math.round(t / spec.timestep));
+              const fr = result.frames[idx];
+              const cells = movers.map((b) => {
+                const p = fr.poses[b.id];
+                return `${b.id}(${p[0].toFixed(0)},${p[1].toFixed(0)},${p[2].toFixed(0)})`;
+              });
+              lines.push(`  ${(t * 1000).toFixed(0).padStart(5)} ms  ${cells.join("  ")}`);
+            }
+          }
+        }
+
+        if (warnings.length > 0) {
+          lines.push("");
+          lines.push("Warnings:");
+          for (const w of warnings) lines.push(`  ${w}`);
+        }
+
+        return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+      });
+    }),
   );
 
   server.tool(

@@ -172,6 +172,9 @@ async function executeUserScript(
       timings: result.timings,
       warnings: result.warnings,
       geometryValid: result.geometryValid,
+      // Phase-1 motion sim: raw `export const sim` block (or undefined). The
+      // viewer resolves it against the rendered parts and drives playback.
+      sim: result.sim,
     });
   } finally {
     executing = false;

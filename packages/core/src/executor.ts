@@ -278,6 +278,8 @@ export function executeScript(
   params: ParamDef[];
   material?: { density: number; name?: string };
   config?: { strict?: boolean; meshQuality?: "preview" | "final" };
+  /** Raw `export const sim = {...}` authoring block, passed through unvalidated. */
+  sim?: unknown;
 } {
   // Graceful fallback: callers that go through `core.execute()` can't extend
   // that signature (owned by another agent), so they prepend a
@@ -393,12 +395,19 @@ export function executeScript(
       var __entryConfig__ = __entrySentinel__
         ? (typeof globalThis !== "undefined" ? globalThis.__SHAPEITUP_ENTRY_CONFIG__ : undefined)
         : undefined;
+      // Simulation block (export const sim) flows through the same entry-marker
+      // gate so a bundled child's sim const can't leak onto the top-level
+      // assembly.
+      var __entrySim__ = __entrySentinel__
+        ? (typeof globalThis !== "undefined" ? globalThis.__SHAPEITUP_ENTRY_SIM__ : undefined)
+        : undefined;
       try {
         if (typeof globalThis !== "undefined") {
           globalThis.__SHAPEITUP_ENTRY_MAIN__ = undefined;
           globalThis.__SHAPEITUP_ENTRY_PARAMS__ = undefined;
           globalThis.__SHAPEITUP_ENTRY_MATERIAL__ = undefined;
           globalThis.__SHAPEITUP_ENTRY_CONFIG__ = undefined;
+          globalThis.__SHAPEITUP_ENTRY_SIM__ = undefined;
           globalThis.__SHAPEITUP_ENTRY_SENTINEL__ = undefined;
         }
       } catch (e) {}
@@ -439,8 +448,11 @@ export function executeScript(
       var __config__ = __entrySentinel__
         ? __entryConfig__
         : (typeof config !== "undefined" ? config : undefined);
+      var __sim__ = __entrySentinel__
+        ? __entrySim__
+        : (typeof sim !== "undefined" ? sim : undefined);
 
-      return { result: __result__, params: __params__, material: __material__, config: __config__ };
+      return { result: __result__, params: __params__, material: __material__, config: __config__, sim: __sim__ };
     })(__replicadExports__, __shapeitupExports__, __paramOverrides__);
   `;
 
@@ -464,7 +476,7 @@ export function executeScript(
     "__paramOverrides__",
     wrappedWithSource
   );
-  const { result, params, material: rawMaterial, config: rawConfig } = fn(
+  const { result, params, material: rawMaterial, config: rawConfig, sim: rawSim } = fn(
     replicadExports,
     shapeitupExports,
     paramOverrides || null
@@ -515,5 +527,10 @@ export function executeScript(
     if (Object.keys(next).length > 0) config = next;
   }
 
-  return { result, params: paramDefs, material, config };
+  // Pass the `sim` block through only when it's a plain object — the viewer/MCP
+  // validate its shape (via @shapeitup/sim's isSimSpecInput) before using it.
+  const sim =
+    rawSim && typeof rawSim === "object" && !Array.isArray(rawSim) ? rawSim : undefined;
+
+  return { result, params: paramDefs, material, config, sim };
 }

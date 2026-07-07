@@ -12,6 +12,7 @@ import { buildMesh, buildEdges } from "./mesh-builder";
 import { initMessageHandler, onMessage, postToExtension } from "./message-handler";
 import type { WorkerToWebview, TessellatedPart } from "@shapeitup/shared";
 import { PART_COLORS } from "./theme";
+import { setupSim, updateSim, clearSim } from "./sim-panel";
 
 // --- Locale-invariant numeric formatting ---------------------------------
 // Screenshots are an agent-facing output channel, so dimension labels must
@@ -284,6 +285,9 @@ let pendingVisibility: { focusPart?: string; hideParts?: string[] } | null = nul
 
 function beginStreaming(totalParts: number) {
   clearModelGroup();
+  // Tear down any prior motion sim — its parts were just disposed, and if this
+  // render declares no `sim` the panel must not linger.
+  clearSim();
   streamingAccum = [];
   streamingExpected = totalParts;
   pendingVisibility = null;
@@ -557,6 +561,13 @@ function handleWorkerMessage(msg: WorkerToWebview) {
           applyPartVisibility(intent.focusPart, intent.hideParts);
         }
         updateParamsUI(msg.params || []);
+        // Motion sim: if the script exported a `sim` block, resolve it against
+        // the parts we just rendered and show the timeline. No-op otherwise.
+        // Async (the dynamics engine awaits Rapier's WASM); fire-and-forget with
+        // its own error handling so a sim failure never breaks the render.
+        void setupSim(msg.sim, currentParts).catch((e) =>
+          console.warn("[ShapeItUp sim] setup failed:", e),
+        );
         if (sectionActive) updateSectionPlane();
         if (dimensionsVisible) updateDimensions();
         // Re-fit with the final model (first-part fit may have been too tight).
@@ -1789,6 +1800,8 @@ function addDimensionLine(
 function animate() {
   requestAnimationFrame(animate);
   controls.update();
+  // Drive kinematic motion-sim playback (no-op unless a `sim` block is active).
+  updateSim();
   // autoClear was flipped to false so the gnomon can composite on top. We
   // now have to clear the color + depth manually before the main render.
   renderer.clear();

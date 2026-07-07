@@ -1058,11 +1058,13 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           // assembly (wrong BOM mass in the viewer's per-part stats).
           `try { globalThis.__SHAPEITUP_ENTRY_MATERIAL__ = __shapeitup_entry__.material; } catch (e) {}\n` +
           `try { globalThis.__SHAPEITUP_ENTRY_CONFIG__ = __shapeitup_entry__.config; } catch (e) {}\n` +
+          `try { globalThis.__SHAPEITUP_ENTRY_SIM__ = __shapeitup_entry__.sim; } catch (e) {}\n` +
           `try { globalThis.__SHAPEITUP_ENTRY_SENTINEL__ = true; } catch (e) {}\n` +
           `export default __shapeitup_entry__.default;\n` +
           `export const params = __shapeitup_entry__.params;\n` +
           `export const material = __shapeitup_entry__.material;\n` +
-          `export const config = __shapeitup_entry__.config;\n`;
+          `export const config = __shapeitup_entry__.config;\n` +
+          `export const sim = __shapeitup_entry__.sim;\n`;
         const result = await esbuild.build({
           stdin: {
             contents: syntheticEntry,

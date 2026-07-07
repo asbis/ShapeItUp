@@ -117,6 +117,13 @@ export interface ExecutionResult {
    * outcome (kernel-free mocks).
    */
   cutAtOutcomes?: boolean[];
+  /**
+   * Raw `export const sim = {...}` authoring block (the Phase-1 motion-sim
+   * declaration). Passed through unvalidated — the viewer/MCP resolve it
+   * against the rendered parts via @shapeitup/sim. Absent when the script
+   * declares no `sim`.
+   */
+  sim?: unknown;
 }
 
 /**
@@ -847,12 +854,14 @@ export async function initCore(
     let scriptConfig:
       | { strict?: boolean; meshQuality?: MeshQuality }
       | undefined;
+    let scriptSim: unknown;
     try {
       const execResult = executeScript(js, replicadExports, shapeitupStdlib, paramOverrides);
       result = execResult.result;
       params = execResult.params;
       material = execResult.material;
       scriptConfig = execResult.config;
+      scriptSim = execResult.sim;
     } catch (err) {
       cleanupGC();
       // If the user script threw a raw WASM pointer, wrap it in an Error with
@@ -1098,6 +1107,7 @@ export async function initCore(
       geometryIssues: geometryIssues.length > 0 ? geometryIssues : undefined,
       material,
       cutAtOutcomes,
+      sim: scriptSim,
     };
   }
 

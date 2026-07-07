@@ -86,6 +86,12 @@ importers:
       '@shapeitup/shared':
         specifier: workspace:*
         version: link:../shared
+      '@shapeitup/sim':
+        specifier: workspace:*
+        version: link:../sim
+      '@shapeitup/sim-dynamics':
+        specifier: workspace:*
+        version: link:../sim-dynamics
       '@types/ws':
         specifier: ^8.18.1
         version: 8.18.1
@@ -101,11 +107,32 @@ importers:
 
   packages/shared: {}
 
+  packages/sim:
+    dependencies:
+      '@shapeitup/shared':
+        specifier: workspace:*
+        version: link:../shared
+
+  packages/sim-dynamics:
+    dependencies:
+      '@dimforge/rapier3d-compat':
+        specifier: ^0.19.0
+        version: 0.19.3
+      '@shapeitup/sim':
+        specifier: workspace:*
+        version: link:../sim
+
   packages/viewer:
     dependencies:
       '@shapeitup/shared':
         specifier: workspace:*
         version: link:../shared
+      '@shapeitup/sim':
+        specifier: workspace:*
+        version: link:../sim
+      '@shapeitup/sim-dynamics':
+        specifier: workspace:*
+        version: link:../sim-dynamics
       three:
         specifier: ^0.170.0
         version: 0.170.0
@@ -130,6 +157,9 @@ importers:
         version: 0.23.0
 
 packages:
+
+  '@dimforge/rapier3d-compat@0.19.3':
+    resolution: {integrity: sha512-mMVdSj1PRTT108s9Swbu2GQOmHbn8kbJANRV5xfczL3s0T4vkgZAuoMRgvBzQcHanpKusbC0ZJj6z3mC3aj3vg==}
 
   '@emnapi/runtime@1.10.0':
     resolution: {integrity: sha512-ewvYlk86xUoGI0zQRNq/mC+16R1QeDlKQy21Ki3oSYXNgLb45GV1P6A0M+/s6nyCuNDqe5VpaY84BzXGwVbwFA==}
@@ -1476,6 +1506,8 @@ packages:
     resolution: {integrity: sha512-rftlrkhHZOcjDwkGlnUtZZkvaPHCsDATp4pGpuOOMDaTdDDXF91wuVDJoWoPsKX/3YPQ5fHuF3STjcYyKr+Qhg==}
 
 snapshots:
+
+  '@dimforge/rapier3d-compat@0.19.3': {}
 
   '@emnapi/runtime@1.10.0':
     dependencies:

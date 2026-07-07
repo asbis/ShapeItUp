@@ -180,6 +180,13 @@ export type WorkerToWebview =
        * rather than "SUCCESS" (see Bug #4).
        */
       geometryValid?: boolean;
+      /**
+       * Raw `export const sim = {...}` motion-simulation authoring block, or
+       * undefined when the script declares none. The viewer resolves it against
+       * the rendered parts (via @shapeitup/sim) to drive kinematic playback.
+       * Left as `unknown` here so @shapeitup/shared stays dependency-free.
+       */
+      sim?: unknown;
     }
   | { type: "export-result"; format: ExportFormat; data: ArrayBuffer }
   | {
