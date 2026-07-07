@@ -12,7 +12,7 @@ import { buildMesh, buildEdges } from "./mesh-builder";
 import { initMessageHandler, onMessage, postToExtension } from "./message-handler";
 import type { WorkerToWebview, TessellatedPart } from "@shapeitup/shared";
 import { PART_COLORS } from "./theme";
-import { setupSim, updateSim, clearSim } from "./sim-panel";
+import { setupSim, updateSim, clearSim, initSimPanel, toggleSimPanel } from "./sim-panel";
 
 // --- Locale-invariant numeric formatting ---------------------------------
 // Screenshots are an agent-facing output channel, so dimension labels must
@@ -1087,6 +1087,11 @@ document.getElementById("btn-section")!.addEventListener("click", () => {
   document.getElementById("section-controls")!.classList.toggle("open", sectionActive);
   updateSectionPlane();
 });
+
+// Motion-simulation panel: wire its transport controls, then the toolbar toggle.
+// The button stays disabled until a render declares an `export const sim` block.
+initSimPanel();
+document.getElementById("btn-sim")!.addEventListener("click", toggleSimPanel);
 
 document.getElementById("btn-measure")!.addEventListener("click", () => {
   measureMode = !measureMode;

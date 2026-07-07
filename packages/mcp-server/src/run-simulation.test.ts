@@ -175,6 +175,44 @@ describe("run_simulation headless integration", () => {
   );
 
   it(
+    "sim-as-function is re-evaluated with param overrides (sweepable without editing)",
+    async () => {
+      const { workdir, storage } = makeDirs();
+      try {
+        const entryPath = join(workdir, "sweep.shape.ts");
+        writeFileSync(
+          entryPath,
+          [
+            `import { drawRectangle } from "replicad";`,
+            `export const params = { lift: 8 };`,
+            `export default function main({ lift }) {`,
+            `  return [{ shape: drawRectangle(10,10).sketchOnPlane("XY").extrude(10).translate(0,0,lift), name: "box" }];`,
+            `}`,
+            `export const sim = (p) => ({`,
+            `  bodies: { box: "kinematic" },`,
+            `  joints: [{ id: "j", body: "box", type: "prismatic", anchor: [0,0,0], axis: [0,0,1] }],`,
+            `  actuators: [{ id: "j", joint: "j", profile: { kind: "position", target: p.lift, rampMs: 10 } }],`,
+            `  duration: 0.1,`,
+            `});`,
+          ].join("\n"),
+        );
+
+        // Default params → target 8.
+        const base = await executeShapeFile(entryPath, storage);
+        expect((base.sim as any).actuators[0].profile.target).toBe(8);
+
+        // Override lift → the sim function sees the merged param.
+        const swept = await executeShapeFile(entryPath, storage, { lift: 20 });
+        expect((swept.sim as any).actuators[0].profile.target).toBe(20);
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
     "leaves sim undefined for a shape with no sim block",
     async () => {
       const { workdir, storage } = makeDirs();

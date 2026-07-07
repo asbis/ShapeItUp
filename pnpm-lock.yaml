@@ -112,6 +112,9 @@ importers:
       '@shapeitup/shared':
         specifier: workspace:*
         version: link:../shared
+      zod:
+        specifier: ^4.3.6
+        version: 4.3.6
 
   packages/sim-dynamics:
     dependencies:

@@ -6,10 +6,15 @@ import { extractExpectedContactsStatic } from "@shapeitup/core";
 import {
   KinematicSim,
   resolveSimSpec,
-  isSimSpecInput,
+  validateSimSpecInput,
+  evaluateAssertions,
+  apply,
   type Aabb,
   type Profile,
   type SimResult,
+  type SimFrame,
+  type SimSpecInput,
+  type Vec3,
 } from "@shapeitup/sim";
 import { runDynamics, type MeshData } from "@shapeitup/sim-dynamics";
 import { homedir } from "os";
@@ -4717,7 +4722,7 @@ export function registerTools(server: McpServer) {
     "Get Replicad API reference. Call without category to list available categories, pass `search` to find the most relevant sections across all categories, or pass `signaturesOnly: true` to get just the method signatures (token-efficient lookup).",
     {
       category: z
-        .enum(["overview", "drawing", "sketching", "solids", "booleans", "modifications", "transforms", "finders", "export", "examples", "stdlib"])
+        .enum(["overview", "drawing", "sketching", "solids", "booleans", "modifications", "transforms", "finders", "export", "examples", "stdlib", "simulation"])
         .optional()
         .describe("API category. Omit to see the list of available categories."),
       search: z.string().optional().describe("Keyword / phrase to search for across all categories. Returns the most relevant sections instead of one full category. Can be combined with `category` to search within a single category."),
@@ -5581,11 +5586,21 @@ export function registerTools(server: McpServer) {
           return { content: [{ type: "text" as const, text: `Cannot simulate — script failed to render.\n${formatStatusText(status)}` }], isError: true };
         }
 
-        if (!isSimSpecInput(sim)) {
+        if (sim === undefined || sim === null) {
           return {
-            content: [{ type: "text" as const, text: `No motion simulation declared. Add an \`export const sim = { bodies: { ... }, joints: [ ... ], actuators: [ ... ] }\` block to ${basename(absPath)}. See docs/simulation-design.md or the carriage-needles example. (The file rendered ${parts.length} part(s) fine — it just has no \`sim\` block.)` }],
+            content: [{ type: "text" as const, text: `No motion simulation declared. Add an \`export const sim = { bodies: { ... }, joints: [ ... ], actuators: [ ... ] }\` block to ${basename(absPath)}. See get_api_reference('simulation') or the carriage-needles example. (The file rendered ${parts.length} part(s) fine — it just has no \`sim\` block.)` }],
           };
         }
+        // Actionable validation up front — a malformed block used to blow up
+        // deep in resolve with `(input.joints ?? []).filter is not a function`.
+        const validated = validateSimSpecInput(sim);
+        if (!validated.ok) {
+          return {
+            content: [{ type: "text" as const, text: `Invalid \`sim\` block in ${basename(absPath)}:\n${validated.errors.map((e) => `  • ${e}`).join("\n")}\n\nSee get_api_reference('simulation') for the schema + units.` }],
+            isError: true,
+          };
+        }
+        const simInput: SimSpecInput = validated.value;
 
         // Rest-pose world AABB per part, from tessellated vertices (same method
         // the viewer uses). Parts with no geometry are skipped — they can't
@@ -5607,13 +5622,27 @@ export function registerTools(server: McpServer) {
           partAabbs.push({ name: p.name, aabb: { min: [minX, minY, minZ], max: [maxX, maxY, maxZ] } });
         }
 
-        const { spec, warnings } = resolveSimSpec(sim, partAabbs);
+        // Merge a colocated `export const expectedContacts = [...]` into the
+        // sim's acceptedPairs — same convention check_collisions honours, so a
+        // design's known-good contacts (needle-in-groove, cam-over-butt) don't
+        // flood the motion report.
+        try {
+          const src = readFileSync(absPath, "utf8");
+          const extra = extractExpectedContactsStatic(src).filter(
+            (p): p is [string, string] => Array.isArray(p) && p.length === 2 && typeof p[0] === "string" && typeof p[1] === "string",
+          );
+          if (extra.length > 0) simInput.acceptedPairs = [...(simInput.acceptedPairs ?? []), ...extra];
+        } catch {
+          // Source-read failure — fall back to the block's own acceptedPairs.
+        }
+
+        const { spec, warnings } = resolveSimSpec(simInput, partAabbs);
 
         // Engine selection: run the Rapier force solver when the block opts in
         // (`mode: "dynamic"`) or declares any force-driven `dynamic` body;
         // otherwise the fast analytic kinematic engine. Both emit a SimResult.
         const wantsDynamics =
-          sim.mode === "dynamic" || spec.bodies.some((b) => b.kind === "dynamic");
+          simInput.mode === "dynamic" || spec.bodies.some((b) => b.kind === "dynamic");
 
         let result: SimResult;
         if (wantsDynamics) {
@@ -5637,9 +5666,15 @@ export function registerTools(server: McpServer) {
             case "position":
               return `position target=${profile.target} ramp=${profile.rampMs}ms${profile.delayMs ? ` delay=${profile.delayMs}ms` : ""}${profile.easing === "smooth" ? " (smooth)" : ""}`;
             case "keyframes":
-              return `keyframes (${profile.points.length} points)`;
+              return `keyframes (${profile.points.length} points, ${profile.interp ?? "linear"})`;
             case "sine":
               return `sine amp=${profile.amplitude} freq=${profile.freq}Hz`;
+            case "firstOrder":
+              return `firstOrder target=${profile.target} τ=${profile.tauMs}ms${profile.deadMs ? ` dead=${profile.deadMs}ms` : ""}`;
+            case "slew":
+              return `slew target=${profile.target} rate=${profile.rate}/s`;
+            case "servo":
+              return `servo target=${profile.target} ${profile.slewDegPerS}°/s`;
           }
         };
         const bodyOfJoint = new Map(spec.joints.map((j) => [j.id, j.body]));
@@ -5682,6 +5717,17 @@ export function registerTools(server: McpServer) {
           }
         }
 
+        // Contact windows (kinematic): show every start–end interval when a pair
+        // re-collides (more windows than first-onsets) or when full detail asked.
+        const intervals = result.contactIntervals ?? [];
+        if (intervals.length > 0 && (intervals.length > result.collisions.length || format === "full")) {
+          lines.push("");
+          lines.push("Contact windows (start–end ms):");
+          for (const iv of intervals) {
+            lines.push(`  ${(iv.start * 1000).toFixed(0).padStart(5)}–${(iv.end * 1000).toFixed(0)} ms  ${iv.a} ↔ ${iv.b}`);
+          }
+        }
+
         // Dynamics: per-dynamic-body net displacement + whether it came to rest.
         if (wantsDynamics && dynamicBodies.length > 0) {
           const frames = result.frames;
@@ -5710,24 +5756,60 @@ export function registerTools(server: McpServer) {
           }
         }
 
-        // Full: coarse per-body position timeline (10 samples, read from frames).
+        const frameAt = (t: number): SimFrame =>
+          result.frames[Math.min(result.frames.length - 1, Math.round(t / spec.timestep))];
+        // Rotation magnitude (deg) from a pose quaternion — so a pure rotation
+        // doesn't read as no motion in a translation-only view.
+        const angleDeg = (p: SimFrame["poses"][string]) =>
+          (2 * Math.acos(Math.min(1, Math.abs(p[6])) ) * 180) / Math.PI;
+
+        // Markers: world position over time — the direct "does the linkage stay
+        // connected / where did the pin go?" readout. Shown whenever declared.
+        if (spec.markers && spec.markers.length > 0) {
+          lines.push("");
+          lines.push("Markers (world x,y,z mm):");
+          const N = format === "full" ? 10 : 5;
+          for (let s = 0; s <= N; s++) {
+            const t = (spec.duration * s) / N;
+            const fr = frameAt(t);
+            const cells = spec.markers.map((mk) => {
+              const p = fr.poses[mk.body];
+              if (!p) return `${mk.name}(?)`;
+              const w = apply({ t: [p[0], p[1], p[2]], q: [p[3], p[4], p[5], p[6]] }, mk.point as Vec3);
+              return `${mk.name}(${w[0].toFixed(1)},${w[1].toFixed(1)},${w[2].toFixed(1)})`;
+            });
+            lines.push(`  ${(t * 1000).toFixed(0).padStart(5)} ms  ${cells.join("  ")}`);
+          }
+        }
+
+        // Full: coarse per-body position + orientation timeline (read from frames).
         if (format === "full") {
           const movers = spec.bodies.filter((b) => b.kind !== "static");
           if (movers.length > 0) {
             lines.push("");
-            lines.push("Position timeline (x,y,z mm of each moving body):");
+            lines.push("Body timeline (x,y,z mm ∠rotation°):");
             const N = 10;
             for (let s = 0; s <= N; s++) {
               const t = (spec.duration * s) / N;
-              const idx = Math.min(result.frames.length - 1, Math.round(t / spec.timestep));
-              const fr = result.frames[idx];
+              const fr = frameAt(t);
               const cells = movers.map((b) => {
                 const p = fr.poses[b.id];
-                return `${b.id}(${p[0].toFixed(0)},${p[1].toFixed(0)},${p[2].toFixed(0)})`;
+                const ang = angleDeg(p);
+                const rot = ang >= 0.5 ? ` ∠${ang.toFixed(0)}°` : "";
+                return `${b.id}(${p[0].toFixed(0)},${p[1].toFixed(0)},${p[2].toFixed(0)}${rot})`;
               });
               lines.push(`  ${(t * 1000).toFixed(0).padStart(5)} ms  ${cells.join("  ")}`);
             }
           }
+        }
+
+        // Assertions: the design's own colocated pass/fail self-tests.
+        if (spec.assertions && spec.assertions.length > 0) {
+          const results = evaluateAssertions(spec, result);
+          const passed = results.filter((r) => r.pass).length;
+          lines.push("");
+          lines.push(`Assertions: ${passed}/${results.length} passed`);
+          for (const r of results) lines.push(`  ${r.pass ? "✓" : "✗"} ${r.name}: ${r.detail}`);
         }
 
         if (warnings.length > 0) {
@@ -7344,6 +7426,93 @@ export function extractSignatures(body: string, category: string): string {
 
 export function getApiReference(category: string): string {
   const refs: Record<string, string> = {
+    simulation: `# Motion Simulation (\`export const sim\`) + run_simulation
+
+Add \`export const sim = {...}\` to a .shape.ts to simulate motion, then run it
+headless with the \`run_simulation\` MCP tool (or press ▶ in the viewer). Two
+engines: KINEMATIC (scripted motion, analytic, fast) and DYNAMICS (Rapier
+physics — gravity/contacts), chosen automatically.
+
+## UNITS (read this — they are explicit and not guessed)
+- length / position / anchor / axis / marker point / gravity vector: MILLIMETRES
+- time (t, duration, timestep): SECONDS.  delayMs / rampMs / tauMs / deadMs / byMs: MILLISECONDS
+- prismatic joint coordinate q: MILLIMETRES
+- revolute joint coordinate q: RADIANS by default. Set the joint's \`unit: "deg"\`
+  to author it in DEGREES instead (avoids "target: 90" meaning 90 rad ≈ 14 turns).
+- gravity: mm/s²  (earth ≈ [0, 0, -9810])
+
+## sim = { ... }
+- \`bodies\`: { "<glob>": "static" | "kinematic" | "dynamic" } — first matching glob
+  wins; unmatched parts default to "static". Names match rendered part names.
+- \`mode?\`: "kinematic" (default) | "dynamic". Any \`dynamic\` body also forces dynamics.
+- \`joints?\`: [{ id, body, type: "prismatic"|"revolute", anchor:[x,y,z], axis:[x,y,z], unit?:"rad"|"deg", motor?:{stiffness?,damping?,mode?:"position"|"velocity"} }]
+    On a KINEMATIC body a joint is scripted by its actuator. On a DYNAMIC body it becomes a
+    real Rapier constraint (to its parent body, else grounded at anchor) — free-swinging so a
+    cam can push it; add an actuator to drive it as a PD motor (tune with \`motor\`).
+- \`actuators?\`: [{ id, joint, profile }] — drives a joint's q(t). Profiles:
+    { kind:"velocity", v, delayMs? }                       q = v·(t−delay), v in units/s
+    { kind:"position", target, rampMs, delayMs?, from?, easing?:"linear"|"smooth" }
+    { kind:"firstOrder", target, tauMs, deadMs?, from? }   dead time + exp lag (solenoid inertia)
+    { kind:"slew", target, rate, from?, delayMs? }         rate-limited (units/s)
+    { kind:"servo", target, slewDegPerS, from?, delayMs? } rate-limited servo move
+    { kind:"keyframes", points:[{t,q}], interp?:"linear"|"smoothstep"|"cubic" }
+    { kind:"sine", amplitude, freq, phase?, offset? }
+- \`parents?\`: { "<glob>": "<bodyId>" } — child rides the parent's motion.
+- \`poses?\`: [{ body, samples:[{ t, position:[x,y,z], quaternion?:[x,y,z,w], axisAngle?:{axis,deg} }] }]
+    Drive a body with an arbitrary time-varying transform in ONE entry — the escape
+    hatch for closed-loop linkages (four-bar couplers): solve loop closure yourself and
+    hand the pose track here. A posed body ignores joints targeting it.
+- \`markers?\`: [{ name, body, point:[x,y,z] }] — a named point rigidly on a body; the
+    tool reports its world position over time. Use to check "does the linkage stay
+    connected?" (two markers with constant distance).
+- \`assertions?\`: pass/fail self-tests printed by the tool:
+    { name, kind:"noCollision", a, b }                                      (glob names)
+    { name, kind:"markerDistance", markerA, markerB, equals?, min?, max?, tol? }
+    { name, kind:"markerReaches", marker, point:[x,y,z], tol?, byMs? }
+- \`linkages?\`: closed-loop PLANAR mechanisms the solver keeps closed automatically —
+    the fix for four-bar couplers (one entry instead of 3 hand-solved joints). Model
+    each link BODY as a bar from its local origin along +X of the given length.
+    { kind:"fourBar", plane?:"XY"|"XZ", ground:[A,D], crank:{body,length}, coupler:{body,length}, rocker:{body,length}, driver:<profile>, unit?, config?:"open"|"crossed" }
+    { kind:"sliderCrank", ground:A, crank:{body,length}, coupler:{body,length}, slider:{body,axis:[x,y,z]}, driver:<profile>, unit?, config? }
+    { kind:"gear", driver:{body,center:[x,y,z],profile:<profile>,unit?}, follower:{body,center:[x,y,z]}, ratio }
+- \`acceptedPairs?\`: [["<glob>","<glob>"]] — expected contacts to suppress. Also merged
+    from a colocated \`export const expectedContacts = [...]\` (same as check_collisions).
+- \`gravity?\`: [x,y,z] mm/s² (dynamics).  \`duration?\`: s (default 2).  \`timestep?\`: s (default 1/240).
+- \`dynamics?\`: DYNAMICS-engine tuning — { ccd?:boolean (default true, stops thin/fast parts
+    tunneling), solverIterations?:number (raise for stiff mechanisms), colliders?:{ "<glob>":
+    "hull"|"trimesh"|"cuboid" } per dynamic body (hull default; trimesh keeps concave surface
+    but is only for kinematic-driven/light parts) }. Dynamic parts get a realistic density so
+    mm-scale contact stays stable — but very small + fast + coarse-timestep combos can still be
+    unstable; use a finer \`timestep\`.
+
+## sim may be a FUNCTION of params
+\`export const sim = (p) => ({...})\` is re-evaluated with param overrides, so
+\`run_simulation({ params: { speed: 300 } })\` can sweep the sim without editing the file.
+
+## Example — carriage sweeping a needle bed, with self-tests
+\`\`\`typescript
+export const sim = {
+  bodies: { carriage: "kinematic", "needle-*": "kinematic" },
+  joints: [
+    { id: "drive", body: "carriage", type: "prismatic", anchor: [0,0,0], axis: [1,0,0] },
+    { id: "sol",   body: "needle-2",  type: "prismatic", anchor: [0,0,0], axis: [0,0,1] },
+  ],
+  actuators: [
+    { id: "drive", joint: "drive", profile: { kind: "velocity", v: 200 } },
+    { id: "sol",   joint: "sol",   profile: { kind: "firstOrder", target: 8, tauMs: 12, deadMs: 8 } },
+  ],
+  markers: [{ name: "needleTip", body: "needle-2", point: [0,0,13] }],
+  assertions: [{ name: "seats", kind: "markerReaches", marker: "needleTip", point: [0,0,21], tol: 1, byMs: 300 }],
+  acceptedPairs: [["needle-*", "bed"]],
+  duration: 1.5,
+};
+\`\`\`
+
+Report includes: actuators, collision/contact events (first onset), contact windows
+(start–end per pair, so a re-collision on the return stroke is captured), markers
+time-series, per-dynamic-body settle state, orientation (∠° in \`format:"full"\`),
+and assertion verdicts.
+\`\`\``,
     overview: `# ShapeItUp / Replicad API Overview
 
 Files: *.shape.ts — export a default main() returning Shape3D.
@@ -8328,7 +8497,7 @@ export default function main({ width, depth, thickness }: typeof params) {
 // category, add it here too.
 const API_REFERENCE_CATEGORIES = [
   "overview", "drawing", "sketching", "solids", "booleans",
-  "modifications", "transforms", "finders", "export", "examples", "stdlib",
+  "modifications", "transforms", "finders", "export", "examples", "stdlib", "simulation",
 ] as const;
 
 const SEARCH_STOPWORDS = new Set([

@@ -1,5 +1,5 @@
 /**
- * DynamicsSim — Phase-3 force-based simulation via Rapier (WASM).
+ * DynamicsSim — force-based simulation via Rapier (WASM).
  *
  * Where the Phase-1 KinematicSim moves parts along scripted profiles, this runs
  * a real rigid-body solver: dynamic bodies fall under gravity and rest/tumble on
@@ -8,25 +8,26 @@
  * exact same SimResult (frames + collisions) the kinematic engine does, so the
  * viewer and MCP consume both identically.
  *
- * Lives in its own package so the heavy Rapier WASM only loads on the headless
- * (MCP/Node) side — the browser viewer's `@shapeitup/sim` import stays lean.
+ * Batch-4 additions for constrained mechanisms: CCD (no tunneling), tunable
+ * solver iterations, per-body collider choice, and REAL joints + motors on
+ * dynamic bodies — so a cam can physically drive a pinned follower, or a servo
+ * motor can drive a joint toward a target.
  *
- * Reproducibility: Rapier's JS/WASM is NOT cross-platform deterministic, so we
- * RECORD the trajectory (fixed timestep → frames) and treat that recording as
- * the artifact, rather than trusting a re-run to match.
- *
- * Units: the CAD frame is millimetres; Rapier is tuned for SI metres (its
- * sleeping/contact thresholds assume ~metre scales), so we scale mm→m on the way
- * in and m→mm on the way out. This is the SimFrame bridge, applied here at the
- * physics boundary. Axes are unchanged (CAD Z-up → gravity along −Z).
+ * Units: CAD is millimetres; Rapier is tuned for SI metres, so we scale mm→m in
+ * and m→mm out (the SimFrame bridge, applied at the physics boundary). Axes
+ * unchanged (CAD Z-up → gravity along −Z). Rapier JS is NOT deterministic, so we
+ * RECORD the trajectory and treat that as the artifact.
  */
 
 import RAPIER from "@dimforge/rapier3d-compat";
 import {
   KinematicSim,
+  evaluateProfile,
+  globToRegex,
   isAcceptedPair,
   rotate,
   type CollisionEvent,
+  type Profile,
   type Quat,
   type SimResult,
   type SimSpec,
@@ -35,6 +36,7 @@ import {
 
 const MM_TO_M = 0.001;
 const M_TO_MM = 1000;
+const DEG = Math.PI / 180;
 
 export interface MeshData {
   /** Flattened world-space vertices (mm): [x,y,z, x,y,z, ...]. */
@@ -44,7 +46,6 @@ export interface MeshData {
 }
 
 let rapierReady: Promise<void> | null = null;
-/** Init Rapier's WASM exactly once per process. */
 function initRapier(): Promise<void> {
   if (!rapierReady) rapierReady = RAPIER.init();
   return rapierReady;
@@ -56,13 +57,14 @@ const centreOf = (b: { aabb: { min: Vec3; max: Vec3 } }): Vec3 => [
   (b.aabb.min[2] + b.aabb.max[2]) / 2,
 ];
 
+const norm3 = (v: Vec3): Vec3 => {
+  const l = Math.hypot(v[0], v[1], v[2]) || 1;
+  return [v[0] / l, v[1] / l, v[2] / l];
+};
+
 /**
  * Run a force-based simulation and return recorded frames + first-contact
  * collision events (same shape as KinematicSim.run()).
- *
- * @param spec    Resolved sim spec (bodies carry rest-pose AABBs).
- * @param meshes  Per-body world-space triangle mesh (mm). Bodies without a mesh
- *                fall back to a cuboid collider derived from their AABB.
  */
 export async function runDynamics(
   spec: SimSpec,
@@ -70,41 +72,50 @@ export async function runDynamics(
 ): Promise<SimResult> {
   await initRapier();
 
-  const g = spec.gravity ?? [0, 0, -9810];
-  const world = new RAPIER.World({
-    x: g[0] * MM_TO_M,
-    y: g[1] * MM_TO_M,
-    z: g[2] * MM_TO_M,
-  });
-  world.timestep = spec.timestep;
+  const opts = spec.dynamics ?? {};
+  const ccd = opts.ccd ?? true;
 
-  // Drives kinematic bodies along their actuator profiles (reuses all the
-  // joint/parent/actuator logic from the kinematic engine).
+  const g = spec.gravity ?? [0, 0, -9810];
+  const world = new RAPIER.World({ x: g[0] * MM_TO_M, y: g[1] * MM_TO_M, z: g[2] * MM_TO_M });
+  world.timestep = spec.timestep;
+  if (opts.solverIterations && opts.solverIterations > 0) {
+    world.numSolverIterations = Math.round(opts.solverIterations);
+  }
+
   const kin = new KinematicSim(spec);
 
   interface Handle {
     id: string;
     body: RAPIER.RigidBody;
-    /** Centroid offset (mm) used to un-bake the collider frame on output. */
+    /** Body-origin offset (mm): centroid for dynamic, [0,0,0] for static/kinematic. */
     offset: Vec3;
+    kind: SimSpec["bodies"][number]["kind"];
   }
   const handles: Handle[] = [];
+  const byId = new Map<string, Handle>();
   const colliderToName = new Map<number, string>();
+
+  /** Which collider type to use for a dynamic body (glob rules → default hull). */
+  const dynColliderType = (id: string): "hull" | "trimesh" | "cuboid" => {
+    const rules = opts.colliders;
+    if (rules) {
+      for (const [glob, type] of Object.entries(rules)) {
+        if (globToRegex(glob).test(id)) return type;
+      }
+    }
+    return "hull";
+  };
 
   for (const b of spec.bodies) {
     const mesh = meshes.get(b.id);
-    let desc: RAPIER.RigidBodyDesc;
     let offset: Vec3 = [0, 0, 0];
+    let desc: RAPIER.RigidBodyDesc;
 
     if (b.kind === "dynamic") {
-      // Dynamic bodies rotate about their geometry centroid, so create the body
-      // there and express the collider RELATIVE to it.
       offset = centreOf(b);
-      desc = RAPIER.RigidBodyDesc.dynamic().setTranslation(
-        offset[0] * MM_TO_M,
-        offset[1] * MM_TO_M,
-        offset[2] * MM_TO_M,
-      );
+      desc = RAPIER.RigidBodyDesc.dynamic()
+        .setTranslation(offset[0] * MM_TO_M, offset[1] * MM_TO_M, offset[2] * MM_TO_M)
+        .setCcdEnabled(ccd);
     } else if (b.kind === "kinematic") {
       desc = RAPIER.RigidBodyDesc.kinematicPositionBased();
     } else {
@@ -112,57 +123,121 @@ export async function runDynamics(
     }
     const body = world.createRigidBody(desc);
 
-    // Collider. Static/kinematic → trimesh (exact, but no interior → invalid for
-    // dynamic bodies). Dynamic → convex hull of the geometry (research: raw
-    // trimesh has no interior and things fall through / stick).
+    // ── Collider ──────────────────────────────────────────────────────────
+    const half: Vec3 = [
+      ((b.aabb.max[0] - b.aabb.min[0]) / 2) * MM_TO_M,
+      ((b.aabb.max[1] - b.aabb.min[1]) / 2) * MM_TO_M,
+      ((b.aabb.max[2] - b.aabb.min[2]) / 2) * MM_TO_M,
+    ];
+    const cuboidLocal = () =>
+      RAPIER.ColliderDesc.cuboid(Math.max(half[0], 1e-4), Math.max(half[1], 1e-4), Math.max(half[2], 1e-4));
+    const relVerts = (): Float32Array => {
+      const out = new Float32Array(mesh!.vertices.length);
+      for (let i = 0; i < mesh!.vertices.length; i += 3) {
+        out[i] = (mesh!.vertices[i] - offset[0]) * MM_TO_M;
+        out[i + 1] = (mesh!.vertices[i + 1] - offset[1]) * MM_TO_M;
+        out[i + 2] = (mesh!.vertices[i + 2] - offset[2]) * MM_TO_M;
+      }
+      return out;
+    };
+
     let collDesc: RAPIER.ColliderDesc | null = null;
     if (b.kind === "dynamic") {
-      if (mesh && mesh.vertices.length >= 9) {
-        const pts = new Float32Array(mesh.vertices.length);
-        for (let i = 0; i < mesh.vertices.length; i += 3) {
-          pts[i] = (mesh.vertices[i] - offset[0]) * MM_TO_M;
-          pts[i + 1] = (mesh.vertices[i + 1] - offset[1]) * MM_TO_M;
-          pts[i + 2] = (mesh.vertices[i + 2] - offset[2]) * MM_TO_M;
-        }
-        collDesc = RAPIER.ColliderDesc.convexHull(pts);
-      }
-      if (!collDesc) {
-        // Degenerate hull (or no mesh) → cuboid from AABB half-extents.
-        const hx = ((b.aabb.max[0] - b.aabb.min[0]) / 2) * MM_TO_M;
-        const hy = ((b.aabb.max[1] - b.aabb.min[1]) / 2) * MM_TO_M;
-        const hz = ((b.aabb.max[2] - b.aabb.min[2]) / 2) * MM_TO_M;
-        collDesc = RAPIER.ColliderDesc.cuboid(
-          Math.max(hx, 1e-4),
-          Math.max(hy, 1e-4),
-          Math.max(hz, 1e-4),
-        );
+      const type = dynColliderType(b.id);
+      if (type === "cuboid") {
+        collDesc = cuboidLocal().setDensity(1000);
+      } else if (type === "trimesh" && mesh && mesh.vertices.length >= 9 && mesh.indices.length >= 3) {
+        collDesc = RAPIER.ColliderDesc.trimesh(relVerts(), mesh.indices);
+        // A trimesh has no interior → no computed mass. Give it a sane mass from
+        // the AABB so it doesn't behave as massless.
+        const massKg = Math.max(8 * half[0] * half[1] * half[2] * 1000, 1e-4);
+        collDesc.setMass(massKg);
+      } else {
+        // hull (default), or trimesh fallback when geometry is missing.
+        if (mesh && mesh.vertices.length >= 9) collDesc = RAPIER.ColliderDesc.convexHull(relVerts());
+        if (!collDesc) collDesc = cuboidLocal();
+        // A realistic density (≈ plastic/metal, kg/m³) so a small mm-scale part
+        // has sane mass — the default (1 ≈ air) makes contact response explode.
+        collDesc.setDensity(1000);
       }
     } else if (mesh && mesh.vertices.length >= 9 && mesh.indices.length >= 3) {
       const verts = new Float32Array(mesh.vertices.length);
       for (let i = 0; i < mesh.vertices.length; i++) verts[i] = mesh.vertices[i] * MM_TO_M;
       collDesc = RAPIER.ColliderDesc.trimesh(verts, mesh.indices);
     } else {
-      // No mesh for a static/kinematic body → AABB cuboid placed at its centre.
       const c = centreOf(b);
-      const hx = ((b.aabb.max[0] - b.aabb.min[0]) / 2) * MM_TO_M;
-      const hy = ((b.aabb.max[1] - b.aabb.min[1]) / 2) * MM_TO_M;
-      const hz = ((b.aabb.max[2] - b.aabb.min[2]) / 2) * MM_TO_M;
-      collDesc = RAPIER.ColliderDesc.cuboid(
-        Math.max(hx, 1e-4),
-        Math.max(hy, 1e-4),
-        Math.max(hz, 1e-4),
-      ).setTranslation(c[0] * MM_TO_M, c[1] * MM_TO_M, c[2] * MM_TO_M);
+      collDesc = cuboidLocal().setTranslation(c[0] * MM_TO_M, c[1] * MM_TO_M, c[2] * MM_TO_M);
     }
 
     collDesc.setActiveEvents(RAPIER.ActiveEvents.COLLISION_EVENTS);
     const collider = world.createCollider(collDesc, body);
     colliderToName.set(collider.handle, b.id);
-    handles.push({ id: b.id, body, offset });
+    const handle: Handle = { id: b.id, body, offset, kind: b.kind };
+    handles.push(handle);
+    byId.set(b.id, handle);
   }
 
-  // Output transform for a body: worldPoint(mm) = Q·restPoint + t_out.
-  // Rapier gives T (m) + Q for a body whose collider was built at `offset`, so
-  //   t_out = T·1000 − Q·offset.  (offset = 0 for static/kinematic ⇒ t_out = T·1000)
+  // ── Joints on dynamic bodies (real Rapier constraints + optional motors) ──
+  const parentOf = new Map(spec.bodies.map((b) => [b.id, b.parent]));
+  const actuatorByJoint = new Map(spec.actuators.map((a) => [a.joint, a]));
+  interface MotorRef {
+    joint: RAPIER.ImpulseJoint;
+    revolute: boolean;
+    unit: "rad" | "deg" | undefined;
+    profile: Profile;
+    mode: "position" | "velocity";
+    stiffness: number;
+    damping: number;
+  }
+  const motors: MotorRef[] = [];
+  const vec = (v: Vec3) => ({ x: v[0], y: v[1], z: v[2] });
+
+  for (const j of spec.joints) {
+    const dyn = byId.get(j.body);
+    if (!dyn || dyn.kind !== "dynamic") continue; // only dynamic joints become constraints
+
+    // The other side: the parent body if present, else a fresh grounded anchor.
+    const parentId = parentOf.get(j.body);
+    let other = parentId ? byId.get(parentId) : undefined;
+    if (!other) {
+      const ground = world.createRigidBody(
+        RAPIER.RigidBodyDesc.fixed().setTranslation(j.anchor[0] * MM_TO_M, j.anchor[1] * MM_TO_M, j.anchor[2] * MM_TO_M),
+      );
+      other = { id: `${j.id}#ground`, body: ground, offset: [...j.anchor] as Vec3, kind: "static" };
+    }
+    const a1: Vec3 = [
+      (j.anchor[0] - other.offset[0]) * MM_TO_M,
+      (j.anchor[1] - other.offset[1]) * MM_TO_M,
+      (j.anchor[2] - other.offset[2]) * MM_TO_M,
+    ];
+    const a2: Vec3 = [
+      (j.anchor[0] - dyn.offset[0]) * MM_TO_M,
+      (j.anchor[1] - dyn.offset[1]) * MM_TO_M,
+      (j.anchor[2] - dyn.offset[2]) * MM_TO_M,
+    ];
+    const axis = norm3(j.axis);
+    const revolute = j.type === "revolute";
+    const params = revolute
+      ? RAPIER.JointData.revolute(vec(a1), vec(a2), vec(axis))
+      : RAPIER.JointData.prismatic(vec(a1), vec(a2), vec(axis));
+    const joint = world.createImpulseJoint(params, other.body, dyn.body, true);
+
+    const act = actuatorByJoint.get(j.id);
+    if (act) {
+      motors.push({
+        joint,
+        revolute,
+        unit: j.unit,
+        profile: act.profile,
+        mode: j.motor?.mode ?? "position",
+        stiffness: j.motor?.stiffness ?? 1e4,
+        damping: j.motor?.damping ?? 1e3,
+      });
+    }
+  }
+
+  // ── Output frame ──────────────────────────────────────────────────────────
+  // worldPoint(mm) = Q·restPoint + t_out, with t_out = T·1000 − Q·offset.
   const recordFrame = (t: number): SimResult["frames"][number] => {
     const poses: SimResult["frames"][number]["poses"] = {};
     for (const h of handles) {
@@ -170,34 +245,31 @@ export async function runDynamics(
       const R = h.body.rotation();
       const q: Quat = [R.x, R.y, R.z, R.w];
       const qo = rotate(q, h.offset);
-      poses[h.id] = [
-        T.x * M_TO_MM - qo[0],
-        T.y * M_TO_MM - qo[1],
-        T.z * M_TO_MM - qo[2],
-        q[0],
-        q[1],
-        q[2],
-        q[3],
-      ];
+      poses[h.id] = [T.x * M_TO_MM - qo[0], T.y * M_TO_MM - qo[1], T.z * M_TO_MM - qo[2], q[0], q[1], q[2], q[3]];
     }
     return { t, poses };
   };
 
-  // Drive kinematic bodies to their pose at time `t` (set as the NEXT kinematic
-  // target so Rapier derives the right velocity for pushing dynamic bodies).
   const driveKinematics = (t: number) => {
     const poses = kin.poseAt(t);
     for (const h of handles) {
-      const bt = h.body.bodyType();
-      if (bt !== RAPIER.RigidBodyType.KinematicPositionBased) continue;
+      if (h.body.bodyType() !== RAPIER.RigidBodyType.KinematicPositionBased) continue;
       const tf = poses.get(h.id);
       if (!tf) continue;
       h.body.setNextKinematicRotation({ x: tf.q[0], y: tf.q[1], z: tf.q[2], w: tf.q[3] });
-      h.body.setNextKinematicTranslation({
-        x: tf.t[0] * MM_TO_M,
-        y: tf.t[1] * MM_TO_M,
-        z: tf.t[2] * MM_TO_M,
-      });
+      h.body.setNextKinematicTranslation({ x: tf.t[0] * MM_TO_M, y: tf.t[1] * MM_TO_M, z: tf.t[2] * MM_TO_M });
+    }
+  };
+
+  const driveMotors = (t: number) => {
+    for (const m of motors) {
+      const raw = evaluateProfile(m.profile, t);
+      // Revolute target: rad (deg→rad if declared). Prismatic target: mm→m.
+      const target = m.revolute ? (m.unit === "deg" ? raw * DEG : raw) : raw * MM_TO_M;
+      // Motor methods live on the Revolute/Prismatic (Unit) joint subtype.
+      const uj = m.joint as unknown as RAPIER.UnitImpulseJoint;
+      if (m.mode === "velocity") uj.configureMotorVelocity(target, m.damping);
+      else uj.configureMotorPosition(target, m.stiffness, m.damping);
     }
   };
 
@@ -209,6 +281,7 @@ export async function runDynamics(
   for (let s = 1; s <= steps; s++) {
     const t = Math.min(spec.duration, s * spec.timestep);
     driveKinematics(t);
+    driveMotors(t);
     world.step(eventQueue);
 
     eventQueue.drainCollisionEvents((h1, h2, started) => {
@@ -216,12 +289,9 @@ export async function runDynamics(
       const a = colliderToName.get(h1);
       const b = colliderToName.get(h2);
       if (!a || !b || a === b) return;
-      const key = a < b ? `${a} ${b}` : `${b} ${a}`;
+      const key = a < b ? `${a}|${b}` : `${b}|${a}`;
       if (firstContact.has(key)) return;
       if (isAcceptedPair(spec.acceptedPairs, a, b)) return;
-      // overlapVolume isn't cheaply available from a contact event; report 0 as
-      // a marker — dynamics collisions are contact-onset events, not overlap
-      // volumes (the kinematic engine reports true AABB overlap volume).
       firstContact.set(key, { a, b, tStart: t, overlapVolume: 0 });
     });
 

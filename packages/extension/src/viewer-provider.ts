@@ -475,6 +475,40 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       padding: 2px; border-radius: 3px;
     }
 
+    /* Motion-simulation timeline panel (docked bottom-center, above the statusbar) */
+    #sim-panel {
+      position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%); z-index: 22;
+      display: none; flex-direction: column; gap: 6px;
+      background: rgba(37,37,38,0.95); border: 1px solid #3c3c3c; border-radius: 6px;
+      padding: 8px 12px; min-width: 440px; max-width: 72vw;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.45); backdrop-filter: blur(8px);
+    }
+    #sim-panel.open { display: flex; }
+    #sim-title { font-size: 10px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+    #sim-transport { display: flex; align-items: center; gap: 8px; }
+    #sim-play {
+      background: #0e639c; color: #fff; border: 1px solid #1177bb; border-radius: 3px;
+      font-family: inherit; font-size: 11px; padding: 4px 10px; cursor: pointer; white-space: nowrap;
+    }
+    #sim-play:hover { background: #1177bb; }
+    #sim-scrub { flex: 1; }
+    #sim-speed { background: #3c3c3c; color: #ccc; border: 1px solid #555; border-radius: 3px; font-size: 11px; padding: 2px; }
+    #sim-time { font-size: 11px; color: #aaa; white-space: nowrap; min-width: 118px; text-align: right; }
+    #sim-log {
+      max-height: 92px; overflow-y: auto; font-size: 11px; line-height: 1.5; color: #ccc;
+      border-top: 1px solid #3c3c3c; padding-top: 5px;
+    }
+    #sim-log::-webkit-scrollbar { width: 6px; }
+    #sim-log::-webkit-scrollbar-thumb { background: #555; border-radius: 3px; }
+    #sim-log .sim-head { color: #888; margin-bottom: 2px; }
+    #sim-log .sim-row { padding: 1px 0; }
+    #sim-log .sim-seek { cursor: pointer; }
+    #sim-log .sim-seek:hover { color: #fff; }
+    #sim-log .sim-pass { color: #4caf50; }
+    #sim-log .sim-fail { color: #ff6b6b; }
+    #toolbar button:disabled { opacity: 0.35; cursor: default; }
+    #toolbar button:disabled:hover { background: transparent; color: #aaa; }
+
     /* Measurement overlay */
     #measure-info {
       position: absolute; top: 40px; left: 50%; transform: translateX(-50%);
@@ -523,6 +557,7 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
         <button id="btn-dims" title="Toggle dimensions">Dims</button>
         <button id="btn-section" title="Section/clip plane">Section</button>
         <button id="btn-measure" title="Click-to-measure mode">Measure</button>
+        <button id="btn-sim" title="Motion simulation timeline (needs an 'export const sim' block)" disabled>Sim</button>
         <div class="sep"></div>
         <div id="export-menu-wrapper" class="menu-wrapper">
           <button id="btn-export" title="Export or open in another app">&#x21e9; Export &#9662;</button>
@@ -563,6 +598,22 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       </div>
 
       <div id="measure-info"></div>
+
+      <div id="sim-panel">
+        <div id="sim-title">Motion simulation</div>
+        <div id="sim-transport">
+          <button id="sim-play">&#9654; Play</button>
+          <input type="range" id="sim-scrub" class="param-slider" min="0" max="1000" value="0">
+          <select id="sim-speed">
+            <option value="0.1">0.1&times;</option>
+            <option value="0.25">0.25&times;</option>
+            <option value="0.5">0.5&times;</option>
+            <option value="1" selected>1&times;</option>
+          </select>
+          <span id="sim-time"></span>
+        </div>
+        <div id="sim-log"></div>
+      </div>
 
       <div id="statusbar">
         <span id="filename"></span>

@@ -1,6 +1,12 @@
 import { describe, it, expect } from "vitest";
 import { runDynamics, type MeshData } from "./dynamics";
-import type { SimSpec } from "@shapeitup/sim";
+import { apply, type SimSpec, type Transform, type Vec3 } from "@shapeitup/sim";
+
+// World position of a body-local point from a recorded frame pose.
+function worldPoint(pose: number[], local: Vec3): Vec3 {
+  const tf: Transform = { t: [pose[0], pose[1], pose[2]], q: [pose[3], pose[4], pose[5], pose[6]] };
+  return apply(tf, local);
+}
 
 // Axis-aligned box mesh in world mm: 8 corners, 12 triangles.
 function boxMesh(cx: number, cy: number, cz: number, w: number, d: number, h: number): MeshData {
@@ -79,5 +85,73 @@ describe("runDynamics", () => {
     expect(last[0]).toBeGreaterThan(90); // ~100 mm of +X travel
     expect(last[0]).toBeLessThan(110);
     expect(Math.abs(last[2])).toBeLessThan(1); // no gravity drop
+  });
+});
+
+describe("runDynamics — Batch 4 (CCD, dynamic joints, motors)", () => {
+  it("CCD keeps a fast box from tunneling through the floor", async () => {
+    // Near the floor the box moves ~16 mm per 1/120 s step — more than the floor
+    // is thick, so without CCD it would pass straight through. CCD is on by default.
+    const spec: SimSpec = {
+      duration: 0.8,
+      timestep: 1 / 120,
+      gravity: [0, 0, -9810],
+      bodies: [
+        { id: "floor", kind: "static", aabb: boxAabb(0, 0, -5, 400, 400, 10) },
+        { id: "mover", kind: "dynamic", aabb: boxAabb(0, 0, 200, 10, 10, 10) },
+      ],
+      joints: [],
+      actuators: [],
+    };
+    const meshes = new Map<string, MeshData>([
+      ["floor", boxMesh(0, 0, -5, 400, 400, 10)],
+      ["mover", boxMesh(0, 0, 200, 10, 10, 10)],
+    ]);
+    const result = await runDynamics(spec, meshes);
+    const finalCentreZ = 200 + result.frames[result.frames.length - 1].poses["mover"][2];
+    expect(finalCentreZ).toBeGreaterThan(-20); // did NOT tunnel below the floor
+    expect(finalCentreZ).toBeLessThan(25); // rested on top (centre ≈ 5)
+  });
+
+  it("a dynamic bar on a revolute joint swings down while its pivot stays put", async () => {
+    // Bar spanning x∈[0,40], pinned at the origin about Y; gravity −Z pulls it down.
+    const spec: SimSpec = {
+      duration: 3,
+      timestep: 1 / 120,
+      gravity: [0, 0, -9810],
+      bodies: [{ id: "bar", kind: "dynamic", aabb: { min: [0, -2, -2], max: [40, 2, 2] } }],
+      joints: [{ id: "pin", body: "bar", type: "revolute", anchor: [0, 0, 0], axis: [0, 1, 0] }],
+      actuators: [],
+    };
+    const meshes = new Map<string, MeshData>([["bar", boxMesh(20, 0, 0, 40, 4, 4)]]);
+    const result = await runDynamics(spec, meshes);
+    // The pinned end stays at the anchor throughout (the constraint holds).
+    for (const f of result.frames) {
+      const pivot = worldPoint(f.poses["bar"], [0, 0, 0]);
+      expect(Math.hypot(pivot[0], pivot[1], pivot[2])).toBeLessThan(5);
+    }
+    // The free end swings well below the pivot.
+    const tipZ = result.frames.map((f) => worldPoint(f.poses["bar"], [40, 0, 0])[2]);
+    expect(Math.min(...tipZ)).toBeLessThan(-20);
+  });
+
+  it("a position motor drives a revolute joint to its target angle (90°)", async () => {
+    // No gravity: the motor alone rotates the arm 90° about Z (+X → +Y).
+    const spec: SimSpec = {
+      duration: 1.5,
+      timestep: 1 / 120,
+      gravity: [0, 0, 0],
+      bodies: [{ id: "arm", kind: "dynamic", aabb: { min: [0, -2, -2], max: [40, 2, 2] } }],
+      joints: [
+        { id: "servo", body: "arm", type: "revolute", anchor: [0, 0, 0], axis: [0, 0, 1], unit: "deg", motor: { stiffness: 1e4, damping: 1e3 } },
+      ],
+      actuators: [{ id: "servo", joint: "servo", profile: { kind: "position", target: 90, rampMs: 200 } }],
+    };
+    const meshes = new Map<string, MeshData>([["arm", boxMesh(20, 0, 0, 40, 4, 4)]]);
+    const result = await runDynamics(spec, meshes);
+    const tip = worldPoint(result.frames[result.frames.length - 1].poses["arm"], [40, 0, 0]);
+    // Rotated ~90° about Z: free end near (0, 40, 0).
+    expect(tip[1]).toBeGreaterThan(30); // swung toward +Y
+    expect(Math.abs(tip[0])).toBeLessThan(12); // near the Y axis (left +X)
   });
 });

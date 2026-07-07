@@ -15,4 +15,7 @@ export * from "./collision";
 export * from "./units";
 export * from "./resolve";
 export * from "./playback";
+export * from "./schema";
+export * from "./assertions";
+export * from "./linkages";
 export { KinematicSim } from "./kinematics";

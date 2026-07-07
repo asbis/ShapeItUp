@@ -1,28 +1,27 @@
 /**
- * Motion-simulation UI + playback for the viewer (Phases 1 & 3b).
+ * Motion-simulation UI + playback for the viewer (Phases 1, 3b, and the Batch-5
+ * UI integration).
  *
- * A shape file can `export const sim = {...}`. On every render the viewer hands
- * that raw block here; we resolve it against the rendered parts and build a
- * PlaybackSource — a uniform `(t) → poses / contacts` interface that abstracts
- * over BOTH engines:
- *   - KINEMATIC: scripted motion evaluated analytically (KinematicSim.poseAt).
- *   - DYNAMICS:  the Rapier force solver (gravity/contacts) runs headless RIGHT
- *     HERE in the viewer (it already holds every part's mesh), records frames,
- *     and we play them back via sampleFrames (lerp + slerp).
+ * The timeline is now a first-class part of the extension's UI: a "Sim" toolbar
+ * button (enabled only when the current render declares `export const sim`)
+ * toggles a themed bottom-docked panel — play/pause, a scrubber, a speed
+ * selector, and a collision + assertion log — instead of a floating overlay.
+ * The panel markup + styling live in the webview template (viewer-provider.ts);
+ * this module wires those elements to the engines.
  *
- * Either way the panel drives each part's THREE.Group transform per frame,
- * flashes interfering parts, and exposes play/pause + a scrubber + a
- * collision/contact log. All maths lives in @shapeitup/sim(-dynamics); this file
- * wires THREE.Groups + DOM to those engines.
+ * A PlaybackSource abstracts both engines: KINEMATIC (analytic KinematicSim) and
+ * DYNAMICS (Rapier runs headless here, then we play back its recorded frames).
  */
 
 import * as THREE from "three";
 import {
   KinematicSim,
-  isSimSpecInput,
+  validateSimSpecInput,
   resolveSimSpec,
+  evaluateAssertions,
   sampleFrames,
   type Aabb,
+  type AssertionResult,
   type CollisionEvent,
   type Transform,
 } from "@shapeitup/sim";
@@ -33,11 +32,11 @@ interface SimPart {
   group: THREE.Group;
 }
 
-/** Uniform playback interface both engines satisfy. */
 interface PlaybackSource {
   engine: "kinematic" | "dynamics";
   duration: number;
   collisions: CollisionEvent[];
+  assertions: AssertionResult[];
   poseAt(t: number): Map<string, Transform>;
   contactsAt(t: number): Array<[string, string]>;
 }
@@ -52,22 +51,60 @@ let lastWall = 0; // performance.now() ms
 // render can't apply its result over a newer one.
 let generation = 0;
 
-// DOM
-let panel: HTMLDivElement | null = null;
-let playBtn: HTMLButtonElement | null = null;
-let scrubber: HTMLInputElement | null = null;
-let timeLabel: HTMLSpanElement | null = null;
-let titleEl: HTMLDivElement | null = null;
-let collisionList: HTMLDivElement | null = null;
+// Template elements (owned by viewer-provider.ts). Grabbed once in initSimPanel.
+let panel: HTMLElement | null = null;
+let btn: HTMLButtonElement | null = null;
+let playBtn: HTMLElement | null = null;
+let scrub: HTMLInputElement | null = null;
+let speedSel: HTMLSelectElement | null = null;
+let timeLabel: HTMLElement | null = null;
+let titleEl: HTMLElement | null = null;
+let log: HTMLElement | null = null;
 
 const RED = new THREE.Color("#ff3b30");
 
+/** Wire the template's sim panel + transport controls. Call once at startup. */
+export function initSimPanel() {
+  panel = document.getElementById("sim-panel");
+  btn = document.getElementById("btn-sim") as HTMLButtonElement | null;
+  playBtn = document.getElementById("sim-play");
+  scrub = document.getElementById("sim-scrub") as HTMLInputElement | null;
+  speedSel = document.getElementById("sim-speed") as HTMLSelectElement | null;
+  timeLabel = document.getElementById("sim-time");
+  titleEl = document.getElementById("sim-title");
+  log = document.getElementById("sim-log");
+
+  playBtn?.addEventListener("click", () => setPlaying(!playing));
+  scrub?.addEventListener("input", () => {
+    const duration = source?.duration ?? 0;
+    time = (Number(scrub!.value) / 1000) * duration;
+    applyPose(time);
+    updateScrubber();
+    setPlaying(false);
+  });
+  speedSel?.addEventListener("change", () => {
+    speed = Number(speedSel!.value);
+  });
+}
+
+/** Toolbar-button handler: show/hide the panel (no-op until a sim is loaded). */
+export function toggleSimPanel() {
+  if (!btn || btn.disabled || !panel) return;
+  const open = panel.classList.toggle("open");
+  btn.classList.toggle("active", open);
+}
+
+function setEnabled(on: boolean) {
+  if (btn) btn.disabled = !on;
+  if (!on) {
+    btn?.classList.remove("active");
+    panel?.classList.remove("open");
+  }
+}
+
 function aabbOf(group: THREE.Group): Aabb {
   const box = new THREE.Box3().setFromObject(group);
-  return {
-    min: [box.min.x, box.min.y, box.min.z],
-    max: [box.max.x, box.max.y, box.max.z],
-  };
+  return { min: [box.min.x, box.min.y, box.min.z], max: [box.max.x, box.max.y, box.max.z] };
 }
 
 /** Extract a world-space triangle mesh (mm) from a part's THREE geometry. */
@@ -85,7 +122,6 @@ function meshOf(group: THREE.Group): MeshData | null {
   if (idx) {
     indices = idx.array instanceof Uint32Array ? idx.array : new Uint32Array(idx.array);
   } else {
-    // Non-indexed geometry → sequential triangle list.
     indices = new Uint32Array(vertices.length / 3);
     for (let i = 0; i < indices.length; i++) indices[i] = i;
   }
@@ -128,36 +164,40 @@ export function clearSim() {
   playing = false;
   time = 0;
   generation++;
-  if (panel) panel.style.display = "none";
+  setEnabled(false);
 }
 
 /**
  * Called on mesh-done with the raw `sim` block and the freshly-rendered parts.
- * Async because the dynamics engine awaits Rapier's WASM init. No-op (and hides
- * the panel) when the script declared no valid sim.
+ * Async because the dynamics engine awaits Rapier's WASM init. Enables the Sim
+ * toolbar button and opens the panel when a valid sim is present.
  */
 export async function setupSim(raw: unknown, currentParts: SimPart[]) {
   clearSim();
-  if (!isSimSpecInput(raw)) return;
+  if (raw === undefined || raw === null) return;
+  const valid = validateSimSpecInput(raw);
+  if (!valid.ok) {
+    console.warn("[ShapeItUp sim] invalid sim block:\n" + valid.errors.map((e) => "  • " + e).join("\n"));
+    return;
+  }
   const myGen = generation;
 
   parts = currentParts.map((p) => ({ name: p.name, group: p.group }));
   const partAabbs = parts.map((p) => ({ name: p.name, aabb: aabbOf(p.group) }));
-  const { spec, warnings } = resolveSimSpec(raw, partAabbs);
+  const { spec, warnings } = resolveSimSpec(valid.value, partAabbs);
   for (const w of warnings) console.warn(`[ShapeItUp sim] ${w}`);
 
-  const wantsDynamics = raw.mode === "dynamic" || spec.bodies.some((b) => b.kind === "dynamic");
+  const wantsDynamics =
+    valid.value.mode === "dynamic" || spec.bodies.some((b) => b.kind === "dynamic");
 
   try {
     if (wantsDynamics) {
-      ensurePanel();
-      if (titleEl) titleEl.textContent = "◷ Simulating physics…";
-      panel!.style.display = "flex";
       const meshes = new Map<string, MeshData>();
       for (const p of parts) {
         const m = meshOf(p.group);
         if (m && m.vertices.length >= 9) meshes.set(p.name, m);
       }
+      if (titleEl) titleEl.textContent = "Simulating physics…";
       const result = await runDynamics(spec, meshes);
       if (generation !== myGen) return; // superseded by a newer render
       const cols = result.collisions;
@@ -165,9 +205,9 @@ export async function setupSim(raw: unknown, currentParts: SimPart[]) {
         engine: "dynamics",
         duration: result.duration,
         collisions: cols,
+        assertions: evaluateAssertions(spec, result),
         poseAt: (t) => sampleFrames(result, t),
-        contactsAt: (t) =>
-          cols.filter((c) => c.tStart <= t).map((c) => [c.a, c.b] as [string, string]),
+        contactsAt: (t) => cols.filter((c) => c.tStart <= t).map((c) => [c.a, c.b] as [string, string]),
       };
     } else {
       const ksim = new KinematicSim(spec);
@@ -176,6 +216,7 @@ export async function setupSim(raw: unknown, currentParts: SimPart[]) {
         engine: "kinematic",
         duration: spec.duration,
         collisions: result.collisions,
+        assertions: evaluateAssertions(spec, result),
         poseAt: (t) => ksim.poseAt(t),
         contactsAt: (t) => ksim.contactsAt(t),
       };
@@ -189,10 +230,11 @@ export async function setupSim(raw: unknown, currentParts: SimPart[]) {
   time = 0;
   playing = false;
   lastWall = performance.now();
-  ensurePanel();
-  if (titleEl) titleEl.textContent = source.engine === "dynamics" ? "◷ Physics simulation" : "◷ Motion simulation";
-  panel!.style.display = "flex";
-  renderCollisionList();
+  if (titleEl) titleEl.textContent = source.engine === "dynamics" ? "Physics simulation" : "Motion simulation";
+  setEnabled(true);
+  panel?.classList.add("open");
+  btn?.classList.add("active");
+  renderLog();
   applyPose(0);
   updateScrubber();
   setPlaying(false);
@@ -230,158 +272,66 @@ function applyPose(t: number) {
   markActiveCollisions(t);
 }
 
-// ── UI ──────────────────────────────────────────────────────────────────────
-
 function setPlaying(next: boolean) {
   playing = next;
   lastWall = performance.now();
-  if (playBtn) playBtn.textContent = playing ? "⏸ Pause" : "▶ Play";
+  if (playBtn) playBtn.innerHTML = playing ? "&#9208; Pause" : "&#9654; Play";
 }
 
 function updateScrubber() {
   const duration = source?.duration ?? 0;
-  if (scrubber) scrubber.value = String(duration > 0 ? (time / duration) * 1000 : 0);
-  if (timeLabel) timeLabel.textContent = `${(time * 1000).toFixed(0)} ms / ${(duration * 1000).toFixed(0)} ms`;
+  if (scrub) scrub.value = String(duration > 0 ? (time / duration) * 1000 : 0);
+  if (timeLabel) timeLabel.textContent = `${(time * 1000).toFixed(0)} / ${(duration * 1000).toFixed(0)} ms`;
 }
 
-function renderCollisionList() {
-  if (!collisionList || !source) return;
+function renderLog() {
+  if (!log || !source) return;
+  log.innerHTML = "";
   const noun = source.engine === "dynamics" ? "contact" : "collision";
-  collisionList.innerHTML = "";
+
+  const head = (text: string, cls = "sim-head") => {
+    const d = document.createElement("div");
+    d.className = cls;
+    d.textContent = text;
+    log!.appendChild(d);
+  };
+
   if (source.collisions.length === 0) {
-    const ok = document.createElement("div");
-    ok.textContent = `✓ no ${noun}s`;
-    ok.style.color = "#4caf50";
-    collisionList.appendChild(ok);
-    return;
+    head(`✓ no ${noun}s`, "sim-pass");
+  } else {
+    head(`${source.collisions.length} ${noun}${source.collisions.length > 1 ? "s" : ""}:`);
+    for (const c of source.collisions) {
+      const row = document.createElement("div");
+      row.className = "sim-row sim-seek sim-collision-row";
+      row.dataset.t = String(c.tStart);
+      row.textContent = `${(c.tStart * 1000).toFixed(0)} ms  ${c.a} ↔ ${c.b}`;
+      row.addEventListener("click", () => {
+        time = c.tStart;
+        applyPose(time);
+        updateScrubber();
+        setPlaying(false);
+      });
+      log.appendChild(row);
+    }
   }
-  const header = document.createElement("div");
-  header.textContent = `${source.collisions.length} ${noun}${source.collisions.length > 1 ? "s" : ""}:`;
-  header.style.opacity = "0.7";
-  header.style.marginBottom = "2px";
-  collisionList.appendChild(header);
-  for (const c of source.collisions) {
-    const row = document.createElement("div");
-    row.className = "sim-collision-row";
-    row.dataset.t = String(c.tStart);
-    row.textContent = `${(c.tStart * 1000).toFixed(0)} ms  ${c.a} ↔ ${c.b}`;
-    row.style.cursor = "pointer";
-    row.style.padding = "1px 0";
-    row.addEventListener("click", () => {
-      time = c.tStart;
-      applyPose(time);
-      updateScrubber();
-      setPlaying(false);
-    });
-    collisionList.appendChild(row);
+
+  if (source.assertions.length > 0) {
+    const passed = source.assertions.filter((a) => a.pass).length;
+    head(`Assertions: ${passed}/${source.assertions.length}`);
+    for (const a of source.assertions) {
+      const row = document.createElement("div");
+      row.className = `sim-row ${a.pass ? "sim-pass" : "sim-fail"}`;
+      row.textContent = `${a.pass ? "✓" : "✗"} ${a.name}: ${a.detail}`;
+      log.appendChild(row);
+    }
   }
 }
 
 /** Colour collision rows whose event time has been reached. */
 function markActiveCollisions(t: number) {
-  if (!collisionList) return;
-  collisionList.querySelectorAll<HTMLElement>(".sim-collision-row").forEach((row) => {
+  if (!log) return;
+  log.querySelectorAll<HTMLElement>(".sim-collision-row").forEach((row) => {
     const tStart = Number(row.dataset.t);
-    row.style.color = t >= tStart ? "#ff3b30" : "#e0e0e0";
+    row.style.color = t >= tStart ? "#ff6b6b" : "";
   });
-}
-
-function ensurePanel() {
-  if (panel) return;
-  panel = document.createElement("div");
-  Object.assign(panel.style, {
-    position: "fixed",
-    left: "50%",
-    bottom: "16px",
-    transform: "translateX(-50%)",
-    display: "none",
-    flexDirection: "column",
-    gap: "8px",
-    padding: "12px 16px",
-    background: "rgba(28,28,32,0.94)",
-    border: "1px solid #3a3a42",
-    borderRadius: "10px",
-    color: "#e0e0e0",
-    font: "12px system-ui, sans-serif",
-    boxShadow: "0 6px 24px rgba(0,0,0,0.5)",
-    zIndex: "50",
-    minWidth: "460px",
-    maxWidth: "70vw",
-  } as Partial<CSSStyleDeclaration>);
-
-  const row = document.createElement("div");
-  Object.assign(row.style, { display: "flex", alignItems: "center", gap: "10px" });
-
-  playBtn = document.createElement("button");
-  playBtn.textContent = "▶ Play";
-  Object.assign(playBtn.style, {
-    background: "#2d6cdf",
-    color: "#fff",
-    border: "none",
-    borderRadius: "6px",
-    padding: "5px 12px",
-    cursor: "pointer",
-    fontWeight: "600",
-    whiteSpace: "nowrap",
-  } as Partial<CSSStyleDeclaration>);
-  playBtn.addEventListener("click", () => setPlaying(!playing));
-
-  scrubber = document.createElement("input");
-  scrubber.type = "range";
-  scrubber.min = "0";
-  scrubber.max = "1000";
-  scrubber.value = "0";
-  scrubber.style.flex = "1";
-  scrubber.addEventListener("input", () => {
-    const duration = source?.duration ?? 0;
-    time = (Number(scrubber!.value) / 1000) * duration;
-    applyPose(time);
-    updateScrubber();
-    setPlaying(false);
-  });
-
-  timeLabel = document.createElement("span");
-  timeLabel.style.whiteSpace = "nowrap";
-  timeLabel.style.opacity = "0.85";
-  timeLabel.style.minWidth = "120px";
-  timeLabel.style.textAlign = "right";
-
-  const speedSel = document.createElement("select");
-  for (const s of [0.1, 0.25, 0.5, 1]) {
-    const opt = document.createElement("option");
-    opt.value = String(s);
-    opt.textContent = `${s}×`;
-    if (s === speed) opt.selected = true;
-    speedSel.appendChild(opt);
-  }
-  Object.assign(speedSel.style, {
-    background: "#1c1c20",
-    color: "#e0e0e0",
-    border: "1px solid #3a3a42",
-    borderRadius: "6px",
-    padding: "4px",
-  } as Partial<CSSStyleDeclaration>);
-  speedSel.addEventListener("change", () => {
-    speed = Number(speedSel.value);
-  });
-
-  row.append(playBtn, scrubber, speedSel, timeLabel);
-
-  titleEl = document.createElement("div");
-  titleEl.textContent = "◷ Motion simulation";
-  titleEl.style.fontWeight = "600";
-  titleEl.style.opacity = "0.6";
-  titleEl.style.letterSpacing = "0.04em";
-
-  collisionList = document.createElement("div");
-  Object.assign(collisionList.style, {
-    maxHeight: "96px",
-    overflowY: "auto",
-    borderTop: "1px solid #3a3a42",
-    paddingTop: "6px",
-    lineHeight: "1.5",
-  } as Partial<CSSStyleDeclaration>);
-
-  panel.append(titleEl, row, collisionList);
-  document.body.appendChild(panel);
 }

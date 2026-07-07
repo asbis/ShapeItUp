@@ -451,6 +451,12 @@ export function executeScript(
       var __sim__ = __entrySentinel__
         ? __entrySim__
         : (typeof sim !== "undefined" ? sim : undefined);
+      // A sim block MAY be a function of params: export const sim = (p) => ({...}).
+      // Evaluate it with the override-merged params so run_simulation can sweep
+      // e.g. speed/tau without editing the file (a plain object still works).
+      if (typeof __sim__ === "function") {
+        try { __sim__ = __sim__(__params__); } catch (e) { __sim__ = undefined; }
+      }
 
       return { result: __result__, params: __params__, material: __material__, config: __config__, sim: __sim__ };
     })(__replicadExports__, __shapeitupExports__, __paramOverrides__);
