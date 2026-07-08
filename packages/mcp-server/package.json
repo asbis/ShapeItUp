@@ -1,6 +1,6 @@
 {
   "name": "@shapeitup/mcp-server",
-  "version": "1.21.0",
+  "version": "1.22.0",
   "description": "ShapeItUp MCP server — scripted CAD tools (Replicad/OpenCascade) for Claude Code, Cursor, Claude Desktop, and other MCP clients.",
   "type": "module",
   "bin": {
@@ -38,12 +38,16 @@
     "manifold-3d": "^3.4.1",
     "replicad-opencascadejs": "^0.23.0"
   },
+  "optionalDependencies": {
+    "@mujoco/mujoco": "^3.10.0"
+  },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@shapeitup/core": "workspace:*",
     "@shapeitup/shared": "workspace:*",
     "@shapeitup/sim": "workspace:*",
     "@shapeitup/sim-dynamics": "workspace:*",
+    "@shapeitup/sim-mujoco": "workspace:*",
     "@types/ws": "^8.18.1",
     "replicad": "^0.23.0",
     "ws": "^8.20.0",

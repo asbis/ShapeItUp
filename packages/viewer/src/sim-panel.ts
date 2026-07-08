@@ -23,9 +23,11 @@ import {
   type Aabb,
   type AssertionResult,
   type CollisionEvent,
+  type SimResult,
   type Transform,
 } from "@shapeitup/sim";
 import { runDynamics, type MeshData } from "@shapeitup/sim-dynamics";
+import { runMujoco } from "@shapeitup/sim-mujoco";
 
 interface SimPart {
   name: string;
@@ -187,19 +189,39 @@ export async function setupSim(raw: unknown, currentParts: SimPart[]) {
   const { spec, warnings } = resolveSimSpec(valid.value, partAabbs);
   for (const w of warnings) console.warn(`[ShapeItUp sim] ${w}`);
 
-  const wantsDynamics =
-    valid.value.mode === "dynamic" || spec.bodies.some((b) => b.kind === "dynamic");
+  // Engine selection. `engine` (if set) wins; otherwise force-based when the block
+  // opts into dynamics. MuJoCo runs its WASM in the webview like Rapier does — but
+  // if that load fails (e.g. the optional glue wasn't shipped) it degrades to
+  // Rapier/kinematic so the viewer never breaks. All three emit a SimResult.
+  const engine = valid.value.engine;
+  const wantsMujoco = engine === "mujoco";
+  const hasDynamics = valid.value.mode === "dynamic" || spec.bodies.some((b) => b.kind === "dynamic");
+  const wantsForceBased = wantsMujoco || engine === "rapier" || hasDynamics;
 
   try {
-    if (wantsDynamics) {
+    let result: SimResult | null = null;
+    if (wantsForceBased) {
       const meshes = new Map<string, MeshData>();
       for (const p of parts) {
         const m = meshOf(p.group);
         if (m && m.vertices.length >= 9) meshes.set(p.name, m);
       }
-      if (titleEl) titleEl.textContent = "Simulating physics…";
-      const result = await runDynamics(spec, meshes);
-      if (generation !== myGen) return; // superseded by a newer render
+      if (wantsMujoco) {
+        try {
+          if (titleEl) titleEl.textContent = "Simulating (MuJoCo)…";
+          result = await runMujoco(spec, meshes);
+        } catch (err) {
+          console.warn("[ShapeItUp sim] MuJoCo engine unavailable in the viewer — falling back:", err);
+        }
+      }
+      if (!result && (engine === "rapier" || hasDynamics)) {
+        if (titleEl) titleEl.textContent = "Simulating physics…";
+        result = await runDynamics(spec, meshes);
+      }
+    }
+    if (generation !== myGen) return; // superseded by a newer render
+
+    if (result) {
       const cols = result.collisions;
       source = {
         engine: "dynamics",
@@ -210,13 +232,15 @@ export async function setupSim(raw: unknown, currentParts: SimPart[]) {
         contactsAt: (t) => cols.filter((c) => c.tStart <= t).map((c) => [c.a, c.b] as [string, string]),
       };
     } else {
+      // Kinematic engine — the default, and the fallback for an all-scripted scene
+      // tagged `engine:"mujoco"` when the MuJoCo WASM couldn't load.
       const ksim = new KinematicSim(spec);
-      const result = ksim.run();
+      const kres = ksim.run();
       source = {
         engine: "kinematic",
         duration: spec.duration,
-        collisions: result.collisions,
-        assertions: evaluateAssertions(spec, result),
+        collisions: kres.collisions,
+        assertions: evaluateAssertions(spec, kres),
         poseAt: (t) => ksim.poseAt(t),
         contactsAt: (t) => ksim.contactsAt(t),
       };

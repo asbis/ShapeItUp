@@ -115,6 +115,10 @@ const linkage = z.discriminatedUnion("kind", [
 
 export const simSpecInputSchema = z.object({
   mode: z.enum(["kinematic", "dynamic"]).optional(),
+  /** Which solver runs the study. Omit for auto (kinematic, or Rapier when a
+   *  `dynamic` body / `mode:"dynamic"` is present). "rapier"/"mujoco" force a
+   *  force-based backend even for all-scripted scenes. */
+  engine: z.enum(["kinematic", "rapier", "mujoco"]).optional(),
   bodies: z.record(z.string(), bodyKind),
   joints: z.array(joint).optional(),
   actuators: z.array(actuator).optional(),

@@ -6,6 +6,7 @@
     "@shapeitup/shared": "workspace:*",
     "@shapeitup/sim": "workspace:*",
     "@shapeitup/sim-dynamics": "workspace:*",
+    "@shapeitup/sim-mujoco": "workspace:*",
     "three": "^0.170.0"
   },
   "devDependencies": {

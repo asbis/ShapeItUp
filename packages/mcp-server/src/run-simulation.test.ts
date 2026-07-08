@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { executeShapeFile } from "./engine";
 import { KinematicSim, resolveSimSpec, isSimSpecInput, type Aabb } from "@shapeitup/sim";
 import { runDynamics, type MeshData } from "@shapeitup/sim-dynamics";
+import { runMujoco } from "@shapeitup/sim-mujoco";
 
 // Mirrors the tool: rest-pose world AABB per part from tessellated vertices.
 function partAabbs(parts: Array<{ name: string; vertices: Float32Array }>): Array<{ name: string; aabb: Aabb }> {
@@ -114,6 +115,45 @@ describe("run_simulation headless integration", () => {
           partAabbs(outcome.parts as Array<{ name: string; vertices: Float32Array }>),
         );
         const result = new KinematicSim(spec).run();
+
+        const hitNeedles = new Set(
+          result.collisions
+            .filter((c) => c.a === "carriage" || c.b === "carriage")
+            .map((c) => (c.a === "carriage" ? c.b : c.a)),
+        );
+        expect(hitNeedles).toEqual(new Set(["needle-2", "needle-4"]));
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "engine: mujoco — same OCCT pipeline runs on MuJoCo; carriage hits only the two raised needles",
+    async () => {
+      const { workdir, storage } = makeDirs();
+      try {
+        const entryPath = join(workdir, "carriage-needles-mj.shape.ts");
+        writeFileSync(entryPath, CARRIAGE_NEEDLES);
+
+        const outcome = await executeShapeFile(entryPath, storage);
+        expect(outcome.status.success).toBe(true);
+        if (!isSimSpecInput(outcome.sim)) throw new Error("sim block not surfaced");
+
+        const parts = outcome.parts as Array<{ name: string; vertices: Float32Array; triangles: Uint32Array }>;
+        const { spec } = resolveSimSpec(outcome.sim, partAabbs(parts));
+        // Feed REAL OCCT tessellation into MuJoCo (Phase 2 mesh-geom path — inline
+        // vertices → convex hull), proving the whole OCCT → mesh → MuJoCo pipeline
+        // and that the optional @mujoco/mujoco dynamic import resolves here.
+        const meshes = new Map<string, MeshData>();
+        for (const p of parts) {
+          if (p.vertices?.length >= 9 && p.triangles?.length >= 3) {
+            meshes.set(p.name, { vertices: p.vertices, indices: p.triangles });
+          }
+        }
+        const result = await runMujoco(spec, meshes);
 
         const hitNeedles = new Set(
           result.collisions

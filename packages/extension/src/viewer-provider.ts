@@ -285,6 +285,14 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     const manifoldWasmFile = webview.asWebviewUri(
       vscode.Uri.joinPath(distUri, "manifold.wasm")
     );
+    // MuJoCo engine (optional): the viewer loads the Emscripten glue from this URL
+    // at runtime and points it at the .wasm URI. Copied to dist by esbuild.
+    const mujocoLoaderJs = webview.asWebviewUri(
+      vscode.Uri.joinPath(distUri, "mujoco.js")
+    );
+    const mujocoWasmFile = webview.asWebviewUri(
+      vscode.Uri.joinPath(distUri, "mujoco.wasm")
+    );
 
     const nonce = getNonce();
 
@@ -628,7 +636,9 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       wasmLoaderUrl: "${wasmLoaderJs}",
       wasmUrl: "${wasmFile}",
       manifoldLoaderUrl: "${manifoldLoaderJs}",
-      manifoldWasmUrl: "${manifoldWasmFile}"
+      manifoldWasmUrl: "${manifoldWasmFile}",
+      mujocoLoaderUrl: "${mujocoLoaderJs}",
+      mujocoWasmUrl: "${mujocoWasmFile}"
     };
   </script>
   <script nonce="${nonce}" src="${viewerJs}"></script>

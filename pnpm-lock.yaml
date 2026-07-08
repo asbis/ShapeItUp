@@ -92,6 +92,9 @@ importers:
       '@shapeitup/sim-dynamics':
         specifier: workspace:*
         version: link:../sim-dynamics
+      '@shapeitup/sim-mujoco':
+        specifier: workspace:*
+        version: link:../sim-mujoco
       '@types/ws':
         specifier: ^8.18.1
         version: 8.18.1
@@ -104,6 +107,10 @@ importers:
       zod:
         specifier: ^4.3.6
         version: 4.3.6
+    optionalDependencies:
+      '@mujoco/mujoco':
+        specifier: ^3.10.0
+        version: 3.10.0
 
   packages/shared: {}
 
@@ -125,6 +132,15 @@ importers:
         specifier: workspace:*
         version: link:../sim
 
+  packages/sim-mujoco:
+    dependencies:
+      '@mujoco/mujoco':
+        specifier: ^3.10.0
+        version: 3.10.0
+      '@shapeitup/sim':
+        specifier: workspace:*
+        version: link:../sim
+
   packages/viewer:
     dependencies:
       '@shapeitup/shared':
@@ -136,6 +152,9 @@ importers:
       '@shapeitup/sim-dynamics':
         specifier: workspace:*
         version: link:../sim-dynamics
+      '@shapeitup/sim-mujoco':
+        specifier: workspace:*
+        version: link:../sim-mujoco
       three:
         specifier: ^0.170.0
         version: 0.170.0
@@ -645,6 +664,9 @@ packages:
     peerDependenciesMeta:
       '@cfworker/json-schema':
         optional: true
+
+  '@mujoco/mujoco@3.10.0':
+    resolution: {integrity: sha512-E1k0FiFf1vVRPkZtq2WKWY0D7DYGJ3BGQAEmup2H20UkTDOWj/JmyGDqf9Ils3RQrWxCEOHMdo9VtEBfymUd9g==}
 
   '@nodable/entities@2.1.0':
     resolution: {integrity: sha512-nyT7T3nbMyBI/lvr6L5TyWbFJAI9FTgVRakNoBqCD+PmID8DzFrrNdLLtHMwMszOtqZa8PAOV24ZqDnQrhQINA==}
@@ -1811,6 +1833,8 @@ snapshots:
       zod-to-json-schema: 3.25.2(zod@4.3.6)
     transitivePeerDependencies:
       - supports-color
+
+  '@mujoco/mujoco@3.10.0': {}
 
   '@nodable/entities@2.1.0': {}
 

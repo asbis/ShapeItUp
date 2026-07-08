@@ -39,6 +39,10 @@ const viewerConfig = {
   platform: "browser",
   format: "iife",
   globalName: "ShapeItUpViewer",
+  // The MuJoCo Emscripten glue can't be bundled into an IIFE (import.meta/require)
+  // — it's loaded at runtime from a webview URI (see sim-mujoco/loader.ts). Keep it
+  // external so esbuild never tries to pull it in.
+  external: ["@mujoco/mujoco"],
 };
 
 // 3. Worker (browser, IIFE)
@@ -63,7 +67,10 @@ const workerConfig = {
 
 // replicad-opencascadejs ships a ~30 MB WASM loader that would blow up the
 // bundle — keep it external so it loads from node_modules at runtime.
-const mcpExternal = ["esbuild-wasm", "replicad-opencascadejs", "@resvg/resvg-wasm"];
+// @mujoco/mujoco is an OPTIONAL engine with a separate 10 MB .wasm that the
+// Emscripten loader locates next to its own .js — so it must stay external and
+// resolve from node_modules (it's dynamically imported only when selected).
+const mcpExternal = ["esbuild-wasm", "replicad-opencascadejs", "@resvg/resvg-wasm", "@mujoco/mujoco"];
 
 // Compile-time constants injected into BOTH mcp-server bundles so the
 // serverInfo advertised over MCP tracks packages/mcp-server/package.json
@@ -142,6 +149,27 @@ function copyWasmFiles() {
     }
   } else {
     console.warn("Warning: manifold-3d not found — mesh-native threads disabled.");
+  }
+
+  // Copy the MuJoCo Emscripten glue + WASM so the viewer can run the optional
+  // MuJoCo engine in the webview. The glue can't be bundled (it uses import.meta/
+  // require), so it's loaded at runtime from these dist copies via a webview URI
+  // (see packages/sim-mujoco/src/loader.ts + viewer-provider's __SHAPEITUP_CONFIG__).
+  const mujocoCandidates = [
+    resolve(__dirname, "node_modules/@mujoco/mujoco"),
+    resolve(__dirname, "node_modules/.pnpm/@mujoco+mujoco@3.10.0/node_modules/@mujoco/mujoco"),
+  ];
+  const mujocoDir = mujocoCandidates.find((d) => existsSync(d));
+  if (mujocoDir) {
+    for (const file of ["mujoco.js", "mujoco.wasm"]) {
+      const src = resolve(mujocoDir, file);
+      if (existsSync(src)) {
+        cpSync(src, resolve(distDir, file));
+        console.log(`Copied ${file} to dist/`);
+      }
+    }
+  } else {
+    console.warn("Warning: @mujoco/mujoco not found — MuJoCo viewer playback disabled (MCP engine still works).");
   }
 }
 

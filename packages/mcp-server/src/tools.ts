@@ -17,6 +17,7 @@ import {
   type Vec3,
 } from "@shapeitup/sim";
 import { runDynamics, type MeshData } from "@shapeitup/sim-dynamics";
+import { runMujoco } from "@shapeitup/sim-mujoco";
 import { homedir } from "os";
 import {
   appendScreenshotMetadata,
@@ -5557,7 +5558,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "run_simulation",
-    "Runs the Phase-1 kinematic MOTION simulation declared by a shape's `export const sim = {...}` block and returns collision events over time — headless, no viewer needed. Use this to test mechanism motion before building/printing: does a moving part hit another as it travels? Does an actuator (e.g. a solenoid with a response delay + finite ramp) reach its target before a colliding part arrives? Unlike `check_collisions` (a single static snapshot) and `sweep_check` (one part rotated through angles), this drives EVERY kinematic body along its actuator profile over the full run and reports the FIRST time each body pair overlaps (transformed-AABB test, mm). Returns: the run's duration/timestep, a list of actuators and what they drive, and each collision as `{tStart(ms), a, b, overlapVolume}`. `format:'full'` also samples a coarse position timeline for each moving body. The `sim` block is authored in the shape file (bodies as static/kinematic/dynamic by glob, joints with anchor+axis, actuators with velocity/position/keyframes/sine profiles, optional acceptedPairs to suppress expected resting contacts) — see docs/simulation-design.md and @shapeitup/sim's SimSpecInput. TWO ENGINES: the default KINEMATIC engine plays scripted motion and reports AABB-overlap collisions (fast, for pattern/interference testing). Declaring any `dynamic` body (or `mode: 'dynamic'` + `gravity`) switches to the DYNAMICS engine (Rapier physics): dynamic bodies fall under gravity and rest/tumble on contact while kinematic bodies still follow their profiles and can shove them — the report then adds each dynamic body's net displacement and whether it settled. Pass either `filePath` OR `code`. `params` overrides numeric parameters for this run without persisting.",
+    "Runs the Phase-1 kinematic MOTION simulation declared by a shape's `export const sim = {...}` block and returns collision events over time — headless, no viewer needed. Use this to test mechanism motion before building/printing: does a moving part hit another as it travels? Does an actuator (e.g. a solenoid with a response delay + finite ramp) reach its target before a colliding part arrives? Unlike `check_collisions` (a single static snapshot) and `sweep_check` (one part rotated through angles), this drives EVERY kinematic body along its actuator profile over the full run and reports the FIRST time each body pair overlaps (transformed-AABB test, mm). Returns: the run's duration/timestep, a list of actuators and what they drive, and each collision as `{tStart(ms), a, b, overlapVolume}`. `format:'full'` also samples a coarse position timeline for each moving body. The `sim` block is authored in the shape file (bodies as static/kinematic/dynamic by glob, joints with anchor+axis, actuators with velocity/position/keyframes/sine profiles, optional acceptedPairs to suppress expected resting contacts) — see docs/simulation-design.md and @shapeitup/sim's SimSpecInput. THREE ENGINES: the default KINEMATIC engine plays scripted motion and reports AABB-overlap collisions (fast, for pattern/interference testing). Declaring any `dynamic` body (or `mode: 'dynamic'` + `gravity`) switches to the DYNAMICS engine (Rapier physics): dynamic bodies fall under gravity and rest/tumble on contact while kinematic bodies still follow their profiles and can shove them — the report then adds each dynamic body's net displacement and whether it settled. Set `engine: 'mujoco'` in the sim block to run the same study on MuJoCo instead (native contacts between scripted bodies, richer actuator/contact model; the ~10 MB WASM loads only when selected). `engine` also takes `'kinematic'` or `'rapier'` to force a specific backend. Pass either `filePath` OR `code`. `params` overrides numeric parameters for this run without persisting.",
     {
       filePath: z.string().optional().describe("Path to the .shape.ts file to simulate. Absolute paths pass through; relative paths probe each VSCode workspace root, else process.cwd(). Mutually exclusive with `code`."),
       code: z.string().optional().describe("Inline .shape.ts source including an `export default` main() AND an `export const sim = {...}` block. Written to a temp file, executed, deleted. Use `workingDir` for local `./` imports. Mutually exclusive with `filePath`."),
@@ -5638,14 +5639,22 @@ export function registerTools(server: McpServer) {
 
         const { spec, warnings } = resolveSimSpec(simInput, partAabbs);
 
-        // Engine selection: run the Rapier force solver when the block opts in
-        // (`mode: "dynamic"`) or declares any force-driven `dynamic` body;
-        // otherwise the fast analytic kinematic engine. Both emit a SimResult.
-        const wantsDynamics =
-          simInput.mode === "dynamic" || spec.bodies.some((b) => b.kind === "dynamic");
+        // Engine selection. `engine` (if set) wins: "kinematic" forces the fast
+        // analytic engine, "rapier"/"mujoco" force that force-based backend. With
+        // no `engine`, auto: force-based when the block opts in (`mode:"dynamic"`)
+        // or declares any `dynamic` body, else kinematic. MuJoCo brings native
+        // contacts between scripted bodies + a richer actuator/contact model; the
+        // WASM only loads when it's actually selected. All emit the same SimResult.
+        const forceBased =
+          simInput.engine === "mujoco" ||
+          simInput.engine === "rapier" ||
+          (simInput.engine !== "kinematic" &&
+            (simInput.mode === "dynamic" || spec.bodies.some((b) => b.kind === "dynamic")));
+        const useMujoco = simInput.engine === "mujoco";
+        const engineLabel = forceBased ? (useMujoco ? "DYNAMICS (MuJoCo)" : "DYNAMICS (Rapier)") : "kinematic";
 
         let result: SimResult;
-        if (wantsDynamics) {
+        if (forceBased) {
           // Physics colliders need real geometry, not just AABBs.
           const meshes = new Map<string, MeshData>();
           for (const p of parts) {
@@ -5653,7 +5662,7 @@ export function registerTools(server: McpServer) {
               meshes.set(p.name, { vertices: p.vertices, indices: p.triangles });
             }
           }
-          result = await runDynamics(spec, meshes);
+          result = useMujoco ? await runMujoco(spec, meshes) : await runDynamics(spec, meshes);
         } else {
           result = new KinematicSim(spec).run();
         }
@@ -5685,11 +5694,11 @@ export function registerTools(server: McpServer) {
         const kindBits = [`${kinematicCount} kinematic`];
         if (dynamicBodies.length) kindBits.push(`${dynamicBodies.length} dynamic`);
         lines.push(
-          `Motion sim [${wantsDynamics ? "DYNAMICS (Rapier)" : "kinematic"}]: ` +
+          `Motion sim [${engineLabel}]: ` +
             `${spec.duration}s @ ${(spec.timestep * 1000).toFixed(1)}ms step — ` +
             `${spec.bodies.length} bodies (${kindBits.join(", ")}), ${spec.actuators.length} actuator(s).`,
         );
-        if (wantsDynamics) {
+        if (forceBased) {
           const g = spec.gravity ?? [0, 0, -9810];
           lines.push(`Gravity: [${g.join(", ")}] mm/s².`);
         }
@@ -5705,14 +5714,21 @@ export function registerTools(server: McpServer) {
         }
 
         // Collisions (kinematic: AABB overlap) / contacts (dynamics: contact onset).
-        const noun = wantsDynamics ? "contact" : "collision";
+        const noun = forceBased ? "contact" : "collision";
         lines.push("");
         if (result.collisions.length === 0) {
           lines.push(`✓ No ${noun}s over the ${spec.duration}s run.`);
         } else {
           lines.push(`⚠ ${result.collisions.length} ${noun}${result.collisions.length > 1 ? "s" : ""} (first onset):`);
           for (const c of result.collisions) {
-            const detail = c.overlapVolume > 0 ? `  (overlap ${c.overlapVolume.toFixed(1)} mm³)` : "";
+            // MuJoCo reports peak contact force + penetration (how hard / how deep);
+            // the kinematic engine reports overlap volume; Rapier reports neither.
+            let detail = "";
+            if (c.peakForceN != null && (c.peakForceN > 0 || (c.peakPenetrationMm ?? 0) > 0)) {
+              detail = `  (peak ${c.peakForceN.toFixed(1)} N, ${(c.peakPenetrationMm ?? 0).toFixed(2)} mm deep)`;
+            } else if (c.overlapVolume > 0) {
+              detail = `  (overlap ${c.overlapVolume.toFixed(1)} mm³)`;
+            }
             lines.push(`  ${(c.tStart * 1000).toFixed(0).padStart(5)} ms  ${c.a} ↔ ${c.b}${detail}`);
           }
         }
@@ -5729,7 +5745,7 @@ export function registerTools(server: McpServer) {
         }
 
         // Dynamics: per-dynamic-body net displacement + whether it came to rest.
-        if (wantsDynamics && dynamicBodies.length > 0) {
+        if (forceBased && dynamicBodies.length > 0) {
           const frames = result.frames;
           const first = frames[0];
           const last = frames[frames.length - 1];

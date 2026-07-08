@@ -294,6 +294,14 @@ export interface CollisionEvent {
   tStart: number;
   /** Overlap volume (mm³) at tStart — a rough severity proxy. */
   overlapVolume: number;
+  /**
+   * DYNAMICS (MuJoCo) only: peak contact normal force (N) between the pair over
+   * the run — how HARD they hit, summed across contact points. Absent on engines
+   * that don't compute contact forces (kinematic, Rapier).
+   */
+  peakForceN?: number;
+  /** DYNAMICS (MuJoCo) only: peak penetration depth (mm) between the pair — how DEEP they interfered. */
+  peakPenetrationMm?: number;
 }
 
 /**

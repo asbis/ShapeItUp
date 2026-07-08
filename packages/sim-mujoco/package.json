@@ -1,0 +1,12 @@
+{
+  "name": "@shapeitup/sim-mujoco",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@shapeitup/sim": "workspace:*",
+    "@mujoco/mujoco": "^3.10.0"
+  }
+}

@@ -35,6 +35,14 @@ export interface SimSpecInput {
    * automatically when any body is declared "dynamic".
    */
   mode?: "kinematic" | "dynamic";
+  /**
+   * Which solver runs the study. Omit for auto: the kinematic engine, or Rapier
+   * when a `dynamic` body / `mode:"dynamic"` is present. "kinematic" forces the
+   * analytic engine; "rapier" and "mujoco" force that force-based backend even
+   * for all-scripted scenes (MuJoCo brings native contacts between scripted
+   * bodies + a richer actuator/contact model). See @shapeitup/sim-mujoco.
+   */
+  engine?: "kinematic" | "rapier" | "mujoco";
   /** Glob → kind. First matching rule (in declaration order) wins; unmatched parts default to "static". */
   bodies: Record<string, BodyKind>;
   joints?: SimJoint[];
