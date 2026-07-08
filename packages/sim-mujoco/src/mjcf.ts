@@ -24,9 +24,27 @@
  * frame, so — unlike many engines — NO axis remap is needed.
  */
 import type { MeshData } from "./mesh";
-import { globToRegex, type Profile, type SimSpec, type Vec3 } from "@shapeitup/sim";
+import {
+  compose,
+  globToRegex,
+  linkageTransforms,
+  mulQuat,
+  rotate,
+  sub,
+  type FourBarLinkage,
+  type Profile,
+  type Quat,
+  type SimSpec,
+  type Transform,
+  type Vec3,
+} from "@shapeitup/sim";
 
 const MM_TO_M = 0.001;
+
+/** Weld solref for the crank of a DYNAMIC linkage (prescribed crank, tight track). */
+const LINK_WELD_SOLREF = "0.002 1";
+/** Connect solref closing a dynamic linkage loop — stiff enough to hold the pin. */
+const CONNECT_SOLREF = "0.002 1";
 
 /** Rotor-inertia floor (kg·m²) added to ACTUATED joints for numerical stability
  *  of stiff servos on light CAD parts. Negligible for realistically massive
@@ -55,6 +73,25 @@ export interface MjcfBuild {
   mocapOrder: string[];
   /** Actuators in declaration order — index === ctrl index. */
   actuators: ActuatorBinding[];
+  /** Physics-solved four-bar linkages (see FourBarLinkage.dynamic). */
+  dynamicLinkages: DynamicLinkageBinding[];
+}
+
+/**
+ * A physics-solved four-bar. The crank is a mocap-weld body prescribed to the
+ * driver angle; the coupler/rocker are dynamic bars closed by a `<connect>`. The
+ * engine drives the crank mocap, reads coupler/rocker from physics, and reports
+ * the connect (pin) force.
+ */
+export interface DynamicLinkageBinding {
+  linkage: FourBarLinkage;
+  /** Mocap index of the crank target (drive it to linkageTransforms(lk,t).crank). */
+  crankMocapIndex: number;
+  crankBody: string;
+  couplerBody: string;
+  rockerBody: string;
+  /** Equality index of the `<connect>` — its 3 efc rows are the pin force. */
+  connectName: string;
 }
 
 /** One MuJoCo actuator, with everything needed to compute its ctrl each step. */
@@ -127,13 +164,29 @@ export function buildMjcf(spec: SimSpec, meshes: Map<string, MeshData>): MjcfBui
   }
   const actuatorByJoint = new Map(spec.actuators.map((a) => [a.joint, a]));
 
-  // Children map for the rigid (static/dynamic) tree. Kinematic bodies are
-  // pulled out as top-level mocap bodies, so they don't participate here.
+  // Physics-solved four-bar linkages own their bars entirely (crank/coupler/rocker
+  // become a mocap-weld + connect subtree), so those bodies are pulled out of the
+  // normal body/joint emission below.
+  const dynFourBars = (spec.linkages ?? []).filter(
+    (l): l is FourBarLinkage => l.kind === "fourBar" && !!l.dynamic,
+  );
+  const linkageBodyIds = new Set<string>();
+  for (const l of dynFourBars) {
+    linkageBodyIds.add(l.crank.body);
+    linkageBodyIds.add(l.coupler.body);
+    linkageBodyIds.add(l.rocker.body);
+  }
+
+  // Parent→children map for the tree. Kinematic bodies are themselves emitted as
+  // top-level mocap+weld bodies (not tree children), but a static/dynamic child
+  // CAN nest under a kinematic parent — so it rides the scripted parent while its
+  // own joint articulates against it (matches Rapier, where a joint anchors to the
+  // parent body). Kinematic children are skipped (they're mocap-driven directly).
   const children = new Map<string, string[]>();
   const roots: string[] = [];
   for (const b of spec.bodies) {
-    if (b.kind === "kinematic") continue;
-    const parent = b.parent && byId.get(b.parent)?.kind !== "kinematic" ? b.parent : undefined;
+    if (b.kind === "kinematic" || linkageBodyIds.has(b.id)) continue;
+    const parent = b.parent && byId.has(b.parent) ? b.parent : undefined;
     if (parent) {
       const arr = children.get(parent) ?? [];
       arr.push(b.id);
@@ -259,13 +312,17 @@ export function buildMjcf(spec: SimSpec, meshes: Map<string, MeshData>): MjcfBui
   // The engine still outputs the exact scripted pose for these bodies (the weld
   // is a means to contacts/forces, not a source of visible lag).
   for (const b of spec.bodies) {
-    if (b.kind !== "kinematic") continue;
+    if (b.kind !== "kinematic" || linkageBodyIds.has(b.id)) continue;
     mocapOrder.push(b.id);
     const centre = centreOf(b.aabb);
     const half = halfOf(b.aabb);
     const mj = mjNameBySimId.get(b.id)!;
     const mt = `${mj}__mt`;
     worldChildren.push(`    <body name="${mt}" mocap="true" pos="${m3(centre)}"/>`);
+    // Static/dynamic children nest INSIDE the weld body so their joints anchor to
+    // this (scripted) frame — they ride the parent. gravcomp is per-body, so a
+    // nested dynamic child still feels gravity.
+    const kids = (children.get(b.id) ?? []).map((c) => emitBody(c, centre, "      ")).join("\n");
     worldChildren.push(
       // gravcomp="1": cancel gravity on the scripted body so it doesn't SAG off
       // its weld target (a sagging carriage would dip into a lowered needle's
@@ -273,9 +330,84 @@ export function buildMjcf(spec: SimSpec, meshes: Map<string, MeshData>): MjcfBui
       `    <body name="${mj}" pos="${m3(centre)}" gravcomp="1">\n` +
         `      <freejoint/>\n` +
         `      ${geomFor(b.id, mj, centre, half)}\n` +
+        (kids ? kids + "\n" : "") +
         `    </body>`,
     );
     equalityXml.push(`    <weld name="weld_${mj}" body1="${mj}" body2="${mt}" solref="${WELD_SOLREF}"/>`);
+  }
+
+  // ── Physics-solved four-bar linkages ────────────────────────────────────────
+  // Declared AFTER the kinematic mocaps so each linkage crank's mocap index just
+  // continues the mocap numbering. Each bar body frame = its rest bar frame
+  // (origin at the bar start, +X along the bar), matching the tessellated part
+  // (drawn +X from origin) — so the engine reads its pose straight out with no
+  // centre offset. The crank is a mocap-weld body prescribed to the driver angle;
+  // the coupler (nested, hinged at B) and rocker (hinged to world at D) are
+  // dynamic, closed by a <connect> at C.
+  const dynamicLinkages: DynamicLinkageBinding[] = [];
+  const excludeXml: string[] = [];
+  const conjQ = (q: Quat): Quat => [-q[0], -q[1], -q[2], q[3]];
+  const mjQuat = (q: Quat): string => `${num(q[3])} ${num(q[0])} ${num(q[1])} ${num(q[2])}`;
+  const posQ = (tf: Transform): string => `pos="${m3(tf.t)}" quat="${mjQuat(tf.q)}"`;
+  /** Bar geom in its own frame (origin at bar start). Mesh if present (already in
+   *  that frame), else a thin capsule of the declared length. */
+  const barGeom = (id: string, mj: string, len: number): string => {
+    const g = geomFor(id, mj, [0, 0, 0], [len / 2, 2, 2]);
+    // geomFor with centre [0,0,0] emits mesh verts as-is (bar frame). Its BOX
+    // fallback would be centred on the origin (wrong for a bar), so swap that for
+    // a +X capsule.
+    if (g.includes('type="mesh"')) return g;
+    return `<geom name="${mj}_g" type="capsule" fromto="0 0 0 ${num(len * MM_TO_M)} 0 0" size="0.003" density="1000"/>`;
+  };
+
+  for (const lk of dynFourBars) {
+    const T0 = linkageTransforms(lk, 0);
+    const Tc = T0.get(lk.crank.body)!;
+    const Tco = T0.get(lk.coupler.body)!;
+    const Tr = T0.get(lk.rocker.body)!;
+    const crankMj = mjNameBySimId.get(lk.crank.body)!;
+    const couplerMj = mjNameBySimId.get(lk.coupler.body)!;
+    const rockerMj = mjNameBySimId.get(lk.rocker.body)!;
+    const mt = `${crankMj}__mt`;
+    // Coupler frame relative to the (moving) crank frame.
+    const relCoupler: Transform = { q: mulQuat(conjQ(Tc.q), Tco.q), t: rotate(conjQ(Tc.q), sub(Tco.t, Tc.t)) };
+
+    worldChildren.push(`    <body name="${mt}" mocap="true" ${posQ(Tc)}/>`);
+    worldChildren.push(
+      `    <body name="${crankMj}" ${posQ(Tc)} gravcomp="1">\n` +
+        `      <freejoint/>\n` +
+        `      ${barGeom(lk.crank.body, crankMj, lk.crank.length)}\n` +
+        `      <body name="${couplerMj}" ${posQ(relCoupler)}>\n` +
+        `        <joint name="${couplerMj}_j" type="hinge" axis="0 0 1" pos="0 0 0" armature="${num(ARMATURE)}"/>\n` +
+        `        ${barGeom(lk.coupler.body, couplerMj, lk.coupler.length)}\n` +
+        `        <site name="${couplerMj}_C" pos="${num(lk.coupler.length * MM_TO_M)} 0 0"/>\n` +
+        `      </body>\n` +
+        `    </body>`,
+    );
+    worldChildren.push(
+      `    <body name="${rockerMj}" ${posQ(Tr)}>\n` +
+        `      <joint name="${rockerMj}_j" type="hinge" axis="0 0 1" pos="0 0 0" armature="${num(ARMATURE)}"/>\n` +
+        `      ${barGeom(lk.rocker.body, rockerMj, lk.rocker.length)}\n` +
+        `      <site name="${rockerMj}_C" pos="${num(lk.rocker.length * MM_TO_M)} 0 0"/>\n` +
+        `    </body>`,
+    );
+    const connectName = `connect_${crankMj}`;
+    equalityXml.push(`    <weld name="weld_${crankMj}" body1="${crankMj}" body2="${mt}" solref="${LINK_WELD_SOLREF}"/>`);
+    equalityXml.push(
+      `    <connect name="${connectName}" body1="${couplerMj}" body2="${rockerMj}" anchor="${num(lk.coupler.length * MM_TO_M)} 0 0" solref="${CONNECT_SOLREF}"/>`,
+    );
+    // The bars overlap at their shared pins — expected, so don't collide them.
+    for (const [a, b] of [[crankMj, couplerMj], [couplerMj, rockerMj], [crankMj, rockerMj]]) {
+      excludeXml.push(`    <exclude name="lex_${a}_${b}" body1="${a}" body2="${b}"/>`);
+    }
+    dynamicLinkages.push({
+      linkage: lk,
+      crankMocapIndex: mocapOrder.length + dynamicLinkages.length,
+      crankBody: lk.crank.body,
+      couplerBody: lk.coupler.body,
+      rockerBody: lk.rocker.body,
+      connectName,
+    });
   }
 
   for (const id of roots) worldChildren.push(emitBody(id, [0, 0, 0], "    "));
@@ -285,7 +417,7 @@ export function buildMjcf(spec: SimSpec, meshes: Map<string, MeshData>): MjcfBui
   // contact forces — shoving a weld-driven part off its scripted path (a needle
   // popping up into the carriage → phantom collisions). So we don't just filter
   // the REPORT (the engine does that too); we physically EXCLUDE the contact.
-  const excludeXml: string[] = [];
+  // (excludeXml already holds the linkage pin-overlap excludes.)
   if (spec.acceptedPairs?.length) {
     const seen = new Set<string>();
     for (const [ga, gb] of spec.acceptedPairs) {
@@ -325,5 +457,5 @@ export function buildMjcf(spec: SimSpec, meshes: Map<string, MeshData>): MjcfBui
     (actuatorXml.length ? `  <actuator>\n${actuatorXml.join("\n")}\n  </actuator>\n` : "") +
     `</mujoco>\n`;
 
-  return { xml, simIdByMjName, mjNameBySimId, mocapOrder, actuators };
+  return { xml, simIdByMjName, mjNameBySimId, mocapOrder, actuators, dynamicLinkages };
 }

@@ -92,6 +92,7 @@ const linkage = z.discriminatedUnion("kind", [
     driver: profile,
     unit: linkUnit,
     config: linkConfig,
+    dynamic: z.boolean().optional(),
   }),
   z.object({
     kind: z.literal("sliderCrank"),

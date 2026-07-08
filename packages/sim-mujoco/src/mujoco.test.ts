@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { runMujoco } from "./mujoco";
 import { buildMjcf } from "./mjcf";
 import type { MeshData } from "./mesh";
-import { apply, type SimSpec, type Transform, type Vec3 } from "@shapeitup/sim";
+import { apply, linkageTransforms, type SimSpec, type Transform, type Vec3 } from "@shapeitup/sim";
 
 // World position of a body-local (rest-world) point from a recorded frame pose.
 function worldPoint(pose: number[], local: Vec3): Vec3 {
@@ -234,6 +234,35 @@ describe("runMujoco", () => {
     expect(await collidesWith(meshes)).toBe(false);
   });
 
+  it("a dynamic body rides a scripted kinematic parent while its own joint articulates", async () => {
+    // A pendulum pinned to a carriage that sweeps +X at 100 mm/s. The pivot must
+    // RIDE the carriage (parent), not stay grounded at the world anchor, while the
+    // bar still swings under gravity — matching Rapier's parent-anchored joints.
+    const spec: SimSpec = {
+      duration: 1,
+      timestep: 1 / 240,
+      gravity: [0, 0, -9810],
+      bodies: [
+        { id: "carriage", kind: "kinematic", aabb: boxAabb(0, 0, 0, 40, 40, 20) },
+        // Resolved SimSpec carries `parent` per body (SimSpecInput.parents → here).
+        { id: "pend", kind: "dynamic", aabb: { min: [-2, -2, -40], max: [2, 2, 0] }, parent: "carriage" },
+      ],
+      joints: [
+        { id: "drive", body: "carriage", type: "prismatic", anchor: [0, 0, 0], axis: [1, 0, 0] },
+        { id: "pin", body: "pend", type: "revolute", anchor: [0, 0, 0], axis: [0, 1, 0] },
+      ],
+      actuators: [{ id: "drive", joint: "drive", profile: { kind: "velocity", v: 100 } }],
+    };
+    const result = await runMujoco(spec, noMeshes);
+    const last = result.frames[result.frames.length - 1].poses["pend"];
+    // Pivot = pendulum local [0,0,0] (its top) — rode the carriage toward x≈100.
+    const pivot = worldPoint(last, [0, 0, 0]);
+    expect(pivot[0]).toBeGreaterThan(50);
+    // Still hangs roughly downward under gravity (tip below the pivot).
+    const tip = worldPoint(last, [0, 0, -40]);
+    expect(tip[2]).toBeLessThan(pivot[2] - 20);
+  });
+
   it("four-bar linkage: the loop stays closed on MuJoCo (analytic solver → kinematic bodies)", async () => {
     // A link body is a bar from its local origin along +X of the declared length.
     const barAabb = (len: number) => boxAabb(len / 2, 0, 2, len, 4, 4);
@@ -284,6 +313,56 @@ describe("runMujoco", () => {
     const tip0 = worldPoint(result.frames[0].poses["crank"], [30, 0, 0]);
     const tipMid = worldPoint(result.frames[Math.floor(result.frames.length / 2)].poses["crank"], [30, 0, 0]);
     expect(Math.hypot(tipMid[0] - tip0[0], tipMid[1] - tip0[1])).toBeGreaterThan(5);
+  });
+
+  it("dynamic four-bar: physics-solves the loop, follows the analytic path, reports pin force", async () => {
+    const barAabb = (len: number) => boxAabb(len / 2, 0, 2, len, 4, 4);
+    const lk = {
+      kind: "fourBar" as const,
+      dynamic: true,
+      ground: [[0, 0, 0], [100, 0, 0]] as [Vec3, Vec3],
+      crank: { body: "crank", length: 30 },
+      coupler: { body: "coupler", length: 90 },
+      rocker: { body: "rocker", length: 60 },
+      driver: { kind: "keyframes" as const, points: [{ t: 0, q: 40 }, { t: 1, q: 140 }, { t: 2, q: 40 }] },
+      unit: "deg" as const,
+    };
+    const spec: SimSpec = {
+      duration: 2,
+      timestep: 1 / 500,
+      gravity: [0, 0, -9810],
+      bodies: [
+        { id: "crank", kind: "kinematic", aabb: barAabb(30) },
+        { id: "coupler", kind: "kinematic", aabb: barAabb(90) },
+        { id: "rocker", kind: "kinematic", aabb: barAabb(60) },
+      ],
+      joints: [],
+      actuators: [],
+      linkages: [lk],
+    };
+    const result = await runMujoco(spec, noMeshes);
+
+    // The pin force is the payoff — under gravity the coupler↔rocker joint carries load.
+    expect(result.pinForces).toBeDefined();
+    expect(result.pinForces).toHaveLength(1);
+    expect(result.pinForces![0].peakForceN).toBeGreaterThan(0);
+
+    // Physics tracks the analytic four-bar within a couple mm (after a brief settle).
+    for (let i = 100; i < result.frames.length; i += 50) {
+      const f = result.frames[i];
+      const T = linkageTransforms(lk, f.t);
+      // Crank is prescribed → exact.
+      const crankTip = worldPoint(f.poses["crank"], [30, 0, 0]);
+      const B = apply(T.get("crank")!, [30, 0, 0]);
+      expect(Math.hypot(crankTip[0] - B[0], crankTip[1] - B[1], crankTip[2] - B[2])).toBeLessThan(0.5);
+      // Coupler far end (C) — physics — matches the analytic solution.
+      const couplerC = worldPoint(f.poses["coupler"], [90, 0, 0]);
+      const C = apply(T.get("coupler")!, [90, 0, 0]);
+      expect(Math.hypot(couplerC[0] - C[0], couplerC[1] - C[1], couplerC[2] - C[2])).toBeLessThan(3);
+      // Loop closed: coupler far end coincides with rocker far end.
+      const rockerC = worldPoint(f.poses["rocker"], [60, 0, 0]);
+      expect(Math.hypot(couplerC[0] - rockerC[0], couplerC[1] - rockerC[1], couplerC[2] - rockerC[2])).toBeLessThan(2);
+    }
   });
 
   it("a position actuator drives a revolute joint to its target angle (90°)", async () => {

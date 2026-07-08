@@ -5733,6 +5733,18 @@ export function registerTools(server: McpServer) {
           }
         }
 
+        // Pin forces: physics-solved linkages (dynamic four-bar on MuJoCo) report
+        // the peak constraint load at each closed-loop joint — the payoff of `dynamic`.
+        if (result.pinForces && result.pinForces.length > 0) {
+          lines.push("");
+          lines.push("Linkage pin forces (peak):");
+          for (const p of result.pinForces) {
+            // Adaptive precision: small (thin/light) parts can carry sub-newton loads.
+            const f = p.peakForceN >= 1 ? p.peakForceN.toFixed(1) : p.peakForceN.toPrecision(2);
+            lines.push(`  ${p.a} ↔ ${p.b}: ${f} N`);
+          }
+        }
+
         // Contact windows (kinematic): show every start–end interval when a pair
         // re-collides (more windows than first-onsets) or when full detail asked.
         const intervals = result.contactIntervals ?? [];

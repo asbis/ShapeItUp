@@ -21,11 +21,13 @@ import {
   apply,
   evaluateProfile,
   isAcceptedPair,
+  linkageTransforms,
   rotate,
   type CollisionEvent,
   type Quat,
   type SimResult,
   type SimSpec,
+  type Transform,
   type Vec3,
 } from "@shapeitup/sim";
 import { loadMujocoModule } from "./loader";
@@ -75,6 +77,19 @@ export async function runMujoco(spec: SimSpec, meshes: Map<string, MeshData>): P
     const kinematicIds = new Set(spec.bodies.filter((b) => b.kind === "kinematic").map((b) => b.id));
     type Pose = { t: Vec3; q: Quat };
 
+    // Physics-solved linkages: the crank is prescribed (its exact analytic pose is
+    // the output), while the coupler/rocker are dynamic bars whose MJCF body frame
+    // IS their rest bar frame — so their pose reads straight from xpos/xquat with
+    // no centre offset (unlike a normal dynamic body, centred on its AABB).
+    const linkageCrank = new Map<string, DynLink>(); // crank sim id → linkage
+    const barFrameBodies = new Set<string>(); // coupler + rocker sim ids
+    type DynLink = (typeof build.dynamicLinkages)[number];
+    for (const dl of build.dynamicLinkages) {
+      linkageCrank.set(dl.crankBody, dl);
+      barFrameBodies.add(dl.couplerBody);
+      barFrameBodies.add(dl.rockerBody);
+    }
+
     // ── Read one frame ──────────────────────────────────────────────────────
     // Kinematic bodies are weld-driven dynamic bodies (so they generate
     // contacts), but their INTENDED motion is the exact script — so we output
@@ -85,6 +100,15 @@ export async function runMujoco(spec: SimSpec, meshes: Map<string, MeshData>): P
       const xquat: ArrayLike<number> = data.xquat; // [nbody*4], (w,x,y,z)
       const poses: SimResult["frames"][number]["poses"] = {};
       for (const b of spec.bodies) {
+        // A physics-linkage crank is prescribed — output its exact analytic pose.
+        const dl = linkageCrank.get(b.id);
+        if (dl) {
+          const tf = linkageTransforms(dl.linkage, t).get(b.id);
+          if (tf) {
+            poses[b.id] = [tf.t[0], tf.t[1], tf.t[2], tf.q[0], tf.q[1], tf.q[2], tf.q[3]];
+            continue;
+          }
+        }
         if (kinematicIds.has(b.id)) {
           const tf = kinPoses?.get(b.id);
           if (tf) {
@@ -97,6 +121,11 @@ export async function runMujoco(spec: SimSpec, meshes: Map<string, MeshData>): P
         const p = bid * 3;
         const w = bid * 4;
         const q: Quat = [xquat[w + 1], xquat[w + 2], xquat[w + 3], xquat[w]]; // (x,y,z,w)
+        if (barFrameBodies.has(b.id)) {
+          // MJCF body frame == rest bar frame → xpos/xquat IS the delta directly.
+          poses[b.id] = [xpos[p] * M_TO_MM, xpos[p + 1] * M_TO_MM, xpos[p + 2] * M_TO_MM, q[0], q[1], q[2], q[3]];
+          continue;
+        }
         const centre = centreById.get(b.id)!;
         const qo = rotate(q, centre); // q·centre (mm)
         poses[b.id] = [
@@ -147,6 +176,61 @@ export async function runMujoco(spec: SimSpec, meshes: Map<string, MeshData>): P
       }
     };
 
+    // ── Prescribe each physics-linkage crank (mocap-weld) to its analytic pose ──
+    // The crank body frame is its rest bar frame, so the mocap target pose IS the
+    // analytic crank transform (no centre offset). The coupler/rocker then solve.
+    const driveLinkageCranks = (t: number) => {
+      if (build.dynamicLinkages.length === 0) return;
+      const mpos = data.mocap_pos;
+      const mquat = data.mocap_quat;
+      for (const dl of build.dynamicLinkages) {
+        const tf = linkageTransforms(dl.linkage, t).get(dl.crankBody);
+        if (!tf) continue;
+        const i = dl.crankMocapIndex;
+        mpos[i * 3] = tf.t[0] * MM_TO_M;
+        mpos[i * 3 + 1] = tf.t[1] * MM_TO_M;
+        mpos[i * 3 + 2] = tf.t[2] * MM_TO_M;
+        mquat[i * 4] = tf.q[3];
+        mquat[i * 4 + 1] = tf.q[0];
+        mquat[i * 4 + 2] = tf.q[1];
+        mquat[i * 4 + 3] = tf.q[2];
+      }
+    };
+
+    // Peak connect (pin) force per physics linkage, over the run.
+    const CONNECT_EQ = 0; // mjtEq.mjEQ_CONNECT
+    const eqType: ArrayLike<number> = model.eq_type;
+    const pinPeak = new Map<string, number>(); // "coupler|rocker" → peak N
+    const samplePinForces = () => {
+      if (build.dynamicLinkages.length === 0) return;
+      const ne: number = data.ne;
+      if (ne <= 0) return;
+      const efcId: ArrayLike<number> = data.efc_id;
+      const efcForce: ArrayLike<number> = data.efc_force;
+      // Group the (3 consecutive) rows of each CONNECT equality by its eq index,
+      // in first-seen order — which is the dynamicLinkages order.
+      const byEq = new Map<number, number[]>();
+      const order: number[] = [];
+      for (let i = 0; i < ne; i++) {
+        const eq = efcId[i];
+        if (eqType[eq] !== CONNECT_EQ) continue;
+        let v = byEq.get(eq);
+        if (!v) {
+          v = [];
+          byEq.set(eq, v);
+          order.push(eq);
+        }
+        if (v.length < 3) v.push(efcForce[i]);
+      }
+      for (let k = 0; k < order.length && k < build.dynamicLinkages.length; k++) {
+        const v = byEq.get(order[k])!;
+        const mag = Math.hypot(v[0] ?? 0, v[1] ?? 0, v[2] ?? 0);
+        const dl = build.dynamicLinkages[k];
+        const key = `${dl.couplerBody}|${dl.rockerBody}`;
+        pinPeak.set(key, Math.max(pinPeak.get(key) ?? 0, mag));
+      }
+    };
+
     // ── Step loop ───────────────────────────────────────────────────────────
     const anyKin = kinematicIds.size > 0;
     const posesAt = (t: number): Map<string, Pose> | null => (anyKin ? kin.poseAt(t) : null);
@@ -154,6 +238,7 @@ export async function runMujoco(spec: SimSpec, meshes: Map<string, MeshData>): P
     mj.mj_forward(model, data); // populate xpos/xquat before frame 0
     const kp0 = posesAt(0);
     if (kp0) driveMocap(kp0);
+    driveLinkageCranks(0);
     const steps = Math.max(1, Math.round(spec.duration / spec.timestep));
     const frames: SimResult["frames"] = [recordFrame(0, kp0)];
 
@@ -170,7 +255,9 @@ export async function runMujoco(spec: SimSpec, meshes: Map<string, MeshData>): P
       const kp = posesAt(t);
       if (kp) driveMocap(kp);
       driveCtrl(t);
+      driveLinkageCranks(t);
       mj.mj_step(model, data);
+      samplePinForces();
 
       const ncon: number = data.ncon;
       if (ncon > 0) {
@@ -216,7 +303,18 @@ export async function runMujoco(spec: SimSpec, meshes: Map<string, MeshData>): P
     forceBuf.delete();
 
     const collisions = [...recs.values()].sort((x, y) => x.tStart - y.tStart);
-    return { frames, collisions, duration: spec.duration, timestep: spec.timestep };
+    const pinForces = build.dynamicLinkages.map((dl) => ({
+      a: dl.couplerBody,
+      b: dl.rockerBody,
+      peakForceN: pinPeak.get(`${dl.couplerBody}|${dl.rockerBody}`) ?? 0,
+    }));
+    return {
+      frames,
+      collisions,
+      duration: spec.duration,
+      timestep: spec.timestep,
+      ...(pinForces.length ? { pinForces } : {}),
+    };
   } finally {
     data.delete();
     model.delete();

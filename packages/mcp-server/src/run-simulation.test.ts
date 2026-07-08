@@ -66,6 +66,29 @@ const CARRIAGE_NEEDLES = [
   `};`,
 ].join("\n");
 
+const DYNAMIC_FOURBAR = [
+  `import { drawRectangle } from "replicad";`,
+  `function bar(len, name, color) {`,
+  `  return { shape: drawRectangle(len, 4).sketchOnPlane("XY").extrude(4).translate(len / 2, 0, 0), name, color };`,
+  `}`,
+  `export default function main() {`,
+  `  return [ bar(30, "crank", "#d64545"), bar(90, "coupler", "#45a0d6"), bar(60, "rocker", "#d6b845") ];`,
+  `}`,
+  `export const sim = {`,
+  `  engine: "mujoco",`,
+  `  bodies: { crank: "kinematic", coupler: "dynamic", rocker: "dynamic" },`,
+  `  gravity: [0, 0, -9810],`,
+  `  timestep: 1 / 500,`,
+  `  linkages: [{`,
+  `    kind: "fourBar", dynamic: true,`,
+  `    ground: [[0, 0, 0], [100, 0, 0]],`,
+  `    crank: { body: "crank", length: 30 }, coupler: { body: "coupler", length: 90 }, rocker: { body: "rocker", length: 60 },`,
+  `    driver: { kind: "keyframes", points: [{ t: 0, q: 40 }, { t: 1, q: 140 }, { t: 2, q: 40 }] }, unit: "deg",`,
+  `  }],`,
+  `  duration: 2,`,
+  `};`,
+].join("\n");
+
 const NO_SIM = [
   `import { drawRectangle } from "replicad";`,
   `export default function main() { return drawRectangle(10, 10).sketchOnPlane("XY").extrude(5); }`,
@@ -161,6 +184,38 @@ describe("run_simulation headless integration", () => {
             .map((c) => (c.a === "carriage" ? c.b : c.a)),
         );
         expect(hitNeedles).toEqual(new Set(["needle-2", "needle-4"]));
+      } finally {
+        rmSync(workdir, { recursive: true, force: true });
+        rmSync(storage, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+
+  it(
+    "engine: mujoco — dynamic four-bar physics-solves the loop and reports a pin force",
+    async () => {
+      const { workdir, storage } = makeDirs();
+      try {
+        const entryPath = join(workdir, "fourbar-dyn.shape.ts");
+        writeFileSync(entryPath, DYNAMIC_FOURBAR);
+        const outcome = await executeShapeFile(entryPath, storage);
+        expect(outcome.status.success).toBe(true);
+        if (!isSimSpecInput(outcome.sim)) throw new Error("sim block not surfaced");
+
+        const parts = outcome.parts as Array<{ name: string; vertices: Float32Array; triangles: Uint32Array }>;
+        const { spec } = resolveSimSpec(outcome.sim, partAabbs(parts));
+        const meshes = new Map<string, MeshData>();
+        for (const p of parts) {
+          if (p.vertices?.length >= 9 && p.triangles?.length >= 3) {
+            meshes.set(p.name, { vertices: p.vertices, indices: p.triangles });
+          }
+        }
+        const result = await runMujoco(spec, meshes);
+        // The whole OCCT → resolve → physics-linkage → pin-force path works.
+        expect(result.pinForces).toBeDefined();
+        expect(result.pinForces).toHaveLength(1);
+        expect(result.pinForces![0].peakForceN).toBeGreaterThan(0);
       } finally {
         rmSync(workdir, { recursive: true, force: true });
         rmSync(storage, { recursive: true, force: true });

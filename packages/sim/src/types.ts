@@ -194,6 +194,15 @@ export interface FourBarLinkage {
   driver: Profile;
   unit?: "rad" | "deg";
   config?: "open" | "crossed";
+  /**
+   * MuJoCo only: physics-solve the loop instead of the analytic path. The crank
+   * is still driven to `driver`, but the coupler and rocker follow from a real
+   * rigid-body solve closed by a `<connect>` constraint — so the run yields the
+   * PIN FORCE at the coupler↔rocker joint (reported as a collision-style entry)
+   * and the links respond to gravity/contacts. Ignored by the kinematic and
+   * Rapier engines, which solve it analytically as before.
+   */
+  dynamic?: boolean;
 }
 
 /**
@@ -330,6 +339,12 @@ export interface SimResult {
   collisions: CollisionEvent[];
   /** Contact windows per pair (a pair may appear more than once). Kinematic engine only. */
   contactIntervals?: ContactInterval[];
+  /**
+   * DYNAMICS (MuJoCo) only: peak PIN FORCE (N) at each physics-solved linkage
+   * joint over the run — the payoff of a `dynamic` four-bar. `a`/`b` are the two
+   * jointed bodies (coupler↔rocker). Absent on the kinematic/Rapier engines.
+   */
+  pinForces?: Array<{ a: string; b: string; peakForceN: number }>;
   duration: number;
   timestep: number;
 }

@@ -198,16 +198,43 @@ Per the release rule, `mcp-server` **and** `extension` were bumped in lockstep
 bodies, hinge/slide joints, position/velocity actuators, gravity, accepted-pair
 excludes, **real mesh-geom colliders** (inline vertices → convex hull, box fallback),
 and **contact force + penetration reporting**. `carriage-needles` (on real OCCT
-tessellation), `gravity-drop`, and **four-bar linkages** reproduce on MuJoCo. Wired
+tessellation), `gravity-drop`, and **four-bar linkages** reproduce on MuJoCo;
+dynamic bodies can **ride a scripted kinematic parent** while articulating. Wired
 into `run_simulation` behind `engine:"mujoco"`, and into the **viewer** (in-webview
-playback via the runtime-loaded glue — see below). 11 unit + 1 end-to-end test; full
+playback via the runtime-loaded glue — see below). 14 unit + 2 end-to-end tests; full
 suite green.
 
-**Closed loops already work.** Linkage bodies are *kinematic*, so the analytic
-`linkages.ts` solver drives them (via `poseAt` → weld-mocap) and the four-bar loop
-stays closed on MuJoCo — verified. A `<equality connect>` path would only be needed
-for *force-driven* dynamic loops (where MuJoCo computes the constraint forces), a
-separate larger feature.
+**Closed loops — two modes.** *Kinematic* (default): linkage bodies are kinematic, the
+analytic `linkages.ts` solver drives them (`poseAt` → weld-mocap), and the four-bar
+loop stays closed on MuJoCo. *Force-driven* (`dynamic: true` on a `FourBarLinkage`,
+MuJoCo only): the crank is prescribed to the driver angle via a mocap-weld body while
+the coupler/rocker are real dynamic bars, closed by a `<connect>` constraint — so the
+run **reports the pin force** at the coupler↔rocker joint (`SimResult.pinForces`) and
+the links respond to gravity/contacts. Implementation notes in §7a.
+
+### 7a. Force-driven four-bar (`dynamic: true`)
+
+The robust recipe (after finding a position servo on the crank is unstable):
+
+- **Seed the closed t=0 config** from `linkageTransforms(lk, 0)`; nest the coupler in
+  the crank frame via `{q: q̄crank·qcoupler, t: R(q̄crank)·(Bcoupler−Acrank)}`. The
+  loop closes to ~0 mm at reference, which is what `<connect>` needs.
+- **Crank = mocap-weld** kinematic body (`gravcomp="1"`), prescribed each step to
+  `linkageTransforms(lk, t).crank` — no servo, so no runaway.
+- **Coupler** (dynamic, hinged at B, nested in the crank) + **rocker** (dynamic,
+  hinged to world at D), closed by `<connect body1=coupler body2=rocker>`.
+- **Bar-frame convention:** each linkage bar's MJCF body frame IS its rest bar frame
+  (origin at the bar start, +X along the bar, matching the tessellated part drawn +X
+  from origin), so the engine reads the coupler/rocker pose straight from `xpos/xquat`
+  with no centre offset (unlike a normal AABB-centred dynamic body). The crank outputs
+  its exact analytic pose.
+- **Pin force:** a `<connect>` is 3 equality rows; the engine finds them by
+  `eq_type == mjEQ_CONNECT` and reads `efc_force`, tracking the peak per linkage.
+- Bars are `<contact><exclude>`'d pairwise (they overlap at shared pins).
+
+Verified: physics tracks the analytic path within ~1–3 mm, the loop holds to <2 mm,
+and the pin force is physically sensible (~fraction of the bars' weight). Only the
+four-bar is wired; slider-crank/gear would follow the same pattern.
 
 ### Viewer playback (implemented; needs one F5 smoke-test)
 
@@ -235,15 +262,24 @@ browser runtime itself (does `import(webviewUri)` + Emscripten fetch work inside
 VS Code webview) — needs a one-time F5 check. Cost: the VSIX grows ~10 MB (the
 `.wasm`), same as it ships OCCT/manifold WASM today.
 
+**Dynamic child riding a kinematic parent — done.** A static/dynamic body with a
+kinematic `parent` now nests inside that parent's weld-driven body, so its own
+joint anchors to the (scripted) parent frame — it rides the carriage while
+articulating, matching Rapier's parent-anchored joints. `gravcomp` is per-body, so
+a nested dynamic child still feels gravity. Verified (a pendulum pinned to a
+sweeping carriage rides +X while hanging under gravity).
+
+**Force-driven four-bar (`dynamic: true`) — done.** See §7a. Physics-solves the loop
+and reports pin forces; verified end-to-end on real OCCT geometry.
+
 **Next.**
 
-1. **Concave decomposition (Phase 2b).** Multi-hull colliders for concave *dynamic*
+1. **Extend force-driven loops to slider-crank / gear.** Same recipe as §7a (seed
+   from `linkageTransforms`, prescribe the driver, close with `<connect>` / a slider
+   guide). Only `fourBar` is wired today.
+2. **Concave decomposition (Phase 2b).** Multi-hull colliders for concave *dynamic*
    parts via `vhacd-js` (only JS/WASM option; unmaintained — pull in only on a
    concrete need). Static concave parts are handled by `acceptedPairs` today.
-3. **Dynamic child riding a kinematic parent.** A freejoint body can't be an MJCF
-   child of a mocap body; today such a child grounds independently. With scripted
-   bodies now contacting, riding-via-contact works; a `<connect>` constraint would
-   make it rigid.
 
 ---
 
