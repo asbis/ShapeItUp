@@ -1,3 +1,5 @@
+import type { WebviewToExt } from "@shapeitup/shared";
+
 type MessageCallback = (data: any) => void;
 
 const vscodeApi = (globalThis as any).acquireVsCodeApi?.();
@@ -63,7 +65,15 @@ export function initMessageHandler() {
   });
 }
 
-export function postToExtension(message: any) {
+/**
+ * Send a message to whichever host is on the other side.
+ *
+ * Typed as `WebviewToExt` rather than `any`: an undeclared message used to
+ * compile fine here and simply never be handled. `export-split-data` sat in
+ * exactly that state — sent on every split export, absent from the union, and
+ * invisible because this parameter accepted anything.
+ */
+export function postToExtension(message: WebviewToExt) {
   if (vscodeApi) {
     vscodeApi.postMessage(message);
     return;

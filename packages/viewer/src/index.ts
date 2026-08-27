@@ -10,7 +10,7 @@ import {
 } from "./camera";
 import { buildMesh, buildEdges } from "./mesh-builder";
 import { initMessageHandler, onMessage, postToExtension } from "./message-handler";
-import type { WorkerToWebview, TessellatedPart } from "@shapeitup/shared";
+import type { WorkerToWebview, TessellatedPart, DetectedApp } from "@shapeitup/shared";
 import { PART_COLORS } from "./theme";
 import { setupSim, updateSim, clearSim, initSimPanel, toggleSimPanel } from "./sim-panel";
 
@@ -1127,7 +1127,10 @@ document.getElementById("btn-measure")!.addEventListener("click", () => {
 });
 
 // --- Export dropdown ---
-type InstalledApp = { id: string; name: string; preferredFormat: "step" | "stl" | "3mf" };
+// Use the shared DetectedApp rather than a local re-declaration: the duplicate
+// had drifted to `id: string`, which quietly widened the id the viewer sends
+// back in `toolbar-open-in-app`.
+type InstalledApp = Pick<DetectedApp, "id" | "name" | "preferredFormat">;
 
 const exportWrapper = document.getElementById("export-menu-wrapper")!;
 const exportMenu = document.getElementById("export-menu")!;

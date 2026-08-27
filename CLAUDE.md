@@ -71,7 +71,8 @@ skills/          — Claude Code skill (skills/<name>/SKILL.md layout)
 
 ```bash
 pnpm install
-pnpm build          # builds all 4 packages
+pnpm build          # builds all bundles
+pnpm lint           # tsc -b over EVERY package — keep it that way
 pnpm dev            # watch mode
 # Press F5 in VS Code to launch Extension Development Host
 ```

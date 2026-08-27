@@ -1,4 +1,4 @@
-import type { ExportFormat } from "./types.js";
+import type { AppId, ExportFormat } from "./types.js";
 
 /**
  * Shared esbuild externals for runtime `.shape.ts` bundling. Both the MCP
@@ -112,10 +112,51 @@ export interface ParamCommitResult {
 // Webview → Extension Host
 export type WebviewToExt =
   | { type: "export-data"; format: ExportFormat; data: ArrayBuffer }
+  /** The split-export counterpart of `export-data`; the host writes one file per item. */
+  | {
+      type: "export-split-data";
+      format: ExportFormat;
+      items: Array<{ name: string; data: ArrayBuffer }>;
+    }
   | { type: "screenshot-data"; dataUrl: string }
-  | { type: "error"; message: string; line?: number; fileName?: string }
+  | { type: "error"; message: string; line?: number; fileName?: string; operation?: string; stack?: string }
   | { type: "status"; message: string }
-  | { type: "toolbar-export"; format: ExportFormat }
+  /** `split: true` asks for one file per part instead of a single document. */
+  | { type: "toolbar-export"; format: ExportFormat; split?: boolean }
+  | { type: "toolbar-open-in-app"; appId: AppId }
+  /** Handshake: the viewer finished rendering both screenshot frames. */
+  | { type: "screenshot-ready" }
+  /**
+   * Non-fatal: a `focusPart` / `hideParts` name matched no loaded part. The
+   * host buffers these so the active render_preview call can surface them.
+   */
+  | { type: "part-warning"; message: string }
+  /**
+   * Everything the host wants to know about a completed render. Only `stats` is
+   * read today; the rest is diagnostic payload the MCP side has historically
+   * grown into, so it is declared rather than left to `any`.
+   */
+  | {
+      type: "render-success";
+      stats: string;
+      partCount: number;
+      partNames: string[];
+      boundingBox: { x: number; y: number; z: number };
+      currentParams: Record<string, number>;
+      timings?: Record<string, number>;
+      warnings?: string[];
+      properties?: {
+        parts: Array<{
+          name: string;
+          volume?: number;
+          surfaceArea?: number;
+          centerOfMass?: [number, number, number];
+        }>;
+        totalVolume?: number;
+        totalSurfaceArea?: number;
+        centerOfMass?: [number, number, number];
+      };
+    }
   | { type: "param-changed"; params: Record<string, number> }
   | { type: "ready" }
   // Webview asks the extension for the cached OCCT (+ optional Manifold) bytes
@@ -213,6 +254,15 @@ export type WorkerToWebview =
       sim?: unknown;
     }
   | { type: "export-result"; format: ExportFormat; data: ArrayBuffer }
+  /**
+   * One buffer per part, for "export each component to its own file". Sent by
+   * `handleExportSplit`; every `data` is transferred, not copied.
+   */
+  | {
+      type: "export-split-result";
+      format: ExportFormat;
+      items: Array<{ name: string; data: ArrayBuffer }>;
+    }
   | {
       type: "error";
       message: string;

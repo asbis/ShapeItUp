@@ -564,7 +564,7 @@ describe("patchShapeMeshLeak — deletes BRepMesh wrapper after meshing", () => 
     // deletion). The module-level `meshPatchApplied` flag protects this.
     const fakeReplicad: any = {
       Shape: class {
-        oc = { BRepMesh_IncrementalMesh_2: function () { this.delete = () => {}; } as any };
+        oc = { BRepMesh_IncrementalMesh_2: function (this: any) { this.delete = () => {}; } as any };
         wrapped = {};
         _mesh() { /* leaky */ }
       },

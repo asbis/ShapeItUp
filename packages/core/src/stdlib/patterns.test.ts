@@ -477,11 +477,13 @@ describe("patterns.cutAt — silent no-op guards", () => {
     const target = mockShape([[-10, -10, 0], [10, 10, 5]], 1000, "real");
     const tool = mockShape([[-1, -1, 0], [1, 1, 5]], 10);
     expect(() =>
-      // @ts-expect-error — intentionally wrong shape to test the runtime guard
+      // Deliberately the wrong shape, to exercise the RUNTIME guard. There is
+      // no suppression directive here on purpose: `tool` is an `any` double, so
+      // TypeScript reports nothing to suppress. The strict `() => Shape3D`
+      // contract still stands for real callers.
       patterns.cutAt(target, tool, [{ translate: [0, 0, 0] }]),
     ).toThrow(TypeError);
     expect(() =>
-      // @ts-expect-error — see above
       patterns.cutAt(target, tool, [{ translate: [0, 0, 0] }]),
     ).toThrow(/must be a factory function/);
   });
@@ -756,11 +758,10 @@ describe("patterns.cutTop / cutBottom — plate-face cut sugar", () => {
     const plate = plateMock([[-10, -10, 0], [10, 10, 5]]);
     const notAFactory = trackingTool([[-1, -1, 0], [1, 1, 5]]);
     expect(() =>
-      // @ts-expect-error — intentionally wrong shape
+      // Wrong shape on purpose — runtime guard only; `notAFactory` is `any`.
       patterns.cutTop(plate, notAFactory, [0, 0]),
     ).toThrow(TypeError);
     expect(() =>
-      // @ts-expect-error — see above
       patterns.cutTop(plate, notAFactory, [0, 0]),
     ).toThrow(/must be a factory function/);
   });
