@@ -1339,10 +1339,14 @@ function updateParamsUI(params: ParamDef[]) {
       const input = document.getElementById(`pv-${p.name}`) as HTMLInputElement | null;
       if (!input) continue;
       input.dataset.step = String(p.step ?? (Math.abs(p.value) >= 10 ? 1 : 0.1));
-      // Never overwrite the field someone is typing in.
-      if (document.activeElement !== input) {
+      // Protect a field with edits in it, not merely one that holds focus.
+      // Guarding on focus alone left a stale number on screen whenever the file
+      // changed while the cursor happened to be resting in that field.
+      const beingEdited = document.activeElement === input && input.dataset.dirty === "1";
+      if (!beingEdited) {
         input.value = formatParamValue(p.value);
         input.classList.remove("invalid");
+        delete input.dataset.dirty;
       }
     }
     return;
@@ -1388,6 +1392,7 @@ function updateParamsUI(params: ParamDef[]) {
 
     const commit = (val: number) => {
       lastGood = val;
+      delete input.dataset.dirty;
       currentParamValues[p.name] = val;
       // Flush any pending preview so what is on screen matches what is written.
       if (paramDebounceTimer) {
@@ -1412,6 +1417,7 @@ function updateParamsUI(params: ParamDef[]) {
     // it is, and committing every keystroke would write "1", "12", "127" on the
     // way to 1270.
     input.addEventListener("input", () => {
+      input.dataset.dirty = "1";
       const val = parse();
       input.classList.toggle("invalid", val === null && input.value.trim() !== "");
       if (val !== null) preview(val);
@@ -1423,6 +1429,7 @@ function updateParamsUI(params: ParamDef[]) {
       if (val === null) {
         input.value = formatParamValue(lastGood);
         input.classList.remove("invalid");
+        delete input.dataset.dirty;
         preview(lastGood);
         return;
       }
@@ -1435,6 +1442,7 @@ function updateParamsUI(params: ParamDef[]) {
     const nudge = (direction: 1 | -1, e: { shiftKey: boolean; altKey: boolean }) => {
       const base = Number(input.dataset.step) || 1;
       const step = e.shiftKey ? base * 10 : e.altKey ? base / 10 : base;
+      input.dataset.dirty = "1";
       const from = parse() ?? lastGood;
       // Re-round to the step's precision, or 0.1 steps accumulate float dust.
       const next = Number((from + direction * step).toFixed(6));
@@ -1479,6 +1487,7 @@ function updateParamsUI(params: ParamDef[]) {
         clearTimeout(nudgeTimer);
         input.value = formatParamValue(lastGood);
         input.classList.remove("invalid");
+        delete input.dataset.dirty;
         preview(lastGood);
         input.blur();
       }
