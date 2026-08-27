@@ -421,6 +421,12 @@ export function executeScript(
 
       var __params__ = __resolvedParams__ || {};
 
+      // Snapshot what the FILE declares before overrides land on top. Slider
+      // ranges are derived from these, not from the effective values — see
+      // the paramDefs comment below for why that distinction is load-bearing.
+      var __declaredParams__ = {};
+      for (var __dk in __params__) __declaredParams__[__dk] = __params__[__dk];
+
       if (__paramOverrides__) {
         for (var k in __paramOverrides__) {
           if (k in __params__) __params__[k] = __paramOverrides__[k];
@@ -458,7 +464,7 @@ export function executeScript(
         try { __sim__ = __sim__(__params__); } catch (e) { __sim__ = undefined; }
       }
 
-      return { result: __result__, params: __params__, material: __material__, config: __config__, sim: __sim__ };
+      return { result: __result__, params: __params__, declaredParams: __declaredParams__, material: __material__, config: __config__, sim: __sim__ };
     })(__replicadExports__, __shapeitupExports__, __paramOverrides__);
   `;
 
@@ -482,7 +488,14 @@ export function executeScript(
     "__paramOverrides__",
     wrappedWithSource
   );
-  const { result, params, material: rawMaterial, config: rawConfig, sim: rawSim } = fn(
+  const {
+    result,
+    params,
+    declaredParams,
+    material: rawMaterial,
+    config: rawConfig,
+    sim: rawSim,
+  } = fn(
     replicadExports,
     shapeitupExports,
     paramOverrides || null
@@ -504,14 +517,24 @@ export function executeScript(
     );
   }
 
+  // The range describes the PARAMETER; the value describes the current state.
+  // Deriving both from the same number made the range chase the value: drag a
+  // slider to its maximum, and the next execution came back with a range three
+  // times wider and the handle sitting a third of the way along. Push it to the
+  // max again and it widens again — the slider could never actually reach its
+  // own end. Anchoring to what the FILE declares keeps the range still while
+  // the value moves, and it still follows along when the user edits the
+  // default, because that is a new declared value.
+  const declared = (declaredParams ?? params) as Record<string, unknown>;
   const paramDefs: ParamDef[] = Object.entries(params).map(([name, value]) => {
     const v = value as number;
+    const d = typeof declared[name] === "number" ? (declared[name] as number) : v;
     return {
       name,
       value: v,
-      min: v > 0 ? 0 : v * 3,
-      max: v > 0 ? v * 3 : 0,
-      step: Math.abs(v) >= 10 ? 1 : 0.1,
+      min: d > 0 ? 0 : d * 3,
+      max: d > 0 ? d * 3 : 0,
+      step: Math.abs(d) >= 10 ? 1 : 0.1,
     };
   });
 

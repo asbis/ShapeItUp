@@ -1215,15 +1215,54 @@ function executeWithCurrentParams() {
   });
 }
 
+/**
+ * Rebuilding this panel is destructive, and it runs on EVERY mesh-done —
+ * including the debounced re-execute 150 ms into a drag. That replaced the very
+ * element the user had hold of: the browser keeps delivering pointer events to
+ * the detached node, so the drag appeared to work while the visible handle
+ * stopped tracking the mouse. It also dropped keyboard focus mid-interaction.
+ *
+ * So: only rebuild when the SET of parameters changes (a different file, or an
+ * edit that added or removed a key). When the names match, update the existing
+ * controls in place and leave the DOM — and the drag — alone.
+ */
+function paramNamesMatch(a: ParamDef[], b: ParamDef[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((p, i) => p.name === b[i]!.name);
+}
+
 function updateParamsUI(params: ParamDef[]) {
+  const previous = currentParamDefs;
   currentParamDefs = params;
-  paramsList.innerHTML = "";
 
   if (params.length === 0) {
+    paramsList.innerHTML = "";
     paramsPanel.classList.remove("open");
     return;
   }
 
+  if (previous && paramNamesMatch(previous, params)) {
+    for (const p of params) {
+      currentParamValues[p.name] = p.value;
+      const slider = document.getElementById(`ps-${p.name}`) as HTMLInputElement | null;
+      const readout = document.getElementById(`pv-${p.name}`);
+      if (readout) {
+        readout.textContent = Number.isInteger(p.value)
+          ? String(p.value)
+          : formatNum(p.value, 1);
+      }
+      if (!slider) continue;
+      slider.min = String(p.min ?? 0);
+      slider.max = String(p.max ?? p.value * 3);
+      slider.step = String(p.step ?? (Math.abs(p.value) >= 10 ? 1 : 0.1));
+      // Never write back into the control the user is currently holding —
+      // that would fight their drag.
+      if (document.activeElement !== slider) slider.value = String(p.value);
+    }
+    return;
+  }
+
+  paramsList.innerHTML = "";
   paramsPanel.classList.add("open");
 
   for (const p of params) {
@@ -1245,6 +1284,7 @@ function updateParamsUI(params: ParamDef[]) {
     const slider = document.createElement("input");
     slider.type = "range";
     slider.className = "param-slider";
+    slider.id = `ps-${p.name}`;
     slider.min = String(p.min ?? 0);
     slider.max = String(p.max ?? p.value * 3);
     slider.step = String(p.step ?? (Math.abs(p.value) >= 10 ? 1 : 0.1));

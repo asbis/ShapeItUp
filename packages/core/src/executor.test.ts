@@ -108,6 +108,45 @@ describe("executeScript — params flow", () => {
     expect(result).toBe(20);
   });
 
+  it("anchors slider ranges to the declared value, not the overridden one", () => {
+    // The bug this guards: deriving min/max from the effective value made the
+    // range chase the value. Drag to the maximum, and the next execution came
+    // back with a range three times wider and the handle a third of the way
+    // along — the slider could never reach its own end.
+    const js = `
+      var params = { width: 80 };
+      function main({ width }) { return width; }
+      export { main as default, params };
+    `;
+    const { params } = executeScript(js, {}, {}, { width: 240 });
+    expect(params).toEqual([
+      // value follows the override, range stays anchored to the declared 80
+      { name: "width", value: 240, min: 0, max: 240, step: 1 },
+    ]);
+  });
+
+  it("keeps the step anchored too, so a small default stays fine-grained", () => {
+    // A 0.5 default steps by 0.1. Overriding it to 12 must not coarsen the
+    // slider to whole units — the parameter is still a fine one.
+    const js = `
+      var params = { fillet: 0.5 };
+      function main({ fillet }) { return fillet; }
+      export { main as default, params };
+    `;
+    const { params } = executeScript(js, {}, {}, { fillet: 12 });
+    expect(params[0]).toMatchObject({ value: 12, step: 0.1 });
+  });
+
+  it("anchors a negative default to its own range", () => {
+    const js = `
+      var params = { offset: -20 };
+      function main({ offset }) { return offset; }
+      export { main as default, params };
+    `;
+    const { params } = executeScript(js, {}, {}, { offset: 5 });
+    expect(params[0]).toMatchObject({ name: "offset", value: 5, min: -60, max: 0 });
+  });
+
   it("returns an empty params array when the script declares no params", () => {
     const js = `
       function main() { return 1; }
