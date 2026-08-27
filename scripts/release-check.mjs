@@ -116,7 +116,23 @@ for (const plugin of marketplace.plugins ?? []) {
   }
 }
 
-// 7. Are we on master? Releases are cut from master.
+// 7. The npm package must carry the browser bundles `open_viewer` serves.
+// They're mirrored into packages/mcp-server/dist by an esbuild onEnd plugin —
+// if that mirror ever breaks, the package still publishes and `open_viewer`
+// fails only at runtime, for npm users only.
+for (const asset of ["viewer.js", "worker.js"]) {
+  const p = resolve(root, "packages/mcp-server/dist", asset);
+  if (!existsSync(p)) {
+    fail(
+      `packages/mcp-server/dist/${asset} is missing — run \`pnpm build\`. ` +
+      `Without it, open_viewer is broken for npx/npm installs.`,
+    );
+  } else {
+    pass(`npm package carries ${asset}`);
+  }
+}
+
+// 8. Are we on master? Releases are cut from master.
 const branch = runOr("git rev-parse --abbrev-ref HEAD", "");
 if (branch !== "master") {
   warn(`On branch '${branch}', not 'master'. Releases are normally cut from master.`);

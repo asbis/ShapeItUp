@@ -1,6 +1,6 @@
 import * as esbuild from "esbuild";
 import { cpSync, mkdirSync, existsSync, writeFileSync, rmSync, readFileSync } from "fs";
-import { resolve, dirname } from "path";
+import { resolve, dirname, basename } from "path";
 import { fileURLToPath } from "url";
 import { execSync } from "child_process";
 
@@ -31,6 +31,27 @@ const extensionConfig = {
   external: ["vscode", "esbuild-wasm"],
 };
 
+// The npm package (`@shapeitup/mcp-server`) ships the two browser bundles so
+// `open_viewer` works from a bare `npx` install. It does NOT ship the .wasm —
+// replicad-opencascadejs / manifold-3d / @mujoco/mujoco are already runtime
+// dependencies, so npm puts those on disk anyway and viewer-host.ts resolves
+// them from node_modules. Copying them here would add ~7 MB gzipped of exact
+// duplicates to every install.
+//
+// An onEnd plugin rather than a post-build copy so `pnpm dev` keeps the two
+// dist directories in sync on every rebuild, not just the first.
+const mirrorToMcpDist = {
+  name: "mirror-to-mcp-dist",
+  setup(build) {
+    build.onEnd(() => {
+      const out = build.initialOptions.outfile;
+      const destDir = resolve(__dirname, "packages/mcp-server/dist");
+      mkdirSync(destDir, { recursive: true });
+      cpSync(out, resolve(destDir, basename(out)), { force: true });
+    });
+  },
+};
+
 // 2. Viewer (browser, IIFE)
 const viewerConfig = {
   ...sharedConfig,
@@ -39,6 +60,7 @@ const viewerConfig = {
   platform: "browser",
   format: "iife",
   globalName: "ShapeItUpViewer",
+  plugins: [...(sharedConfig.plugins ?? []), mirrorToMcpDist],
   // The MuJoCo Emscripten glue can't be bundled into an IIFE (import.meta/require)
   // — it's loaded at runtime from a webview URI (see sim-mujoco/loader.ts). Keep it
   // external so esbuild never tries to pull it in.
@@ -53,6 +75,7 @@ const workerConfig = {
   platform: "browser",
   format: "iife",
   globalName: "ShapeItUpWorker",
+  plugins: [...(sharedConfig.plugins ?? []), mirrorToMcpDist],
   // replicad-opencascadejs is loaded at runtime via importScripts, not bundled
   external: ["replicad-opencascadejs"],
   // replicad has conditional requires for Node.js fs/path — stub them out for browser

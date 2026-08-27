@@ -133,6 +133,32 @@ Two gotchas that cost real time when the HTTP host was built:
   "Loading ShapeItUp..." until it gets a reply. An empty `{type:"wasm-assets"}`
   is fine — the worker then fetches the wasm by URL itself.
 
+## Viewer asset distribution
+
+`open_viewer` serves eight browser assets. They are resolved individually
+(`viewer-host.ts:createAssetResolver`), not from one directory, because the two
+distribution channels lay them out differently:
+
+| Asset | VSIX | npm (`@shapeitup/mcp-server`) |
+|---|---|---|
+| `viewer.js`, `worker.js` | `extension/dist/` | shipped in `dist/` (~1.3 MB gzipped) |
+| `replicad_single.*` | `extension/dist/` | `node_modules/replicad-opencascadejs` |
+| `manifold.*` | `extension/dist/` | `node_modules/manifold-3d` |
+| `mujoco.*` | `extension/dist/` | `node_modules/@mujoco/mujoco` (optional) |
+
+The npm package deliberately does NOT ship the `.wasm` files: those three
+packages are already runtime dependencies, so npm puts the exact same bytes on
+disk anyway. Copying them in would add ~7 MB gzipped of duplicates to every
+install, including installs that never open a viewer. `SHAPEITUP_VIEWER_DIST`
+overrides the search for unusual layouts.
+
+MuJoCo is optional throughout — a 404 on `mujoco.wasm` just disables Sim.
+
+**Anything under `packages/mcp-server/` that only workspace packages provide must
+sit in `devDependencies`, not `dependencies`.** esbuild inlines them into
+`dist/index.js`, and every `@shapeitup/*` workspace package is `private: true` —
+a `workspace:*` entry in `dependencies` publishes a spec npm cannot resolve.
+
 ## MCP Server
 
 Registered globally in `~/.claude/settings.json`. Viewer-related tools:
