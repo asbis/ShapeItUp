@@ -2,7 +2,13 @@ import * as vscode from "vscode";
 import * as esbuild from "esbuild-wasm";
 import * as path from "path";
 import * as fs from "fs";
-import { BUNDLE_EXTERNALS, renderViewerHtml, type ExportFormat } from "@shapeitup/shared";
+import {
+  BUNDLE_EXTERNALS,
+  renderViewerHtml,
+  computeParamEdit,
+  type ExportFormat,
+  type ParamCommitResult,
+} from "@shapeitup/shared";
 import type { DetectedApp } from "./app-detector";
 import { getDetectedApps } from "./app-detector";
 import { getCachedWasmAssets } from "./wasm-cache";
@@ -334,6 +340,9 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           });
           this.pendingScript = undefined;
         }
+        break;
+      case "param-changed":
+        void this.commitParams(msg.params);
         break;
       case "error":
         this.output.appendLine(`[error] ${msg.message}`);
@@ -715,6 +724,99 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       }
     }
     return null;
+  }
+
+  /**
+   * Persist committed slider values into the source.
+   *
+   * Deliberately different from the standalone host's writer, and simpler:
+   *
+   * - It edits the DOCUMENT, not the file. `doc.getText()` returns the buffer,
+   *   so a commit composes with edits the user hasn't saved yet instead of
+   *   overwriting them — something a plain `writeFile` cannot see, and the
+   *   reason the standalone host documents that limitation.
+   * - `applyEdit` enters the editor's undo stack, so Cmd-Z restores the value
+   *   the user dragged away from. That is the behaviour a direct manipulation
+   *   has to have; a raw write silently breaks it.
+   * - No echo suppression is needed. Rebuilds are driven by
+   *   `onDidSaveTextDocument`, and we do not save a document the user can see —
+   *   so nothing fires until they choose to save, which SHOULD rebuild.
+   * - No mtime race to guard. VS Code owns the document; the text we compute
+   *   against is the text we edit.
+   */
+  private async commitParams(params: unknown): Promise<void> {
+    if (!params || typeof params !== "object") return;
+    for (const [name, value] of Object.entries(params as Record<string, unknown>)) {
+      if (typeof value !== "number") continue;
+      const result = await this.commitParam(name, value);
+      if (!result.ok) {
+        this.output.appendLine(`[param] ${name} declined: ${result.reason}`);
+      }
+      this.getActiveWebview()?.postMessage(result);
+    }
+  }
+
+  private async commitParam(name: string, value: number): Promise<ParamCommitResult> {
+    const fail = (reason: string): ParamCommitResult => ({
+      type: "param-commit-result",
+      name,
+      value,
+      ok: false,
+      reason,
+    });
+
+    const file = this.lastExecutedFile;
+    if (!file) return fail("no file open");
+
+    let doc: vscode.TextDocument;
+    try {
+      // Returns the already-open document when there is one, so unsaved edits
+      // are part of the text we compute against.
+      doc = await vscode.workspace.openTextDocument(file);
+    } catch (e: any) {
+      return fail(`could not open ${path.basename(file)}: ${e?.message ?? e}`);
+    }
+
+    const result = computeParamEdit(doc.getText(), name, value);
+    if (!result.ok) {
+      // The file already says what the user asked for. Reporting that as a
+      // failure would be a lie.
+      if (result.reason === "unchanged") {
+        return { type: "param-commit-result", name, value, ok: true };
+      }
+      return fail(result.reason);
+    }
+
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(
+      doc.uri,
+      new vscode.Range(doc.positionAt(result.edit.start), doc.positionAt(result.edit.end)),
+      result.edit.text,
+    );
+    if (!(await vscode.workspace.applyEdit(edit))) {
+      return fail("the editor rejected the edit");
+    }
+
+    // A document nobody can see is a document nobody can save: closing the
+    // window would prompt about a file the user never opened. Save that case
+    // for them. A VISIBLE document is left dirty on purpose — it is theirs to
+    // save, and saving it would also persist unrelated edits in progress.
+    const visible = vscode.window.visibleTextEditors.some(
+      (e) => e.document.uri.toString() === doc.uri.toString(),
+    );
+    if (!visible) {
+      try {
+        await doc.save();
+      } catch (e: any) {
+        return fail(`edit applied but save failed: ${e?.message ?? e}`);
+      }
+    }
+
+    this.output.appendLine(
+      `[param] ${name} = ${result.edit.text} in ${path.basename(file)}` +
+        (visible ? " (unsaved — yours to save)" : " (saved)"),
+    );
+    return { type: "param-commit-result", name, value, ok: true };
   }
 
   async executeScript(
