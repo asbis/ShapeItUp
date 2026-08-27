@@ -242,6 +242,12 @@ interface PartInfo {
   color: string;
   visible: boolean;
   group: THREE.Group;
+  /** Measured on the OCCT shape, not the mesh. Absent on degenerate geometry. */
+  volume?: number;
+  surfaceArea?: number;
+  centerOfMass?: [number, number, number];
+  /** Tree disclosure state, kept across re-renders of the list. */
+  expanded?: boolean;
 }
 let currentParts: PartInfo[] = [];
 
@@ -315,7 +321,16 @@ function addPart(part: TessellatedPart) {
   }
 
   modelGroup.add(partGroup);
-  currentParts.push({ name: part.name, color: colorHex, visible: true, group: partGroup });
+  currentParts.push({
+    name: part.name,
+    color: colorHex,
+    visible: true,
+    group: partGroup,
+    volume: part.volume,
+    surfaceArea: part.surfaceArea,
+    centerOfMass: part.centerOfMass,
+    expanded: false,
+  });
   streamingAccum.push(part);
   updatePartsList();
 
@@ -345,13 +360,64 @@ function addPart(part: TessellatedPart) {
 }
 
 // --- Parts browser panel ---
+/** mm3 gets unreadable fast; switch to cm3 once it would need five digits. */
+function formatVolume(mm3: number): string {
+  return mm3 >= 1000
+    ? `${formatNum(mm3 / 1000, 2)} cm\u00B3`
+    : `${formatNum(mm3, 1)} mm\u00B3`;
+}
+
+function formatArea(mm2: number): string {
+  return mm2 >= 1000
+    ? `${formatNum(mm2 / 100, 2)} cm\u00B2`
+    : `${formatNum(mm2, 1)} mm\u00B2`;
+}
+
+/**
+ * The browser tree.
+ *
+ * A flat list said only which parts exist. Every CAD browser is a tree because
+ * a part has properties worth reading in place — and these were already being
+ * measured on the OCCT shape and thrown away before they reached the panel.
+ * Now each body expands to its own volume, surface area and centre of mass,
+ * which until now you could only get by asking the MCP server.
+ */
 function updatePartsList() {
   partsList.innerHTML = "";
   partsCount.textContent = currentParts.length > 1 ? `(${currentParts.length})` : "";
 
-  currentParts.forEach((part, i) => {
-    const item = document.createElement("div");
-    item.className = `part-item${part.visible ? "" : " hidden"}`;
+  const bodies = document.createElement("div");
+  bodies.className = "tree-group";
+
+  const groupRow = document.createElement("div");
+  groupRow.className = "tree-row tree-branch";
+  groupRow.innerHTML =
+    `<span class="tree-twisty open">\u25BE</span>` +
+    `<span class="tree-label">Bodies</span>` +
+    `<span class="tree-count">${currentParts.length}</span>`;
+  const bodyList = document.createElement("div");
+  bodyList.className = "tree-children";
+
+  groupRow.addEventListener("click", () => {
+    const open = bodyList.style.display !== "none";
+    bodyList.style.display = open ? "none" : "";
+    groupRow.querySelector(".tree-twisty")!.classList.toggle("open", !open);
+    groupRow.querySelector(".tree-twisty")!.textContent = open ? "\u25B8" : "\u25BE";
+  });
+
+  currentParts.forEach((part) => {
+    const hasStats =
+      part.volume !== undefined ||
+      part.surfaceArea !== undefined ||
+      part.centerOfMass !== undefined;
+
+    const row = document.createElement("div");
+    row.className = `tree-row tree-leaf part-item${part.visible ? "" : " hidden"}`;
+
+    const twisty = document.createElement("span");
+    twisty.className = "tree-twisty";
+    twisty.textContent = hasStats ? (part.expanded ? "\u25BE" : "\u25B8") : "";
+    twisty.classList.toggle("open", !!part.expanded);
 
     const swatch = document.createElement("div");
     swatch.className = "part-swatch";
@@ -360,22 +426,78 @@ function updatePartsList() {
     const nameEl = document.createElement("span");
     nameEl.className = "part-name";
     nameEl.textContent = part.name;
+    nameEl.title = part.name;
 
     const eyeEl = document.createElement("span");
     eyeEl.className = "part-eye";
     eyeEl.textContent = part.visible ? "\u25C9" : "\u25CB";
+    eyeEl.title = part.visible ? "Hide this body" : "Show this body";
 
-    item.append(swatch, nameEl, eyeEl);
+    row.append(twisty, swatch, nameEl, eyeEl);
 
-    item.addEventListener("click", () => {
+    const props = document.createElement("div");
+    props.className = "tree-props";
+    props.style.display = part.expanded ? "" : "none";
+    // A coordinate triple plus a long label will not fit a narrow panel on one
+    // line, and truncating the NUMBERS is the worst of the options — so those
+    // rows stack instead.
+    const addProp = (label: string, value: string, stacked = false) => {
+      const r = document.createElement("div");
+      r.className = stacked ? "tree-prop stacked" : "tree-prop";
+      r.innerHTML = `<span></span><span class="tree-prop-val"></span>`;
+      r.querySelector("span")!.textContent = label;
+      r.querySelector(".tree-prop-val")!.textContent = value;
+      props.appendChild(r);
+    };
+    if (part.volume !== undefined) addProp("Volume", formatVolume(part.volume));
+    if (part.surfaceArea !== undefined) addProp("Surface", formatArea(part.surfaceArea));
+    if (part.centerOfMass) {
+      // Which centre this is depends on how the part was measured. Without
+      // volume the core took the cheap path and this is the bounding-box
+      // centre, which is NOT the centre of mass for anything asymmetric.
+      // Labelling both "Center" would quietly overstate one of them.
+      addProp(
+        part.volume === undefined ? "Bounds center" : "Center of mass",
+        part.centerOfMass.map((n) => formatNum(n, 1)).join(", "),
+        true,
+      );
+    }
+    if (part.volume === undefined) {
+      // Measuring volume and area costs roughly 200ms per part, so the core
+      // only does it when a material is declared — at which point you get mass
+      // too. Say so, rather than leaving the reader wondering what is missing.
+      const hint = document.createElement("div");
+      hint.className = "tree-hint";
+      hint.textContent = "Add export const material for volume and mass";
+      props.appendChild(hint);
+    }
+
+    // The eye owns visibility; the row owns expansion. Previously the whole row
+    // toggled visibility, which meant there was nowhere left to click to read a
+    // body's properties.
+    eyeEl.addEventListener("click", (e) => {
+      e.stopPropagation();
       part.visible = !part.visible;
       part.group.visible = part.visible;
-      item.className = `part-item${part.visible ? "" : " hidden"}`;
+      row.classList.toggle("hidden", !part.visible);
       eyeEl.textContent = part.visible ? "\u25C9" : "\u25CB";
+      eyeEl.title = part.visible ? "Hide this body" : "Show this body";
     });
 
-    partsList.appendChild(item);
+    if (hasStats) {
+      row.addEventListener("click", () => {
+        part.expanded = !part.expanded;
+        props.style.display = part.expanded ? "" : "none";
+        twisty.textContent = part.expanded ? "\u25BE" : "\u25B8";
+        twisty.classList.toggle("open", !!part.expanded);
+      });
+    }
+
+    bodyList.append(row, props);
   });
+
+  bodies.append(groupRow, bodyList);
+  partsList.appendChild(bodies);
 }
 
 function togglePartsPanel() {

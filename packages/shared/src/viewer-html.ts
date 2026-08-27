@@ -90,12 +90,47 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
     }
     #parts-list::-webkit-scrollbar { width: 6px; }
     #parts-list::-webkit-scrollbar-thumb { background: #555; border-radius: 3px; }
+    /* Browser tree. Indentation and a twisty per level, the way every CAD
+       browser does it — a body is a node you can open, not just a name. */
+    .tree-row {
+      display: flex; align-items: center; gap: 5px;
+      padding: 2px 10px 2px 6px; cursor: pointer; font-size: 12px; color: #ccc;
+      user-select: none; min-height: 20px;
+    }
+    .tree-row:hover { background: #2a2d2e; }
+    .tree-twisty {
+      width: 11px; flex-shrink: 0; text-align: center;
+      font-size: 9px; color: #7a7a7a; line-height: 1;
+    }
+    .tree-row:hover .tree-twisty { color: #ccc; }
+    .tree-branch { color: #d4d4d4; }
+    .tree-count {
+      color: #7a7a7a; font-size: 11px;
+      font-variant-numeric: tabular-nums;
+    }
+    .tree-children .tree-row { padding-left: 16px; }
+    .tree-props { padding: 1px 8px 4px 32px; }
+    .tree-prop {
+      display: flex; justify-content: space-between; gap: 8px;
+      font-size: 10.5px; color: #8a8a8a; padding: 1px 0; white-space: nowrap;
+    }
+    .tree-prop > span:first-child { flex: 0 0 auto; }
+    .tree-prop-val {
+      color: #b9bcc0; font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+      overflow: hidden; text-overflow: ellipsis; text-align: right;
+    }
+    .tree-prop.stacked { display: block; }
+    .tree-prop.stacked .tree-prop-val { display: block; text-align: left; padding-top: 1px; }
+    .tree-hint {
+      font-size: 10px; color: #6f6f6f; font-style: italic;
+      padding-top: 3px; white-space: normal; line-height: 1.35;
+    }
     .part-item {
-      display: flex; align-items: center; gap: 6px;
-      padding: 3px 10px; cursor: pointer; font-size: 12px; color: #ccc;
+      display: flex; align-items: center; gap: 5px;
+      cursor: pointer; font-size: 12px; color: #ccc;
       user-select: none;
     }
-    .part-item:hover { background: #2a2d2e; }
     .part-item.hidden { opacity: 0.4; }
     .part-swatch {
       width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0;
@@ -106,7 +141,8 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
       width: 16px; height: 16px; flex-shrink: 0; opacity: 0.6;
       display: flex; align-items: center; justify-content: center; font-size: 13px;
     }
-    .part-item:hover .part-eye { opacity: 1; }
+    .tree-row:hover .part-eye { opacity: 1; }
+    .part-eye:hover { color: #4fc1ff; opacity: 1; }
 
     /* Canvas area */
     #viewport { flex: 1; position: relative; overflow: hidden; }
