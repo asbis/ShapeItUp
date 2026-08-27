@@ -226,13 +226,27 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
     }
     #params-status.show { min-height: 16px; padding-bottom: 4px; }
     #params-status.warn { color: #e5a03c; }
+    /* One line per parameter: name on the left, a typed value on the right.
+       No slider — its range was a heuristic (0..3x the declared value), so it
+       could never be trusted for an exact dimension. */
     .param-row {
-      padding: 4px 10px; display: flex; flex-direction: column; gap: 2px;
+      padding: 3px 10px; display: flex; align-items: center; gap: 8px;
+      justify-content: space-between;
     }
-    .param-label {
-      display: flex; justify-content: space-between; font-size: 11px; color: #aaa;
+    .param-name {
+      font-size: 11px; color: #aaa; overflow: hidden;
+      text-overflow: ellipsis; white-space: nowrap;
     }
-    .param-label .param-value { color: #4fc1ff; font-family: monospace; }
+    .param-input {
+      flex: 0 0 auto; width: 84px; padding: 3px 6px;
+      background: #1e1e1e; color: #4fc1ff; font-family: monospace; font-size: 12px;
+      text-align: right; border: 1px solid #3c3c3c; border-radius: 3px;
+    }
+    .param-input:hover { border-color: #4a4a4a; }
+    .param-input:focus { outline: none; border-color: #007acc; background: #1a1a1a; }
+    /* Only a focused field takes the wheel, so say which one has it. */
+    .param-input:focus::placeholder { color: #555; }
+    .param-input.invalid { border-color: #e5a03c; color: #e5a03c; }
     .param-slider {
       -webkit-appearance: none; width: 100%; height: 4px; border-radius: 2px;
       background: #3c3c3c; outline: none;

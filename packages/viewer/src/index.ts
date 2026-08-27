@@ -1336,20 +1336,14 @@ function updateParamsUI(params: ParamDef[]) {
   if (previous && paramNamesMatch(previous, params)) {
     for (const p of params) {
       currentParamValues[p.name] = p.value;
-      const slider = document.getElementById(`ps-${p.name}`) as HTMLInputElement | null;
-      const readout = document.getElementById(`pv-${p.name}`);
-      if (readout) {
-        readout.textContent = Number.isInteger(p.value)
-          ? String(p.value)
-          : formatNum(p.value, 1);
+      const input = document.getElementById(`pv-${p.name}`) as HTMLInputElement | null;
+      if (!input) continue;
+      input.dataset.step = String(p.step ?? (Math.abs(p.value) >= 10 ? 1 : 0.1));
+      // Never overwrite the field someone is typing in.
+      if (document.activeElement !== input) {
+        input.value = formatParamValue(p.value);
+        input.classList.remove("invalid");
       }
-      if (!slider) continue;
-      slider.min = String(p.min ?? 0);
-      slider.max = String(p.max ?? p.value * 3);
-      slider.step = String(p.step ?? (Math.abs(p.value) >= 10 ? 1 : 0.1));
-      // Never write back into the control the user is currently holding —
-      // that would fight their drag.
-      if (document.activeElement !== slider) slider.value = String(p.value);
     }
     return;
   }
@@ -1363,55 +1357,39 @@ function updateParamsUI(params: ParamDef[]) {
     const row = document.createElement("div");
     row.className = "param-row";
 
-    const label = document.createElement("div");
-    label.className = "param-label";
-    const nameSpan = document.createElement("span");
-    nameSpan.textContent = p.name;
-    const valueSpan = document.createElement("span");
-    valueSpan.className = "param-value";
-    valueSpan.id = `pv-${p.name}`;
-    valueSpan.textContent = String(p.value);
-    label.append(nameSpan, valueSpan);
+    const nameEl = document.createElement("div");
+    nameEl.className = "param-name";
+    nameEl.textContent = p.name;
+    nameEl.title = p.name;
 
-    const slider = document.createElement("input");
-    slider.type = "range";
-    slider.className = "param-slider";
-    slider.id = `ps-${p.name}`;
-    slider.min = String(p.min ?? 0);
-    slider.max = String(p.max ?? p.value * 3);
-    slider.step = String(p.step ?? (Math.abs(p.value) >= 10 ? 1 : 0.1));
-    slider.value = String(p.value);
+    const input = document.createElement("input");
+    input.type = "text";
+    // `text` rather than `number`: number inputs bring spinners we would only
+    // hide, reject intermediate states like "1." while typing, and hand the
+    // wheel to the browser on terms we cannot control.
+    input.inputMode = "decimal";
+    input.className = "param-input";
+    input.id = `pv-${p.name}`;
+    input.value = formatParamValue(p.value);
+    input.spellcheck = false;
+    input.autocomplete = "off";
+    input.dataset.step = String(p.step ?? (Math.abs(p.value) >= 10 ? 1 : 0.1));
+    input.title =
+      "Type a value, or scroll / arrow while focused. Shift = x10, Alt = x0.1.";
 
-    const readSlider = () => {
-      const val = parseFloat(slider.value);
+    /** Last value we know is good, for Escape and for rejecting bad input. */
+    let lastGood = p.value;
+
+    const preview = (val: number) => {
       currentParamValues[p.name] = val;
-      document.getElementById(`pv-${p.name}`)!.textContent =
-        Number.isInteger(val) ? String(val) : formatNum(val, 1);
-      return val;
-    };
-
-    // `input` fires continuously while dragging: preview only. The override is
-    // ephemeral — it lives in the worker and never reaches the file.
-    slider.addEventListener("input", () => {
-      readSlider();
       if (paramDebounceTimer) clearTimeout(paramDebounceTimer);
       paramDebounceTimer = setTimeout(executeWithCurrentParams, 150);
-    });
+    };
 
-    // `change` fires once, when the drag is released (or on each arrow key of a
-    // focused slider). THAT is the commit signal, not `input` — writing on every
-    // frame of a drag would churn the file and flood the editor's undo stack.
-    //
-    // Only the param that moved is sent. The host computes one edit from it; a
-    // full map would force it to diff against the file to find what changed,
-    // which is both wasteful and racy against an edit from elsewhere.
-    //
-    // No host acts on this yet, so today it is a no-op. That is deliberate —
-    // it lands ahead of the write path so the two can be reviewed separately.
-    slider.addEventListener("change", () => {
-      const val = readSlider();
-      // Flush the pending preview so the geometry on screen matches the value
-      // being committed, rather than trailing it by up to the debounce window.
+    const commit = (val: number) => {
+      lastGood = val;
+      currentParamValues[p.name] = val;
+      // Flush any pending preview so what is on screen matches what is written.
       if (paramDebounceTimer) {
         clearTimeout(paramDebounceTimer);
         paramDebounceTimer = undefined;
@@ -1420,12 +1398,104 @@ function updateParamsUI(params: ParamDef[]) {
       if (writebackEnabled) {
         postToExtension({ type: "param-changed", params: { [p.name]: val } });
       }
+    };
+
+    /** Parse what is typed. Rejects blanks, words, and half-typed signs. */
+    const parse = (): number | null => {
+      const raw = input.value.trim().replace(",", ".");
+      if (!raw || !/^[+-]?(\d+(\.\d*)?|\.\d+)$/.test(raw)) return null;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : null;
+    };
+
+    // Typing previews but never commits: a value is not finished until you say
+    // it is, and committing every keystroke would write "1", "12", "127" on the
+    // way to 1270.
+    input.addEventListener("input", () => {
+      const val = parse();
+      input.classList.toggle("invalid", val === null && input.value.trim() !== "");
+      if (val !== null) preview(val);
     });
 
-    row.appendChild(label);
-    row.appendChild(slider);
+    // Enter and blur are the two ways a typed value is finished.
+    const finish = () => {
+      const val = parse();
+      if (val === null) {
+        input.value = formatParamValue(lastGood);
+        input.classList.remove("invalid");
+        preview(lastGood);
+        return;
+      }
+      input.value = formatParamValue(val);
+      commit(val);
+    };
+    input.addEventListener("blur", finish);
+
+    /** Nudge by one step, scaled by the modifier held. */
+    const nudge = (direction: 1 | -1, e: { shiftKey: boolean; altKey: boolean }) => {
+      const base = Number(input.dataset.step) || 1;
+      const step = e.shiftKey ? base * 10 : e.altKey ? base / 10 : base;
+      const from = parse() ?? lastGood;
+      // Re-round to the step's precision, or 0.1 steps accumulate float dust.
+      const next = Number((from + direction * step).toFixed(6));
+      input.value = formatParamValue(next);
+      input.classList.remove("invalid");
+      preview(next);
+      scheduleNudgeCommit(next);
+    };
+
+    // A wheel or an arrow key has no natural "release", so a commit follows
+    // once the nudging stops. Long enough to spin freely, short enough that
+    // you do not wonder whether it saved.
+    let nudgeTimer: ReturnType<typeof setTimeout> | undefined;
+    const scheduleNudgeCommit = (val: number) => {
+      clearTimeout(nudgeTimer);
+      nudgeTimer = setTimeout(() => commit(val), 400);
+    };
+
+    // Focused only. Taking the wheel on hover would make the parameter list
+    // itself unscrollable, since the inputs cover most of it.
+    input.addEventListener("wheel", (e) => {
+      if (document.activeElement !== input) return;
+      e.preventDefault();
+      nudge(e.deltaY < 0 ? 1 : -1, e);
+    }, { passive: false });
+
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+        e.preventDefault();
+        nudge(e.key === "ArrowUp" ? 1 : -1, e);
+        return;
+      }
+      if (e.key === "Enter") {
+        e.preventDefault();
+        clearTimeout(nudgeTimer);
+        finish();
+        input.blur();
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        clearTimeout(nudgeTimer);
+        input.value = formatParamValue(lastGood);
+        input.classList.remove("invalid");
+        preview(lastGood);
+        input.blur();
+      }
+    });
+
+    // Selecting on focus makes replacing a value one gesture rather than three.
+    input.addEventListener("focus", () => input.select());
+
+    row.append(nameEl, input);
     paramsList.appendChild(row);
   }
+}
+
+/** Compact, and never scientific notation — nobody wants `1e-7` in a dimension. */
+function formatParamValue(v: number): string {
+  if (Number.isInteger(v)) return String(v);
+  return String(Number(v.toFixed(4)));
 }
 
 paramsHeader.addEventListener("click", () => {
