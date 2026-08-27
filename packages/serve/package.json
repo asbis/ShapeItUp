@@ -1,0 +1,19 @@
+{
+  "name": "@shapeitup/serve",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone HTTP + WebSocket host for the ShapeItUp viewer — runs the 3D preview in any browser (e.g. the Claude Code browser pane) instead of a VSCode webview.",
+  "bin": {
+    "shapeitup-serve": "./dist/cli.js"
+  },
+  "dependencies": {
+    "@shapeitup/shared": "workspace:*",
+    "esbuild": "^0.24.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.13"
+  },
+  "main": "./src/index.ts",
+  "types": "./src/index.ts"
+}

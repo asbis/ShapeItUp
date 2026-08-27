@@ -4,8 +4,22 @@
     {
       "name": "icon-preview",
       "runtimeExecutable": "npx",
-      "runtimeArgs": ["serve", "."],
+      "runtimeArgs": [
+        "serve",
+        "."
+      ],
       "port": 3000
+    },
+    {
+      "name": "shapeitup-viewer",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "packages/serve/dist/cli.js",
+        "examples/stdlib/wall-mounted-shelf.shape.ts",
+        "--port",
+        "4444"
+      ],
+      "port": 4444
     }
   ]
 }

@@ -12,7 +12,8 @@
     "package": "pnpm build && cd packages/extension && vsce package --no-dependencies",
     "test": "vitest run",
     "test:watch": "vitest",
-    "release:check": "node scripts/release-check.mjs"
+    "release:check": "node scripts/release-check.mjs",
+    "serve": "node packages/serve/dist/cli.js"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

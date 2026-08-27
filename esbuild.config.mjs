@@ -105,6 +105,19 @@ const mcpServerExtConfig = {
   define: mcpDefine,
 };
 
+// 6. Standalone viewer host (Node.js, CJS) — serves the same viewer bundle over
+// HTTP + WebSocket so the 3D preview runs in any browser (e.g. the Claude Code
+// browser pane) with no VSCode webview involved.
+const serveConfig = {
+  ...sharedConfig,
+  entryPoints: [resolve(__dirname, "packages/serve/src/cli.ts")],
+  outfile: resolve(__dirname, "packages/serve/dist/cli.js"),
+  platform: "node",
+  format: "cjs",
+  // The shebang already lives at the top of src/index.ts; esbuild preserves it.
+  external: ["esbuild", "ws"],
+};
+
 function copyWasmFiles() {
   const distDir = resolve(__dirname, "packages/extension/dist");
   mkdirSync(distDir, { recursive: true });
@@ -322,7 +335,7 @@ async function build() {
 
   const configs = mcpOnly
     ? [mcpServerConfig, mcpServerExtConfig]
-    : [extensionConfig, viewerConfig, workerConfig, mcpServerConfig, mcpServerExtConfig];
+    : [extensionConfig, viewerConfig, workerConfig, mcpServerConfig, mcpServerExtConfig, serveConfig];
 
   if (watch) {
     const contexts = await Promise.all(configs.map((c) => esbuild.context(c)));
