@@ -44,6 +44,7 @@
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@shapeitup/core": "workspace:*",
+    "@shapeitup/serve": "workspace:*",
     "@shapeitup/shared": "workspace:*",
     "@shapeitup/sim": "workspace:*",
     "@shapeitup/sim-dynamics": "workspace:*",

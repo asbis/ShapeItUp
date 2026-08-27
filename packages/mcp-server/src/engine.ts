@@ -34,7 +34,7 @@ import * as esbuild from "esbuild-wasm";
 // Cross-platform via WASM — avoids shipping native binaries in the VSIX at the
 // cost of ~2-3x slower bundling, which is fine for runtime .shape.ts bundles.
 let esbuildInitPromise: Promise<void> | null = null;
-function ensureEsbuild(): Promise<void> {
+export function ensureEsbuild(): Promise<void> {
   if (!esbuildInitPromise) {
     esbuildInitPromise = esbuild.initialize({}).catch((e) => {
       esbuildInitPromise = null;

@@ -52,6 +52,7 @@ import {
 } from "./verify-helpers.js";
 import { getDetectedAppsAsync, getDetectedApps } from "./app-detector.js";
 import { getSubscriberBus, defaultGlobalStorageDir } from "./subscriber-bus.js";
+import { startViewer, stopViewer, getViewerHost } from "./viewer-host.js";
 import { openFileInApp } from "./app-launcher.js";
 import { sanitizeToolListResponse } from "./schema-sanitizer.js";
 
@@ -5204,6 +5205,54 @@ export function registerTools(server: McpServer) {
           isError: true,
         };
       }
+    })
+  );
+
+  server.tool(
+    "open_viewer",
+    "Open the interactive 3D viewer for a .shape.ts file in a browser and return its URL. " +
+      "Runs the same viewer as the VSCode extension but over plain HTTP, so it works with no editor attached — " +
+      "point a browser (or the Claude Code browser pane) at the returned URL. " +
+      "The viewer live-reloads on every save, and set_render_mode / toggle_dimensions / open_shape drive it. " +
+      "Idempotent: calling it again re-targets the existing viewer instead of opening a second one.",
+    {
+      filePath: z.string().describe("Path to the .shape.ts file to display"),
+      port: z
+        .number()
+        .int()
+        .min(0)
+        .max(65535)
+        .optional()
+        .describe("TCP port to bind on 127.0.0.1. Omit for an OS-assigned port; ignored once the viewer is running."),
+    },
+    safeHandler("open_viewer", async ({ filePath, port }) => {
+      const r = await startViewer(filePath, port);
+      const lines = [
+        `Viewer ${r.alreadyRunning ? "re-targeted" : "started"}: ${r.url}`,
+        `File: ${r.file}`,
+        r.clients > 0
+          ? `${r.clients} viewer(s) already attached — the model updated in place.`
+          : "No browser attached yet. Open the URL above to see the model.",
+      ];
+      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    })
+  );
+
+  server.tool(
+    "close_viewer",
+    "Shut down the browser 3D viewer started by open_viewer and release its port. Safe to call when no viewer is running.",
+    {},
+    safeHandler("close_viewer", async () => {
+      const wasRunning = getViewerHost() !== null;
+      stopViewer();
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: wasRunning ? "Viewer stopped." : "No viewer was running.",
+          },
+        ],
+      };
     })
   );
 

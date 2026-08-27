@@ -36,10 +36,27 @@ export interface McpServerHeartbeat {
 }
 
 interface SubscriberState {
-  ws: WebSocket;
+  /**
+   * Wire transport. Absent for in-process subscribers (see
+   * `addLocalSubscriber`) — the standalone viewer host lives inside this very
+   * process, so looping a WebSocket back to ourselves would be pure overhead.
+   */
+  ws?: WebSocket;
+  /** Deliver one already-serialised event frame to this subscriber. */
+  send: (text: string) => void;
   workspaceRoots: string[];
   /** Latched once we receive a `hello` message. */
   hasHello: boolean;
+}
+
+/**
+ * Handle returned by `addLocalSubscriber`. Lets the owner update the roots it
+ * advertises (the viewer host learns its workspace root only once a shape is
+ * opened) and detach on shutdown.
+ */
+export interface LocalSubscription {
+  setWorkspaceRoots(roots: string[]): void;
+  dispose(): void;
 }
 
 export interface PublishOptions {
@@ -146,7 +163,7 @@ export class SubscriberBus {
     }
     this.pendingAwait.clear();
     for (const sub of this.subscribers) {
-      try { sub.ws.close(); } catch {}
+      try { sub.ws?.close(); } catch {}
     }
     this.subscribers.clear();
     if (this.wss) {
@@ -173,7 +190,7 @@ export class SubscriberBus {
     let delivered = 0;
     for (const sub of targets) {
       try {
-        sub.ws.send(msg);
+        sub.send(msg);
         delivered++;
       } catch {
         // Drop dead sockets; the 'close' handler will clean up.
@@ -208,7 +225,7 @@ export class SubscriberBus {
     let delivered = 0;
     for (const sub of targets) {
       try {
-        sub.ws.send(msg);
+        sub.send(msg);
         delivered++;
       } catch {}
     }
@@ -259,6 +276,61 @@ export class SubscriberBus {
     return n;
   }
 
+  /**
+   * Register an in-process subscriber.
+   *
+   * Same contract as a WebSocket subscriber — it receives every event
+   * `publishEvent`/`publishAndAwait` routes to it, and `reply` closes the
+   * correlation loop for awaited events — but with no socket in between. Used
+   * by the standalone browser viewer host, which runs inside the MCP server.
+   *
+   * Unlike a wire subscriber there is no `hello` round trip; the roots are
+   * supplied up front and `hasHello` is latched immediately.
+   */
+  addLocalSubscriber(
+    workspaceRoots: string[],
+    onEvent: (
+      msg: Record<string, any>,
+      reply: (ok: boolean, error?: string) => void,
+    ) => void,
+  ): LocalSubscription {
+    const state: SubscriberState = {
+      send: (text) => {
+        const parsed = JSON.parse(text) as Record<string, any>;
+        const _id = typeof parsed._id === "string" ? parsed._id : undefined;
+        const reply = (ok: boolean, error?: string) => {
+          if (_id) this.resolveReply(_id, ok, error);
+        };
+        // Defer so a synchronous `onEvent` reply can't resolve the awaited
+        // promise before `publishAndAwait` has registered it.
+        setTimeout(() => onEvent(parsed, reply), 0);
+      },
+      workspaceRoots,
+      hasHello: true,
+    };
+    this.subscribers.add(state);
+    return {
+      setWorkspaceRoots: (roots) => {
+        state.workspaceRoots = roots;
+      },
+      dispose: () => {
+        this.subscribers.delete(state);
+      },
+    };
+  }
+
+  private resolveReply(_id: string, ok: boolean, error?: unknown): void {
+    const pend = this.pendingAwait.get(_id);
+    if (!pend) return;
+    this.pendingAwait.delete(_id);
+    clearTimeout(pend.timer);
+    pend.resolve({
+      delivered: 1,
+      ok,
+      error: typeof error === "string" ? error : undefined,
+    });
+  }
+
   private pickTargets(targetWorkspaceRoot?: string): SubscriberState[] {
     const out: SubscriberState[] = [];
     for (const sub of this.subscribers) {
@@ -273,7 +345,12 @@ export class SubscriberBus {
 
   private attachHandlers(wss: WebSocketServer): void {
     wss.on("connection", (ws) => {
-      const state: SubscriberState = { ws, workspaceRoots: [], hasHello: false };
+      const state: SubscriberState = {
+        ws,
+        send: (text) => ws.send(text),
+        workspaceRoots: [],
+        hasHello: false,
+      };
       this.subscribers.add(state);
 
       ws.on("message", (data) => {
@@ -292,16 +369,7 @@ export class SubscriberBus {
           return;
         }
         if (parsed && typeof parsed._id === "string") {
-          const pend = this.pendingAwait.get(parsed._id);
-          if (pend) {
-            this.pendingAwait.delete(parsed._id);
-            clearTimeout(pend.timer);
-            pend.resolve({
-              delivered: 1,
-              ok: parsed.ok === true,
-              error: typeof parsed.error === "string" ? parsed.error : undefined,
-            });
-          }
+          this.resolveReply(parsed._id, parsed.ok === true, parsed.error);
         }
       });
 

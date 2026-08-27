@@ -43,8 +43,9 @@ packages/
   extension/     — VS Code extension host (commands, file watching, webview provider)
   viewer/        — Three.js 3D viewer (runs in webview)
   worker/        — OCCT WASM + Replicad script execution (runs in web worker)
-  mcp-server/    — Claude Code MCP server (stdio, 9 tools)
-  shared/        — Shared TypeScript types and message definitions
+  mcp-server/    — Claude Code MCP server (stdio)
+  serve/         — Standalone HTTP+WS viewer host (browser instead of webview)
+  shared/        — Shared types, message defs, viewer HTML template, bundle spec
 examples/        — Example .shape.ts files
 skill/           — Claude Code skill (Replicad API reference)
 ```
@@ -53,7 +54,11 @@ skill/           — Claude Code skill (Replicad API reference)
 
 | File | Purpose |
 |------|---------|
-| `packages/extension/src/viewer-provider.ts` | Webview HTML template, CSP, message bridge, screenshot capture |
+| `packages/extension/src/viewer-provider.ts` | Webview host: message bridge, screenshot capture, script bundling |
+| `packages/shared/src/viewer-html.ts` | The viewer page template — shared by BOTH hosts, so they can't drift |
+| `packages/shared/src/bundle-spec.ts` | Synthetic-wrapper + esbuild options every `.shape.ts` bundler must agree on |
+| `packages/serve/src/host.ts` | `ViewerHost`: HTTP static + `/ws`, file watch, live reload |
+| `packages/mcp-server/src/viewer-host.ts` | Singleton `ViewerHost` + local bus subscriber (browser viewers) |
 | `packages/extension/src/extension.ts` | Extension entry, commands, auto-preview, MCP bridge |
 | `packages/viewer/src/index.ts` | Three.js scene, parts panel, section plane, measure tool, params UI |
 | `packages/worker/src/executor.ts` | Import rewriting + script execution sandbox |
@@ -101,13 +106,41 @@ return [
 import { makeBolt } from "./bolt.shape";
 ```
 
+## Two viewer hosts
+
+The viewer (`packages/viewer`) is host-agnostic. It picks its transport at
+runtime in `message-handler.ts`: `acquireVsCodeApi()` inside a webview, a
+same-origin WebSocket otherwise. Both hosts speak the same `ExtToWebview`
+messages, so nothing downstream of the transport knows which one it is on.
+
+```
+VSCode extension  ──postMessage──┐
+                                 ├──► packages/viewer ──► worker ──► OCCT WASM
+MCP server (HTTP) ──WebSocket ───┘
+```
+
+The HTTP host lives INSIDE the MCP server process and registers as a local
+SubscriberBus subscriber (`bus.addLocalSubscriber`), so every existing
+`publishEvent` call site — `set_render_mode`, `toggle_dimensions`,
+`open_shape` — reaches browser viewers with no change at those call sites.
+Start it with `open_viewer`, or standalone via `pnpm serve <file.shape.ts>`.
+
+Two gotchas that cost real time when the HTTP host was built:
+- **Asset URLs must be absolute.** The OCCT worker runs from a `blob:` URL, so
+  relative URLs in `__SHAPEITUP_CONFIG__` resolve against the blob context and
+  every fetch fails with "Failed to fetch OCCT loader".
+- **`request-wasm-assets` must be answered.** The viewer blocks on
+  "Loading ShapeItUp..." until it gets a reply. An empty `{type:"wasm-assets"}`
+  is fine — the worker then fetches the wasm by URL itself.
+
 ## MCP Server
 
-Registered globally in `~/.claude/settings.json`. Provides 9 tools:
+Registered globally in `~/.claude/settings.json`. Viewer-related tools:
 - `create_shape`, `modify_shape`, `read_shape`, `list_shapes`, `validate_syntax`
 - `render_preview` (captures screenshot in AI high-contrast mode with dimensions)
 - `set_render_mode`, `toggle_dimensions`
 - `get_api_reference` (returns Replicad API docs by category)
+- `open_viewer` / `close_viewer` (browser 3D viewer — no editor required)
 
 ## Publishing
 
