@@ -20,7 +20,11 @@ jobs:
 
       - uses: pnpm/action-setup@v5
         with:
-          version: 10
+          # Must be 11+: the build-script allowlist lives in pnpm-workspace.yaml
+          # (`allowBuilds`) since pnpm 11 stopped reading the `pnpm` field in
+          # package.json. On pnpm 10 esbuild's postinstall never runs and the
+          # Build step fails on a missing platform binary.
+          version: 11
 
       # NOTE: no `registry-url` here on purpose. setup-node's registry-url
       # writes an `_authToken=${NODE_AUTH_TOKEN}` line into .npmrc; with no
