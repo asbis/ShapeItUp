@@ -101,6 +101,12 @@ export interface ParamCommitResult {
   ok: boolean;
   /** Absent when ok. */
   reason?: string;
+  /**
+   * True when the commit also dropped a `tune_params --persist` pin for this
+   * parameter. Worth surfacing: the user's number would otherwise have been
+   * silently overridden in every export.
+   */
+  clearedSidecar?: boolean;
 }
 
 // Webview → Extension Host

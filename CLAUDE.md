@@ -159,6 +159,39 @@ sit in `devDependencies`, not `dependencies`.** esbuild inlines them into
 `dist/index.js`, and every `@shapeitup/*` workspace package is `private: true` —
 a `workspace:*` entry in `dependencies` publishes a spec npm cannot resolve.
 
+## Parameter writeback vs. the params sidecar
+
+Releasing a slider commits its value to the `.shape.ts` (`param-changed` →
+`computeParamEdit` → the host's writer). Two hosts, two mechanisms:
+
+| | Serve host | VS Code host |
+|---|---|---|
+| Applies via | atomic write + mtime guard | `WorkspaceEdit` |
+| Unsaved edits | invisible to it | composed with |
+| Undo | none | Cmd-Z |
+| Watcher echo | suppressed by content match | n/a — it doesn't save a visible doc |
+
+`.shapeitup-params.json` is read by the MCP tools layer and by NOTHING else —
+not the viewer, not either host, not the core. So the two paths diverge on
+their own, before writeback enters the picture:
+
+```
+file declares gussetH: 45, sidecar pins gussetH: 120
+  verify_shape / export_shape / render_preview -> bbox Z = 126
+  the viewer, and open_viewer                  -> bbox Z = 51
+```
+
+Resolution is precedence, not detection: the file is the durable artifact and
+the sidecar is a scratch overlay, so **committing a parameter clears its
+sidecar pin**. Other pinned parameters are untouched — a commit says nothing
+about them. Without this, a committed value is silently overridden in every
+export.
+
+The file FORMAT lives in `@shapeitup/shared/sidecar`, a Node-only subpath that
+the barrel deliberately does not re-export (the barrel is imported by the
+browser viewer). The merge PRECEDENCE stays in `mcp-server/tools.ts` — the
+hosts have no business knowing it.
+
 ## MCP Server
 
 Registered globally in `~/.claude/settings.json`. Viewer-related tools:

@@ -9,6 +9,7 @@ import {
   type ParamCommitResult,
   type ViewerAssetUrls,
 } from "@shapeitup/shared";
+import { clearSidecarParam } from "@shapeitup/shared/sidecar";
 
 const MIME: Record<string, string> = {
   ".js": "text/javascript; charset=utf-8",
@@ -330,8 +331,15 @@ export class ViewerHost {
       return fail(`could not write ${path.basename(file)}: ${e?.message ?? e}`);
     }
 
-    this.log(`commit ${name}=${result.edit.text} → ${path.basename(file)}`);
-    return { type: "param-commit-result", name, value, ok: true };
+    // The file is the durable artifact; a `tune_params --persist` pin is a
+    // scratch overlay that only the MCP tools read. Leaving it would mean the
+    // number the user just committed is silently overridden in every export.
+    const clearedSidecar = clearSidecarParam(file, name);
+    this.log(
+      `commit ${name}=${result.edit.text} → ${path.basename(file)}` +
+        (clearedSidecar ? " (dropped a persisted override)" : ""),
+    );
+    return { type: "param-commit-result", name, value, ok: true, clearedSidecar };
   }
 
   private handleHttp(req: http.IncomingMessage, res: http.ServerResponse) {

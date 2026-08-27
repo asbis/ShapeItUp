@@ -53,6 +53,13 @@ import {
 import { getDetectedAppsAsync, getDetectedApps } from "./app-detector.js";
 import { getSubscriberBus, defaultGlobalStorageDir } from "./subscriber-bus.js";
 import { startViewer, stopViewer, getViewerHost } from "./viewer-host.js";
+import {
+  readSidecar,
+  writeSidecar,
+  SIDECAR_FILENAME,
+  type SidecarValue,
+  type SidecarMap,
+} from "@shapeitup/shared/sidecar";
 import { openFileInApp } from "./app-launcher.js";
 import { sanitizeToolListResponse } from "./schema-sanitizer.js";
 
@@ -2398,27 +2405,10 @@ export function computePartsLine(
 // call-time overrides. Namespaced by basename so multiple files in one dir
 // coexist. Documented in the `clear_params` tool description for discoverability.
 
-const SIDECAR_FILENAME = ".shapeitup-params.json";
-
-type SidecarValue = number | boolean | string;
-type SidecarMap = Record<string, Record<string, SidecarValue>>;
-
-function readSidecar(dir: string): SidecarMap {
-  try {
-    const p = join(dir, SIDECAR_FILENAME);
-    if (!existsSync(p)) return {};
-    const parsed = JSON.parse(readFileSync(p, "utf-8"));
-    return parsed && typeof parsed === "object" ? parsed as SidecarMap : {};
-  } catch {
-    return {};
-  }
-}
-
-function writeSidecar(dir: string, map: SidecarMap): void {
-  const p = join(dir, SIDECAR_FILENAME);
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(p, JSON.stringify(map, null, 2), "utf-8");
-}
+// The file format lives in @shapeitup/shared/sidecar so the two viewer hosts
+// can drop a pin when a slider commit supersedes it — see that module for why.
+// The MERGE POLICY below stays here: precedence is an MCP concern, and the
+// hosts have no business knowing about it.
 
 /**
  * Look up persisted overrides for a given shape file and merge them UNDER the

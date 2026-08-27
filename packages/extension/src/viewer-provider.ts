@@ -9,6 +9,7 @@ import {
   type ExportFormat,
   type ParamCommitResult,
 } from "@shapeitup/shared";
+import { clearSidecarParam } from "@shapeitup/shared/sidecar";
 import type { DetectedApp } from "./app-detector";
 import { getDetectedApps } from "./app-detector";
 import { getCachedWasmAssets } from "./wasm-cache";
@@ -812,11 +813,15 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    // See the serve host's writer: a persisted override would silently win over
+    // the value the user just committed, in every export.
+    const clearedSidecar = clearSidecarParam(file, name);
     this.output.appendLine(
       `[param] ${name} = ${result.edit.text} in ${path.basename(file)}` +
-        (visible ? " (unsaved — yours to save)" : " (saved)"),
+        (visible ? " (unsaved — yours to save)" : " (saved)") +
+        (clearedSidecar ? " — dropped a persisted override" : ""),
     );
-    return { type: "param-commit-result", name, value, ok: true };
+    return { type: "param-commit-result", name, value, ok: true, clearedSidecar };
   }
 
   async executeScript(

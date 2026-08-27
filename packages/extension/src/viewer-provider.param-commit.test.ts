@@ -11,7 +11,10 @@
  * behaviour around it: composing with an unsaved buffer, and the rule about
  * which documents get saved.
  */
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { __reset, __addDoc, __state } from "./testing/vscode-stub.js";
 import { ViewerProvider } from "./viewer-provider.js";
 
@@ -49,7 +52,14 @@ describe("ViewerProvider.commitParam", () => {
 
     const r = await commit(provider, "depth", 65);
 
-    expect(r).toEqual({ type: "param-commit-result", name: "depth", value: 65, ok: true });
+    expect(r).toEqual({
+      type: "param-commit-result",
+      name: "depth",
+      value: 65,
+      ok: true,
+      // No sidecar next to this path, so nothing to retire.
+      clearedSidecar: false,
+    });
     expect(doc.text).toBe(SRC.replace("depth: 50", "depth: 65"));
   });
 
@@ -115,6 +125,41 @@ describe("ViewerProvider.commitParam", () => {
 
     expect(r).toMatchObject({ ok: false, reason: "not-a-numeric-literal" });
     expect(doc.text).toBe(src);
+  });
+
+  it("retires the sidecar pin for the parameter it just committed", async () => {
+    // clearSidecarParam touches the real filesystem, so this one needs a real
+    // directory — the stubbed editor only fakes the document.
+    const dir = mkdtempSync(join(tmpdir(), "commit-sidecar-"));
+    const file = join(dir, "bracket.shape.ts");
+    writeFileSync(
+      join(dir, ".shapeitup-params.json"),
+      JSON.stringify({ "bracket.shape.ts": { depth: 999, width: 111 } }),
+    );
+    __addDoc(file, SRC, { visible: true });
+    const { provider } = makeProvider(file);
+
+    const r = await commit(provider, "depth", 65);
+
+    expect(r).toMatchObject({ ok: true, clearedSidecar: true });
+    // Only the committed parameter loses its pin.
+    expect(JSON.parse(readFileSync(join(dir, ".shapeitup-params.json"), "utf-8"))).toEqual({
+      "bracket.shape.ts": { width: 111 },
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("reports clearedSidecar false when nothing was pinned", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "commit-nosidecar-"));
+    const file = join(dir, "bracket.shape.ts");
+    __addDoc(file, SRC, { visible: true });
+    const { provider } = makeProvider(file);
+
+    const r = await commit(provider, "depth", 65);
+
+    expect(r).toMatchObject({ ok: true, clearedSidecar: false });
+    expect(existsSync(join(dir, ".shapeitup-params.json"))).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
   });
 
   it("declines when no file is open", async () => {
