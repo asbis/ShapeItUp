@@ -36,3 +36,6 @@ packages/core/src/instrumentation.d.ts
 
 # Transient release notes
 .release-notes-*.md
+
+# tsc -b typecheck output (kept out of dist so it cannot clobber the bundle)
+.tsc/

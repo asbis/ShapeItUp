@@ -1,7 +1,11 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "outDir": "./dist",
+  // Typecheck output goes to .tsc, NOT dist: esbuild writes the real bundle
+  // into dist, and `tsc -b` emitting there overwrites it with unbundled
+  // per-file output. That made `pnpm lint` after `pnpm build` produce a broken
+  // artifact — it only ever went unnoticed because CI runs lint first.
+    "outDir": "./.tsc",
     "rootDir": "./src",
     "lib": ["ES2022"],
     "noEmit": true
