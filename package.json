@@ -8,7 +8,7 @@
     "dev:mcp": "node esbuild.config.mjs --watch --mcp-only",
     "build": "node esbuild.config.mjs",
     "build:mcp": "node esbuild.config.mjs --mcp-only",
-    "lint": "tsc -b packages/extension packages/mcp-server",
+    "lint": "tsc -b packages/extension packages/mcp-server packages/serve",
     "package": "pnpm build && cd packages/extension && vsce package --no-dependencies",
     "test": "vitest run",
     "test:watch": "vitest",

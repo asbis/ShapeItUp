@@ -3,7 +3,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
-import { renderViewerHtml, type ViewerAssetUrls } from "@shapeitup/shared";
+import {
+  renderViewerHtml,
+  computeParamEdit,
+  type ParamCommitResult,
+  type ViewerAssetUrls,
+} from "@shapeitup/shared";
 
 const MIME: Record<string, string> = {
   ".js": "text/javascript; charset=utf-8",
@@ -107,6 +112,14 @@ export class ViewerHost {
   private watcher: fs.FSWatcher | null = null;
   private debounce: NodeJS.Timeout | undefined;
   private boundPort = 0;
+  /**
+   * Content this host just wrote. The watcher fires on our own write, and
+   * without this we would bundle and push a rebuild of the code we just
+   * produced. Matched on CONTENT rather than a timer: a time window is either
+   * too short on a slow disk or long enough to swallow a real edit that
+   * arrived from the editor a moment later.
+   */
+  private selfWrite: { path: string; content: string } | null = null;
 
   constructor(private readonly opts: ViewerHostOptions) {}
 
@@ -208,6 +221,7 @@ export class ViewerHost {
     // dance editors do on save, which would otherwise orphan a file watch.
     this.watcher = fs.watch(dir, (_e, name) => {
       if (!name || !String(name).endsWith(".shape.ts")) return;
+      if (this.isOwnWrite(path.join(dir, String(name)))) return;
       clearTimeout(this.debounce);
       this.debounce = setTimeout(() => void this.push(`changed: ${name}`), 150);
     });
@@ -229,6 +243,95 @@ export class ViewerHost {
       this.log(`bundle failed: ${message}`);
       this.sendViewerCommand("error", { message });
     }
+  }
+
+  /**
+   * Write a committed slider value into the source.
+   *
+   * The file is re-read here rather than trusting anything the viewer sent:
+   * offsets are computed against the bytes we are about to overwrite, so an
+   * edit that arrived from the editor, an agent, or a `git checkout` in the
+   * meantime is picked up instead of silently clobbered. If the value stopped
+   * being a plain literal in that time, the commit declines.
+   *
+   * No rebuild follows a successful write. The viewer that sent the commit is
+   * already rendering that exact value — it applied the same number as a worker
+   * override on release — so a rebuild would spend an execution to produce
+   * identical geometry. (A second viewer attached to the same file therefore
+   * stays stale until the next real edit. Multi-viewer is not a workflow we
+   * support yet; when it is, broadcast to the others rather than to everyone.)
+   */
+  /**
+   * True when this watcher event is the echo of our own write.
+   *
+   * Compares CONTENT, and clears the latch on the first match so a later,
+   * genuine edit that happens to restore the same bytes is not swallowed too.
+   */
+  private isOwnWrite(changed: string): boolean {
+    const pending = this.selfWrite;
+    if (!pending) return false;
+    if (path.resolve(changed) !== pending.path) return false;
+    let onDisk: string;
+    try {
+      onDisk = fs.readFileSync(pending.path, "utf-8");
+    } catch {
+      return false;
+    }
+    if (onDisk !== pending.content) return false;
+    this.selfWrite = null;
+    return true;
+  }
+
+  private async commitParam(name: string, value: number): Promise<ParamCommitResult> {
+    const fail = (reason: string): ParamCommitResult => ({
+      type: "param-commit-result",
+      name,
+      value,
+      ok: false,
+      reason,
+    });
+
+    const file = this.currentFile;
+    if (!file) return fail("no file open");
+
+    let source: string;
+    let statBefore: fs.Stats;
+    try {
+      statBefore = fs.statSync(file);
+      source = fs.readFileSync(file, "utf-8");
+    } catch (e: any) {
+      return fail(`could not read ${path.basename(file)}: ${e?.message ?? e}`);
+    }
+
+    const result = computeParamEdit(source, name, value);
+    if (!result.ok) {
+      // `unchanged` is a success from the user's point of view — the file
+      // already says what they asked for — so it isn't reported as a failure.
+      if (result.reason === "unchanged") {
+        return { type: "param-commit-result", name, value, ok: true };
+      }
+      return fail(result.reason);
+    }
+
+    const next =
+      source.slice(0, result.edit.start) + result.edit.text + source.slice(result.edit.end);
+
+    try {
+      // Re-stat immediately before writing. This only closes the read→write
+      // window; a change from before the read is already handled by having
+      // computed the edit against the text we just read.
+      if (fs.statSync(file).mtimeMs !== statBefore.mtimeMs) {
+        return fail("file changed while writing — nothing was saved");
+      }
+      this.selfWrite = { path: path.resolve(file), content: next };
+      fs.writeFileSync(file, next, "utf-8");
+    } catch (e: any) {
+      this.selfWrite = null;
+      return fail(`could not write ${path.basename(file)}: ${e?.message ?? e}`);
+    }
+
+    this.log(`commit ${name}=${result.edit.text} → ${path.basename(file)}`);
+    return { type: "param-commit-result", name, value, ok: true };
   }
 
   private handleHttp(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -288,6 +391,16 @@ export class ViewerHost {
 
       if (msg?.type === "ready") {
         void this.push("viewer ready");
+        return;
+      }
+      if (msg?.type === "param-changed" && msg.params) {
+        for (const [name, value] of Object.entries(msg.params)) {
+          if (typeof value !== "number") continue;
+          void this.commitParam(name, value).then((r) => {
+            if (!r.ok) this.log(`commit ${name} declined: ${r.reason}`);
+            if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(r));
+          });
+        }
         return;
       }
       if (msg?.type === "request-wasm-assets") {

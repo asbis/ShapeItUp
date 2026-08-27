@@ -1,4 +1,3 @@
-export * from "./param-edit.js";
 /**
  * @shapeitup/core — environment-agnostic CAD pipeline.
  *

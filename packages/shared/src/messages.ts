@@ -45,6 +45,7 @@ export type ExtToWebview =
       // default "final" tessellation and negates the MCP caller's intent.
       meshQuality?: "preview" | "final";
     }
+  | ParamCommitResult
   | { type: "request-export"; format: ExportFormat }
   | { type: "request-screenshot"; width?: number; height?: number }
   | { type: "viewer-command"; command: string; [key: string]: any }
@@ -83,6 +84,23 @@ export interface RenderPreviewCommand {
   // webview → worker → core.execute. Absent means "let core auto-degrade
   // based on part count" (the pre-P3-10 default).
   meshQuality?: "preview" | "final";
+}
+
+/**
+ * Outcome of a `param-changed` commit, host → viewer.
+ *
+ * A commit can decline for reasons the viewer can't know up front — the file
+ * changed underneath, the value stopped being a plain literal — so the viewer
+ * needs to hear about it rather than assume the write landed. `reason` is the
+ * `ParamEditFailure` string, plus the host-only cases.
+ */
+export interface ParamCommitResult {
+  type: "param-commit-result";
+  name: string;
+  value: number;
+  ok: boolean;
+  /** Absent when ok. */
+  reason?: string;
 }
 
 // Webview → Extension Host

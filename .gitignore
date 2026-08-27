@@ -33,3 +33,6 @@ shapeitup-previews/
 
 # Accidental hand-written declaration shadowing instrumentation.ts
 packages/core/src/instrumentation.d.ts
+
+# Transient release notes
+.release-notes-*.md
