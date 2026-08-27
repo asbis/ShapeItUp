@@ -1379,7 +1379,7 @@ function updateParamsUI(params: ParamDef[]) {
     input.autocomplete = "off";
     input.dataset.step = String(p.step ?? (Math.abs(p.value) >= 10 ? 1 : 0.1));
     input.title =
-      "Type a value, or scroll / arrow while focused. Shift = x10, Alt = x0.1.";
+      "Scroll over this field to change it, or click to type. Shift = x10, Alt = x0.1.";
 
     /** Last value we know is good, for Escape and for rejecting bad input. */
     let lastGood = p.value;
@@ -1461,10 +1461,28 @@ function updateParamsUI(params: ParamDef[]) {
       nudgeTimer = setTimeout(() => commit(val), 400);
     };
 
-    // Focused only. Taking the wheel on hover would make the parameter list
-    // itself unscrollable, since the inputs cover most of it.
+    // Hover is enough — no click first. The listener is on the INPUT, not the
+    // row, so the label half of every row still scrolls the panel normally.
+    // That is the whole reason the field is only 58px wide.
+    //
+    // Two guards, both about not changing a dimension by accident:
+    //
+    //   deltaX — a sideways trackpad swipe is never an adjustment, and letting
+    //   it through would make horizontal flicks nudge values.
+    //
+    //   dwell — scrolling the panel drags the cursor across these fields on the
+    //   way past. Without a short settle, a scroll gesture would rewrite every
+    //   parameter it swept over, and with writeback on it would save them too.
+    //   Adjusting deliberately always means coming to rest on the field first.
+    let hoverSince = 0;
+    const DWELL_MS = 140;
+    input.addEventListener("mouseenter", () => {
+      hoverSince = performance.now();
+    });
     input.addEventListener("wheel", (e) => {
-      if (document.activeElement !== input) return;
+      if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+      const settled = document.activeElement === input || performance.now() - hoverSince > DWELL_MS;
+      if (!settled) return;
       e.preventDefault();
       nudge(e.deltaY < 0 ? 1 : -1, e);
     }, { passive: false });

@@ -228,36 +228,46 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
     #params-status.show { min-height: 16px; padding-bottom: 4px; }
     #params-status.warn { color: #e5a03c; }
     /* One line per parameter: name left, editable value right.
-       The field is flat until you approach it — the panel should read as a list
-       of values, not a stack of form boxes. Hover brings the affordance in, so
-       nothing is hidden, it just is not shouting seven times over. */
+       Quiet by default — seven bright numbers in a column is noise, and none of
+       them is more important than the model. Colour and chrome arrive on hover,
+       which is also when the field becomes interactive. */
     .param-row {
       display: flex; align-items: center; justify-content: space-between;
-      gap: 10px; padding: 1px 10px 1px 12px; min-height: 21px;
+      gap: 10px; padding: 0 10px 0 12px; min-height: 22px;
       border-left: 2px solid transparent;
     }
     .param-row:hover { background: #2a2d2e; border-left-color: #37373d; }
-    .param-row:focus-within { background: #2a2d2e; border-left-color: #007acc; }
+    .param-row:focus-within { background: #2a2d2e; border-left-color: #0e639c; }
     .param-name {
       font-size: 11px; color: #9d9d9d; letter-spacing: 0.1px;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      /* The label half is deliberately inert: it is where the wheel still
+         scrolls the panel, since the field itself takes the wheel on hover. */
+      cursor: default;
     }
     .param-row:hover .param-name,
-    .param-row:focus-within .param-name { color: #cfcfcf; }
+    .param-row:focus-within .param-name { color: #d4d4d4; }
     .param-input {
-      flex: 0 0 auto; width: 58px; padding: 1px 4px;
-      background: transparent; border: 1px solid transparent; border-radius: 2px;
-      color: #4fc1ff; text-align: right;
+      flex: 0 0 auto; width: 58px; padding: 2px 5px;
+      background: transparent; border: 1px solid transparent; border-radius: 3px;
+      color: #b9bcc0; text-align: right;
       font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 11px;
-      /* Digits line up column-wise even as values change width. */
+      /* Digits stay column-aligned as values change width. */
       font-variant-numeric: tabular-nums;
+      /* The standard "scroll or drag me vertically" signal. Doing the work the
+         tooltip would otherwise have to, without a glyph cluttering the row. */
+      cursor: ns-resize;
+      transition: background-color 0.1s ease, border-color 0.1s ease, color 0.1s ease;
     }
-    .param-row:hover .param-input { background: #1e1e1e; border-color: #3c3c3c; }
+    .param-row:hover .param-input {
+      background: #1e1e1e; border-color: #3c3c3c; color: #4fc1ff;
+    }
     .param-input:focus {
-      outline: none; background: #1a1a1a; border-color: #007acc; color: #7fd0ff;
+      outline: none; cursor: text;
+      background: #1a1a1a; border-color: #0e639c; color: #7fd0ff;
     }
     .param-input.invalid,
-    .param-row:hover .param-input.invalid { border-color: #e5a03c; color: #e5a03c; }
+    .param-row:hover .param-input.invalid { border-color: #cc8a3c; color: #e5a03c; }
     .param-slider {
       -webkit-appearance: none; width: 100%; height: 4px; border-radius: 2px;
       background: #3c3c3c; outline: none;
