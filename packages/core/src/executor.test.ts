@@ -118,7 +118,10 @@ describe("executeScript — params flow", () => {
       export { main as default, params };
     `;
     const { params } = executeScript(js, {}, {}, { width: 240 });
-    expect(params).toEqual([{ name: "width", value: 240, step: 1 }]);
+    // `declared` rides along because an override is in force: the effective
+    // value is 240, but the FILE still says 80, and the viewer needs the
+    // latter to preview a face selector that the host will actually produce.
+    expect(params).toEqual([{ name: "width", value: 240, declared: 80, step: 1 }]);
   });
 
   it("keeps the step anchored too, so a small default stays fine-grained", () => {
@@ -140,7 +143,7 @@ describe("executeScript — params flow", () => {
       export { main as default, params };
     `;
     const { params } = executeScript(js, {}, {}, { offset: 5 });
-    expect(params[0]).toEqual({ name: "offset", value: 5, step: 1 });
+    expect(params[0]).toEqual({ name: "offset", value: 5, declared: -20, step: 1 });
   });
 
   it("returns an empty params array when the script declares no params", () => {
@@ -1348,5 +1351,31 @@ describe("executeScript — multi-file entry disambiguation", () => {
       /Multi-file bundle detected multiple `main` symbols/.test(w),
     );
     expect(hit).toBeUndefined();
+  });
+});
+
+describe("executeScript — declared vs effective params", () => {
+  const js = `
+    var params = { width: 80 };
+    function main({ width }) { return width; }
+    export { main as default, params };
+  `;
+
+  it("omits `declared` when no override is in force", () => {
+    // Carrying it unconditionally would put a redundant field on every
+    // parameter of every message, for the sake of the minority case.
+    const { params } = executeScript(js, {}, {});
+    expect(params[0]).toEqual({ name: "width", value: 80, step: 1 });
+    expect("declared" in params[0]!).toBe(false);
+  });
+
+  it("carries `declared` when the override changes the value", () => {
+    const { params } = executeScript(js, {}, {}, { width: 240 });
+    expect(params[0]).toMatchObject({ value: 240, declared: 80 });
+  });
+
+  it("omits it when the override happens to equal the declared value", () => {
+    const { params } = executeScript(js, {}, {}, { width: 80 });
+    expect("declared" in params[0]!).toBe(false);
   });
 });

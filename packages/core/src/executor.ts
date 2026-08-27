@@ -527,7 +527,14 @@ export function executeScript(
   const paramDefs: ParamDef[] = Object.entries(params).map(([name, value]) => {
     const v = value as number;
     const d = typeof declared[name] === "number" ? (declared[name] as number) : v;
-    return { name, value: v, step: Math.abs(d) >= 10 ? 1 : 0.1 };
+    return {
+      name,
+      value: v,
+      // Only carried when an override is actually in force; equal values would
+      // just be noise on every message.
+      ...(d !== v ? { declared: d } : {}),
+      step: Math.abs(d) >= 10 ? 1 : 0.1,
+    };
   });
 
   // Feature #3: surface an `export const config` only when it's shaped

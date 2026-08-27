@@ -9,6 +9,7 @@
 import * as holes from "./holes";
 import * as mounts from "./mounts";
 import * as cosmetic from "./cosmetic";
+import { extrudeFace } from "./faces";
 import * as printHints from "./printHints";
 import * as bearings from "./bearings";
 import * as extrusions from "./extrusions";
@@ -80,6 +81,7 @@ export {
   holes,
   mounts,
   cosmetic,
+  extrudeFace,
   printHints,
   bearings,
   extrusions,
@@ -133,6 +135,7 @@ export const shapeitupStdlib = {
   holes,
   mounts,
   cosmetic,
+  extrudeFace,
   screws,
   bolts,
   washers,

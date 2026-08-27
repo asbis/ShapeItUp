@@ -20,6 +20,7 @@ import {
 } from "./selection";
 import { initMessageHandler, onMessage, postToExtension } from "./message-handler";
 import type { WorkerToWebview, TessellatedPart, DetectedApp } from "@shapeitup/shared";
+import { synthesizeFaceSelector } from "@shapeitup/shared";
 import { PART_COLORS } from "./theme";
 import { setupSim, updateSim, clearSim, initSimPanel, toggleSimPanel } from "./sim-panel";
 
@@ -306,47 +307,173 @@ const facePicker = new FacePicker(
   () => currentParts as PickablePart[],
 );
 
+/**
+ * What the FILE declares, which is what the host synthesises a selector
+ * against. Distinct from the effective values driving the render: drag a
+ * parameter without committing it and the two diverge, and previewing the
+ * effective one would promise a binding the host will not make.
+ */
+let declaredParamValues: Record<string, number> = {};
+
 const faceInfoEl = document.getElementById("face-info")!;
 const fiKindEl = document.getElementById("fi-kind")!;
-const fiPartEl = document.getElementById("fi-part")!;
-const fiRowsEl = document.getElementById("fi-rows")!;
-const fiNoteEl = document.getElementById("fi-note")!;
+const fiMetaEl = document.getElementById("fi-meta")!;
+const fiPreviewEl = document.getElementById("fi-preview")!;
+const fiToolsEl = document.getElementById("fi-tools") as HTMLElement;
+const fiFormEl = document.getElementById("fi-form") as HTMLElement;
+const fiDistEl = document.getElementById("fi-dist") as HTMLInputElement;
+const fiExtrudeEl = document.getElementById("fi-extrude") as HTMLButtonElement;
+const fiApplyEl = document.getElementById("fi-apply") as HTMLButtonElement;
 const fiLookAtEl = document.getElementById("fi-lookat") as HTMLButtonElement;
 const fiClearEl = document.getElementById("fi-clear") as HTMLButtonElement;
 
-function faceInfoRow(key: string, value: string, stacked = false): string {
-  const cls = stacked ? "fi-row stacked" : "fi-row";
-  return `<div class="${cls}"><span class="k">${key}</span><span class="v">${value}</span></div>`;
+/**
+ * Extrude mode swaps the bar's tools for a distance field and shows the line
+ * that will be written. It is a separate mode rather than an always-visible
+ * field so the resting state stays one short line.
+ */
+let extruding = false;
+
+function setExtruding(on: boolean): void {
+  extruding = on;
+  faceInfoEl.classList.toggle("extruding", on);
+  fiToolsEl.hidden = on;
+  fiFormEl.hidden = !on;
+  if (on) {
+    // Render before focusing: the preview IS the feature, and leaving it blank
+    // until the user types means the first thing they see is an empty promise.
+    renderExtrudePreview();
+    fiDistEl.focus();
+    fiDistEl.select();
+  }
 }
 
 function updateFaceInfoPanel(): void {
   const sel = facePicker.getSelection();
   if (!sel) {
     faceInfoEl.classList.remove("visible");
+    setExtruding(false);
     return;
   }
   const { info } = sel;
   fiKindEl.textContent = describeKind(info.kind);
-  // Multi-part assemblies need to say which body; a single part does not.
-  fiPartEl.textContent = currentParts.length > 1 ? sel.partName : "";
-  fiPartEl.style.display = currentParts.length > 1 ? "" : "none";
 
-  const rows: string[] = [];
-  if (typeof info.area === "number") rows.push(faceInfoRow("Area", formatFaceArea(info.area)));
-  rows.push(faceInfoRow("Center", formatTriple(info.center), true));
-  if (info.normal) rows.push(faceInfoRow("Normal", formatTriple(info.normal, 2), true));
-  fiRowsEl.innerHTML = rows.join("");
+  // One line: where it is, then how big. Centre and normal move into the
+  // tooltip — still available, no longer occupying four rows of the viewport.
+  const bits: string[] = [];
+  const placement = describePlacement(info);
+  if (placement) bits.push(placement);
+  if (currentParts.length > 1) bits.push(sel.partName);
+  if (typeof info.area === "number") bits.push(`<b>${formatFaceArea(info.area)}</b>`);
+  fiMetaEl.innerHTML = bits.join(" · ");
+  faceInfoEl.title =
+    `Center ${formatTriple(info.center)}` +
+    (info.normal ? `\nNormal ${formatTriple(info.normal, 2)}` : "");
 
-  // For an axis-aligned plane, name the plane the way a `.shape.ts` would —
-  // real information about the model, and the same shorthand a future step
-  // will write into the file. Everything else gets silence or an explanation.
-  fiNoteEl.textContent =
-    describePlacement(info) ??
-    (info.normal ? "" : "No single normal — cannot orient the camera to it.");
   fiLookAtEl.disabled = !info.normal;
+  // Only an axis-aligned plane can be named by a selector we are willing to
+  // write, so anything else cannot be extruded from here. Saying why in the
+  // tooltip beats a button that silently does nothing.
+  const selector = buildSelectorPreview(sel);
+  fiExtrudeEl.disabled = selector === null;
+  fiExtrudeEl.title = selector
+    ? "Push or pull this face along its normal"
+    : "This face is not parallel to a standard plane, so there is no stable way to name it in code yet";
 
+  if (extruding) renderExtrudePreview();
   faceInfoEl.classList.add("visible");
 }
+
+/**
+ * The selector the host would synthesise for this face — computed here too, so
+ * the bar can show it BEFORE the user commits and can grey out Extrude when
+ * there is nothing writable.
+ *
+ * `declaredParams` is what the viewer knows from the last render, which is the
+ * same set the host reads out of the file. If the two ever disagreed, the host
+ * is authoritative — it re-derives from the source at commit time.
+ */
+function buildSelectorPreview(sel: FaceSelection) {
+  const r = synthesizeFaceSelector(sel.info, declaredParamValues);
+  return r.ok ? r.selector : null;
+}
+
+function renderExtrudePreview(): void {
+  const sel = facePicker.getSelection();
+  const selector = sel ? buildSelectorPreview(sel) : null;
+  if (!sel || !selector) {
+    fiPreviewEl.textContent = "";
+    return;
+  }
+  const d = parseDistance();
+  const target = currentParts.length > 1 ? sel.partName : "shape";
+  const dist = d === null ? "…" : String(d);
+  fiPreviewEl.textContent = `extrudeFace(${target}, ${selector.code}, ${dist})`;
+  if (!selector.durable) {
+    // A literal offset is correct now and silently stops matching the moment
+    // that dimension changes. The user is about to write it into their file;
+    // they should know which kind of line they are getting.
+    const warn = document.createElement("span");
+    warn.className = "warn";
+    warn.textContent = "   ⚠ fixed offset — no parameter matched, so this breaks if the model moves";
+    fiPreviewEl.appendChild(warn);
+  }
+}
+
+/** The distance field, or null when it does not hold a usable number. */
+function parseDistance(): number | null {
+  const raw = fiDistEl.value.trim().replace(",", ".");
+  if (raw === "" || raw === "-") return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n !== 0 ? n : null;
+}
+
+let faceOpRequestId = 0;
+let pendingFaceOp: number | null = null;
+
+function applyExtrude(): void {
+  const sel = facePicker.getSelection();
+  const d = parseDistance();
+  if (!sel || d === null) {
+    setParamsStatus("Enter a non-zero distance.", true);
+    return;
+  }
+  if (pendingFaceOp !== null) return;
+
+  faceOpRequestId += 1;
+  pendingFaceOp = faceOpRequestId;
+  fiApplyEl.disabled = true;
+  setParamsStatus(`Extruding ${d} mm…`);
+  postToExtension({
+    type: "face-op",
+    requestId: faceOpRequestId,
+    op: "extrude",
+    // A single-part script returns a bare shape and has no name to match on.
+    partName: currentParts.length > 1 ? sel.partName : null,
+    face: {
+      kind: sel.info.kind,
+      center: sel.info.center,
+      ...(sel.info.normal ? { normal: sel.info.normal } : {}),
+    },
+    distance: d,
+  });
+}
+
+fiExtrudeEl.addEventListener("click", () => setExtruding(true));
+fiApplyEl.addEventListener("click", applyExtrude);
+fiDistEl.addEventListener("input", () => {
+  if (extruding) renderExtrudePreview();
+});
+fiDistEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    applyExtrude();
+    e.preventDefault();
+  } else if (e.key === "Escape") {
+    setExtruding(false);
+    e.preventDefault();
+    e.stopPropagation();
+  }
+});
 
 fiLookAtEl.addEventListener("click", () => {
   const sel = facePicker.getSelection();
@@ -810,7 +937,13 @@ function handleWorkerMessage(msg: WorkerToWebview) {
           pendingVisibility = null;
           applyPartVisibility(intent.focusPart, intent.hideParts);
         }
+        // Track what the file declares, for the selection bar's selector
+        // preview. `declared` is only present when an override is in force.
+        declaredParamValues = {};
+        for (const p of msg.params || []) declaredParamValues[p.name] = p.declared ?? p.value;
         updateParamsUI(msg.params || []);
+        // A rebuild replaced every face; the bar is showing a stale one.
+        updateFaceInfoPanel();
         // Motion sim: if the script exported a `sim` block, resolve it against
         // the parts we just rendered and show the timeline. No-op otherwise.
         // Async (the dynamics engine awaits Rapier's WASM); fire-and-forget with
@@ -1257,6 +1390,30 @@ onMessage("param-commit-result", (msg) => {
   setParamsStatus(`Not saved — ${msg.name}: ${why}`, true);
 });
 
+onMessage("face-op-result", (msg) => {
+  // A reply to a superseded request would report on work the user has already
+  // moved past, so only the outstanding one is allowed to speak.
+  if (msg.requestId !== pendingFaceOp) return;
+  pendingFaceOp = null;
+  fiApplyEl.disabled = false;
+
+  if (!msg.ok) {
+    setParamsStatus(`Not applied — ${msg.reason ?? "unknown reason"}`, true);
+    return;
+  }
+  setParamsStatus(
+    msg.addedImport
+      ? "Extruded — and added the shapeitup import"
+      : "Extruded",
+  );
+  // The file changed, so a re-render is on its way from the watcher. The
+  // selection indexes into buffers that render is about to replace, and there
+  // is no honest way to re-find "the same face" across a topology change.
+  setExtruding(false);
+  facePicker.setSelection(null);
+  updateFaceInfoPanel();
+});
+
 onMessage("viewer-command", (msg) => {
   switch (msg.command) {
     case "set-render-mode":
@@ -1369,6 +1526,15 @@ document.getElementById("btn-sim")!.addEventListener("click", toggleSimPanel);
 
 document.getElementById("btn-measure")!.addEventListener("click", () => {
   measureMode = !measureMode;
+  if (measureMode) {
+    // The selection bar and the measurement readout occupy the same slot at
+    // the top of the viewport, and picking is suppressed in measure mode
+    // anyway — so a live selection here could only sit there stale, under the
+    // measurement it is overlapping.
+    facePicker.setSelection(null);
+    facePicker.setHover(null);
+    updateFaceInfoPanel();
+  }
   document.getElementById("btn-measure")!.classList.toggle("active", measureMode);
   renderer.domElement.style.cursor = measureMode ? "crosshair" : "default";
   if (!measureMode) {

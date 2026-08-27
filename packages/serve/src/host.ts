@@ -4,10 +4,13 @@ import * as path from "node:path";
 import * as crypto from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import {
+  buildFaceOpCall,
   renderViewerHtml,
   computeParamEdit,
+  type FaceOpResultMessage,
   type ParamCommitResult,
   type ViewerAssetUrls,
+  type WebviewToExt,
 } from "@shapeitup/shared";
 import { clearSidecarParam } from "@shapeitup/shared/sidecar";
 
@@ -342,6 +345,77 @@ export class ViewerHost {
     return { type: "param-commit-result", name, value, ok: true, clearedSidecar };
   }
 
+  /**
+   * Apply a face operation picked in the viewer to the `.shape.ts` on disk.
+   *
+   * Shares the read → compute → re-stat → write shape with `commitParam`, and
+   * for the same reason: this host writes the file directly rather than through
+   * an editor, so the only protection against clobbering a concurrent change is
+   * to check the mtime it read against the mtime it is about to overwrite.
+   *
+   * Unlike a parameter commit this can also fail BEFORE touching the file — the
+   * face may not be one an `inPlane` selector can name, or the source may not
+   * be shaped the way the writer requires. Those are reported as prose, because
+   * the string goes straight into the viewer's status line.
+   */
+  private async commitFaceOp(msg: FaceOpMessage): Promise<FaceOpResultMessage> {
+    const fail = (reason: string): FaceOpResultMessage => ({
+      type: "face-op-result",
+      requestId: msg.requestId,
+      ok: false,
+      reason,
+    });
+
+    const file = this.currentFile;
+    if (!file) return fail("no file open");
+
+    let source: string;
+    let statBefore: fs.Stats;
+    try {
+      statBefore = fs.statSync(file);
+      source = fs.readFileSync(file, "utf-8");
+    } catch (e: any) {
+      return fail(`could not read ${path.basename(file)}: ${e?.message ?? e}`);
+    }
+
+    const built = buildFaceOpCall(source, msg);
+    if (!built.ok) return fail(built.reason);
+
+    let next = source;
+    // Descending, so each edit's offsets still describe the text they were
+    // computed against.
+    for (const e of [...built.edits].sort((a, b) => b.start - a.start)) {
+      next = next.slice(0, e.start) + e.text + next.slice(e.end);
+    }
+
+    try {
+      if (fs.statSync(file).mtimeMs !== statBefore.mtimeMs) {
+        return fail("file changed while writing — nothing was saved");
+      }
+      // NOT marked as a self-write, unlike a parameter commit. A committed
+      // slider needs no rebuild because the viewer is already rendering that
+      // number as a worker override; a face operation changes GEOMETRY that
+      // exists nowhere but the file, so the watcher's reload is the only thing
+      // that will ever show it. Suppressing the echo here left the model on
+      // screen looking exactly as it did before the edit landed.
+      fs.writeFileSync(file, next, "utf-8");
+    } catch (e: any) {
+      return fail(`could not write ${path.basename(file)}: ${e?.message ?? e}`);
+    }
+
+    this.log(
+      `${msg.op} ${msg.distance} mm on ${msg.partName ?? "shape"} → ${path.basename(file)}` +
+        (built.addedImport ? " (added the shapeitup import)" : ""),
+    );
+    return {
+      type: "face-op-result",
+      requestId: msg.requestId,
+      ok: true,
+      applied: built.applied,
+      addedImport: built.addedImport,
+    };
+  }
+
   private handleHttp(req: http.IncomingMessage, res: http.ServerResponse) {
     const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
 
@@ -411,6 +485,18 @@ export class ViewerHost {
         }
         return;
       }
+      if (msg?.type === "face-op") {
+        const req = parseFaceOp(msg);
+        if (!req) {
+          this.log("face-op ignored: malformed message");
+          return;
+        }
+        void this.commitFaceOp(req).then((r) => {
+          if (!r.ok) this.log(`${req.op} declined: ${r.reason}`);
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(r));
+        });
+        return;
+      }
       if (msg?.type === "request-wasm-assets") {
         // The extension answers this from a pre-read cache to save the worker
         // a fetch. We have no cache and need none — the assets are same-origin
@@ -423,4 +509,41 @@ export class ViewerHost {
       this.opts.onViewerMessage?.(msg);
     });
   }
+}
+
+type FaceOpMessage = Extract<WebviewToExt, { type: "face-op" }>;
+
+/**
+ * Validate a `face-op` off the wire.
+ *
+ * This host's messages arrive over a WebSocket from a page, so the payload is
+ * untrusted in the ordinary way any network input is: the fields have to be
+ * CHECKED, not asserted. The one that matters most is `distance` — it flows
+ * into generated source, and a NaN or an Infinity there would write a line
+ * that cannot be parsed back.
+ */
+function parseFaceOp(msg: Record<string, any>): FaceOpMessage | null {
+  const triple = (v: any): v is [number, number, number] =>
+    Array.isArray(v) && v.length === 3 && v.every((n) => typeof n === "number" && Number.isFinite(n));
+
+  if (msg.op !== "extrude") return null;
+  if (typeof msg.requestId !== "number" || !Number.isFinite(msg.requestId)) return null;
+  if (typeof msg.distance !== "number" || !Number.isFinite(msg.distance)) return null;
+  if (msg.partName !== null && typeof msg.partName !== "string") return null;
+  const face = msg.face;
+  if (!face || typeof face.kind !== "string" || !triple(face.center)) return null;
+  if (face.normal !== undefined && !triple(face.normal)) return null;
+
+  return {
+    type: "face-op",
+    requestId: msg.requestId,
+    op: "extrude",
+    partName: msg.partName,
+    face: {
+      kind: face.kind,
+      center: face.center,
+      ...(face.normal ? { normal: face.normal } : {}),
+    },
+    distance: msg.distance,
+  };
 }

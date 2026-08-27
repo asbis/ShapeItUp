@@ -8445,6 +8445,36 @@ Every helper returns a new \`Shape3D\` and swallows OCCT no-match errors
 part never crashes the render. Pass \`opts.silent = true\` to mute the
 warning when a no-op is expected.
 
+---
+
+## extrudeFace — push or pull one face
+
+\`\`\`typescript
+import { extrudeFace } from "shapeitup";
+
+// Pull the top face 5 mm outward. Holes in the face are preserved.
+extrudeFace(plate, (f) => f.inPlane("XY", thickness), 5)
+
+// A negative distance pushes inward, removing material.
+extrudeFace(plate, (f) => f.inPlane("XY", thickness), -3)
+\`\`\`
+
+This is what the viewer writes when you select a face and press **Extrude** —
+the GUI produces a code edit rather than hidden state, so the file stays the
+only description of the model.
+
+The face is named by a FINDER, and the finder must resolve to exactly ONE
+planar face. Anything else (no match, several matches, a curved face) returns
+the shape unchanged with a runtime warning rather than throwing.
+
+**Bind the offset to a parameter.** \`inPlane("XY", thickness)\` keeps working
+when \`thickness\` changes; \`inPlane("XY", 8)\` silently stops matching and the
+operation quietly disappears from the model. The viewer binds automatically
+when a declared parameter equals the offset, and warns in the preview when it
+has to fall back to a literal.
+
+---
+
 **Print orientation helpers** — re-orient a part for FDM printing and pack
 multiple parts onto one build plate:
 

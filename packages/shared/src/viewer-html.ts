@@ -392,41 +392,54 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
     #toolbar button:disabled { opacity: 0.35; cursor: default; }
     #toolbar button:disabled:hover { background: transparent; color: #aaa; }
 
-    /* Selection readout — what the click actually landed on.
-       Sits under the view toolbar rather than near the cursor: a panel that
-       chases the pointer is unreadable while you are still choosing a face. */
+    /* Selection bar — one line, the way a CAD context toolbar is one line.
+       Top-centre rather than following the cursor: a panel that chases the
+       pointer is unreadable while you are still choosing a face.
+       72px clears the command ribbon above it (measured at 64.5px tall);
+       #measure-info sits higher, at 40px, but the two can never be on screen
+       together — entering measure mode clears the selection. */
     #face-info {
-      position: absolute; top: 46px; left: 8px; z-index: 22;
-      min-width: 176px; max-width: 240px;
+      position: absolute; top: 72px; left: 50%; transform: translateX(-50%);
+      z-index: 23; display: none; max-width: calc(100% - 32px);
       background: rgba(37,37,38,0.96); border: 1px solid #3c3c3c;
-      border-left: 2px solid #2f9bff; border-radius: 3px;
-      padding: 7px 9px; display: none;
+      border-radius: 4px; box-shadow: 0 4px 14px rgba(0,0,0,0.35);
       font-size: 11px; color: #ccc;
-      box-shadow: 0 4px 14px rgba(0,0,0,0.35);
     }
     #face-info.visible { display: block; }
-    .fi-kind { color: #e8e8e8; font-weight: 600; font-size: 11.5px; }
-    .fi-part {
-      color: #888; font-size: 10px; margin-top: 1px;
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    .fi-main {
+      display: flex; align-items: center; gap: 8px;
+      padding: 4px 5px 4px 9px; white-space: nowrap;
     }
-    .fi-rows { margin-top: 6px; border-top: 1px solid #333; padding-top: 5px; }
-    .fi-row { display: flex; justify-content: space-between; gap: 10px; line-height: 1.65; }
-    .fi-row .k { color: #7a7a7a; }
-    .fi-row .v { color: #4fc1ff; font-variant-numeric: tabular-nums; }
-    /* Coordinate triples get their own line — three numbers plus a label do not
-       fit the panel width, and truncating a coordinate is worse than wrapping. */
-    .fi-row.stacked { display: block; }
-    .fi-row.stacked .v { display: block; margin-top: 1px; }
-    .fi-actions { margin-top: 7px; display: flex; gap: 5px; }
-    .fi-actions button {
-      flex: 1; background: #333336; border: 1px solid #454548; color: #ccc;
-      border-radius: 3px; padding: 4px 6px; font-size: 10.5px; cursor: pointer;
+    .fi-kind { color: #e8e8e8; font-weight: 600; }
+    .fi-meta { color: #8a8a8a; font-variant-numeric: tabular-nums; }
+    .fi-meta b { color: #4fc1ff; font-weight: 400; }
+    .fi-rule { width: 1px; align-self: stretch; background: #3c3c3c; margin: 0 1px; }
+    #face-info button {
+      background: transparent; border: 1px solid transparent; color: #bbb;
+      border-radius: 3px; padding: 3px 7px; font-size: 11px; cursor: pointer;
     }
-    .fi-actions button:hover { background: #3d3d41; color: #fff; border-color: #555; }
-    .fi-actions button:disabled { opacity: 0.35; cursor: default; }
-    .fi-actions button:disabled:hover { background: #333336; color: #ccc; border-color: #454548; }
-    .fi-note { margin-top: 6px; color: #6f6f6f; font-size: 10px; line-height: 1.4; }
+    #face-info button:hover { background: #3d3d41; color: #fff; border-color: #4a4a4e; }
+    #face-info button:disabled { opacity: 0.3; cursor: default; }
+    #face-info button:disabled:hover { background: transparent; color: #bbb; border-color: transparent; }
+    #fi-apply { background: #0e639c; border-color: #1177bb; color: #fff; }
+    #fi-apply:hover { background: #1177bb; border-color: #1a8ad4; }
+    #fi-dist {
+      width: 52px; background: #1e1e1e; border: 1px solid #4a4a4e; color: #4fc1ff;
+      border-radius: 3px; padding: 3px 5px; font-size: 11px; text-align: right;
+      font-family: inherit; font-variant-numeric: tabular-nums;
+    }
+    #fi-dist:focus { outline: none; border-color: #0e639c; }
+    .fi-unit { color: #6f6f6f; }
+    /* The generated line, shown before it is written. This is the whole
+       contract of the feature: you see the code you are about to commit. */
+    #fi-preview {
+      display: none; border-top: 1px solid #333; padding: 4px 9px 5px;
+      font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+      font-size: 10px; color: #7ea36f; white-space: nowrap;
+      overflow-x: auto; max-width: 100%;
+    }
+    #face-info.extruding #fi-preview { display: block; }
+    #fi-preview .warn { color: #d3a04a; }
 
     /* Measurement overlay */
     #measure-info {
@@ -570,14 +583,22 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
       </div>
 
       <div id="face-info">
-        <div class="fi-kind" id="fi-kind"></div>
-        <div class="fi-part" id="fi-part"></div>
-        <div class="fi-rows" id="fi-rows"></div>
-        <div class="fi-actions">
-          <button id="fi-lookat" title="Orient the camera down this face's normal">Look at</button>
-          <button id="fi-clear" title="Clear selection (Esc)">Clear</button>
+        <div class="fi-main">
+          <span class="fi-kind" id="fi-kind"></span>
+          <span class="fi-meta" id="fi-meta"></span>
+          <span class="fi-rule"></span>
+          <span id="fi-tools">
+            <button id="fi-extrude" title="Push or pull this face along its normal">Extrude</button>
+            <button id="fi-lookat" title="Orient the camera down this face's normal">Look at</button>
+          </span>
+          <span id="fi-form" hidden>
+            <input id="fi-dist" type="text" inputmode="decimal" value="5" title="Positive adds material, negative removes it">
+            <span class="fi-unit">mm</span>
+            <button id="fi-apply" title="Write this into the file">Apply</button>
+          </span>
+          <button id="fi-clear" title="Clear selection (Esc)">&#10005;</button>
         </div>
-        <div class="fi-note" id="fi-note"></div>
+        <div id="fi-preview"></div>
       </div>
 
       <div id="measure-info"></div>

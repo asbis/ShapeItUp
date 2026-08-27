@@ -1024,6 +1024,7 @@ Full parameter tables for every stdlib namespace are available via `get_api_refe
 - `patterns` — polar/grid/linear placement arrays; `spread`, `cutAt`, `cutTop`, `cutBottom` helpers
 - `printHints` — `elephantFootChamfer`, `firstLayerPad`, `flatForPrint`, `layoutOnBed`
 - `cosmetic` — generic fillet/chamfer recipes (`softenVerticalEdges`, `softenTopEdges`, `bottomChamfer`, `softenAllEdges`, `softenCircularEdges`)
+- `extrudeFace(shape, finder, distance)` — push (negative) or pull (positive) one planar face along its normal, holes preserved. This is what the viewer writes when you select a face and press Extrude. Bind the offset to a parameter — `f.inPlane("XY", thickness)`, not `f.inPlane("XY", 8)` — or the operation silently stops matching the moment that dimension changes.
 - `pins` — `pin`, `pivot`, `teeBar` (shafts and hinge axles)
 - `cradles` — `cradle` (ball cup) and `band_post` (rubber-band anchor)
 - `standards.SPORTS_BALLS` — ITF tennis, pingpong, golf, baseball, soccer diameters

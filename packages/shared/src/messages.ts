@@ -46,6 +46,7 @@ export type ExtToWebview =
       meshQuality?: "preview" | "final";
     }
   | ParamCommitResult
+  | FaceOpResultMessage
   | { type: "request-export"; format: ExportFormat }
   | { type: "request-screenshot"; width?: number; height?: number }
   | { type: "viewer-command"; command: string; [key: string]: any }
@@ -109,6 +110,28 @@ export interface ParamCommitResult {
   clearedSidecar?: boolean;
 }
 
+/**
+ * Outcome of a `face-op` commit, host → viewer.
+ *
+ * Separate from ParamCommitResult because the failure surface is different in
+ * kind: a parameter commit can only fail on ONE number it already located,
+ * while a face operation can fail because the selector could not be built,
+ * because the part could not be found in the source, or because the file is
+ * shaped in a way the editor deliberately refuses to guess about.
+ */
+export interface FaceOpResultMessage {
+  type: "face-op-result";
+  /** Echoed back so a stale reply cannot be attributed to a newer request. */
+  requestId: number;
+  ok: boolean;
+  /** The line written, for the status area. Absent when the commit declined. */
+  applied?: string;
+  /** Absent when ok. Prose, not an enum — this reaches the user directly. */
+  reason?: string;
+  /** True when an `import { … } from "shapeitup"` was added alongside. */
+  addedImport?: boolean;
+}
+
 // Webview → Extension Host
 export type WebviewToExt =
   | { type: "export-data"; format: ExportFormat; data: ArrayBuffer }
@@ -158,6 +181,22 @@ export type WebviewToExt =
       };
     }
   | { type: "param-changed"; params: Record<string, number> }
+  /**
+   * Push or pull a picked face, writing the operation into the `.shape.ts`.
+   *
+   * The viewer sends the FACE, not a finder: synthesising the selector needs
+   * the file's declared parameters in order to bind an offset to a name, and
+   * the host is the side that has the file. `partName` is null for a script
+   * that returns a bare shape rather than a named list.
+   */
+  | {
+      type: "face-op";
+      requestId: number;
+      op: "extrude";
+      partName: string | null;
+      face: { kind: string; center: [number, number, number]; normal?: [number, number, number] };
+      distance: number;
+    }
   | { type: "ready" }
   // Webview asks the extension for the cached OCCT (+ optional Manifold) bytes
   // on worker init. The extension replies with a `wasm-assets` message
@@ -235,7 +274,17 @@ export interface TessellatedPart {
 // Parameter definition extracted from script
 export interface ParamDef {
   name: string;
+  /** The value the model was BUILT with — declared value plus any override. */
   value: number;
+  /**
+   * What the FILE declares, when an override is in force and the two differ.
+   * Absent when they are the same.
+   *
+   * The viewer needs this to preview a generated selector honestly: the host
+   * synthesises against the file, so a parameter dragged to 10 in a session
+   * where the file still says 6 must not be previewed as a match.
+   */
+  declared?: number;
   /**
    * Increment for one wheel notch or arrow press in the viewer. Derived from
    * the value the FILE declares, so overriding a 0.5 default to 12 keeps the
