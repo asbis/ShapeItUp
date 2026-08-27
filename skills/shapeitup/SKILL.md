@@ -1,7 +1,7 @@
 ---
 name: shapeitup
 description: Create and modify 3D CAD models using Replicad TypeScript API in ShapeItUp
-globs: ["**/*.shape.ts"]
+paths: ["**/*.shape.ts"]
 ---
 
 # ShapeItUp — Replicad CAD Scripting Reference

@@ -1,4 +1,4 @@
-import { readFileSync } from "fs";
+import { readFileSync, existsSync, readdirSync } from "fs";
 import { execSync } from "child_process";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -12,6 +12,7 @@ const runOr = (cmd, fallback) => {
 
 const ext = read("packages/extension/package.json");
 const mcp = read("packages/mcp-server/package.json");
+const marketplace = read(".claude-plugin/marketplace.json");
 
 const failures = [];
 const warnings = [];
@@ -76,7 +77,46 @@ if (ext.version !== mcp.version) {
   pass("Extension and mcp-server versions match");
 }
 
-// 5. Are we on master? Releases are cut from master.
+// 5. Claude Code plugin entry must track the extension version.
+// `strict: false` means the marketplace entry IS the whole plugin definition,
+// so nothing else corrects a stale version here. It drifted 1.3.0 -> 1.23.0
+// unnoticed once already because no check looked at this file.
+for (const plugin of marketplace.plugins ?? []) {
+  if (plugin.version !== ext.version) {
+    fail(
+      `.claude-plugin/marketplace.json plugin '${plugin.name}' is at ${plugin.version}, ` +
+      `extension is at ${ext.version}. Bump the plugin entry to match.`,
+    );
+  } else {
+    pass(`Plugin entry '${plugin.name}' matches extension version ${ext.version}`);
+  }
+
+  // 6. Every declared skills path must resolve to a directory holding at
+  // least one `<skill>/SKILL.md`. A skill is a DIRECTORY containing SKILL.md —
+  // pointing at a bare SKILL.md, or at a path that doesn't exist, loads
+  // nothing and fails silently at install time.
+  const skillPaths = typeof plugin.skills === "string" ? [plugin.skills] : plugin.skills ?? [];
+  for (const rel of skillPaths) {
+    const dir = resolve(root, rel);
+    if (!existsSync(dir)) {
+      fail(`Plugin '${plugin.name}' declares skills path '${rel}' but ${dir} does not exist.`);
+      continue;
+    }
+    const found = readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && existsSync(resolve(dir, e.name, "SKILL.md")))
+      .map((e) => e.name);
+    if (found.length === 0) {
+      fail(
+        `Plugin '${plugin.name}' skills path '${rel}' contains no <skill>/SKILL.md. ` +
+        `Skills must be directories: ${rel}/<name>/SKILL.md`,
+      );
+    } else {
+      pass(`Skills path '${rel}' resolves ${found.length} skill(s): ${found.join(", ")}`);
+    }
+  }
+}
+
+// 7. Are we on master? Releases are cut from master.
 const branch = runOr("git rev-parse --abbrev-ref HEAD", "");
 if (branch !== "master") {
   warn(`On branch '${branch}', not 'master'. Releases are normally cut from master.`);

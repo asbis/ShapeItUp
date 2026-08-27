@@ -311,14 +311,14 @@ function copyTypingsToMcpServer() {
 function copySkillFiles() {
   // Bundle the Claude Code skill with the extension so it can be installed
   // on activation (~/.claude/skills/shapeitup/SKILL.md).
-  const src = resolve(__dirname, "skill/SKILL.md");
-  const destDir = resolve(__dirname, "packages/extension/dist/skill");
+  const src = resolve(__dirname, "skills/shapeitup/SKILL.md");
+  const destDir = resolve(__dirname, "packages/extension/dist/skills/shapeitup");
   if (existsSync(src)) {
     mkdirSync(destDir, { recursive: true });
     cpSync(src, resolve(destDir, "SKILL.md"));
-    console.log("Copied skill/SKILL.md to dist/skill/");
+    console.log("Copied skills/shapeitup/SKILL.md to dist/skills/shapeitup/");
   } else {
-    console.warn("Warning: skill/SKILL.md not found — skill will not be installable.");
+    console.warn("Warning: skills/shapeitup/SKILL.md not found — skill will not be installable.");
   }
 }
 

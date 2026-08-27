@@ -47,7 +47,7 @@ packages/
   serve/         — Standalone HTTP+WS viewer host (browser instead of webview)
   shared/        — Shared types, message defs, viewer HTML template, bundle spec
 examples/        — Example .shape.ts files
-skill/           — Claude Code skill (Replicad API reference)
+skills/          — Claude Code skill (skills/<name>/SKILL.md layout)
 ```
 
 ## Key Files
@@ -64,7 +64,7 @@ skill/           — Claude Code skill (Replicad API reference)
 | `packages/worker/src/executor.ts` | Import rewriting + script execution sandbox |
 | `packages/worker/src/index.ts` | WASM loading, GC, tessellation orchestration |
 | `packages/mcp-server/src/tools.ts` | All MCP tool definitions + API reference content |
-| `skill/SKILL.md` | Replicad API reference loaded by `/shapeitup` skill |
+| `skills/shapeitup/SKILL.md` | Replicad API reference loaded by `/shapeitup` skill |
 | `esbuild.config.mjs` | Single build script for all 4 packages |
 
 ## Build & Run
