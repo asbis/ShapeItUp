@@ -259,10 +259,18 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
       cursor: ns-resize;
       transition: background-color 0.1s ease, border-color 0.1s ease, color 0.1s ease;
     }
-    .param-row:hover .param-input {
-      background: #1e1e1e; border-color: #3c3c3c; color: #4fc1ff;
-    }
-    .param-input:focus {
+    /* No box on hover. The value stays plain text you can just scroll — the
+       row highlight and the accent colour already say which one you are on,
+       and a field appearing under the cursor makes a quiet list feel like a
+       form. The box arrives only on focus, when you are typing and need to see
+       exactly what you are editing. */
+    .param-row:hover .param-input { color: #4fc1ff; }
+    /* Must out-specify the hover rule above (0,3,0) — you are always hovering
+       the field you just clicked into, so a plain .param-input:focus (0,2,0)
+       lost, and the box never appeared when it was needed most. NOTE: no
+       backticks in this block; the whole stylesheet is a template literal. */
+    .param-input:focus,
+    .param-row:hover .param-input:focus {
       outline: none; cursor: text;
       background: #1a1a1a; border-color: #0e639c; color: #7fd0ff;
     }

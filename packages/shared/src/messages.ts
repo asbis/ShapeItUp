@@ -209,8 +209,11 @@ export interface TessellatedPart {
 export interface ParamDef {
   name: string;
   value: number;
-  min?: number;
-  max?: number;
+  /**
+   * Increment for one wheel notch or arrow press in the viewer. Derived from
+   * the value the FILE declares, so overriding a 0.5 default to 12 keeps the
+   * fine 0.1 step — the parameter is still a fine one.
+   */
   step?: number;
   label?: string;
 }

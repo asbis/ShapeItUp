@@ -83,8 +83,8 @@ describe("executeScript — params flow", () => {
     const { result, params } = executeScript(js, {}, {});
     expect(result).toBe(130);
     expect(params).toEqual([
-      { name: "width", value: 80, min: 0, max: 240, step: 1 },
-      { name: "height", value: 50, min: 0, max: 150, step: 1 },
+      { name: "width", value: 80, step: 1 },
+      { name: "height", value: 50, step: 1 },
     ]);
   });
 
@@ -108,21 +108,17 @@ describe("executeScript — params flow", () => {
     expect(result).toBe(20);
   });
 
-  it("anchors slider ranges to the declared value, not the overridden one", () => {
-    // The bug this guards: deriving min/max from the effective value made the
-    // range chase the value. Drag to the maximum, and the next execution came
-    // back with a range three times wider and the handle a third of the way
-    // along — the slider could never reach its own end.
+  it("reports no bounds — the viewer takes a typed value", () => {
+    // min/max used to be invented here as 0..3x the value. That was a guess
+    // about a parameter nobody declared bounds for, and it made the slider's
+    // range chase its own value. There is no slider now, and no guess.
     const js = `
       var params = { width: 80 };
       function main({ width }) { return width; }
       export { main as default, params };
     `;
     const { params } = executeScript(js, {}, {}, { width: 240 });
-    expect(params).toEqual([
-      // value follows the override, range stays anchored to the declared 80
-      { name: "width", value: 240, min: 0, max: 240, step: 1 },
-    ]);
+    expect(params).toEqual([{ name: "width", value: 240, step: 1 }]);
   });
 
   it("keeps the step anchored too, so a small default stays fine-grained", () => {
@@ -137,14 +133,14 @@ describe("executeScript — params flow", () => {
     expect(params[0]).toMatchObject({ value: 12, step: 0.1 });
   });
 
-  it("anchors a negative default to its own range", () => {
+  it("handles a negative default", () => {
     const js = `
       var params = { offset: -20 };
       function main({ offset }) { return offset; }
       export { main as default, params };
     `;
     const { params } = executeScript(js, {}, {}, { offset: 5 });
-    expect(params[0]).toMatchObject({ name: "offset", value: 5, min: -60, max: 0 });
+    expect(params[0]).toEqual({ name: "offset", value: 5, step: 1 });
   });
 
   it("returns an empty params array when the script declares no params", () => {

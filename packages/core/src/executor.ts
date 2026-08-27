@@ -517,25 +517,17 @@ export function executeScript(
     );
   }
 
-  // The range describes the PARAMETER; the value describes the current state.
-  // Deriving both from the same number made the range chase the value: drag a
-  // slider to its maximum, and the next execution came back with a range three
-  // times wider and the handle sitting a third of the way along. Push it to the
-  // max again and it widens again — the slider could never actually reach its
-  // own end. Anchoring to what the FILE declares keeps the range still while
-  // the value moves, and it still follows along when the user edits the
-  // default, because that is a new declared value.
+  // `step` is anchored to what the FILE declares, not to the effective value.
+  // Deriving it from the current value made it chase: override a 0.5 default to
+  // 12 and the step coarsened to whole units, so the parameter stopped being
+  // adjustable at the precision it was written for. There is no min/max — the
+  // viewer takes a typed value, and any bound we invented here would be a guess
+  // about a parameter nobody declared bounds for.
   const declared = (declaredParams ?? params) as Record<string, unknown>;
   const paramDefs: ParamDef[] = Object.entries(params).map(([name, value]) => {
     const v = value as number;
     const d = typeof declared[name] === "number" ? (declared[name] as number) : v;
-    return {
-      name,
-      value: v,
-      min: d > 0 ? 0 : d * 3,
-      max: d > 0 ? d * 3 : 0,
-      step: Math.abs(d) >= 10 ? 1 : 0.1,
-    };
+    return { name, value: v, step: Math.abs(d) >= 10 ? 1 : 0.1 };
   });
 
   // Feature #3: surface an `export const config` only when it's shaped
