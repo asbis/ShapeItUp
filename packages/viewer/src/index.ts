@@ -1200,6 +1200,21 @@ let currentParamValues: Record<string, number> = {};
 let lastScriptJs: string = "";
 let paramDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 
+/**
+ * Re-run the last bundle with the current slider values. The bundle is reused
+ * as-is — parameters are applied as overrides inside the worker, so no
+ * re-bundle and no round trip to the host is needed.
+ */
+function executeWithCurrentParams() {
+  if (!worker || !lastScriptJs) return;
+  statusEl.textContent = "Updating...";
+  worker.postMessage({
+    type: "execute",
+    js: lastScriptJs,
+    paramOverrides: { ...currentParamValues },
+  });
+}
+
 function updateParamsUI(params: ParamDef[]) {
   currentParamDefs = params;
   paramsList.innerHTML = "";
@@ -1235,24 +1250,42 @@ function updateParamsUI(params: ParamDef[]) {
     slider.step = String(p.step ?? (Math.abs(p.value) >= 10 ? 1 : 0.1));
     slider.value = String(p.value);
 
-    slider.addEventListener("input", () => {
+    const readSlider = () => {
       const val = parseFloat(slider.value);
       currentParamValues[p.name] = val;
       document.getElementById(`pv-${p.name}`)!.textContent =
         Number.isInteger(val) ? String(val) : formatNum(val, 1);
+      return val;
+    };
 
-      // Debounce re-execution
+    // `input` fires continuously while dragging: preview only. The override is
+    // ephemeral — it lives in the worker and never reaches the file.
+    slider.addEventListener("input", () => {
+      readSlider();
       if (paramDebounceTimer) clearTimeout(paramDebounceTimer);
-      paramDebounceTimer = setTimeout(() => {
-        if (worker && lastScriptJs) {
-          statusEl.textContent = "Updating...";
-          worker.postMessage({
-            type: "execute",
-            js: lastScriptJs,
-            paramOverrides: { ...currentParamValues },
-          });
-        }
-      }, 150);
+      paramDebounceTimer = setTimeout(executeWithCurrentParams, 150);
+    });
+
+    // `change` fires once, when the drag is released (or on each arrow key of a
+    // focused slider). THAT is the commit signal, not `input` — writing on every
+    // frame of a drag would churn the file and flood the editor's undo stack.
+    //
+    // Only the param that moved is sent. The host computes one edit from it; a
+    // full map would force it to diff against the file to find what changed,
+    // which is both wasteful and racy against an edit from elsewhere.
+    //
+    // No host acts on this yet, so today it is a no-op. That is deliberate —
+    // it lands ahead of the write path so the two can be reviewed separately.
+    slider.addEventListener("change", () => {
+      const val = readSlider();
+      // Flush the pending preview so the geometry on screen matches the value
+      // being committed, rather than trailing it by up to the debounce window.
+      if (paramDebounceTimer) {
+        clearTimeout(paramDebounceTimer);
+        paramDebounceTimer = undefined;
+      }
+      executeWithCurrentParams();
+      postToExtension({ type: "param-changed", params: { [p.name]: val } });
     });
 
     row.appendChild(label);
