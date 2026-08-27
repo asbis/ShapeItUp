@@ -204,8 +204,28 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
       padding: 8px 10px; font-size: 11px; font-weight: 600; color: #ccc;
       border-bottom: 1px solid #3c3c3c; text-transform: uppercase; letter-spacing: 0.5px;
       cursor: pointer;
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
     }
     #params-header:hover { background: #2a2d2e; }
+    /* The switch sits inside a header that toggles the panel, so it has to stop
+       its own clicks from collapsing the thing it lives in. */
+    #params-save {
+      display: flex; align-items: center; gap: 5px;
+      font-weight: 400; text-transform: none; letter-spacing: 0;
+      color: #888; cursor: pointer; white-space: nowrap;
+    }
+    #params-save:hover { color: #ccc; }
+    #params-save input { margin: 0; cursor: pointer; accent-color: #4fc1ff; }
+    #params-save.on { color: #4fc1ff; }
+    #params-status {
+      /* Directly under the header and sticky: a decline is unreadable if a long
+         parameter list can scroll it off the bottom of the panel. */
+      position: sticky; top: 0; z-index: 1; background: #252526;
+      padding: 0 10px; font-size: 10px; color: #888; min-height: 0;
+      transition: min-height 0.15s ease;
+    }
+    #params-status.show { min-height: 16px; padding-bottom: 4px; }
+    #params-status.warn { color: #e5a03c; }
     .param-row {
       padding: 4px 10px; display: flex; flex-direction: column; gap: 2px;
     }
@@ -303,7 +323,14 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
       <div id="parts-header">Components <span class="count" id="parts-count"></span></div>
       <div id="parts-list"></div>
       <div id="params-panel">
-        <div id="params-header">Parameters</div>
+        <div id="params-header">
+          <span>Parameters</span>
+          <label id="params-save" title="Write a value into the .shape.ts when you release a slider">
+            <input type="checkbox" id="params-save-toggle">
+            <span>Save to file</span>
+          </label>
+        </div>
+        <div id="params-status" aria-live="polite"></div>
         <div id="params-list"></div>
       </div>
     </div>

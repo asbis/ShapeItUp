@@ -983,6 +983,30 @@ function restorePartVisibility() {
   updateDimensions();
 }
 
+/**
+ * A commit can decline for reasons the viewer cannot know in advance — the file
+ * changed underneath, the value stopped being a plain literal, the disk said no.
+ * Say so. A slider that silently fails to save is worse than one that never
+ * offered to, because the user walks away believing the change is on disk.
+ */
+onMessage("param-commit-result", (msg) => {
+  if (msg.ok) {
+    setParamsStatus(
+      msg.clearedSidecar
+        ? `Saved ${msg.name} — and dropped a pinned override for it`
+        : `Saved ${msg.name} = ${msg.value}`,
+    );
+    return;
+  }
+  const explain: Record<string, string> = {
+    "not-a-numeric-literal": "its value in the file is an expression, not a plain number",
+    "param-not-found": "it is no longer declared in the file",
+    "no-params-declaration": "the file has no `export const params`",
+  };
+  const why = explain[msg.reason] ?? msg.reason;
+  setParamsStatus(`Not saved — ${msg.name}: ${why}`, true);
+});
+
 onMessage("viewer-command", (msg) => {
   switch (msg.command) {
     case "set-render-mode":
@@ -1196,6 +1220,71 @@ const paramsPanel = document.getElementById("params-panel")!;
 const paramsList = document.getElementById("params-list")!;
 const paramsHeader = document.getElementById("params-header")!;
 let currentParamDefs: ParamDef[] = [];
+
+/**
+ * Writeback is OFF by default, and deliberately so.
+ *
+ * A viewer that shows a model and a viewer that edits your source are different
+ * promises. Nobody opening a preview expects a stray drag to modify a file, so
+ * the destructive behaviour is the one you opt into. Turning it on later is a
+ * click; taking it away from people who came to rely on it is not.
+ *
+ * The choice is per-viewer and remembered locally, since it is a habit rather
+ * than a property of the model. Storage is wrapped because a webview or a
+ * private window can refuse it outright, and a thrown SecurityError here would
+ * take the whole panel down with it.
+ */
+const SAVE_PREF_KEY = "shapeitup.paramWriteback";
+const paramsSaveToggle = document.getElementById("params-save-toggle") as HTMLInputElement;
+const paramsSaveLabel = document.getElementById("params-save")!;
+const paramsStatus = document.getElementById("params-status")!;
+
+function readSavePref(): boolean {
+  try {
+    return localStorage.getItem(SAVE_PREF_KEY) === "on";
+  } catch {
+    return false;
+  }
+}
+
+function writeSavePref(on: boolean): void {
+  try {
+    localStorage.setItem(SAVE_PREF_KEY, on ? "on" : "off");
+  } catch {
+    // Not worth telling the user about: the switch still works for this session.
+  }
+}
+
+let writebackEnabled = readSavePref();
+paramsSaveToggle.checked = writebackEnabled;
+paramsSaveLabel.classList.toggle("on", writebackEnabled);
+
+paramsSaveToggle.addEventListener("change", () => {
+  writebackEnabled = paramsSaveToggle.checked;
+  paramsSaveLabel.classList.toggle("on", writebackEnabled);
+  writeSavePref(writebackEnabled);
+  setParamsStatus(
+    writebackEnabled
+      ? "Releasing a slider now writes its value to the file."
+      : "Sliders preview only — the file is not touched.",
+  );
+});
+
+// The switch lives inside the header that expands and collapses the panel.
+// Without this, flipping it also folds the panel away.
+paramsSaveLabel.addEventListener("click", (e) => e.stopPropagation());
+
+let paramsStatusTimer: ReturnType<typeof setTimeout> | undefined;
+function setParamsStatus(text: string, warn = false): void {
+  paramsStatus.textContent = text;
+  paramsStatus.classList.toggle("warn", warn);
+  paramsStatus.classList.toggle("show", text.length > 0);
+  clearTimeout(paramsStatusTimer);
+  if (text) {
+    // A decline needs to sit long enough to read; a confirmation does not.
+    paramsStatusTimer = setTimeout(() => setParamsStatus(""), warn ? 8000 : 3000);
+  }
+}
 let currentParamValues: Record<string, number> = {};
 let lastScriptJs: string = "";
 let paramDebounceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1325,7 +1414,9 @@ function updateParamsUI(params: ParamDef[]) {
         paramDebounceTimer = undefined;
       }
       executeWithCurrentParams();
-      postToExtension({ type: "param-changed", params: { [p.name]: val } });
+      if (writebackEnabled) {
+        postToExtension({ type: "param-changed", params: { [p.name]: val } });
+      }
     });
 
     row.appendChild(label);

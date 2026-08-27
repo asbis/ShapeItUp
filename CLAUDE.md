@@ -181,6 +181,12 @@ file declares gussetH: 45, sidecar pins gussetH: 120
   the viewer, and open_viewer                  -> bbox Z = 51
 ```
 
+Writeback is **off by default**, behind a "Save to file" switch in the
+Parameters header (remembered per viewer in `localStorage`). A viewer that
+shows a model and a viewer that edits your source are different promises, so
+the destructive one is opt-in. Commit outcomes — saved, or declined and why —
+appear in a status line pinned under that header.
+
 Resolution is precedence, not detection: the file is the durable artifact and
 the sidecar is a scratch overlay, so **committing a parameter clears its
 sidecar pin**. Other pinned parameters are untouched — a commit says nothing
