@@ -142,6 +142,37 @@ export interface TessellatedPart {
   normals: Float32Array;
   triangles: Uint32Array;
   edgeVertices: Float32Array;
+  /**
+   * Which span of `triangles` belongs to which face of the B-Rep, as flat
+   * `[start, count, start, count, …]` pairs — both in **index units**, so
+   * face `i` covers `triangles[start .. start + count)` and therefore
+   * triangle numbers `start / 3 .. (start + count) / 3`.
+   *
+   * replicad also hands out a `faceId` per group. We deliberately drop it:
+   * it is a WASM heap pointer, not an identity. Building the *same* geometry
+   * twice in one process yields 8489761 then 9050681 — it rises with every
+   * allocation. It is meaningful only inside the single `mesh()` result that
+   * produced it, so persisting or transmitting it would invite exactly the
+   * bug it looks like it prevents.
+   *
+   * Omitted when the shape is not an OCCT B-Rep (MeshShape / Manifold parts
+   * have no faces to pick).
+   */
+  faceGroups?: Uint32Array;
+  /**
+   * Geometry of each face, index-aligned with `faceGroups`. Populated by the
+   * orchestration loop in `index.ts` (which owns the replicad handle), not by
+   * `tessellatePart`. See {@link FaceInfo}.
+   */
+  faceInfo?: FaceInfo[];
+  /**
+   * Which span of `edgeVertices` belongs to which edge, as flat
+   * `[start, count, …]` pairs in **point units** — edge `i` covers points
+   * `start .. start + count`, i.e. floats `start * 3 .. (start + count) * 3`.
+   * Note the different unit from `faceGroups`; that asymmetry is replicad's,
+   * and normalising it here would only hide it from whoever reads the spec.
+   */
+  edgeGroups?: Uint32Array;
   volume?: number;
   surfaceArea?: number;
   centerOfMass?: [number, number, number];
@@ -318,6 +349,35 @@ function chooseTolerance(shape: any): number {
 export type MeshQuality = "preview" | "final";
 
 /**
+ * A picked-face descriptor: what the viewer needs to name one face of a part
+ * back to the user, and what a later step needs to synthesise a replicad
+ * finder for it.
+ *
+ * Index-aligned with the `[start, count]` pairs in
+ * {@link TessellatedPart.faceGroups}, which is safe because OCCT enumerates
+ * faces in the same order for `mesh()` and for `new FaceFinder().find(shape)`.
+ * That is an observed property of the library, not a documented guarantee, so
+ * {@link TessellatedPart.faceGroups} carries the mesh spans and this carries
+ * the geometry — a caller that distrusts the pairing can always fall back to
+ * matching a group's centroid against `center`.
+ */
+export interface FaceInfo {
+  /** OCCT surface type: "PLANE", "CYLINDRE", "SPHERE", "BSPLINE_SURFACE", … */
+  kind: string;
+  /** Face centre in world mm — the centre of mass of the surface, not of its AABB. */
+  center: [number, number, number];
+  /**
+   * Outward unit normal. Meaningful for planar faces; for curved ones it is
+   * the normal at the surface's parametric midpoint, which is why the viewer
+   * only offers plane-based actions when `kind === "PLANE"`.
+   * Omitted when OCCT could not evaluate one.
+   */
+  normal?: [number, number, number];
+  /** Surface area in mm². Omitted when measurement failed. */
+  area?: number;
+}
+
+/**
  * How much per-part measurement work to do on the tessellation hot path.
  *
  * `"none"` — skip both `measureShapeVolumeProperties` and
@@ -372,6 +432,107 @@ export interface TessellateOptions {
   partStats?: PartStatsLevel;
 }
 
+/**
+ * Upper bound on faces we will describe for picking. Past this the per-face
+ * OCCT calls stop being free relative to meshing (~0.45 ms each, so 1000 faces
+ * ≈ 450 ms) and the UI value collapses anyway — nobody picks one face out of
+ * four thousand by eye. Parts above the cap still render and still highlight
+ * nothing; they simply are not pickable.
+ */
+export const MAX_DESCRIBED_FACES = 1000;
+
+/**
+ * Describe every face of an OCCT shape, index-aligned with the `faceGroups`
+ * that `tessellatePart` captured from the same shape.
+ *
+ * Kept out of `tessellatePart` on purpose: that function is documented as
+ * never calling into replicad's measurement API, and it has no replicad
+ * handle. The orchestration loop in `index.ts` has both, so it calls this.
+ *
+ * Everything here is best-effort. A shape with no `FaceFinder` (Manifold
+ * MeshShape), a face OCCT cannot evaluate a normal for, a failed area
+ * measurement — each degrades to a missing field rather than a thrown error,
+ * because a part that cannot be picked should still be a part that renders.
+ */
+export function describeFaces(
+  shape: any,
+  replicadExports: Record<string, any>,
+  expectedCount?: number,
+): FaceInfo[] | undefined {
+  const FaceFinder = replicadExports.FaceFinder;
+  if (typeof FaceFinder !== "function") return undefined;
+
+  let faces: any[];
+  try {
+    faces = new FaceFinder().find(shape);
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(faces) || faces.length === 0) return undefined;
+
+  const deleteAll = () => {
+    for (const f of faces) {
+      try { f.delete?.(); } catch { /* freeing is best effort */ }
+    }
+  };
+
+  // The pairing with faceGroups is positional, so a length disagreement means
+  // the assumption behind it does not hold for this shape. Ship nothing rather
+  // than ship descriptors that name the wrong face.
+  if (expectedCount !== undefined && faces.length !== expectedCount) {
+    deleteAll();
+    return undefined;
+  }
+  if (faces.length > MAX_DESCRIBED_FACES) {
+    deleteAll();
+    return undefined;
+  }
+
+  const measureArea = replicadExports.measureShapeSurfaceProperties;
+  const out: FaceInfo[] = faces.map((f) => {
+    const info: FaceInfo = { kind: "UNKNOWN", center: [0, 0, 0] };
+    try { info.kind = String(f.geomType ?? "UNKNOWN"); } catch { /* keep UNKNOWN */ }
+    try {
+      const c = f.center;
+      info.center = [c.x, c.y, c.z];
+    } catch { /* keep origin */ }
+    try {
+      const n = f.normalAt();
+      const len = Math.hypot(n.x, n.y, n.z);
+      if (len > 0) info.normal = [n.x / len, n.y / len, n.z / len];
+    } catch { /* curved or degenerate — leave normal off */ }
+    if (typeof measureArea === "function") {
+      try {
+        const props = measureArea(f);
+        if (props && Number.isFinite(props.area)) info.area = props.area;
+        try { props?.delete?.(); } catch { /* best effort */ }
+      } catch { /* leave area off */ }
+    }
+    return info;
+  });
+
+  deleteAll();
+  return out;
+}
+
+/**
+ * Flatten replicad's group records into a transferable `[start, count, …]`
+ * pair array. Returns undefined for a missing or empty list so the field can
+ * simply be omitted rather than shipping a zero-length buffer that every
+ * consumer then has to distinguish from "not computed".
+ */
+function packGroups(
+  groups: { start: number; count: number }[] | undefined,
+): Uint32Array | undefined {
+  if (!Array.isArray(groups) || groups.length === 0) return undefined;
+  const out = new Uint32Array(groups.length * 2);
+  for (let i = 0; i < groups.length; i++) {
+    out[i * 2] = groups[i].start;
+    out[i * 2 + 1] = groups[i].count;
+  }
+  return out;
+}
+
 export function tessellatePart(part: PartInput, opts: TessellateOptions = {}): TessellatedPart {
   const quality: MeshQuality = opts.meshQuality ?? "final";
   const factor = QUALITY_FACTOR[quality] ?? QUALITY_FACTOR.final;
@@ -392,10 +553,19 @@ export function tessellatePart(part: PartInput, opts: TessellateOptions = {}): T
   const normals = new Float32Array(meshData.normals);
   const triangles = new Uint32Array(meshData.triangles);
 
+  // Flatten replicad's `{start, count, faceId}[]` into `[start, count, …]`.
+  // See TessellatedPart.faceGroups for why faceId is dropped rather than kept.
+  const faceGroups = packGroups(meshData.faceGroups);
+
   let edgeVertices: Float32Array;
+  let edgeGroups: Uint32Array | undefined;
   try {
+    // Called AFTER mesh() on purpose. OCCT builds the triangulation lazily and
+    // meshEdges reads it; calling it on an un-meshed shape returns lines that
+    // do not line up with the mesh we are about to draw them over.
     const edgeData = part.shape.meshEdges({ tolerance });
     edgeVertices = new Float32Array(edgeData.lines);
+    edgeGroups = packGroups(edgeData.edgeGroups);
   } catch {
     edgeVertices = new Float32Array(0);
   }
@@ -407,6 +577,8 @@ export function tessellatePart(part: PartInput, opts: TessellateOptions = {}): T
     normals,
     triangles,
     edgeVertices,
+    ...(faceGroups ? { faceGroups } : {}),
+    ...(edgeGroups ? { edgeGroups } : {}),
     // Propagate optional BOM metadata. Omit when absent so downstream
     // serializers don't render noise (`qty: undefined` / `material: undefined`).
     ...(typeof part.qty === "number" ? { qty: part.qty } : {}),

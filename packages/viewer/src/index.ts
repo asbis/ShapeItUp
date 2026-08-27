@@ -9,6 +9,15 @@ import {
   isAxisAligned,
 } from "./camera";
 import { buildMesh, buildEdges } from "./mesh-builder";
+import {
+  FacePicker,
+  describeKind,
+  describePlacement,
+  formatFaceArea,
+  formatTriple,
+  type FaceSelection,
+  type PickablePart,
+} from "./selection";
 import { initMessageHandler, onMessage, postToExtension } from "./message-handler";
 import type { WorkerToWebview, TessellatedPart, DetectedApp } from "@shapeitup/shared";
 import { PART_COLORS } from "./theme";
@@ -66,6 +75,13 @@ const orthoCamera = createOrthoCamera();
 
 const modelGroup = new THREE.Group();
 scene.add(modelGroup);
+
+// Highlight overlays live in their own group, not inside the part groups.
+// Keeping them out means hiding a part via the Components tree cannot leave a
+// stranded highlight behind, and clearModelGroup's dispose walk does not have
+// to know about them.
+const overlayGroup = new THREE.Group();
+scene.add(overlayGroup);
 
 // --- Compass / gnomon overlay --------------------------------------------
 // A small RGB axis indicator pinned to the lower-right corner so agents can
@@ -242,6 +258,18 @@ interface PartInfo {
   color: string;
   visible: boolean;
   group: THREE.Group;
+  /**
+   * Picking surface. `mesh` is the raycast target; `vertices` / `triangles`
+   * are kept so a highlight overlay can be cut from the same buffers the
+   * renderer is already using, and `faceGroups` / `faceInfo` say which
+   * triangles are which face. The last two are absent for Manifold parts,
+   * which have no B-Rep faces — those render but do not pick.
+   */
+  mesh: THREE.Mesh;
+  vertices: Float32Array;
+  triangles: Uint32Array;
+  faceGroups?: Uint32Array;
+  faceInfo?: TessellatedPart["faceInfo"];
   /** Measured on the OCCT shape, not the mesh. Absent on degenerate geometry. */
   volume?: number;
   surfaceArea?: number;
@@ -266,6 +294,96 @@ window.addEventListener("unhandledrejection", (e) => {
   console.error("[ShapeItUp] Unhandled rejection:", e.reason);
 });
 
+// --- Face picking ---------------------------------------------------------
+// Hover previews what a click would select; a click commits to it. The panel
+// under the view toolbar reports what OCCT actually says about that face,
+// which is more than the mesh alone could tell you — a cylinder's mesh is
+// triangles, but its FACE is a cylinder, and that distinction is what a later
+// step needs in order to write a durable selector into the source file.
+const facePicker = new FacePicker(
+  overlayGroup,
+  camera,
+  () => currentParts as PickablePart[],
+);
+
+const faceInfoEl = document.getElementById("face-info")!;
+const fiKindEl = document.getElementById("fi-kind")!;
+const fiPartEl = document.getElementById("fi-part")!;
+const fiRowsEl = document.getElementById("fi-rows")!;
+const fiNoteEl = document.getElementById("fi-note")!;
+const fiLookAtEl = document.getElementById("fi-lookat") as HTMLButtonElement;
+const fiClearEl = document.getElementById("fi-clear") as HTMLButtonElement;
+
+function faceInfoRow(key: string, value: string, stacked = false): string {
+  const cls = stacked ? "fi-row stacked" : "fi-row";
+  return `<div class="${cls}"><span class="k">${key}</span><span class="v">${value}</span></div>`;
+}
+
+function updateFaceInfoPanel(): void {
+  const sel = facePicker.getSelection();
+  if (!sel) {
+    faceInfoEl.classList.remove("visible");
+    return;
+  }
+  const { info } = sel;
+  fiKindEl.textContent = describeKind(info.kind);
+  // Multi-part assemblies need to say which body; a single part does not.
+  fiPartEl.textContent = currentParts.length > 1 ? sel.partName : "";
+  fiPartEl.style.display = currentParts.length > 1 ? "" : "none";
+
+  const rows: string[] = [];
+  if (typeof info.area === "number") rows.push(faceInfoRow("Area", formatFaceArea(info.area)));
+  rows.push(faceInfoRow("Center", formatTriple(info.center), true));
+  if (info.normal) rows.push(faceInfoRow("Normal", formatTriple(info.normal, 2), true));
+  fiRowsEl.innerHTML = rows.join("");
+
+  // For an axis-aligned plane, name the plane the way a `.shape.ts` would —
+  // real information about the model, and the same shorthand a future step
+  // will write into the file. Everything else gets silence or an explanation.
+  fiNoteEl.textContent =
+    describePlacement(info) ??
+    (info.normal ? "" : "No single normal — cannot orient the camera to it.");
+  fiLookAtEl.disabled = !info.normal;
+
+  faceInfoEl.classList.add("visible");
+}
+
+fiLookAtEl.addEventListener("click", () => {
+  const sel = facePicker.getSelection();
+  if (!sel?.info.normal) return;
+  // Look ALONG the inward normal, i.e. place the camera out on the outward
+  // one — setCameraAngle takes the direction from the model to the camera.
+  setCameraAngle(sel.info.normal);
+});
+
+fiClearEl.addEventListener("click", () => {
+  facePicker.setSelection(null);
+  updateFaceInfoPanel();
+});
+
+// Hover is advisory, so it is the first thing to give up: skip it entirely
+// while the user is orbiting (a raycast per pointermove during a drag is both
+// wasted work and visually noisy), and while the measure tool owns the cursor.
+let orbiting = false;
+controls.addEventListener("start", () => {
+  orbiting = true;
+  facePicker.setHover(null);
+});
+controls.addEventListener("end", () => {
+  orbiting = false;
+});
+
+renderer.domElement.addEventListener("pointermove", (event) => {
+  if (orbiting || measureMode) return;
+  const sel = facePicker.pick(event.clientX, event.clientY, renderer.domElement);
+  facePicker.setHover(sel);
+  renderer.domElement.style.cursor = sel ? "pointer" : "";
+});
+
+renderer.domElement.addEventListener("pointerleave", () => {
+  facePicker.setHover(null);
+});
+
 // --- Model management ---
 function clearModelGroup() {
   modelGroup.traverse((child) => {
@@ -276,6 +394,11 @@ function clearModelGroup() {
   });
   modelGroup.clear();
   currentParts = [];
+  // The selection indexed into buffers that no longer exist. Re-selecting the
+  // "same" face after a rebuild would need geometry matching, not an index —
+  // see the note at the top of selection.ts.
+  facePicker.clear();
+  updateFaceInfoPanel();
 }
 
 // ── Streaming render state ────────────────────────────────────────────────
@@ -326,6 +449,11 @@ function addPart(part: TessellatedPart) {
     color: colorHex,
     visible: true,
     group: partGroup,
+    mesh,
+    vertices: part.vertices,
+    triangles: part.triangles,
+    faceGroups: part.faceGroups,
+    faceInfo: part.faceInfo,
     volume: part.volume,
     surfaceArea: part.surfaceArea,
     centerOfMass: part.centerOfMass,
@@ -1756,11 +1884,30 @@ function addMeasurePoint(point: THREE.Vector3) {
   }
 }
 
+// A `click` also fires at the end of an orbit drag, and selecting whatever
+// happened to be under the cursor when the user finished rotating is the kind
+// of thing that makes a viewer feel like it is fighting you. Compare against
+// where the press started and treat anything that moved as a drag.
+let pressX = 0;
+let pressY = 0;
+const CLICK_SLOP_PX = 4;
+renderer.domElement.addEventListener("pointerdown", (event) => {
+  pressX = event.clientX;
+  pressY = event.clientY;
+});
+
 renderer.domElement.addEventListener("click", (event) => {
   // Gnomon click wins over everything else (including measure mode) so the
   // bottom-right nav widget is always responsive.
   if (tryGnomonClick(event)) return;
-  if (!measureMode) return;
+  if (!measureMode) {
+    if (Math.hypot(event.clientX - pressX, event.clientY - pressY) > CLICK_SLOP_PX) return;
+    // Clicking empty space clears — the standard CAD gesture, and the only
+    // way to deselect without reaching for the keyboard.
+    facePicker.setSelection(facePicker.pick(event.clientX, event.clientY, renderer.domElement));
+    updateFaceInfoPanel();
+    return;
+  }
 
   const rect = renderer.domElement.getBoundingClientRect();
   mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
@@ -1805,6 +1952,15 @@ window.addEventListener("keydown", (event) => {
       active.tagName === "TEXTAREA" ||
       (active as HTMLElement).isContentEditable)
   ) {
+    return;
+  }
+  // Escape clears the selection. Checked before the lowercase fold because
+  // "Escape".toLowerCase() is "escape", which would collide with nothing today
+  // but is a needless thing to depend on.
+  if (event.key === "Escape" && facePicker.getSelection()) {
+    facePicker.setSelection(null);
+    updateFaceInfoPanel();
+    event.preventDefault();
     return;
   }
   const key = event.key.toLowerCase();

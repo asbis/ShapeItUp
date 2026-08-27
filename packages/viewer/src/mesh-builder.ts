@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { createModelMaterial, createEdgeMaterial } from "./theme";
+import { createModelMaterial, createEdgeMaterial, createHighlightMaterial } from "./theme";
 
 export function buildMesh(
   vertices: Float32Array,
@@ -23,4 +23,42 @@ export function buildEdges(edgeVertices: Float32Array): THREE.LineSegments {
   );
 
   return new THREE.LineSegments(geometry, createEdgeMaterial());
+}
+
+/**
+ * Build an overlay mesh covering one face's triangles.
+ *
+ * Copies the span into its own small geometry rather than re-grouping the
+ * part's geometry with a second material. Re-grouping would mean touching the
+ * model's own buffers on every pointer move; this touches nothing the renderer
+ * already uploaded, and a face is a few hundred triangles at most.
+ *
+ * `start` and `count` are index units into `triangles` — the same units
+ * replicad's faceGroups use.
+ */
+export function buildFaceHighlight(
+  vertices: Float32Array,
+  triangles: Uint32Array,
+  start: number,
+  count: number,
+  mode: "hover" | "select",
+): THREE.Mesh {
+  // Flatten to non-indexed: the span references vertices scattered through the
+  // full buffer, so an indexed copy would have to carry the whole vertex array
+  // along with it.
+  const positions = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    const v = triangles[start + i] * 3;
+    positions[i * 3] = vertices[v];
+    positions[i * 3 + 1] = vertices[v + 1];
+    positions[i * 3 + 2] = vertices[v + 2];
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  const mesh = new THREE.Mesh(geometry, createHighlightMaterial(mode));
+  // Never let the overlay itself be a raycast target — it sits in front of the
+  // very face it describes, so it would shadow every subsequent pick.
+  mesh.raycast = () => {};
+  mesh.renderOrder = 1;
+  return mesh;
 }

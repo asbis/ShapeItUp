@@ -149,15 +149,19 @@ async function executeUserScript(
         self.postMessage({ type: "mesh-start", totalParts });
       },
       onPart: (part, index, total) => {
-        self.postMessage(
-          { type: "mesh-part", index, total, part },
-          [
-            part.vertices.buffer,
-            part.normals.buffer,
-            part.triangles.buffer,
-            part.edgeVertices.buffer,
-          ] as any,
-        );
+        // Transfer rather than copy. faceGroups/edgeGroups are optional —
+        // MeshShape parts have no B-Rep faces — and postMessage throws on an
+        // undefined entry in the transfer list, so they are appended only
+        // when present.
+        const transfer: ArrayBufferLike[] = [
+          part.vertices.buffer,
+          part.normals.buffer,
+          part.triangles.buffer,
+          part.edgeVertices.buffer,
+        ];
+        if (part.faceGroups) transfer.push(part.faceGroups.buffer);
+        if (part.edgeGroups) transfer.push(part.edgeGroups.buffer);
+        self.postMessage({ type: "mesh-part", index, total, part }, transfer as any);
       },
       // P3-10: optional tessellation-quality knob. Undefined means "let core
       // auto-degrade based on part count" — preserves the pre-P3-10 default.

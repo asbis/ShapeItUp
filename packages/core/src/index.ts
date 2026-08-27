@@ -10,7 +10,7 @@
 import type { ParamDef } from "@shapeitup/shared";
 import { executeScript } from "./executor";
 export { extractParamsStatic, extractConfigStatic, extractExpectedContactsStatic } from "./executor";
-import { normalizeParts, tessellatePart, type MeshQuality, type PartInput, type PartStatsLevel, type TessellatedPart } from "./tessellate";
+import { describeFaces, normalizeParts, tessellatePart, type MeshQuality, type PartInput, type PartStatsLevel, type TessellatedPart } from "./tessellate";
 import { exportShapes, exportShapesSplit } from "./exporter";
 import {
   validateParts,
@@ -38,7 +38,7 @@ import {
   resetRuntimeWarnings,
 } from "./stdlib/warnings";
 
-export type { PartInput, TessellatedPart, MeshQuality, PartStatsLevel } from "./tessellate";
+export type { PartInput, TessellatedPart, FaceInfo, MeshQuality, PartStatsLevel } from "./tessellate";
 export { exportShapes, exportShapesSplit, resolvePartFileNames } from "./exporter";
 
 // Re-export the shared externals list so MCP's engine (which already imports
@@ -1076,6 +1076,19 @@ export async function initCore(
         }
         // partStats === "none": nothing to do. volume/surfaceArea/mass/CoM
         // all stay undefined on the emitted part.
+
+        // Face descriptors for viewer picking. Deliberately NOT gated on
+        // partStats: that knob trades measurement cost against BOM numbers,
+        // while this is what makes the part clickable, and a part should not
+        // become unpickable because nobody declared a material. The cost is
+        // small next to meshing — 154 faces measured 78 ms against 2136 ms of
+        // mesh() on the same shape — and `describeFaces` caps itself.
+        //
+        // MeshShape (Manifold) parts are skipped: they have no B-Rep faces, so
+        // FaceFinder has nothing to find and picking has nothing to name.
+        if (!isMeshShape && t.faceGroups) {
+          t.faceInfo = describeFaces(shape, replicadExports, t.faceGroups.length / 2);
+        }
       }
       tessellated.push(t);
       streaming?.onPart?.(t, i, parts.length);

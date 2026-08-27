@@ -392,6 +392,42 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
     #toolbar button:disabled { opacity: 0.35; cursor: default; }
     #toolbar button:disabled:hover { background: transparent; color: #aaa; }
 
+    /* Selection readout — what the click actually landed on.
+       Sits under the view toolbar rather than near the cursor: a panel that
+       chases the pointer is unreadable while you are still choosing a face. */
+    #face-info {
+      position: absolute; top: 46px; left: 8px; z-index: 22;
+      min-width: 176px; max-width: 240px;
+      background: rgba(37,37,38,0.96); border: 1px solid #3c3c3c;
+      border-left: 2px solid #2f9bff; border-radius: 3px;
+      padding: 7px 9px; display: none;
+      font-size: 11px; color: #ccc;
+      box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+    }
+    #face-info.visible { display: block; }
+    .fi-kind { color: #e8e8e8; font-weight: 600; font-size: 11.5px; }
+    .fi-part {
+      color: #888; font-size: 10px; margin-top: 1px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .fi-rows { margin-top: 6px; border-top: 1px solid #333; padding-top: 5px; }
+    .fi-row { display: flex; justify-content: space-between; gap: 10px; line-height: 1.65; }
+    .fi-row .k { color: #7a7a7a; }
+    .fi-row .v { color: #4fc1ff; font-variant-numeric: tabular-nums; }
+    /* Coordinate triples get their own line — three numbers plus a label do not
+       fit the panel width, and truncating a coordinate is worse than wrapping. */
+    .fi-row.stacked { display: block; }
+    .fi-row.stacked .v { display: block; margin-top: 1px; }
+    .fi-actions { margin-top: 7px; display: flex; gap: 5px; }
+    .fi-actions button {
+      flex: 1; background: #333336; border: 1px solid #454548; color: #ccc;
+      border-radius: 3px; padding: 4px 6px; font-size: 10.5px; cursor: pointer;
+    }
+    .fi-actions button:hover { background: #3d3d41; color: #fff; border-color: #555; }
+    .fi-actions button:disabled { opacity: 0.35; cursor: default; }
+    .fi-actions button:disabled:hover { background: #333336; color: #ccc; border-color: #454548; }
+    .fi-note { margin-top: 6px; color: #6f6f6f; font-size: 10px; line-height: 1.4; }
+
     /* Measurement overlay */
     #measure-info {
       position: absolute; top: 40px; left: 50%; transform: translateX(-50%);
@@ -531,6 +567,17 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
         <label style="margin-top:4px">Position</label>
         <input type="range" id="section-pos" class="param-slider" min="0" max="100" value="50">
         <div style="font-size:10px;color:#4fc1ff;text-align:center" id="section-value">50%</div>
+      </div>
+
+      <div id="face-info">
+        <div class="fi-kind" id="fi-kind"></div>
+        <div class="fi-part" id="fi-part"></div>
+        <div class="fi-rows" id="fi-rows"></div>
+        <div class="fi-actions">
+          <button id="fi-lookat" title="Orient the camera down this face's normal">Look at</button>
+          <button id="fi-clear" title="Clear selection (Esc)">Clear</button>
+        </div>
+        <div class="fi-note" id="fi-note"></div>
       </div>
 
       <div id="measure-info"></div>

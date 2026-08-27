@@ -190,6 +190,22 @@ export type WebviewToWorker =
     }
   | { type: "export"; format: ExportFormat };
 
+/**
+ * Geometry of one B-Rep face, index-aligned with the `[start, count]` pairs in
+ * `TessellatedPart.faceGroups`. Mirrors `FaceInfo` in @shapeitup/core — the
+ * duplication is the same one TessellatedPart already lives with, so that the
+ * viewer can typecheck against @shapeitup/shared alone.
+ */
+export interface FaceInfo {
+  /** OCCT surface type: "PLANE", "CYLINDRE", "SPHERE", "BSPLINE_SURFACE", … */
+  kind: string;
+  center: [number, number, number];
+  /** Unit outward normal; absent when OCCT could not evaluate one. */
+  normal?: [number, number, number];
+  /** mm². */
+  area?: number;
+}
+
 // A single tessellated part
 export interface TessellatedPart {
   name: string;
@@ -198,6 +214,17 @@ export interface TessellatedPart {
   normals: Float32Array;
   triangles: Uint32Array;
   edgeVertices: Float32Array;
+  /**
+   * `[start, count, …]` spans of `triangles`, in index units — one pair per
+   * face. Present only for OCCT B-Rep parts. See the fuller note in
+   * @shapeitup/core's tessellate.ts, including why replicad's `faceId` is
+   * dropped on the way through.
+   */
+  faceGroups?: Uint32Array;
+  /** One entry per pair in `faceGroups`, same order. */
+  faceInfo?: FaceInfo[];
+  /** `[start, count, …]` spans of `edgeVertices`, in POINT units (3 floats each). */
+  edgeGroups?: Uint32Array;
   // Geometric properties computed from the original OCCT shape (not the mesh).
   // Optional because measurement can fail on degenerate geometry.
   volume?: number;

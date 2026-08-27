@@ -25,6 +25,14 @@ export const THEME = {
   edgeColor: 0x1a1a1a,
   edgeWidth: 1,
 
+  // Selection. Two strengths, the way a CAD app distinguishes "the cursor is
+  // over this" from "this is what your next command will act on": hover is a
+  // hint you can ignore, selection is a commitment you can act on.
+  hoverColor: 0x6fb3ff,
+  hoverOpacity: 0.32,
+  selectColor: 0x2f9bff,
+  selectOpacity: 0.55,
+
   // Lighting
   ambientColor: 0x404050,
   ambientIntensity: 0.5,
@@ -80,5 +88,32 @@ export function createEdgeMaterial(): THREE.LineBasicMaterial {
   return new THREE.LineBasicMaterial({
     color: THEME.edgeColor,
     linewidth: THEME.edgeWidth,
+  });
+}
+
+/**
+ * Material for the overlay drawn on top of a hovered or selected face.
+ *
+ * Drawn as a separate mesh sitting exactly on the model's own triangles, so
+ * it needs `polygonOffset` to win the depth fight — without it the two
+ * coplanar surfaces z-fight and the highlight stipples. The offset is
+ * NEGATIVE (toward the camera) where the model material's is positive, which
+ * is what pushes the highlight in front rather than behind.
+ *
+ * `depthWrite: false` keeps the translucent overlay from occluding anything
+ * drawn after it, and `side: DoubleSide` means a face still highlights when
+ * the camera is inside the solid or looking at a shell from behind.
+ */
+export function createHighlightMaterial(mode: "hover" | "select"): THREE.MeshBasicMaterial {
+  const selected = mode === "select";
+  return new THREE.MeshBasicMaterial({
+    color: selected ? THEME.selectColor : THEME.hoverColor,
+    transparent: true,
+    opacity: selected ? THEME.selectOpacity : THEME.hoverOpacity,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+    polygonOffset: true,
+    polygonOffsetFactor: -2,
+    polygonOffsetUnits: -2,
   });
 }
