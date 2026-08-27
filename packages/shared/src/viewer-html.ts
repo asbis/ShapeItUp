@@ -199,9 +199,10 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
       border-top: 1px solid #3c3c3c; padding: 0; max-height: 0; overflow: hidden;
       transition: max-height 0.2s ease;
     }
-    #params-panel.open { max-height: 400px; overflow-y: auto; padding-bottom: 4px; }
+    #params-panel.open { max-height: 400px; overflow-y: auto; padding-bottom: 6px; }
+    #params-list { padding-top: 3px; }
     #params-header {
-      padding: 8px 10px; font-size: 11px; font-weight: 600; color: #ccc;
+      padding: 7px 10px; font-size: 11px; font-weight: 600; color: #ccc;
       border-bottom: 1px solid #3c3c3c; text-transform: uppercase; letter-spacing: 0.5px;
       cursor: pointer;
       display: flex; align-items: center; justify-content: space-between; gap: 8px;
@@ -226,27 +227,37 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
     }
     #params-status.show { min-height: 16px; padding-bottom: 4px; }
     #params-status.warn { color: #e5a03c; }
-    /* One line per parameter: name on the left, a typed value on the right.
-       No slider — its range was a heuristic (0..3x the declared value), so it
-       could never be trusted for an exact dimension. */
+    /* One line per parameter: name left, editable value right.
+       The field is flat until you approach it — the panel should read as a list
+       of values, not a stack of form boxes. Hover brings the affordance in, so
+       nothing is hidden, it just is not shouting seven times over. */
     .param-row {
-      padding: 3px 10px; display: flex; align-items: center; gap: 8px;
-      justify-content: space-between;
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 10px; padding: 1px 10px 1px 12px; min-height: 21px;
+      border-left: 2px solid transparent;
     }
+    .param-row:hover { background: #2a2d2e; border-left-color: #37373d; }
+    .param-row:focus-within { background: #2a2d2e; border-left-color: #007acc; }
     .param-name {
-      font-size: 11px; color: #aaa; overflow: hidden;
-      text-overflow: ellipsis; white-space: nowrap;
+      font-size: 11px; color: #9d9d9d; letter-spacing: 0.1px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
+    .param-row:hover .param-name,
+    .param-row:focus-within .param-name { color: #cfcfcf; }
     .param-input {
-      flex: 0 0 auto; width: 84px; padding: 3px 6px;
-      background: #1e1e1e; color: #4fc1ff; font-family: monospace; font-size: 12px;
-      text-align: right; border: 1px solid #3c3c3c; border-radius: 3px;
+      flex: 0 0 auto; width: 58px; padding: 1px 4px;
+      background: transparent; border: 1px solid transparent; border-radius: 2px;
+      color: #4fc1ff; text-align: right;
+      font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 11px;
+      /* Digits line up column-wise even as values change width. */
+      font-variant-numeric: tabular-nums;
     }
-    .param-input:hover { border-color: #4a4a4a; }
-    .param-input:focus { outline: none; border-color: #007acc; background: #1a1a1a; }
-    /* Only a focused field takes the wheel, so say which one has it. */
-    .param-input:focus::placeholder { color: #555; }
-    .param-input.invalid { border-color: #e5a03c; color: #e5a03c; }
+    .param-row:hover .param-input { background: #1e1e1e; border-color: #3c3c3c; }
+    .param-input:focus {
+      outline: none; background: #1a1a1a; border-color: #007acc; color: #7fd0ff;
+    }
+    .param-input.invalid,
+    .param-row:hover .param-input.invalid { border-color: #e5a03c; color: #e5a03c; }
     .param-slider {
       -webkit-appearance: none; width: 100%; height: 4px; border-radius: 2px;
       background: #3c3c3c; outline: none;
