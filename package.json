@@ -14,17 +14,6 @@
     "test:watch": "vitest",
     "release:check": "node scripts/release-check.mjs"
   },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild",
-      "@esbuild/win32-x64"
-    ],
-    "peerDependencyRules": {
-      "allowedVersions": {
-        "manifold-3d>esbuild-wasm": "^0.28.0"
-      }
-    }
-  },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "esbuild": "^0.24.0",

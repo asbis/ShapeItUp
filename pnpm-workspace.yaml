@@ -1,2 +1,13 @@
 packages:
   - "packages/*"
+
+# pnpm >=11 no longer reads the `pnpm` field in package.json — these settings
+# live here now. Without `allowBuilds`, esbuild's postinstall never runs and
+# `pnpm build` hard-fails with ERR_PNPM_IGNORED_BUILDS.
+allowBuilds:
+  esbuild: true
+  sharp: true
+
+peerDependencyRules:
+  allowedVersions:
+    manifold-3d>esbuild-wasm: "^0.28.0"
