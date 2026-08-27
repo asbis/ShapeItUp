@@ -114,20 +114,40 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
     canvas { display: block; width: 100% !important; height: 100% !important; }
 
     /* Top toolbar */
+    /* Ribbon-style command bar: glyph over label, grouped by what the commands
+       do, each group captioned. Undifferentiated text buttons made every
+       command look equally likely; grouping is what lets you find one without
+       reading all eight. */
     #toolbar {
       position: absolute; top: 8px; right: 8px; z-index: 20;
-      display: flex; gap: 3px; background: rgba(37,37,38,0.9);
-      padding: 3px; border-radius: 5px; border: 1px solid #3c3c3c;
+      display: flex; align-items: stretch;
+      background: rgba(37,37,38,0.92);
+      padding: 4px 3px 2px; border-radius: 6px; border: 1px solid #3c3c3c;
       backdrop-filter: blur(8px);
+      box-shadow: 0 2px 10px rgba(0,0,0,0.35);
+    }
+    .tb-group { display: flex; flex-direction: column; align-items: center; padding: 0 5px; }
+    .tb-group + .tb-group { border-left: 1px solid #383838; }
+    .tb-row { display: flex; gap: 1px; }
+    .tb-caption {
+      font-size: 8px; letter-spacing: 0.09em; text-transform: uppercase;
+      color: #6b6b6b; margin-top: 2px; user-select: none;
     }
     #toolbar button {
-      background: transparent; border: 1px solid transparent; color: #aaa;
-      font-family: inherit; font-size: 11px; padding: 4px 8px;
-      border-radius: 3px; cursor: pointer;
+      display: flex; flex-direction: column; align-items: center; gap: 2px;
+      min-width: 44px; padding: 4px 4px 3px;
+      background: transparent; border: 1px solid transparent; border-radius: 4px;
+      color: #b0b0b0; font-family: inherit; font-size: 9.5px; cursor: pointer;
+      line-height: 1;
     }
-    #toolbar button:hover { background: #3c3c3c; color: #fff; }
-    #toolbar button:active { background: #505050; }
+    #toolbar button svg {
+      width: 17px; height: 17px; fill: none; stroke: currentColor;
+      stroke-width: 1.3; stroke-linecap: round; stroke-linejoin: round;
+    }
+    #toolbar button:hover:not(:disabled) { background: #37373d; color: #f0f0f0; }
+    #toolbar button:active:not(:disabled) { background: #4a4a52; }
     #toolbar button.active { background: #0e639c; color: #fff; border-color: #1177bb; }
+    #toolbar button:disabled { color: #5a5a5a; cursor: default; }
     #toolbar .sep { width: 1px; background: #3c3c3c; margin: 2px 1px; }
 
     /* Export dropdown */
@@ -385,27 +405,73 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
       </div>
 
       <div id="toolbar">
-        <button id="btn-fit" title="Fit to view">Fit</button>
-        <button id="btn-edges" class="active" title="Toggle edges">Edges</button>
-        <button id="btn-wire" title="Toggle wireframe">Wire</button>
-        <button id="btn-dims" title="Toggle dimensions">Dims</button>
-        <button id="btn-section" title="Section/clip plane">Section</button>
-        <button id="btn-measure" title="Click-to-measure mode">Measure</button>
-        <button id="btn-sim" title="Motion simulation timeline (needs an 'export const sim' block)" disabled>Sim</button>
-        <div class="sep"></div>
-        <div id="export-menu-wrapper" class="menu-wrapper">
-          <button id="btn-export" title="Export or open in another app">&#x21e9; Export &#9662;</button>
-          <div id="export-menu" class="dropdown-menu">
-            <button data-action="export-step">Save as STEP…</button>
-            <button data-action="export-stl">Save as STL…</button>
-            <button data-action="export-3mf">Save as 3MF (Bambu / Orca)…</button>
-            <div class="menu-sep" role="separator"></div>
-            <div class="menu-heading">Separate file per part</div>
-            <button data-action="export-split-step">STEP — one file per part…</button>
-            <button data-action="export-split-stl">STL — one file per part…</button>
-            <button data-action="export-split-3mf">3MF — one file per part…</button>
-            <div id="export-menu-apps"></div>
+        <div class="tb-group">
+          <div class="tb-row">
+            <button id="btn-fit" title="Fit model to view">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 6V2h4M14 6V2h-4M2 10v4h4M14 10v4h-4"/></svg>
+              <span>Fit</span>
+            </button>
           </div>
+          <div class="tb-caption">View</div>
+        </div>
+
+        <div class="tb-group">
+          <div class="tb-row">
+            <button id="btn-edges" class="active" title="Show model edges">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.6 14 5v6l-6 3.4L2 11V5z"/><path d="M8 1.6V8m0 0 6-3M8 8l-6-3"/></svg>
+              <span>Edges</span>
+            </button>
+            <button id="btn-wire" title="Wireframe">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2.2" y="5.2" width="8.6" height="8.6"/><path d="M5.2 2.2h8.6v8.6M2.2 5.2l3-3M10.8 5.2l3-3M10.8 13.8l3-3"/></svg>
+              <span>Wire</span>
+            </button>
+            <button id="btn-dims" title="Bounding-box dimensions">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3.5v9M13 3.5v9M3 8h10"/><path d="M5 6.4 3.2 8 5 9.6M11 6.4 12.8 8 11 9.6"/></svg>
+              <span>Dims</span>
+            </button>
+          </div>
+          <div class="tb-caption">Display</div>
+        </div>
+
+        <div class="tb-group">
+          <div class="tb-row">
+            <button id="btn-section" title="Section / clip plane">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.6 14 5v6l-6 3.4L2 11V5z"/><path d="M1.4 9.6 14.6 5.2"/></svg>
+              <span>Section</span>
+            </button>
+            <button id="btn-measure" title="Click two points to measure">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="4" cy="12" r="1.7"/><circle cx="12" cy="4" r="1.7"/><path d="M5.2 10.8 10.8 5.2"/></svg>
+              <span>Measure</span>
+            </button>
+            <button id="btn-sim" title="Motion simulation timeline (needs an 'export const sim' block)" disabled>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3.4v9.2L13 8z"/><path d="M2.4 3.4v9.2"/></svg>
+              <span>Sim</span>
+            </button>
+          </div>
+          <div class="tb-caption">Inspect</div>
+        </div>
+
+        <div class="tb-group">
+          <div class="tb-row">
+            <div id="export-menu-wrapper" class="menu-wrapper">
+              <button id="btn-export" title="Export, or open in another app">
+                <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.8v7.6m0 0 3-3m-3 3-3-3"/><path d="M2.6 11.2v2.6h10.8v-2.6"/></svg>
+                <span>Export</span>
+              </button>
+              <div id="export-menu" class="dropdown-menu">
+                <button data-action="export-step">Save as STEP&#8230;</button>
+                <button data-action="export-stl">Save as STL&#8230;</button>
+                <button data-action="export-3mf">Save as 3MF (Bambu / Orca)&#8230;</button>
+                <div class="menu-sep" role="separator"></div>
+                <div class="menu-heading">Separate file per part</div>
+                <button data-action="export-split-step">STEP &#8212; one file per part&#8230;</button>
+                <button data-action="export-split-stl">STL &#8212; one file per part&#8230;</button>
+                <button data-action="export-split-3mf">3MF &#8212; one file per part&#8230;</button>
+                <div id="export-menu-apps"></div>
+              </div>
+            </div>
+          </div>
+          <div class="tb-caption">Output</div>
         </div>
       </div>
 
