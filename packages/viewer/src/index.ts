@@ -719,8 +719,17 @@ function renderOpPreview(): void {
 // wraps the part's shape expression, so the operation is the outermost call
 // there too.
 
-const PREVIEW_DEBOUNCE_MS = 260;
+// Short, because the run itself is now ~100 ms at preview tessellation. Long
+// enough that a continuous drag does not queue a run per pointer event.
+const PREVIEW_DEBOUNCE_MS = 110;
 let lastPreviewKey = "";
+/**
+ * The worker DROPS an execute that arrives while it is busy — it does not
+ * queue. Without tracking that, a drag whose last move landed mid-run would
+ * leave the model showing a value the user has already dragged past.
+ */
+let previewInFlight = false;
+let queuedPreview: { payload: PreviewFaceOp; key: string } | null = null;
 
 /** What the worker needs to reproduce the pending operation. */
 function previewPayload(): PreviewFaceOp | null {
@@ -759,16 +768,29 @@ function schedulePreview(): void {
 
 function runPreview(payload: PreviewFaceOp, key: string): void {
   if (!worker || !lastScriptJs) return;
+  if (previewInFlight) {
+    // Latest wins: an intermediate value the user has already dragged past is
+    // not worth rendering.
+    queuedPreview = { payload, key };
+    return;
+  }
+  previewInFlight = true;
   // Remember what to go back to. Captured on the FIRST preview only, so a
   // second one does not adopt the first preview as its baseline.
   if (!previewShowing) previewBaseJs = lastScriptJs;
   previewShowing = true;
   lastPreviewKey = key;
   statusEl.textContent = "Previewing…";
+  fitOnThisRender = false;
   worker.postMessage({
     type: "execute",
     js: lastScriptJs,
     paramOverrides: { ...currentParamValues },
+    // Coarse while the handle is actually held — meshing cost scales with
+    // roughly the square of the tolerance, and nobody judges a fillet's
+    // smoothness mid-drag. Released or typed, it re-renders at full quality,
+    // so what you settle on is what you see.
+    meshQuality: handleDrag ? "preview" : "final",
     previewOp: payload,
   });
 }
@@ -780,11 +802,13 @@ function runPreview(payload: PreviewFaceOp, key: string): void {
 function revertPreview(): boolean {
   clearTimeout(previewTimer);
   lastPreviewKey = "";
+  queuedPreview = null;
   if (!previewShowing) return false;
   previewShowing = false;
   const js = previewBaseJs;
   previewBaseJs = null;
   if (!worker || !js) return false;
+  fitOnThisRender = false;
   worker.postMessage({
     type: "execute",
     js,
@@ -1112,6 +1136,10 @@ function updateHandleDrag(event: PointerEvent): void {
 function endHandleDrag(event: PointerEvent): void {
   if (!handleDrag || event.pointerId !== handleDrag.pointerId) return;
   handleDrag = null;
+  // Re-render the settled value at full quality: the coarse mesh used during
+  // the drag is not what the user should be judging the result by.
+  lastPreviewKey = "";
+  schedulePreview();
   controls.enabled = true;
   renderer.domElement.style.cursor = "";
   try {
@@ -1166,6 +1194,15 @@ let streamingExpected = 0;
 // arrive and once more on mesh-done, so a delegating snippet whose resolved
 // runtime result is an assembly still gets focusPart/hideParts honored.
 let pendingVisibility: { focusPart?: string; hideParts?: string[] } | null = null;
+
+/**
+ * Whether the render now arriving should reframe the view.
+ *
+ * True for a new script, false for a re-execution of the one already on
+ * screen. A re-execution is always something the user is actively adjusting,
+ * and moving the camera under them mid-adjustment reads as lag.
+ */
+let fitOnThisRender = true;
 
 function beginStreaming(totalParts: number) {
   clearModelGroup();
@@ -1222,12 +1259,17 @@ function addPart(part: TessellatedPart) {
   updatePartsList();
 
   // Fit on the first part so the user immediately sees something instead
-  // of waiting for the full gallery to finish.
-  if (currentParts.length === 1) {
+  // of waiting for the full gallery to finish — but ONLY for a script that
+  // just arrived. Re-executions of the SAME script (a dragged parameter, a
+  // face-operation preview) used to refit too, which yanked the camera every
+  // time the value moved. That is most of what "laggy" was.
+  if (currentParts.length === 1 && fitOnThisRender) {
     fitCameraToObject(camera, controls, modelGroup, dimensionsVisible ? dimensionGroup : undefined);
   }
-  // Auto-open parts panel as soon as we know we're multi-part.
-  if (currentParts.length === 2 && streamingExpected > 1 && !partsPanelOpen) {
+  // Auto-open parts panel as soon as we know we're multi-part — once, for a
+  // new model. Re-opening it under a user who closed it, on every preview
+  // frame, is the same intrusion as reframing the camera.
+  if (fitOnThisRender && currentParts.length === 2 && streamingExpected > 1 && !partsPanelOpen) {
     togglePartsPanel();
   }
 
@@ -1574,6 +1616,11 @@ function handleWorkerMessage(msg: WorkerToWebview) {
         reportFaceOpWarnings(msg.warnings);
         // A cancelled preview leaves a selection to restore.
         applyPendingReselect();
+        // The worker is free again; send whatever the drag moved on to.
+        previewInFlight = false;
+        const queued = queuedPreview;
+        queuedPreview = null;
+        if (queued) runPreview(queued.payload, queued.key);
 
         // Track what the file declares, for the selection bar's selector
         // preview. `declared` is only present when an override is in force.
@@ -1742,6 +1789,8 @@ initMessageHandler();
 onMessage("execute-script", (msg) => {
   if (worker) {
     statusEl.textContent = "Executing...";
+    // A script arriving from the host is a new model to frame.
+    fitOnThisRender = true;
     lastScriptJs = msg.js;
     // Reset slider state unless the caller supplied explicit overrides (e.g.
     // MCP tune_params rendering an ephemeral configuration). Seeding
@@ -2357,6 +2406,8 @@ let paramDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 function executeWithCurrentParams() {
   if (!worker || !lastScriptJs) return;
   statusEl.textContent = "Updating...";
+  // Same model, new numbers — reframing here would fight the user's own view.
+  fitOnThisRender = false;
   worker.postMessage({
     type: "execute",
     js: lastScriptJs,
