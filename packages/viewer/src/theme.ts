@@ -32,6 +32,13 @@ export const THEME = {
   hoverOpacity: 0.32,
   selectColor: 0x2f9bff,
   selectOpacity: 0.55,
+  // Edge overlays need their own hue. Part colours are user-chosen, and the
+  // selection blue above disappears entirely against the default blue-grey
+  // part — a highlighted edge you cannot see is not a highlight. Cyan is
+  // high-luminance and rare in the muted part palette, so it reads on top of
+  // anything, including the dark background.
+  edgeSelectColor: 0x00e5ff,
+  edgeHoverColor: 0x7fe9ff,
 
   // Lighting
   ambientColor: 0x404050,

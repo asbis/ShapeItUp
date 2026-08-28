@@ -65,6 +65,12 @@ export interface FaceSelector {
    * UI is expected to say so before the user commits.
    */
   durable: boolean;
+  /**
+   * True when the binding is a `param / 2` inference rather than an equality.
+   * Durable, but worth naming in the UI: it is a reading of the user's intent,
+   * and they are the only one who can confirm it.
+   */
+  derived?: boolean;
 }
 
 export type SelectorFailure =
@@ -130,30 +136,65 @@ export function synthesizeFaceSelector(
       offsetExpr,
       offset,
       ...(bound ? { boundTo: bound.name } : {}),
+      ...(bound?.derived ? { derived: true } : {}),
       durable: bound !== null,
     },
   };
 }
 
+export interface OffsetBinding {
+  name: string;
+  /** The expression to write: `thickness`, `-thickness`, `depth / 2`, … */
+  expr: string;
+  /** True for `param / 2` forms, which are an inference rather than an equality. */
+  derived: boolean;
+}
+
 /**
- * Find a parameter whose value IS this offset, or whose negation is.
+ * Find a parameter that explains this offset.
  *
- * Declaration order breaks ties. Two parameters holding the same number are
- * genuinely ambiguous and nothing in the geometry can distinguish them — the
- * generated line names the one it chose, which is the only way the user gets
- * to disagree.
+ * Four forms are tried, in this order: `p`, `-p`, `p / 2`, `-p / 2`.
+ *
+ * The halves are the difference between the feature being useful and being
+ * useless. A part drawn about the origin puts every outer face at `±size / 2`
+ * and every edge midpoint with it — `drawRoundedRectangle(width, depth, 6)`
+ * spans y from `-depth/2` to `depth/2` — so without them almost nothing binds
+ * and every generated line carries a brittleness warning.
+ *
+ * They are still an inference, not an equality: 30 is `depth / 2`, and it is
+ * also `gussetH - 15`. So they are ranked last, and reported separately, so
+ * the UI can name the binding and let the user disagree with it. Exact matches
+ * always win.
+ *
+ * Declaration order breaks ties within a form. Two parameters holding the same
+ * number are genuinely ambiguous and nothing in the geometry can distinguish
+ * them — naming the one it chose is what lets the user notice.
  */
 function bindOffset(
   offset: number,
   params: Record<string, number>,
-): { name: string; expr: string } | null {
+): OffsetBinding | null {
   // Zero is every parameter that happens to be zero, and none of them
   // meaningfully. A plane through the origin stays at the origin.
   if (Math.abs(offset) < BIND_EPSILON) return null;
-  for (const [name, value] of Object.entries(params)) {
-    if (typeof value !== "number" || !Number.isFinite(value)) continue;
-    if (Math.abs(value - offset) < BIND_EPSILON) return { name, expr: name };
-    if (Math.abs(value + offset) < BIND_EPSILON) return { name, expr: `-${name}` };
+  const entries = Object.entries(params).filter(
+    ([, v]) => typeof v === "number" && Number.isFinite(v),
+  );
+  for (const [name, value] of entries) {
+    if (Math.abs(value - offset) < BIND_EPSILON) return { name, expr: name, derived: false };
+  }
+  for (const [name, value] of entries) {
+    if (Math.abs(value + offset) < BIND_EPSILON) return { name, expr: `-${name}`, derived: false };
+  }
+  for (const [name, value] of entries) {
+    if (Math.abs(value / 2 - offset) < BIND_EPSILON) {
+      return { name, expr: `${name} / 2`, derived: true };
+    }
+  }
+  for (const [name, value] of entries) {
+    if (Math.abs(value / 2 + offset) < BIND_EPSILON) {
+      return { name, expr: `-${name} / 2`, derived: true };
+    }
   }
   return null;
 }
@@ -515,15 +556,81 @@ function stringLiteralValue(raw: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// Naming ONE edge
+// ---------------------------------------------------------------------------
+
+export interface EdgeSelector {
+  /** e.g. `(e) => e.containsPoint([0, -depth / 2, thickness])`. */
+  code: string;
+  /** The parameter expression written for each coordinate. */
+  coords: [string, string, string];
+  /** True when every coordinate is a bound parameter or an exact zero. */
+  durable: boolean;
+  /** True when any coordinate used a `param / 2` inference. */
+  derived: boolean;
+}
+
+/**
+ * Name a single edge by a point that lies on it.
+ *
+ * `containsPoint` is the only predicate that reliably isolates ONE edge.
+ * The obvious alternative — intersecting two planes, `inPlane("XY", t)` and
+ * `inPlane("XZ", -d/2)` — was tried and does not work: replicad's edge
+ * `inPlane` over-matches, returning the edge on the OPPOSITE face plus a
+ * corner arc that is merely tangent to the plane. Two filters gave two wrong
+ * edges where one point gives one right one.
+ *
+ * Durability lives entirely in the coordinates. A point frozen at the values
+ * that were picked stops lying on the edge the moment the part changes size —
+ * measured: `containsPoint([0, -30, 8])` finds the edge on a 60-deep plate and
+ * nothing at all on a 90-deep one. The same point written as
+ * `[0, -depth / 2, thickness]` follows both.
+ */
+export function synthesizeEdgeSelector(
+  point: [number, number, number],
+  params: Record<string, number> = {},
+): EdgeSelector {
+  let durable = true;
+  let derived = false;
+  const coords = point.map((v) => {
+    // An exact zero is the centre line, and it stays there. Binding it to some
+    // parameter that happens to be zero would move it.
+    if (Math.abs(v) < BIND_EPSILON) return "0";
+    const bound = bindOffset(v, params);
+    if (!bound) {
+      durable = false;
+      return formatNumber(v);
+    }
+    if (bound.derived) derived = true;
+    return bound.expr;
+  }) as [string, string, string];
+
+  return {
+    code: `(e) => e.containsPoint([${coords.join(", ")}])`,
+    coords,
+    durable,
+    derived,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The whole commit, in one call
 // ---------------------------------------------------------------------------
 
 export type FaceOp = "extrude" | "fillet" | "chamfer";
 
+/**
+ * What an operation acts on. A face drives all three operations; a single
+ * edge can only be rounded, since "extrude an edge" has no meaning.
+ */
+export type FaceOpTarget =
+  | { kind: "face"; face: SelectableFace }
+  | { kind: "edge"; point: [number, number, number] };
+
 export interface FaceOpRequest {
   op: FaceOp;
   partName: string | null;
-  face: SelectableFace;
+  target: FaceOpTarget;
   /**
    * Millimetres. For `extrude` it is signed — positive pulls the face out,
    * negative pushes it in. For `fillet` and `chamfer` it is the radius or
@@ -550,24 +657,32 @@ export type BuiltFaceOp =
  * "part-not-found" is not a sentence.
  */
 export function buildFaceOpCall(source: string, req: FaceOpRequest): BuiltFaceOp {
-  // All three operations name the same picked FACE. `fillet` and `chamfer`
-  // act on the edges around it, but they resolve that boundary from the face's
-  // own wires at build time rather than from an edge predicate written into
-  // the source — see stdlib/faces.ts for why an edge predicate gets it wrong.
-  const selector = synthesizeFaceSelector(req.face, declaredParams(source));
-  if (!selector.ok) {
-    return { ok: false, reason: SELECTOR_PROSE[selector.reason] };
-  }
-
   if (!Number.isFinite(req.distance) || req.distance === 0) {
     return { ok: false, reason: "distance must be a non-zero number" };
   }
   if (req.op !== "extrude" && req.distance < 0) {
     return { ok: false, reason: `a ${req.op} radius must be positive` };
   }
+  if (req.op === "extrude" && req.target.kind === "edge") {
+    return { ok: false, reason: "an edge cannot be extruded — pick a face" };
+  }
+
+  const params = declaredParams(source);
+  let selectorCode: string;
+  if (req.target.kind === "edge") {
+    selectorCode = synthesizeEdgeSelector(req.target.point, params).code;
+  } else {
+    // A face drives all three operations. `fillet` and `chamfer` act on the
+    // edges around it, but they resolve that boundary from the face's own
+    // wires at build time rather than from an edge predicate written into the
+    // source — see stdlib/faces.ts for why an edge predicate gets it wrong.
+    const selector = synthesizeFaceSelector(req.target.face, params);
+    if (!selector.ok) return { ok: false, reason: SELECTOR_PROSE[selector.reason] };
+    selectorCode = selector.selector.code;
+  }
 
   const d = formatNumber(req.distance);
-  const call = buildCallTemplate(req.op, selector.selector.code, d);
+  const call = buildCallTemplate(req.op, req.target.kind, selectorCode, d);
   const edit = computeFaceOpEdit(source, req.partName, call);
   if (!edit.ok) return { ok: false, reason: EDIT_PROSE[edit.reason] };
 
@@ -597,8 +712,22 @@ export function buildFaceOpCall(source: string, req: FaceOpRequest): BuiltFaceOp
  * The helpers resolve the boundary exactly and degrade to a warning, which is
  * the same choice the repo's own `cosmetic.*` namespace already makes.
  */
-function buildCallTemplate(op: FaceOp, selector: string, distance: string): string {
-  const fn = op === "extrude" ? "extrudeFace" : op === "fillet" ? "filletFace" : "chamferFace";
+function buildCallTemplate(
+  op: FaceOp,
+  target: FaceOpTarget["kind"],
+  selector: string,
+  distance: string,
+): string {
+  const fn =
+    op === "extrude"
+      ? "extrudeFace"
+      : target === "edge"
+        ? op === "fillet"
+          ? "filletEdge"
+          : "chamferEdge"
+        : op === "fillet"
+          ? "filletFace"
+          : "chamferFace";
   return `${fn}($SHAPE, ${selector}, ${distance})`;
 }
 

@@ -8,6 +8,7 @@
 import { describe, it, expect } from "vitest";
 import {
   buildFaceOpCall,
+  synthesizeEdgeSelector,
   computeFaceOpEdit,
   synthesizeFaceSelector,
   type SelectableFace,
@@ -63,12 +64,38 @@ describe("synthesizeFaceSelector", () => {
       .toMatchObject({ ok: true, selector: { code: '(f) => f.inPlane("YZ", plateW)' } });
   });
 
-  it("falls back to a literal and says it is not durable", () => {
-    // 30 is plateD / 2, but nothing here proves that rather than a coincidence.
+  it("reads a half-dimension as `param / 2`, and flags it as an inference", () => {
+    // This started out refusing to bind: 30 is `plateD / 2` and also
+    // `gussetH - 15`, so binding it is a reading of intent rather than an
+    // equality. Two things changed that.
+    //
+    // First, a part drawn about the origin puts EVERY outer face and edge
+    // midpoint at a half-dimension, so without this almost nothing binds and
+    // every generated line carries a brittleness warning — the guidance
+    // becomes noise. Second, the user's own file computes those positions
+    // exactly this way: `.sketchOnPlane("XZ", -plateD / 2)`. Binding recovers
+    // the construction rather than guessing at it.
+    //
+    // It is still an inference, so it is ranked below exact matches and
+    // reported separately — the UI names it and lets the user disagree.
     const r = synthesizeFaceSelector(planar([0, 1, 0], [0, 30, 0]), params);
     expect(r).toMatchObject({
       ok: true,
-      selector: { code: '(f) => f.inPlane("XZ", 30)', offsetExpr: "30", durable: false },
+      selector: {
+        code: '(f) => f.inPlane("XZ", plateD / 2)',
+        offsetExpr: "plateD / 2",
+        boundTo: "plateD",
+        durable: true,
+        derived: true,
+      },
+    });
+  });
+
+  it("still falls back to a literal when nothing explains the offset", () => {
+    const r = synthesizeFaceSelector(planar([0, 1, 0], [0, 37, 0]), params);
+    expect(r).toMatchObject({
+      ok: true,
+      selector: { code: '(f) => f.inPlane("XZ", 37)', offsetExpr: "37", durable: false },
     });
     expect(r.ok && "boundTo" in r.selector).toBe(false);
   });
@@ -286,6 +313,7 @@ export default function main() {
 
 describe("buildFaceOpCall — per-operation output", () => {
   const TOP: SelectableFace = { kind: "PLANE", center: [0, 0, 6], normal: [0, 0, 1] };
+  const FACE_TARGET = { kind: "face", face: TOP } as const;
 
   /** Apply a built operation and return the resulting source. */
   function build(source: string, req: Parameters<typeof buildFaceOpCall>[1]): string {
@@ -302,21 +330,21 @@ describe("buildFaceOpCall — per-operation output", () => {
     // fillet and chamfer act on the edges around the face, but they resolve
     // that boundary at build time from the face's own wires — so what goes in
     // the source is a FaceFinder, not an edge predicate.
-    const out = build(SINGLE, { op: "fillet", partName: null, face: TOP, distance: 2 });
+    const out = build(SINGLE, { op: "fillet", partName: null, target: FACE_TARGET, distance: 2 });
     expect(out).toContain(
       'return filletFace(drawCircle(d / 2).sketchOnPlane().extrude(h), (f) => f.inPlane("XY", 6), 2);',
     );
   });
 
   it("emits chamfer the same way", () => {
-    const out = build(SINGLE, { op: "chamfer", partName: null, face: TOP, distance: 1 });
+    const out = build(SINGLE, { op: "chamfer", partName: null, target: FACE_TARGET, distance: 1 });
     expect(out).toContain('chamferFace(drawCircle(d / 2).sketchOnPlane().extrude(h), (f) => f.inPlane("XY", 6), 1);');
   });
 
   it("imports the helper each operation names", () => {
     const wanted = { extrude: "extrudeFace", fillet: "filletFace", chamfer: "chamferFace" } as const;
     for (const [op, fn] of Object.entries(wanted) as [keyof typeof wanted, string][]) {
-      const out = build(SINGLE, { op, partName: null, face: TOP, distance: 2 });
+      const out = build(SINGLE, { op, partName: null, target: FACE_TARGET, distance: 2 });
       expect(out).toContain(`import { ${fn} } from "shapeitup";`);
     }
   });
@@ -324,7 +352,7 @@ describe("buildFaceOpCall — per-operation output", () => {
   it("binds the offset to a parameter for all three operations", () => {
     const src = SINGLE.replace("{ d: 20, h: 8 }", "{ d: 20, h: 6 }");
     for (const op of ["extrude", "fillet", "chamfer"] as const) {
-      const r = buildFaceOpCall(src, { op, partName: null, face: TOP, distance: 2 });
+      const r = buildFaceOpCall(src, { op, partName: null, target: FACE_TARGET, distance: 2 });
       expect(r.ok && r.applied).toContain('inPlane("XY", h)');
     }
   });
@@ -336,7 +364,7 @@ describe("buildFaceOpCall — per-operation output", () => {
   return round ? roundOne() : squareOne();
 }
 `;
-    const out = build(ternary, { op: "fillet", partName: null, face: TOP, distance: 2 });
+    const out = build(ternary, { op: "fillet", partName: null, target: FACE_TARGET, distance: 2 });
     expect(out).toContain("filletFace(round ? roundOne() : squareOne(), ");
   });
 
@@ -345,35 +373,114 @@ describe("buildFaceOpCall — per-operation output", () => {
   return round ? roundOne() : squareOne();
 }
 `;
-    const out = build(ternary, { op: "extrude", partName: null, face: TOP, distance: 2 });
+    const out = build(ternary, { op: "extrude", partName: null, target: FACE_TARGET, distance: 2 });
     expect(out).toContain("extrudeFace(round ? roundOne() : squareOne(), ");
   });
 
   it("refuses a negative fillet or chamfer but allows a negative extrude", () => {
     // Pushing a face in is meaningful; a negative radius is not.
     for (const op of ["fillet", "chamfer"] as const) {
-      const r = buildFaceOpCall(SINGLE, { op, partName: null, face: TOP, distance: -2 });
+      const r = buildFaceOpCall(SINGLE, { op, partName: null, target: FACE_TARGET, distance: -2 });
       expect(r).toMatchObject({ ok: false });
       expect(!r.ok && r.reason).toMatch(/must be positive/);
     }
-    const ex = buildFaceOpCall(SINGLE, { op: "extrude", partName: null, face: TOP, distance: -2 });
+    const ex = buildFaceOpCall(SINGLE, { op: "extrude", partName: null, target: FACE_TARGET, distance: -2 });
     expect(ex.ok).toBe(true);
   });
 
   it("refuses a zero distance for every operation", () => {
     for (const op of ["extrude", "fillet", "chamfer"] as const) {
-      expect(buildFaceOpCall(SINGLE, { op, partName: null, face: TOP, distance: 0 })).toMatchObject({
+      expect(buildFaceOpCall(SINGLE, { op, partName: null, target: FACE_TARGET, distance: 0 })).toMatchObject({
         ok: false,
       });
     }
   });
 
   it("stacks operations, each applying to the result of the last", () => {
-    const once = build(SINGLE, { op: "extrude", partName: null, face: TOP, distance: 5 });
-    const twice = build(once, { op: "fillet", partName: null, face: TOP, distance: 1 });
+    const once = build(SINGLE, { op: "extrude", partName: null, target: FACE_TARGET, distance: 5 });
+    const twice = build(once, { op: "fillet", partName: null, target: FACE_TARGET, distance: 1 });
     expect(twice).toContain("filletFace(extrudeFace(drawCircle(d / 2)");
     // One import statement, carrying both helpers.
     expect(twice.match(/from "shapeitup"/g)).toHaveLength(1);
     expect(twice).toContain('import { extrudeFace, filletFace } from "shapeitup";');
+  });
+});
+
+describe("synthesizeEdgeSelector", () => {
+  const params = { width: 80, depth: 60, thickness: 8 };
+
+  it("names one edge by a point, with every coordinate bound", () => {
+    // The midpoint of a plate's top-front edge. Verified against OCCT: this
+    // point finds exactly one edge, and follows the part through resizes.
+    const r = synthesizeEdgeSelector([0, -30, 8], params);
+    expect(r.code).toBe('(e) => e.containsPoint([0, -depth / 2, thickness])');
+    expect(r.durable).toBe(true);
+    // -depth / 2 is an inference about intent, not an equality.
+    expect(r.derived).toBe(true);
+  });
+
+  it("keeps an exact zero as zero rather than binding it", () => {
+    // A centre line stays on the centre; binding it to some parameter that
+    // happens to be zero would move it.
+    const r = synthesizeEdgeSelector([0, -30, 8], { ...params, offset: 0 });
+    expect(r.coords[0]).toBe("0");
+  });
+
+  it("prefers an exact parameter over a half", () => {
+    // 30 is `depth / 2` and also `half` exactly. The equality wins.
+    const r = synthesizeEdgeSelector([0, 30, 8], { ...params, half: 30 });
+    expect(r.coords[1]).toBe("half");
+    expect(r.derived).toBe(false);
+  });
+
+  it("falls back to literals and says the selector is not durable", () => {
+    const r = synthesizeEdgeSelector([13, -30, 8], params);
+    expect(r.code).toBe('(e) => e.containsPoint([13, -depth / 2, thickness])');
+    expect(r.durable).toBe(false);
+  });
+
+  it("is durable only when every coordinate is bound", () => {
+    expect(synthesizeEdgeSelector([0, -30, 8], params).durable).toBe(true);
+    expect(synthesizeEdgeSelector([0, -30, 7], params).durable).toBe(false);
+  });
+});
+
+describe("buildFaceOpCall — edge targets", () => {
+  const EDGE_TARGET = { kind: "edge" as const, point: [0, -30, 8] as [number, number, number] };
+
+  function build(source: string, req: Parameters<typeof buildFaceOpCall>[1]): string {
+    const r = buildFaceOpCall(source, req);
+    if (!r.ok) throw new Error(`expected a build, got: ${r.reason}`);
+    let out = source;
+    for (const e of [...r.edits].sort((a, b) => b.start - a.start)) {
+      out = out.slice(0, e.start) + e.text + out.slice(e.end);
+    }
+    return out;
+  }
+
+  const SRC = `import { drawCircle } from "replicad";
+export const params = { depth: 60, thickness: 8 };
+export default function main({ depth, thickness }: typeof params) {
+  return plate(depth, thickness);
+}
+`;
+
+  it("writes filletEdge and chamferEdge, not their face counterparts", () => {
+    expect(build(SRC, { op: "fillet", partName: null, target: EDGE_TARGET, distance: 2 }))
+      .toContain('return filletEdge(plate(depth, thickness), (e) => e.containsPoint([0, -depth / 2, thickness]), 2);');
+    expect(build(SRC, { op: "chamfer", partName: null, target: EDGE_TARGET, distance: 1 }))
+      .toContain("chamferEdge(plate(depth, thickness), (e) => e.containsPoint([0, -depth / 2, thickness]), 1);");
+  });
+
+  it("refuses to extrude an edge", () => {
+    // Pushing a line "along its normal" has no meaning.
+    const r = buildFaceOpCall(SRC, { op: "extrude", partName: null, target: EDGE_TARGET, distance: 5 });
+    expect(r).toMatchObject({ ok: false });
+    expect(!r.ok && r.reason).toMatch(/cannot be extruded/);
+  });
+
+  it("still refuses a negative radius", () => {
+    const r = buildFaceOpCall(SRC, { op: "fillet", partName: null, target: EDGE_TARGET, distance: -2 });
+    expect(!r.ok && r.reason).toMatch(/must be positive/);
   });
 });

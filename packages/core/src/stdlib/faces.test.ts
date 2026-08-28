@@ -14,12 +14,14 @@ let rc: typeof import("replicad");
 let extrudeFace: typeof import("./faces.js").extrudeFace;
 let filletFace: typeof import("./faces.js").filletFace;
 let chamferFace: typeof import("./faces.js").chamferFace;
+let filletEdge: typeof import("./faces.js").filletEdge;
+let chamferEdge: typeof import("./faces.js").chamferEdge;
 
 beforeAll(async () => {
   const oc = await loadOCCTForTest();
   rc = await import("replicad");
   rc.setOC(oc);
-  ({ extrudeFace, filletFace, chamferFace } = await import("./faces.js"));
+  ({ extrudeFace, filletFace, chamferFace, filletEdge, chamferEdge } = await import("./faces.js"));
 }, 120_000);
 
 /** 80 x 60 x 8 plate, corners rounded r6, with a central Ø12 through-hole. */
@@ -235,5 +237,94 @@ describe("filletFace / chamferFace", () => {
     // It may or may not be geometrically possible; what must NOT happen is a
     // throw, and the shape must survive either way.
     expect(Number.isFinite(vol(twice))).toBe(true);
+  });
+});
+
+describe("filletEdge / chamferEdge", () => {
+  // The plate's top-front straight edge: x on the centre line, y at half the
+  // depth, z at the thickness. Verified against OCCT to match exactly one edge.
+  const frontTop = (f: any) => f.containsPoint([0, -30, 8]);
+
+  /** The same plate, but with a SHARP outline — no tangent neighbours. */
+  const sharp = () => {
+    const p = rc.drawRectangle(80, 60).sketchOnPlane().extrude(8) as any;
+    return p.cut(rc.drawCircle(6).sketchOnPlane("XY", -1).extrude(10) as any);
+  };
+  const sharpEdge = (f: any) => f.containsPoint([0, -30, 8]);
+  const perMm = (r: number) => r * r * (1 - Math.PI / 4);
+
+  it("rounds exactly one edge when its neighbours meet it at an angle", () => {
+    const removed = vol(sharp()) - vol(filletEdge(sharp(), sharpEdge, 2));
+    // One 80 mm edge, (1 - pi/4)r^2 per mm. Verified against a plain box,
+    // where the same formula matches to three decimal places.
+    expect(removed).toBeCloseTo(perMm(2) * 80, 0);
+  });
+
+  it("chamfers exactly one edge", () => {
+    const removed = vol(sharp()) - vol(chamferEdge(sharp(), sharpEdge, 1));
+    // A 45-degree chamfer of setback c removes c^2/2 per mm.
+    expect(removed).toBeCloseTo(((1 * 1) / 2) * 80, 0);
+  });
+
+  it("carries across edges that meet smoothly — OCCT's rule, not ours", () => {
+    // On a ROUNDED outline the straight edges are tangent to the corner arcs,
+    // and OCCT propagates the fillet all the way around the loop. Picking one
+    // 68 mm edge removes what the whole 269.7 mm boundary would, not what that
+    // edge alone would.
+    //
+    // This is standard CAD behaviour and not something to work around; it is
+    // here so the number is on record, because the viewer has to PREVIEW it —
+    // highlighting only the clicked edge would be a lie on any rounded part.
+    const removed = BASE_VOLUME - vol(filletEdge(build(), frontTop, 2));
+    const oneEdge = perMm(2) * 68;
+    const wholeLoop = perMm(2) * (2 * (80 + 60) - 8 * 6 + 2 * Math.PI * 6);
+    expect(removed).toBeGreaterThan(oneEdge * 3);
+    expect(removed).toBeCloseTo(wholeLoop, -1);
+  });
+
+  it("follows the parameters when the point is recomputed from them", () => {
+    // The whole reason the coordinates are written as expressions. A deeper
+    // plate puts that edge somewhere else, and a point rebuilt from the new
+    // values still finds it.
+    const deeper = rc.drawRectangle(80, 90).sketchOnPlane().extrude(8) as any;
+    const withBore = deeper.cut(rc.drawCircle(6).sketchOnPlane("XY", -1).extrude(10) as any);
+    const at45 = (f: any) => f.containsPoint([0, -45, 8]);
+    const removed = vol(withBore) - vol(filletEdge(withBore, at45, 2));
+    expect(removed).toBeCloseTo(perMm(2) * 80, 0);
+  });
+
+  it("declines a point that lands on nothing, and explains why", () => {
+    resetRuntimeWarnings();
+    // The failure a frozen coordinate produces once the model has moved.
+    const out = filletEdge(build(), (f: any) => f.containsPoint([0, -45, 8]), 2);
+    expect(vol(out)).toBeCloseTo(BASE_VOLUME, 1);
+    expect(drainRuntimeWarnings().join(" ")).toMatch(
+      /no edge contains that point.*express them with the model's parameters/,
+    );
+  });
+
+  it("declines a point that lies on more than one edge", () => {
+    resetRuntimeWarnings();
+    // A corner: two edges meet there, and rounding both is not what one click
+    // asked for.
+    const out = filletEdge(build(), (f: any) => f.containsPoint([34, -30, 8]), 1);
+    expect(vol(out)).toBeCloseTo(BASE_VOLUME, 1);
+    expect(drainRuntimeWarnings().join(" ")).toMatch(/lies on \d+ edges/);
+  });
+
+  it("declines a negative size and treats zero as a no-op", () => {
+    resetRuntimeWarnings();
+    expect(vol(filletEdge(build(), frontTop, -2))).toBeCloseTo(BASE_VOLUME, 1);
+    expect(drainRuntimeWarnings().join(" ")).toMatch(/negative radius/);
+    resetRuntimeWarnings();
+    expect(vol(filletEdge(build(), frontTop, 0))).toBeCloseTo(BASE_VOLUME, 1);
+    expect(drainRuntimeWarnings()).toHaveLength(0);
+  });
+
+  it("declines a size OCCT cannot apply without breaking the shape", () => {
+    resetRuntimeWarnings();
+    const out = filletEdge(build(), frontTop, 50);
+    expect(vol(out)).toBeCloseTo(BASE_VOLUME, 1);
+    expect(drainRuntimeWarnings().join(" ")).toMatch(/^filletEdge:/);
   });
 });

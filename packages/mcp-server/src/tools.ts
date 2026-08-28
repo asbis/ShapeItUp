@@ -8477,6 +8477,34 @@ curve away out of it, and OCCT then rejects the whole operation. \`filletFace\`
 reads the face's own outer and inner wires instead, so it gets the boundary
 exactly — including hole rims.
 
+## One edge at a time — \`filletEdge\`, \`chamferEdge\`
+
+\`\`\`typescript
+import { filletEdge, chamferEdge } from "shapeitup";
+
+filletEdge(plate, (e) => e.containsPoint([0, -depth / 2, thickness]), 2)
+\`\`\`
+
+An edge is named by a POINT that lies on it. \`containsPoint\` is the only
+predicate that reliably isolates one edge — intersecting two planes does not:
+replicad's edge \`inPlane\` over-matches and returns the edge on the opposite
+face plus a corner arc that is merely tangent to the plane.
+
+Write the coordinates as expressions, not numbers. A point frozen at the
+values you picked stops lying on the edge as soon as the part changes size:
+\`containsPoint([0, -30, 8])\` finds the edge on a 60-deep plate and nothing at
+all on a 90-deep one, so the fillet silently disappears. The same point as
+\`[0, -depth / 2, thickness]\` follows both.
+
+**A fillet carries across edges that meet smoothly.** That is OCCT's rule and
+standard CAD behaviour, not something these helpers add. On a plate with a
+ROUNDED outline the straight edges are tangent to the corner arcs, so picking
+one 68 mm edge rounds the whole 269.7 mm boundary. On the same plate with a
+SHARP outline, the same pick rounds exactly that edge. The viewer previews the
+chain, so what lights up is what changes.
+
+---
+
 **Bind the offset to a parameter.** \`inPlane("XY", thickness)\` keeps working
 when \`thickness\` changes; \`inPlane("XY", 8)\` silently stops matching and the
 operation quietly disappears from the model. The viewer binds automatically

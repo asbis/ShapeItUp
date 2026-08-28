@@ -198,7 +198,22 @@ export type WebviewToExt =
       requestId: number;
       op: "extrude" | "fillet" | "chamfer";
       partName: string | null;
-      face: { kind: string; center: [number, number, number]; normal?: [number, number, number] };
+      /**
+       * A face drives all three operations. A single edge can only be
+       * rounded — "extrude an edge" has no meaning — and is named by a point
+       * that lies on it, because `containsPoint` is the only predicate that
+       * reliably isolates one edge.
+       */
+      target:
+        | {
+            kind: "face";
+            face: {
+              kind: string;
+              center: [number, number, number];
+              normal?: [number, number, number];
+            };
+          }
+        | { kind: "edge"; point: [number, number, number] };
       /** Signed for extrude; a positive radius / setback for the other two. */
       distance: number;
     }

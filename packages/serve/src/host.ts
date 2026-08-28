@@ -404,7 +404,8 @@ export class ViewerHost {
     }
 
     this.log(
-      `${msg.op} ${msg.distance} mm on ${msg.partName ?? "shape"} → ${path.basename(file)}` +
+      `${msg.op} ${msg.distance} mm on ${msg.target.kind} of ` +
+        `${msg.partName ?? "shape"} → ${path.basename(file)}` +
         (built.addedImport ? " (added the shapeitup import)" : ""),
     );
     return {
@@ -530,20 +531,35 @@ function parseFaceOp(msg: Record<string, any>): FaceOpMessage | null {
   if (typeof msg.requestId !== "number" || !Number.isFinite(msg.requestId)) return null;
   if (typeof msg.distance !== "number" || !Number.isFinite(msg.distance)) return null;
   if (msg.partName !== null && typeof msg.partName !== "string") return null;
-  const face = msg.face;
-  if (!face || typeof face.kind !== "string" || !triple(face.center)) return null;
-  if (face.normal !== undefined && !triple(face.normal)) return null;
+
+  const t = msg.target;
+  if (!t) return null;
+  let target: FaceOpMessage["target"];
+  if (t.kind === "edge") {
+    if (!triple(t.point)) return null;
+    target = { kind: "edge", point: t.point };
+  } else if (t.kind === "face") {
+    const face = t.face;
+    if (!face || typeof face.kind !== "string" || !triple(face.center)) return null;
+    if (face.normal !== undefined && !triple(face.normal)) return null;
+    target = {
+      kind: "face",
+      face: {
+        kind: face.kind,
+        center: face.center,
+        ...(face.normal ? { normal: face.normal } : {}),
+      },
+    };
+  } else {
+    return null;
+  }
 
   return {
     type: "face-op",
     requestId: msg.requestId,
     op: msg.op,
     partName: msg.partName,
-    face: {
-      kind: face.kind,
-      center: face.center,
-      ...(face.normal ? { normal: face.normal } : {}),
-    },
+    target,
     distance: msg.distance,
   };
 }

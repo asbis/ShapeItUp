@@ -435,12 +435,26 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
        contract of the feature: you see the code you are about to commit. */
     #fi-preview {
       display: none; border-top: 1px solid #333; padding: 4px 9px 5px;
+      max-width: 100%;
+    }
+    #face-info.extruding #fi-preview { display: block; }
+    /* The call itself never wraps — a line of code broken mid-token is harder
+       to read than one you scroll. */
+    #fi-code {
       font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
       font-size: 10px; color: #7ea36f; white-space: nowrap;
       overflow-x: auto; max-width: 100%;
     }
-    #face-info.extruding #fi-preview { display: block; }
-    #fi-preview .warn { color: #d3a04a; }
+    /* The notes DO wrap, on their own line. They were previously appended to
+       the code line, where the horizontal scroll hid them — and the hidden
+       half was the brittleness warning, the one thing that must not be. */
+    #fi-notes {
+      margin-top: 3px; font-size: 10px; color: #8a8a8a;
+      white-space: normal; line-height: 1.4;
+    }
+    #fi-notes:empty { display: none; }
+    #fi-notes .warn { color: #d3a04a; }
+    #fi-notes span { margin-right: 10px; }
 
     /* Measurement overlay */
     #measure-info {
@@ -603,7 +617,10 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
           </span>
           <button id="fi-clear" title="Clear selection (Esc)">&#10005;</button>
         </div>
-        <div id="fi-preview"></div>
+        <div id="fi-preview">
+          <div id="fi-code"></div>
+          <div id="fi-notes"></div>
+        </div>
       </div>
 
       <div id="measure-info"></div>

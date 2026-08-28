@@ -15,7 +15,7 @@
  * every generated call takes one.
  */
 
-import { FaceFinder, Sketch, type Edge, type Shape3D, type Face } from "replicad";
+import { EdgeFinder, FaceFinder, Sketch, type Edge, type Shape3D, type Face } from "replicad";
 import { pushRuntimeWarning } from "./warnings";
 
 export interface FaceOpOptions {
@@ -252,6 +252,97 @@ function roundBoundary(
       opaque
         ? `${detail}. The size is probably too large for the surrounding ` +
             `material, or those edges have already been rounded.`
+        : detail,
+    );
+    return shape;
+  }
+}
+
+/**
+ * Round ONE edge, named by a point that lies on it.
+ *
+ * The single-edge counterpart of {@link filletFace}. It insists on exactly one
+ * match, because that is the gesture it exists to serve: the user clicked one
+ * edge, and a selector that has quietly come to match three would round two
+ * they never picked.
+ *
+ * Write the point in terms of the model's parameters —
+ * `[0, -depth / 2, thickness]`, not `[0, -30, 8]`. A frozen point stops lying
+ * on the edge the moment the part changes size, and the operation then
+ * disappears. The viewer does this binding automatically and says so when it
+ * cannot.
+ *
+ * @example
+ *   filletEdge(plate, (e) => e.containsPoint([0, -depth / 2, thickness]), 2)
+ */
+export function filletEdge(
+  shape: Shape3D,
+  finder: (e: EdgeFinder) => EdgeFinder,
+  radius: number,
+  opts: FaceOpOptions = {},
+): Shape3D {
+  return roundOneEdge("filletEdge", shape, finder, radius, opts);
+}
+
+/** The chamfer counterpart of {@link filletEdge}. */
+export function chamferEdge(
+  shape: Shape3D,
+  finder: (e: EdgeFinder) => EdgeFinder,
+  distance: number,
+  opts: FaceOpOptions = {},
+): Shape3D {
+  return roundOneEdge("chamferEdge", shape, finder, distance, opts);
+}
+
+function roundOneEdge(
+  label: "filletEdge" | "chamferEdge",
+  shape: Shape3D,
+  finder: (e: EdgeFinder) => EdgeFinder,
+  size: number,
+  opts: FaceOpOptions,
+): Shape3D {
+  if (!Number.isFinite(size) || size === 0) return shape;
+  const warn = (msg: string) => {
+    if (!opts.silent) pushRuntimeWarning(`${label}: ${msg} Returning shape unchanged.`);
+  };
+  if (size < 0) {
+    warn(`a negative ${label === "filletEdge" ? "radius" : "setback"} is not meaningful.`);
+    return shape;
+  }
+
+  let edges: Edge[];
+  try {
+    edges = finder(new EdgeFinder()).find(shape);
+  } catch (err) {
+    warn(`could not evaluate the selector — ${errText(err)}.`);
+    return shape;
+  }
+  if (edges.length === 0) {
+    // Overwhelmingly the reason is a point written as fixed numbers that the
+    // geometry has since moved away from.
+    warn(
+      "no edge contains that point. If it was written as fixed coordinates, " +
+        "they no longer land on the edge — express them with the model's parameters.",
+    );
+    return shape;
+  }
+  if (edges.length > 1) {
+    warn(`the point lies on ${edges.length} edges, but it must identify exactly one.`);
+    for (const e of edges) tryDelete(e);
+    return shape;
+  }
+
+  try {
+    return label === "filletEdge"
+      ? shape.fillet(size, (e) => e.inList(edges))
+      : shape.chamfer(size, (e) => e.inList(edges));
+  } catch (err) {
+    const detail = errText(err);
+    const opaque = /^OCCT error \d+$/.test(detail);
+    warn(
+      opaque
+        ? `${detail}. The size is probably too large for this edge, or it has ` +
+            `already been rounded.`
         : detail,
     );
     return shape;

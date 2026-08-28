@@ -9,8 +9,11 @@
  */
 import { describe, it, expect } from "vitest";
 import {
+  edgePointAndLength,
+  edgeIndexForPoint,
   edgesInPlane,
   faceBounds,
+  tangentChain,
   describeKind,
   describePlacement,
   faceIndexForTriangle,
@@ -226,5 +229,99 @@ describe("faceBounds", () => {
     expect(b.max[1]).toBeCloseTo(8.05);
     expect(b.min[2]).toBeCloseTo(4.95);
     expect(b.max[2]).toBeCloseTo(5.05);
+  });
+});
+
+describe("edgeIndexForPoint", () => {
+  // Three edges: 2, 4 and 2 points.
+  const groups = new Uint32Array([0, 2, 2, 4, 6, 2]);
+
+  it("maps every point to the edge that owns it", () => {
+    expect([0, 1, 2, 3, 4, 5, 6, 7].map((p) => edgeIndexForPoint(groups, p)))
+      .toEqual([0, 0, 1, 1, 1, 1, 2, 2]);
+  });
+
+  it("returns -1 past the end rather than clamping", () => {
+    expect(edgeIndexForPoint(groups, 8)).toBe(-1);
+    expect(edgeIndexForPoint(new Uint32Array([]), 0)).toBe(-1);
+  });
+});
+
+describe("edgePointAndLength", () => {
+  it("takes the midpoint of a straight edge — the value most likely to bind", () => {
+    // A single segment from (0,-30,8) to (60,-30,8). The midpoint is exactly
+    // on the edge AND it is the round number a parameter can explain.
+    const v = new Float32Array([0, -30, 8, 60, -30, 8]);
+    const r = edgePointAndLength(v, 0, 2);
+    expect(r.point).toEqual([30, -30, 8]);
+    expect(r.length).toBeCloseTo(60);
+  });
+
+  it("takes a real vertex on a curve, not a midpoint off it", () => {
+    // Pair layout: p0,p1, p1,p2. A midpoint between vertices would sit inside
+    // the chord, where `containsPoint` would miss the true curve.
+    const v = new Float32Array([0, 0, 0, 1, 1, 0, 1, 1, 0, 2, 0, 0]);
+    const r = edgePointAndLength(v, 0, 4);
+    expect(r.point).toEqual([1, 1, 0]);
+    expect(r.length).toBeCloseTo(2 * Math.SQRT2);
+  });
+});
+
+describe("tangentChain", () => {
+  /**
+   * Four segments forming a square outline: each meets the next at 90 degrees,
+   * so nothing is tangent-continuous.
+   */
+  function squareLoop(): any {
+    const pts = [
+      0, 0, 0, 10, 0, 0,
+      10, 0, 0, 10, 10, 0,
+      10, 10, 0, 0, 10, 0,
+      0, 10, 0, 0, 0, 0,
+    ];
+    const groups = new Uint32Array([0, 2, 2, 2, 4, 2, 6, 2]);
+    return { edgeVertices: new Float32Array(pts), edgeGroups: groups };
+  }
+
+  /** Two collinear segments meeting end to end: one smooth chain. */
+  function straightPair(): any {
+    const pts = [0, 0, 0, 10, 0, 0, 10, 0, 0, 20, 0, 0];
+    return { edgeVertices: new Float32Array(pts), edgeGroups: new Uint32Array([0, 2, 2, 2]) };
+  }
+
+  it("stops at a corner, so a boxy part rounds only what was clicked", () => {
+    expect(tangentChain(squareLoop(), 0)).toEqual([0]);
+    expect(tangentChain(squareLoop(), 2)).toEqual([2]);
+  });
+
+  it("carries across a smooth join, the way OCCT's fillet does", () => {
+    // Measured on real geometry: filleting one edge of a ROUNDED outline
+    // removes what the whole loop would, because the straights are tangent to
+    // the corner arcs. Previewing only the clicked edge would be a lie.
+    expect(tangentChain(straightPair(), 0)).toEqual([0, 1]);
+    expect(tangentChain(straightPair(), 1)).toEqual([0, 1]);
+  });
+
+  it("is transitive across a chain of joins", () => {
+    const pts = [0, 0, 0, 10, 0, 0, 10, 0, 0, 20, 0, 0, 20, 0, 0, 30, 0, 0];
+    const part: any = {
+      edgeVertices: new Float32Array(pts),
+      edgeGroups: new Uint32Array([0, 2, 2, 2, 4, 2]),
+    };
+    expect(tangentChain(part, 0)).toEqual([0, 1, 2]);
+  });
+
+  it("does not join edges that merely pass near each other", () => {
+    // Same directions, but no shared endpoint.
+    const pts = [0, 0, 0, 10, 0, 0, 10, 5, 0, 20, 5, 0];
+    const part: any = {
+      edgeVertices: new Float32Array(pts),
+      edgeGroups: new Uint32Array([0, 2, 2, 2]),
+    };
+    expect(tangentChain(part, 0)).toEqual([0]);
+  });
+
+  it("returns the edge itself when the part carries no edge data", () => {
+    expect(tangentChain({} as any, 3)).toEqual([3]);
   });
 });

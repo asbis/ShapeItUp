@@ -32,8 +32,10 @@ import { buildEdgeHighlight, buildFaceHighlight } from "./mesh-builder";
 /** Everything the picker needs about one rendered part. */
 export interface PickablePart {
   name: string;
-  /** The part's model mesh — the raycast target. */
+  /** The part's model mesh — the raycast target for faces. */
   mesh: THREE.Mesh;
+  /** The part's edge lines, if drawn — the raycast target for edges. */
+  edgeLines?: THREE.LineSegments;
   vertices: Float32Array;
   triangles: Uint32Array;
   faceGroups?: Uint32Array;
@@ -46,6 +48,7 @@ export interface PickablePart {
 }
 
 export interface FaceSelection {
+  kind: "face";
   partIndex: number;
   partName: string;
   /** Index into `faceGroups` pairs and `faceInfo` — see the note above. */
@@ -156,10 +159,10 @@ function fmtOffset(n: number): string {
 export class FacePicker {
   private raycaster = new THREE.Raycaster();
   private ndc = new THREE.Vector2();
-  private hoverMesh: THREE.Mesh | null = null;
-  private selectMesh: THREE.Mesh | null = null;
-  private hovered: FaceSelection | null = null;
-  private selected: FaceSelection | null = null;
+  private hoverObj: THREE.Object3D | null = null;
+  private selectObj: THREE.Object3D | null = null;
+  private hovered: Selection | null = null;
+  private selected: Selection | null = null;
 
   constructor(
     private overlayGroup: THREE.Group,
@@ -196,6 +199,7 @@ export class FacePicker {
     if (!info) return null;
 
     return {
+      kind: "face",
       partIndex,
       partName: part.name,
       faceIndex,
@@ -205,30 +209,96 @@ export class FacePicker {
     };
   }
 
-  getSelection(): FaceSelection | null {
+  getSelection(): Selection | null {
     return this.selected;
   }
 
-  getHover(): FaceSelection | null {
+  getHover(): Selection | null {
     return this.hovered;
   }
 
-  setHover(sel: FaceSelection | null): void {
-    if (sameFace(sel, this.hovered)) return;
-    // Never draw a hover over the face that is already selected — two stacked
-    // translucent overlays read as a third, brighter state that means nothing.
-    const suppress = sel !== null && sameFace(sel, this.selected);
-    this.hovered = sel;
-    this.hoverMesh = this.swap(this.hoverMesh, suppress ? null : sel, "hover");
+  /**
+   * Resolve a pointer position to the edge under it, or null.
+   *
+   * Edges win over faces near a border, the way they do in a CAD app: an edge
+   * is a one-pixel-wide target, so it needs a grab radius, and inside that
+   * radius it is almost certainly what the user is aiming at.
+   *
+   * `thresholdWorld` must be computed per frame from the camera distance — a
+   * fixed world radius is a huge grab area when zoomed in and an unhittable
+   * one when zoomed out.
+   */
+  pickEdge(
+    clientX: number,
+    clientY: number,
+    canvas: HTMLElement,
+    thresholdWorld: number,
+  ): EdgeSelection | null {
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return null;
+    this.ndc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    this.ndc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+    this.raycaster.setFromCamera(this.ndc, this.camera);
+
+    const previous = this.raycaster.params.Line?.threshold;
+    this.raycaster.params.Line = { threshold: thresholdWorld };
+
+    try {
+      const parts = this.getParts();
+      const targets: THREE.LineSegments[] = [];
+      for (const p of parts) {
+        if (p.visible && p.edgeLines?.visible && p.edgeGroups && p.edgeVertices) {
+          targets.push(p.edgeLines);
+        }
+      }
+      if (targets.length === 0) return null;
+
+      const hits = this.raycaster.intersectObjects(targets, false);
+      if (hits.length === 0) return null;
+      const hit = hits[0]!;
+      if (hit.index === undefined || hit.index === null) return null;
+
+      const partIndex = parts.findIndex((p) => p.edgeLines === hit.object);
+      if (partIndex < 0) return null;
+      const part = parts[partIndex]!;
+      const edgeIndex = edgeIndexForPoint(part.edgeGroups!, hit.index);
+      if (edgeIndex < 0) return null;
+
+      const start = part.edgeGroups![edgeIndex * 2]!;
+      const count = part.edgeGroups![edgeIndex * 2 + 1]!;
+      const { point, length } = edgePointAndLength(part.edgeVertices!, start, count);
+      return {
+        kind: "edge",
+        partIndex,
+        partName: part.name,
+        edgeIndex,
+        start,
+        count,
+        point,
+        length,
+        straight: count <= 2,
+      };
+    } finally {
+      this.raycaster.params.Line = { threshold: previous ?? 1 };
+    }
   }
 
-  setSelection(sel: FaceSelection | null): void {
+  setHover(sel: Selection | null): void {
+    if (same(sel, this.hovered)) return;
+    // Never draw a hover over what is already selected — two stacked
+    // translucent overlays read as a third, brighter state that means nothing.
+    const suppress = sel !== null && same(sel, this.selected);
+    this.hovered = sel;
+    this.hoverObj = this.swap(this.hoverObj, suppress ? null : sel, "hover");
+  }
+
+  setSelection(sel: Selection | null): void {
     this.selected = sel;
-    this.selectMesh = this.swap(this.selectMesh, sel, "select");
-    // A face that just became selected must drop its hover overlay, or the two
-    // stack; a face that just became deselected may legitimately regain one.
-    if (sel && sameFace(sel, this.hovered)) {
-      this.hoverMesh = this.swap(this.hoverMesh, null, "hover");
+    this.selectObj = this.swap(this.selectObj, sel, "select");
+    // What just became selected must drop its hover overlay, or the two stack;
+    // what just became deselected may legitimately regain one.
+    if (sel && same(sel, this.hovered)) {
+      this.hoverObj = this.swap(this.hoverObj, null, "hover");
     }
   }
 
@@ -239,36 +309,45 @@ export class FacePicker {
   }
 
   private swap(
-    current: THREE.Mesh | null,
-    sel: FaceSelection | null,
+    current: THREE.Object3D | null,
+    sel: Selection | null,
     mode: "hover" | "select",
-  ): THREE.Mesh | null {
+  ): THREE.Object3D | null {
     if (current) {
       this.overlayGroup.remove(current);
-      current.geometry.dispose();
-      (current.material as THREE.Material).dispose();
+      disposeOverlay(current);
     }
     if (!sel) return null;
     const part = this.getParts()[sel.partIndex];
     if (!part) return null;
-    const mesh = buildFaceHighlight(
-      part.vertices,
-      part.triangles,
-      sel.start,
-      sel.count,
-      mode,
-    );
+
+    const obj =
+      sel.kind === "face"
+        ? buildFaceHighlight(part.vertices, part.triangles, sel.start, sel.count, mode)
+        : buildEdgesHighlight(part, [sel.edgeIndex], mode);
+    if (!obj) return null;
+
     // The overlay group is a sibling of the part groups, so the part's own
     // transform (if any) has to be carried across for the copy to land on top.
-    mesh.applyMatrix4(part.mesh.matrixWorld);
-    this.overlayGroup.add(mesh);
-    return mesh;
+    obj.applyMatrix4(part.mesh.matrixWorld);
+    this.overlayGroup.add(obj);
+    return obj;
   }
 }
 
-function sameFace(a: FaceSelection | null, b: FaceSelection | null): boolean {
+function disposeOverlay(o: THREE.Object3D): void {
+  const g = (o as THREE.Mesh).geometry;
+  const m = (o as THREE.Mesh).material;
+  g?.dispose?.();
+  if (m instanceof THREE.Material) m.dispose();
+}
+
+function same(a: Selection | null, b: Selection | null): boolean {
   if (a === null || b === null) return a === b;
-  return a.partIndex === b.partIndex && a.faceIndex === b.faceIndex;
+  if (a.kind !== b.kind || a.partIndex !== b.partIndex) return false;
+  return a.kind === "face"
+    ? a.faceIndex === (b as FaceSelection).faceIndex
+    : a.edgeIndex === (b as EdgeSelection).edgeIndex;
 }
 
 // ---------------------------------------------------------------------------
@@ -383,28 +462,193 @@ export function faceBounds(part: PickablePart, sel: FaceSelection, pad = 0.05): 
 export function buildEdgesHighlight(
   part: PickablePart,
   edgeIndices: number[],
+  mode: "hover" | "select" = "select",
 ): THREE.LineSegments | null {
   const { edgeVertices: v, edgeGroups: g } = part;
   if (!v || !g || edgeIndices.length === 0) return null;
 
-  // Each edge is a polyline of N points, which is N-1 segments, which is
-  // 2(N-1) endpoints in a LineSegments buffer.
-  let segments = 0;
-  for (const e of edgeIndices) segments += Math.max(0, g[e * 2 + 1]! - 1);
-  if (segments === 0) return null;
+  // `edgeVertices` is ALREADY in LineSegments pair layout — replicad emits
+  // `p0,p1, p1,p2, …` with interior vertices duplicated — so each span can be
+  // copied verbatim. Re-pairing it as a polyline, as an earlier version did,
+  // draws every segment twice plus a degenerate one between the duplicates.
+  let points = 0;
+  for (const e of edgeIndices) points += g[e * 2 + 1]!;
+  if (points === 0) return null;
 
-  const out = new Float32Array(segments * 6);
+  const out = new Float32Array(points * 3);
   let w = 0;
   for (const e of edgeIndices) {
     const start = g[e * 2]!;
     const count = g[e * 2 + 1]!;
-    for (let p = start; p < start + count - 1; p++) {
-      for (const q of [p, p + 1]) {
-        out[w++] = v[q * 3]!;
-        out[w++] = v[q * 3 + 1]!;
-        out[w++] = v[q * 3 + 2]!;
+    out.set(v.subarray(start * 3, (start + count) * 3), w);
+    w += count * 3;
+  }
+  return buildEdgeHighlight(out, mode);
+}
+
+// ---------------------------------------------------------------------------
+// Picking ONE edge
+// ---------------------------------------------------------------------------
+
+export interface EdgeSelection {
+  kind: "edge";
+  partIndex: number;
+  partName: string;
+  /** Index into `edgeGroups` pairs. Valid only for the mesh it came from. */
+  edgeIndex: number;
+  /** Span of `edgeVertices`, in POINT units. */
+  start: number;
+  count: number;
+  /** A point that lies exactly on the edge — what names it in generated code. */
+  point: [number, number, number];
+  /** Summed segment length, mm. */
+  length: number;
+  /** A single segment is a straight edge; more means it was tessellated. */
+  straight: boolean;
+}
+
+export type Selection = FaceSelection | EdgeSelection;
+
+/**
+ * Which edge owns the segment starting at point index `pointIndex`?
+ *
+ * `edgeGroups` tiles the point buffer, so a binary search is exact. Returns -1
+ * when the spans do not cover the hit, which highlights nothing rather than
+ * highlighting the wrong edge.
+ */
+export function edgeIndexForPoint(edgeGroups: Uint32Array, pointIndex: number): number {
+  let lo = 0;
+  let hi = edgeGroups.length / 2 - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const start = edgeGroups[mid * 2]!;
+    const count = edgeGroups[mid * 2 + 1]!;
+    if (pointIndex < start) hi = mid - 1;
+    else if (pointIndex >= start + count) lo = mid + 1;
+    else return mid;
+  }
+  return -1;
+}
+
+/**
+ * A point lying exactly on an edge, and the edge's length.
+ *
+ * `edgeVertices` is in THREE's LineSegments pair layout — `p0,p1, p1,p2, …` —
+ * so a straight edge is two points and a curve is many, with every interior
+ * vertex duplicated.
+ *
+ * For a straight edge the midpoint of the two endpoints is used: it is exactly
+ * on the edge AND it is the value most likely to be a clean multiple of a
+ * parameter, which is what makes the generated selector durable. For a curve
+ * an actual tessellation VERTEX is used instead — vertices lie on the true
+ * curve, while a midpoint between them would sit slightly inside the chord and
+ * `containsPoint` would miss.
+ */
+export function edgePointAndLength(
+  v: Float32Array,
+  start: number,
+  count: number,
+): { point: [number, number, number]; length: number } {
+  const at = (i: number): [number, number, number] => [v[i * 3]!, v[i * 3 + 1]!, v[i * 3 + 2]!];
+
+  let length = 0;
+  for (let i = start; i + 1 < start + count; i += 2) {
+    const a = at(i);
+    const b = at(i + 1);
+    length += Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+  }
+
+  if (count <= 2) {
+    const a = at(start);
+    const b = at(start + 1);
+    return { point: [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2], length };
+  }
+  // Round down to an even offset so the index lands on a segment START, which
+  // is always a real vertex of the tessellation.
+  const mid = start + 2 * Math.floor(count / 4);
+  return { point: at(mid), length };
+}
+
+/**
+ * The tangent-continuous chain of edges containing `edgeIndex`.
+ *
+ * OCCT propagates a fillet along edges that meet smoothly, which is standard
+ * CAD behaviour and not optional. Measured on a plate with a rounded outline:
+ * filleting ONE 68 mm edge with r=2 removed 229.1 mm³, where that edge alone
+ * accounts for 58.4 and the whole outline for 231.5 — the fillet ran all the
+ * way around. On the same plate with a SHARP outline, the same pick removed
+ * 68.7 mm³, exactly the one edge.
+ *
+ * So a preview that highlights only the clicked edge is honest on a boxy part
+ * and wrong on a rounded one. This walks the chain so it can be honest on both.
+ *
+ * Tangency is judged from the tessellated ends: two edges continue each other
+ * when they share an endpoint and their directions there are parallel. `|dot|`
+ * rather than `dot` because edge orientation is arbitrary — either end of
+ * either edge may be the shared one.
+ */
+export function tangentChain(
+  part: PickablePart,
+  edgeIndex: number,
+  angleToleranceDeg = 5,
+  pointTolerance = 1e-3,
+): number[] {
+  const { edgeVertices: v, edgeGroups: g } = part;
+  if (!v || !g) return [edgeIndex];
+
+  const n = g.length / 2;
+  const cosLimit = Math.cos((angleToleranceDeg * Math.PI) / 180);
+  const at = (i: number): [number, number, number] => [v[i * 3]!, v[i * 3 + 1]!, v[i * 3 + 2]!];
+  const sub = (a: number[], b: number[]) => [a[0]! - b[0]!, a[1]! - b[1]!, a[2]! - b[2]!];
+  const norm = (a: number[]) => {
+    const L = Math.hypot(a[0]!, a[1]!, a[2]!) || 1;
+    return [a[0]! / L, a[1]! / L, a[2]! / L];
+  };
+  const near = (a: number[], b: number[]) =>
+    Math.abs(a[0]! - b[0]!) < pointTolerance &&
+    Math.abs(a[1]! - b[1]!) < pointTolerance &&
+    Math.abs(a[2]! - b[2]!) < pointTolerance;
+
+  /** Both endpoints of an edge, with the direction pointing OUT of each. */
+  const ends = (e: number) => {
+    const s = g[e * 2]!;
+    const c = g[e * 2 + 1]!;
+    if (c < 2) return null;
+    const first = at(s);
+    const last = at(s + c - 1);
+    return [
+      { point: first, dir: norm(sub(at(s + 1), first)) },
+      { point: last, dir: norm(sub(at(s + c - 2), last)) },
+    ];
+  };
+
+  const cache = new Map<number, ReturnType<typeof ends>>();
+  const endsOf = (e: number) => {
+    if (!cache.has(e)) cache.set(e, ends(e));
+    return cache.get(e)!;
+  };
+
+  const chain = new Set<number>([edgeIndex]);
+  const queue = [edgeIndex];
+  while (queue.length > 0) {
+    const cur = queue.pop()!;
+    const a = endsOf(cur);
+    if (!a) continue;
+    for (let other = 0; other < n; other++) {
+      if (chain.has(other)) continue;
+      const b = endsOf(other);
+      if (!b) continue;
+      for (const ea of a) {
+        for (const eb of b) {
+          if (!near(ea.point, eb.point)) continue;
+          const dot = ea.dir[0]! * eb.dir[0]! + ea.dir[1]! * eb.dir[1]! + ea.dir[2]! * eb.dir[2]!;
+          if (Math.abs(dot) >= cosLimit) {
+            chain.add(other);
+            queue.push(other);
+          }
+        }
       }
     }
   }
-  return buildEdgeHighlight(out);
+  return [...chain].sort((x, y) => x - y);
 }

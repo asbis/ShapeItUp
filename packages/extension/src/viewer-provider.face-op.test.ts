@@ -42,10 +42,21 @@ const request = (over: Record<string, unknown> = {}) => ({
   requestId: 1,
   op: "extrude" as const,
   partName: null,
-  face: TOP_FACE,
+  target: { kind: "face" as const, face: TOP_FACE },
   distance: 5,
   ...over,
 });
+
+/** The same request, aimed at one edge instead of a face. */
+const edgeRequest = (over: Record<string, unknown> = {}) =>
+  request({
+    op: "fillet",
+    // The midpoint of the plate's top-front edge: x is the centre line, y is
+    // half the depth, z is the thickness.
+    target: { kind: "edge" as const, point: [0, -30, 6] as [number, number, number] },
+    distance: 2,
+    ...over,
+  });
 
 describe("ViewerProvider.commitFaceOp", () => {
   beforeEach(() => __reset());
@@ -109,7 +120,9 @@ describe("ViewerProvider.commitFaceOp", () => {
 
     // A 45-degree fillet face: planar, but parallel to no standard plane.
     const r = await provider.commitFaceOp(
-      request({ face: { kind: "PLANE", center: [0, -28, 4], normal: [0, -0.707, 0.707] } }),
+      request({
+        target: { kind: "face", face: { kind: "PLANE", center: [0, -28, 4], normal: [0, -0.707, 0.707] } },
+      }),
     );
 
     expect(r.ok).toBe(false);
@@ -121,7 +134,7 @@ describe("ViewerProvider.commitFaceOp", () => {
     __addDoc(FILE, SRC, { visible: true });
     const { provider } = makeProvider(FILE);
     const r = await provider.commitFaceOp(
-      request({ face: { kind: "CYLINDRE", center: [6, 0, 3], normal: [1, 0, 0] } }),
+      request({ target: { kind: "face", face: { kind: "CYLINDRE", center: [6, 0, 3], normal: [1, 0, 0] } } }),
     );
     expect(r.reason).toMatch(/only planar faces/);
   });

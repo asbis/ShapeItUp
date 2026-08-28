@@ -891,7 +891,8 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     }
 
     this.output.appendLine(
-      `[face] ${msg.op} ${msg.distance} on ${msg.partName ?? "shape"} in ${path.basename(file)}` +
+      `[face] ${msg.op} ${msg.distance} on ${msg.target.kind} of ` +
+        `${msg.partName ?? "shape"} in ${path.basename(file)}` +
         (visible ? " (unsaved — yours to save)" : " (saved)") +
         (built.addedImport ? " — added the shapeitup import" : ""),
     );

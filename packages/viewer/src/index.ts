@@ -16,6 +16,7 @@ import {
   describePlacement,
   edgesInPlane,
   faceBounds,
+  tangentChain,
   formatFaceArea,
   formatTriple,
   type FaceSelection,
@@ -23,7 +24,7 @@ import {
 } from "./selection";
 import { initMessageHandler, onMessage, postToExtension } from "./message-handler";
 import type { WorkerToWebview, TessellatedPart, DetectedApp } from "@shapeitup/shared";
-import { synthesizeFaceSelector } from "@shapeitup/shared";
+import { synthesizeEdgeSelector, synthesizeFaceSelector } from "@shapeitup/shared";
 import { PART_COLORS } from "./theme";
 import { setupSim, updateSim, clearSim, initSimPanel, toggleSimPanel } from "./sim-panel";
 
@@ -274,7 +275,8 @@ interface PartInfo {
   triangles: Uint32Array;
   faceGroups?: Uint32Array;
   faceInfo?: TessellatedPart["faceInfo"];
-  /** Edge polylines and their spans — used to preview which edges a fillet hits. */
+  /** Edge lines and their spans — the raycast target and preview source. */
+  edgeLines?: THREE.LineSegments;
   edgeVertices?: Float32Array;
   edgeGroups?: Uint32Array;
   /** Measured on the OCCT shape, not the mesh. Absent on degenerate geometry. */
@@ -324,7 +326,8 @@ let declaredParamValues: Record<string, number> = {};
 const faceInfoEl = document.getElementById("face-info")!;
 const fiKindEl = document.getElementById("fi-kind")!;
 const fiMetaEl = document.getElementById("fi-meta")!;
-const fiPreviewEl = document.getElementById("fi-preview")!;
+const fiCodeEl = document.getElementById("fi-code")!;
+const fiNotesEl = document.getElementById("fi-notes")!;
 const fiToolsEl = document.getElementById("fi-tools") as HTMLElement;
 const fiFormEl = document.getElementById("fi-form") as HTMLElement;
 const fiDistEl = document.getElementById("fi-dist") as HTMLInputElement;
@@ -388,33 +391,48 @@ function updateFaceInfoPanel(): void {
     setActiveOp(null);
     return;
   }
-  const { info } = sel;
-  fiKindEl.textContent = describeKind(info.kind);
 
-  // One line: where it is, then how big. Centre and normal move into the
-  // tooltip — still available, no longer occupying four rows of the viewport.
   const bits: string[] = [];
-  const placement = describePlacement(info);
-  if (placement) bits.push(placement);
-  if (currentParts.length > 1) bits.push(sel.partName);
-  if (typeof info.area === "number") bits.push(`<b>${formatFaceArea(info.area)}</b>`);
-  fiMetaEl.innerHTML = bits.join(" · ");
-  faceInfoEl.title =
-    `Center ${formatTriple(info.center)}` +
-    (info.normal ? `\nNormal ${formatTriple(info.normal, 2)}` : "");
+  let writable: boolean;
+  let why: string | null = null;
 
-  fiLookAtEl.disabled = !info.normal;
-  // Only an axis-aligned plane can be named by a selector we are willing to
-  // write, so nothing can be modelled from anything else. Saying why in the
-  // tooltip beats three buttons that silently do nothing.
-  const writable = buildSelectorPreview(sel) !== null;
-  const why = writable
-    ? null
-    : "This face is not parallel to a standard plane, so there is no stable way to name it in code yet";
+  if (sel.kind === "face") {
+    const { info } = sel;
+    fiKindEl.textContent = describeKind(info.kind);
+    const placement = describePlacement(info);
+    if (placement) bits.push(placement);
+    if (currentParts.length > 1) bits.push(sel.partName);
+    if (typeof info.area === "number") bits.push(`<b>${formatFaceArea(info.area)}</b>`);
+    faceInfoEl.title =
+      `Center ${formatTriple(info.center)}` +
+      (info.normal ? `\nNormal ${formatTriple(info.normal, 2)}` : "");
+    fiLookAtEl.disabled = !info.normal;
+    writable = buildSelectorPreview(sel) !== null;
+    if (!writable) {
+      why = "This face is not parallel to a standard plane, so there is no stable way to name it in code yet";
+    }
+  } else {
+    fiKindEl.textContent = sel.straight ? "Edge" : "Curved edge";
+    bits.push(`<b>${sel.length.toFixed(1)} mm</b>`);
+    if (currentParts.length > 1) bits.push(sel.partName);
+    faceInfoEl.title = `On the edge at ${formatTriple(sel.point)}`;
+    // Nothing to look down: an edge has no normal.
+    fiLookAtEl.disabled = true;
+    writable = true;
+  }
+
+  fiMetaEl.innerHTML = bits.join(" · ");
+
+  // An edge can be rounded but not extruded — pushing a line along "its
+  // normal" has no meaning.
+  fiExtrudeEl.disabled = !writable || sel.kind === "edge";
+  fiExtrudeEl.title =
+    sel.kind === "edge"
+      ? "An edge cannot be extruded — pick a face"
+      : (why ?? "Push or pull this face along its normal");
   for (const [btn, tip] of [
-    [fiExtrudeEl, "Push or pull this face along its normal"],
-    [fiFilletEl, "Round the edges around this face"],
-    [fiChamferEl, "Bevel the edges around this face"],
+    [fiFilletEl, sel.kind === "edge" ? "Round this edge" : "Round the edges around this face"],
+    [fiChamferEl, sel.kind === "edge" ? "Bevel this edge" : "Bevel the edges around this face"],
   ] as const) {
     btn.disabled = !writable;
     btn.title = why ?? tip;
@@ -437,25 +455,34 @@ function clearEdgePreview(): void {
   edgePreview = null;
 }
 
-/** Highlight the edges a fillet/chamfer would touch; returns how many. */
-function showEdgePreview(sel: FaceSelection, plane: string, offset: number): number {
+/** Draw the given edges of a part as the pending-operation overlay. */
+function showEdgeSet(partIndex: number, indices: number[]): void {
   clearEdgePreview();
-  const part = currentParts[sel.partIndex] as PickablePart | undefined;
-  if (!part) return 0;
-  const indices = edgesInPlane(part, plane, offset, faceBounds(part, sel));
+  const part = currentParts[partIndex] as PickablePart | undefined;
+  if (!part) return;
   const lines = buildEdgesHighlight(part, indices);
-  if (lines) {
-    lines.applyMatrix4(part.mesh.matrixWorld);
-    overlayGroup.add(lines);
-    edgePreview = lines;
+  if (!lines) return;
+  lines.applyMatrix4(part.mesh.matrixWorld);
+  overlayGroup.add(lines);
+  edgePreview = lines;
+}
+
+/** Highlight the edges a face-driven fillet/chamfer would touch; returns how many. */
+function showEdgePreview(sel: FaceSelection, plane: string, offset: number): number {
+  const part = currentParts[sel.partIndex] as PickablePart | undefined;
+  if (!part) {
+    clearEdgePreview();
+    return 0;
   }
+  const indices = edgesInPlane(part, plane, offset, faceBounds(part, sel));
+  showEdgeSet(sel.partIndex, indices);
   return indices.length;
 }
 
 /**
- * The selector the host would synthesise for this face. All three operations
- * name the FACE — fillet and chamfer resolve its boundary at build time — so
- * there is one selector, not one per operation.
+ * The selector the host would synthesise for a picked face. All three
+ * operations name the FACE — fillet and chamfer resolve its boundary at build
+ * time — so there is one selector, not one per operation.
  */
 function buildSelectorPreview(sel: FaceSelection) {
   const r = synthesizeFaceSelector(sel.info, declaredParamValues);
@@ -464,41 +491,87 @@ function buildSelectorPreview(sel: FaceSelection) {
 
 function renderOpPreview(): void {
   const sel = facePicker.getSelection();
-  const selector = sel ? buildSelectorPreview(sel) : null;
-  if (!sel || !selector || !activeOp) {
-    fiPreviewEl.textContent = "";
+  if (!sel || !activeOp) {
+    fiCodeEl.textContent = "";
+    fiNotesEl.textContent = "";
     clearEdgePreview();
     return;
   }
+  fiNotesEl.textContent = "";
   const d = parseDistance();
-  const target = currentParts.length > 1 ? sel.partName : "shape";
   const dist = d === null ? "…" : String(d);
-  const fn =
-    activeOp === "extrude" ? "extrudeFace" : activeOp === "fillet" ? "filletFace" : "chamferFace";
-  fiPreviewEl.textContent = `${fn}(${target}, ${selector.code}, ${dist})`;
+  const target = currentParts.length > 1 ? sel.partName : "shape";
 
-  if (activeOp === "extrude") {
-    clearEdgePreview();
-  } else {
-    // The offset the VIEWER matches on is the raw number, not the parameter
-    // name — the name is what gets written, the number is what it evaluates to.
-    const n = showEdgePreview(sel, selector.plane, selector.offset);
-    const note = document.createElement("span");
-    if (n === 0) {
-      // replicad throws on an empty selector, so this would break the render.
-      note.className = "warn";
-      note.textContent = "   ⚠ this face has no boundary edges to round";
-    } else {
-      note.textContent = `   → ${n} edge${n === 1 ? "" : "s"}`;
+  let durable: boolean;
+  let derived = false;
+  const notes: { text: string; warn: boolean }[] = [];
+
+  if (sel.kind === "edge") {
+    const selector = synthesizeEdgeSelector(sel.point, declaredParamValues);
+    const fn = activeOp === "fillet" ? "filletEdge" : "chamferEdge";
+    fiCodeEl.textContent = `${fn}(${target}, ${selector.code}, ${dist})`;
+    durable = selector.durable;
+    derived = selector.derived;
+
+    // OCCT carries a fillet along edges that meet smoothly, so on a rounded
+    // outline one click rounds the whole loop. Show the chain, not the click.
+    const part = currentParts[sel.partIndex] as PickablePart | undefined;
+    const chain = part ? tangentChain(part, sel.edgeIndex) : [sel.edgeIndex];
+    showEdgeSet(sel.partIndex, chain);
+    if (chain.length > 1) {
+      notes.push({
+        text: `→ ${chain.length} edges — they meet smoothly, so the round carries across`,
+        warn: false,
+      });
     }
-    fiPreviewEl.appendChild(note);
+  } else {
+    const selector = buildSelectorPreview(sel);
+    if (!selector) {
+      fiCodeEl.textContent = "";
+      clearEdgePreview();
+      return;
+    }
+    const fn =
+      activeOp === "extrude" ? "extrudeFace" : activeOp === "fillet" ? "filletFace" : "chamferFace";
+    fiCodeEl.textContent = `${fn}(${target}, ${selector.code}, ${dist})`;
+    durable = selector.durable;
+    derived = selector.derived === true;
+
+    if (activeOp === "extrude") {
+      clearEdgePreview();
+    } else {
+      // The offset the VIEWER matches on is the raw number, not the parameter
+      // name — the name is what gets written, the number is what it evaluates to.
+      const n = showEdgePreview(sel, selector.plane, selector.offset);
+      notes.push(
+        n === 0
+          ? { text: "⚠ this face has no boundary edges to round", warn: true }
+          : { text: `→ ${n} edge${n === 1 ? "" : "s"}`, warn: false },
+      );
+    }
   }
 
-  if (!selector.durable) {
-    const warn = document.createElement("span");
-    warn.className = "warn";
-    warn.textContent = "   ⚠ fixed offset — no parameter matched, so this breaks if the model moves";
-    fiPreviewEl.appendChild(warn);
+  if (!durable) {
+    notes.push({
+      // A literal is correct now and silently stops matching the moment the
+      // model moves. The user is about to write it; they should know which
+      // kind of line they are getting.
+      text: "⚠ fixed numbers — no parameter matched, so this breaks if the model moves",
+      warn: true,
+    });
+  } else if (derived) {
+    notes.push({
+      // Half-dimension bindings are a reading of intent, not an equality.
+      text: "⚠ read as half a parameter — check that is what you meant",
+      warn: true,
+    });
+  }
+
+  for (const n of notes) {
+    const el = document.createElement("span");
+    if (n.warn) el.className = "warn";
+    el.textContent = n.text;
+    fiNotesEl.appendChild(el);
   }
 }
 
@@ -528,7 +601,7 @@ let pendingFaceOp: number | null = null;
 let awaitingFaceOpRebuild: FaceOpKind | null = null;
 
 /** Prefixes the stdlib helpers put on their runtime warnings. */
-const FACE_OP_WARNING = /^(extrudeFace|filletFace|chamferFace):\s*/;
+const FACE_OP_WARNING = /^(extrudeFace|filletFace|chamferFace|filletEdge|chamferEdge):\s*/;
 
 /**
  * Report a warning raised by the operation the user just applied.
@@ -552,9 +625,7 @@ function applyOp(): void {
   const d = parseDistance();
   if (!sel || !activeOp || d === null) {
     setParamsStatus(
-      activeOp === "extrude"
-        ? "Enter a non-zero distance."
-        : "Enter a positive radius.",
+      activeOp === "extrude" ? "Enter a non-zero distance." : "Enter a positive radius.",
       true,
     );
     return;
@@ -572,11 +643,17 @@ function applyOp(): void {
     op: activeOp,
     // A single-part script returns a bare shape and has no name to match on.
     partName: currentParts.length > 1 ? sel.partName : null,
-    face: {
-      kind: sel.info.kind,
-      center: sel.info.center,
-      ...(sel.info.normal ? { normal: sel.info.normal } : {}),
-    },
+    target:
+      sel.kind === "edge"
+        ? { kind: "edge", point: sel.point }
+        : {
+            kind: "face",
+            face: {
+              kind: sel.info.kind,
+              center: sel.info.center,
+              ...(sel.info.normal ? { normal: sel.info.normal } : {}),
+            },
+          },
     distance: d,
   });
 }
@@ -602,7 +679,8 @@ fiDistEl.addEventListener("keydown", (e) => {
 
 fiLookAtEl.addEventListener("click", () => {
   const sel = facePicker.getSelection();
-  if (!sel?.info.normal) return;
+  // Only a face has a normal to look down.
+  if (sel?.kind !== "face" || !sel.info.normal) return;
   // Look ALONG the inward normal, i.e. place the camera out on the outward
   // one — setCameraAngle takes the direction from the model to the camera.
   setCameraAngle(sel.info.normal);
@@ -625,9 +703,48 @@ controls.addEventListener("end", () => {
   orbiting = false;
 });
 
+/**
+ * The grab radius for edge picking, in world units, sized so it is roughly
+ * constant on screen.
+ *
+ * An edge is a one-pixel target; without a radius it is essentially
+ * unclickable. But the radius has to be in world units for the raycaster,
+ * and a fixed one is a huge grab area zoomed in and an unhittable one zoomed
+ * out. So it is derived from how much world one pixel covers at the model's
+ * distance.
+ */
+const EDGE_GRAB_PX = 7;
+
+function edgeGrabRadius(): number {
+  const h = renderer.domElement.clientHeight || 1;
+  const dist = camera.position.distanceTo(controls.target);
+  if (camera instanceof THREE.PerspectiveCamera) {
+    const worldPerPixel = (2 * dist * Math.tan((camera.fov * Math.PI) / 360)) / h;
+    return EDGE_GRAB_PX * worldPerPixel;
+  }
+  // Orthographic: the view height IS the world height, no distance term.
+  const ortho = camera as THREE.OrthographicCamera;
+  return (EDGE_GRAB_PX * (ortho.top - ortho.bottom)) / ortho.zoom / h;
+}
+
+/**
+ * Resolve a pointer position to an edge if one is within the grab radius,
+ * otherwise to the face under it.
+ *
+ * Edges win near a border because that is where the user is aiming when they
+ * put the cursor there — the same precedence a CAD app uses. The cost is that
+ * a face is slightly harder to select within 7 px of its own boundary, which
+ * is a much smaller annoyance than an unselectable edge.
+ */
+function pickAt(clientX: number, clientY: number) {
+  const edge = facePicker.pickEdge(clientX, clientY, renderer.domElement, edgeGrabRadius());
+  if (edge) return edge;
+  return facePicker.pick(clientX, clientY, renderer.domElement);
+}
+
 renderer.domElement.addEventListener("pointermove", (event) => {
   if (orbiting || measureMode) return;
-  const sel = facePicker.pick(event.clientX, event.clientY, renderer.domElement);
+  const sel = pickAt(event.clientX, event.clientY);
   facePicker.setHover(sel);
   renderer.domElement.style.cursor = sel ? "pointer" : "";
 });
@@ -689,10 +806,11 @@ function addPart(part: TessellatedPart) {
   const mesh = buildMesh(part.vertices, part.normals, part.triangles, colorValue);
   partGroup.add(mesh);
 
+  let edgeLines: THREE.LineSegments | undefined;
   if (part.edgeVertices.length > 0) {
-    const edges = buildEdges(part.edgeVertices);
-    edges.visible = edgesVisible;
-    partGroup.add(edges);
+    edgeLines = buildEdges(part.edgeVertices);
+    edgeLines.visible = edgesVisible;
+    partGroup.add(edgeLines);
   }
 
   modelGroup.add(partGroup);
@@ -706,6 +824,7 @@ function addPart(part: TessellatedPart) {
     triangles: part.triangles,
     faceGroups: part.faceGroups,
     faceInfo: part.faceInfo,
+    edgeLines,
     edgeVertices: part.edgeVertices,
     edgeGroups: part.edgeGroups,
     volume: part.volume,
@@ -2199,7 +2318,7 @@ renderer.domElement.addEventListener("click", (event) => {
     if (Math.hypot(event.clientX - pressX, event.clientY - pressY) > CLICK_SLOP_PX) return;
     // Clicking empty space clears — the standard CAD gesture, and the only
     // way to deselect without reaching for the keyboard.
-    facePicker.setSelection(facePicker.pick(event.clientX, event.clientY, renderer.domElement));
+    facePicker.setSelection(pickAt(event.clientX, event.clientY));
     updateFaceInfoPanel();
     return;
   }

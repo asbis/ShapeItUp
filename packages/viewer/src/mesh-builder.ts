@@ -71,14 +71,17 @@ export function buildFaceHighlight(
  * behind the surface it belongs to would defeat the point, which is letting
  * the user count what they are about to round.
  */
-export function buildEdgeHighlight(points: Float32Array): THREE.LineSegments {
+export function buildEdgeHighlight(
+  points: Float32Array,
+  mode: "hover" | "select" = "select",
+): THREE.LineSegments {
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(points, 3));
   const material = new THREE.LineBasicMaterial({
-    color: THEME.selectColor,
+    color: mode === "select" ? THEME.edgeSelectColor : THEME.edgeHoverColor,
     depthTest: false,
     transparent: true,
-    opacity: 0.95,
+    opacity: mode === "select" ? 0.95 : 0.7,
   });
   const lines = new THREE.LineSegments(geometry, material);
   lines.raycast = () => {};
