@@ -12,6 +12,7 @@ import {
 import { buildMesh, buildEdges } from "./mesh-builder";
 import { createDeltaMaterial, syncEdgeHighlightWidths } from "./theme";
 import { DragHandle, projectRayOntoAxis } from "./drag-handle";
+import { ViewCube } from "./view-cube";
 import {
   FacePicker,
   buildEdgesHighlight,
@@ -165,11 +166,16 @@ const gnomonLabelZ = makeGnomonLabel("Z", "#3388ff");
 gnomonLabelZ.position.set(0, 0, 0.95);
 gnomonScene.add(gnomonLabelX, gnomonLabelY, gnomonLabelZ);
 
-// Fusion-style ViewCube: the three +axis labels plus three invisible hit
-// spheres on the -axis ends make the gnomon a 6-way clickable navigator.
-// The spheres are opacity:0 but still raycastable, so -X/-Y/-Z are reachable
-// without visual clutter. Each hit proxy carries the camera preset tuple on
-// `userData.preset` — the click handler reads it directly.
+// The gnomon is also a 6-way navigator: the three +axis labels plus three
+// invisible hit spheres on the -axis ends. The spheres are opacity:0 but still
+// raycastable, so -X/-Y/-Z are reachable without visual clutter, and each hit
+// proxy carries the camera preset on `userData.preset`.
+//
+// The ViewCube below has since taken over as the primary navigator — it offers
+// all 26 directions rather than 6, and it reads as an orientation rather than
+// as three lines. This stays because it is the thing that survives into a
+// SCREENSHOT, where an agent needs axis colours and directions rather than
+// something to click.
 gnomonLabelX.userData.preset = [1, 0, 0];   // click +X → right view
 gnomonLabelY.userData.preset = [0, 1, 0];   // click +Y → back view
 gnomonLabelZ.userData.preset = [0, 0, 1];   // click +Z → top view
@@ -3623,18 +3629,67 @@ onMessage("installed-apps", (msg) => {
   renderAppsMenu();
 });
 
-// --- ViewCube ---
-// Side presets are axis-aligned (no tilt) so they match
-// CAMERA_ANGLE_PRESETS and trigger the orthographic capture path when used
-// by the screenshot pipeline. The interactive viewport still renders through
-// the perspective camera in both cases — live orbit/zoom remains unchanged.
-document.getElementById("vc-iso")!.addEventListener("click", () => setCameraAngle([1, -1, 0.7]));
-document.getElementById("vc-top")!.addEventListener("click", () => setCameraAngle([0, 0, 1]));
-document.getElementById("vc-bottom")!.addEventListener("click", () => setCameraAngle([0, 0, -1]));
-document.getElementById("vc-front")!.addEventListener("click", () => setCameraAngle([0, -1, 0]));
-document.getElementById("vc-back")!.addEventListener("click", () => setCameraAngle([0, 1, 0]));
-document.getElementById("vc-right")!.addEventListener("click", () => setCameraAngle([1, 0, 0]));
-document.getElementById("vc-left")!.addEventListener("click", () => setCameraAngle([-1, 0, 0]));
+// ── The ViewCube ──────────────────────────────────────────────────────────
+//
+// Replaces the grid of seven text buttons that used to sit here. Those gave
+// you the six faces and an iso, and nothing else: no diagonal, no reading of
+// where you already were. A cube gives all twenty-six directions, and — the
+// part a button grid can never do — it TELLS you which way the model is
+// facing, because it is turning as you orbit.
+//
+// The directions it hands back are axis-aligned (no tilt), so they still match
+// CAMERA_ANGLE_PRESETS and trigger the orthographic capture path when the
+// screenshot pipeline uses one. The interactive viewport keeps rendering
+// through the perspective camera either way.
+
+/** Kept in sync with #viewcube / #vc-home in viewer-html.ts. */
+const VIEW_CUBE_SIZE = 96;
+const VIEW_CUBE_MARGIN_RIGHT = 10;
+const VIEW_CUBE_MARGIN_BOTTOM = 96;
+
+/** Home. The same view `1` gives, and the one the model first loads in. */
+const HOME_VIEW: [number, number, number] = [1, -1, 0.7];
+
+/**
+ * Spin the camera about the orbit target, in the same units OrbitControls
+ * uses for a drag on the model — so dragging the cube feels like dragging the
+ * view, because it is the same gesture at the same speed.
+ */
+function orbitCameraBy(dxPx: number, dyPx: number): void {
+  const h = renderer.domElement.clientHeight || 1;
+  const offset = camera.position.clone().sub(controls.target);
+
+  // Spherical coordinates are Y-up and this application is Z-up, so the
+  // offset is rotated into a Y-up frame for the maths and back out again.
+  // Skipping this is how a Z-up orbit ends up tumbling about the wrong pole.
+  const toYUp = new THREE.Quaternion().setFromUnitVectors(
+    camera.up.clone().normalize(),
+    new THREE.Vector3(0, 1, 0),
+  );
+  const fromYUp = toYUp.clone().invert();
+
+  const spherical = new THREE.Spherical().setFromVector3(offset.applyQuaternion(toYUp));
+  const speed = (2 * Math.PI) / h;
+  spherical.theta -= dxPx * speed;
+  spherical.phi -= dyPx * speed;
+  // Stop just short of the poles: at exactly 0 or PI the azimuth is undefined
+  // and the view snaps to an arbitrary roll.
+  const EPS = 1e-4;
+  spherical.phi = Math.max(EPS, Math.min(Math.PI - EPS, spherical.phi));
+
+  camera.position
+    .copy(controls.target)
+    .add(offset.setFromSpherical(spherical).applyQuaternion(fromYUp));
+  camera.lookAt(controls.target);
+  controls.update();
+}
+
+const viewCube = new ViewCube(document.getElementById("viewcube")!, {
+  onPick: (dir) => setCameraAngle(dir),
+  onOrbit: orbitCameraBy,
+});
+
+document.getElementById("vc-home")!.addEventListener("click", () => setCameraAngle(HOME_VIEW));
 
 // --- Parameter Sliders ---
 import type { ParamDef } from "@shapeitup/shared";
@@ -4579,6 +4634,11 @@ function animate() {
   const w = container.clientWidth;
   const h = container.clientHeight;
   renderGnomon(w, h);
+  // Live view only. The screenshot paths render the gnomon deliberately — it
+  // is how an agent reads orientation out of a still — but a navigation
+  // control in a captured frame is just something covering the model.
+  viewCube.syncTo(camera, controls.target);
+  viewCube.render(renderer, w, VIEW_CUBE_SIZE, VIEW_CUBE_MARGIN_RIGHT, VIEW_CUBE_MARGIN_BOTTOM);
 }
 
 // --- Handle resize ---

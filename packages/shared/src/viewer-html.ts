@@ -249,19 +249,23 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
     /* ViewCube — 3×2 grid of axis views (top/bottom, front/back, right/left)
        plus a full-width Iso row. Gives one-click access to every side so
        users don't need to drag past the pole to see the underside. */
+    /* ViewCube hit surface.
+       The cube itself is drawn by WebGL into this exact rectangle of the main
+       canvas; this div only catches the pointer. It has to, because the canvas
+       underneath belongs to OrbitControls — without something above it, every
+       press on the cube would start spinning the model instead.
+       Kept in sync with VIEW_CUBE_SIZE / VIEW_CUBE_MARGIN in the viewer. */
     #viewcube {
-      position: absolute; bottom: 40px; right: 10px; z-index: 20;
-      display: grid; grid-template-columns: 1fr 1fr; gap: 2px;
-      background: rgba(37,37,38,0.85); padding: 4px; border-radius: 5px;
-      border: 1px solid #3c3c3c;
+      position: absolute; right: 10px; bottom: 96px; z-index: 20;
+      width: 96px; height: 96px; touch-action: none;
     }
-    #viewcube button {
-      background: transparent; border: none; color: #999; cursor: pointer;
-      font-size: 10px; padding: 3px 6px; border-radius: 2px; font-family: inherit;
-      min-width: 44px;
+    #vc-home {
+      position: absolute; right: 106px; bottom: 166px; z-index: 21;
+      width: 24px; height: 24px; padding: 0; line-height: 1;
+      background: rgba(37,37,38,0.85); border: 1px solid #3c3c3c;
+      border-radius: 4px; color: #9aa2ac; cursor: pointer; font-size: 13px;
     }
-    #viewcube button:hover { background: #3c3c3c; color: #fff; }
-    #viewcube button.vc-iso { grid-column: 1 / span 2; }
+    #vc-home:hover { background: #3c3c3c; color: #fff; border-color: #4a4a4e; }
 
     /* Parameters panel (bottom of parts panel) */
     #params-panel {
@@ -689,15 +693,8 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
         </div>
       </div>
 
-      <div id="viewcube">
-        <button id="vc-iso" class="vc-iso" title="Isometric view (1)">Iso</button>
-        <button id="vc-top" title="Top view — looking down -Z (4)">Top</button>
-        <button id="vc-bottom" title="Bottom view — looking up +Z (7)">Bottom</button>
-        <button id="vc-front" title="Front view — looking along +Y (2)">Front</button>
-        <button id="vc-back" title="Back view — looking along -Y (5)">Back</button>
-        <button id="vc-right" title="Right view — looking along -X (3)">Right</button>
-        <button id="vc-left" title="Left view — looking along +X (6)">Left</button>
-      </div>
+      <button id="vc-home" title="Home \u2014 isometric view (1)">&#8962;</button>
+      <div id="viewcube" title="Click a face, edge or corner for that view. Drag to orbit."></div>
 
       <div id="section-controls">
         <label>Axis</label>
