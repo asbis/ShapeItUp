@@ -398,14 +398,14 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
        72px clears the command ribbon above it (measured at 64.5px tall);
        #measure-info sits higher, at 40px, but the two can never be on screen
        together — entering measure mode clears the selection. */
-    #face-info {
+    #face-info, #combine-info {
       position: absolute; top: 72px; left: 50%; transform: translateX(-50%);
       z-index: 23; display: none; max-width: calc(100% - 32px);
       background: rgba(37,37,38,0.96); border: 1px solid #3c3c3c;
       border-radius: 4px; box-shadow: 0 4px 14px rgba(0,0,0,0.35);
       font-size: 11px; color: #ccc;
     }
-    #face-info.visible { display: block; }
+    #face-info.visible, #combine-info.visible { display: block; }
     .fi-main {
       display: flex; align-items: center; gap: 8px;
       padding: 4px 5px 4px 9px; white-space: nowrap;
@@ -414,15 +414,15 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
     .fi-meta { color: #8a8a8a; font-variant-numeric: tabular-nums; }
     .fi-meta b { color: #4fc1ff; font-weight: 400; }
     .fi-rule { width: 1px; align-self: stretch; background: #3c3c3c; margin: 0 1px; }
-    #face-info button {
+    #face-info button, #combine-info button {
       background: transparent; border: 1px solid transparent; color: #bbb;
       border-radius: 3px; padding: 3px 7px; font-size: 11px; cursor: pointer;
     }
-    #face-info button:hover { background: #3d3d41; color: #fff; border-color: #4a4a4e; }
-    #face-info button:disabled { opacity: 0.3; cursor: default; }
-    #face-info button:disabled:hover { background: transparent; color: #bbb; border-color: transparent; }
-    #fi-apply { background: #0e639c; border-color: #1177bb; color: #fff; }
-    #fi-apply:hover { background: #1177bb; border-color: #1a8ad4; }
+    #face-info button:hover, #combine-info button:hover { background: #3d3d41; color: #fff; border-color: #4a4a4e; }
+    #face-info button:disabled, #combine-info button:disabled { opacity: 0.3; cursor: default; }
+    #face-info button:disabled:hover, #combine-info button:disabled:hover { background: transparent; color: #bbb; border-color: transparent; }
+    #fi-apply, #ci-apply { background: #0e639c; border-color: #1177bb; color: #fff; }
+    #fi-apply:hover, #ci-apply:hover { background: #1177bb; border-color: #1a8ad4; }
     #fi-dist {
       width: 52px; background: #1e1e1e; border: 1px solid #4a4a4e; color: #4fc1ff;
       border-radius: 3px; padding: 3px 5px; font-size: 11px; text-align: right;
@@ -438,6 +438,43 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
       max-width: 100%;
     }
     #face-info.extruding #fi-preview { display: block; }
+
+    /* The Combine bar. Same chrome as the selection bar — it is the same kind
+       of object, a one-line context toolbar — but it never coexists with it:
+       arming Combine clears the face selection, because a body operation and a
+       face operation would be reading the same click differently. */
+    #ci-preview {
+      border-top: 1px solid #333; padding: 4px 9px 5px; max-width: 100%;
+    }
+    #ci-code {
+      font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+      font-size: 10px; color: #7ea36f; white-space: nowrap;
+      overflow-x: auto; max-width: 100%;
+    }
+    #ci-notes { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 3px; font-size: 10px; color: #8a8a8a; }
+    #ci-notes .warn { color: #e0b060; }
+    #combine-info select {
+      background: #1e1e1e; border: 1px solid #4a4a4e; color: #4fc1ff;
+      border-radius: 3px; padding: 2px 4px; font-size: 11px; font-family: inherit;
+      max-width: 130px;
+    }
+    #combine-info select:focus { outline: none; border-color: #0e639c; }
+    .ci-label { color: #8a8a8a; }
+    /* One chip per selected tool body, each with its own remove control —
+       so a mis-click costs one click to undo rather than restarting the
+       whole selection. */
+    .ci-chip {
+      display: inline-flex; align-items: center; gap: 3px;
+      background: #33383f; border: 1px solid #4a5560; border-radius: 9px;
+      padding: 1px 3px 1px 7px; color: #d6e4f0; margin-right: 3px;
+    }
+    .ci-chip button {
+      padding: 0 3px !important; line-height: 1; color: #8fa6b8 !important;
+      border: none !important; background: none !important;
+    }
+    .ci-chip button:hover { color: #fff !important; background: none !important; }
+    #ci-keep { display: inline-flex; align-items: center; gap: 3px; color: #8a8a8a; cursor: pointer; }
+    #ci-keep input { accent-color: #0e639c; margin: 0; }
     /* The call itself never wraps — a line of code broken mid-token is harder
        to read than one you scroll. */
     #fi-code {
@@ -553,6 +590,24 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
 
         <div class="tb-group">
           <div class="tb-row">
+            <button id="btn-join" title="Merge bodies into one \u2014 Fusion's Combine / Join" disabled>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6.4 3.4a4.6 4.6 0 1 0 0 9.2 4.6 4.6 0 1 0 0-9.2"/><path d="M9.6 3.4a4.6 4.6 0 1 1 0 9.2 4.6 4.6 0 1 1 0-9.2"/></svg>
+              <span>Join</span>
+            </button>
+            <button id="btn-cut" title="Subtract bodies from one \u2014 Fusion's Combine / Cut" disabled>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.4" cy="8" r="4.6"/><circle cx="9.6" cy="8" r="4.6" stroke-dasharray="1.7 1.5"/></svg>
+              <span>Cut</span>
+            </button>
+            <button id="btn-intersect" title="Keep only the volume the bodies share \u2014 Fusion's Combine / Intersect" disabled>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="6.4" cy="8" r="4.6"/><circle cx="9.6" cy="8" r="4.6"/><path d="M8 3.9a4.6 4.6 0 0 0 0 8.2 4.6 4.6 0 0 0 0-8.2" fill="currentColor" stroke="none"/></svg>
+              <span>Intersect</span>
+            </button>
+          </div>
+          <div class="tb-caption">Combine</div>
+        </div>
+
+        <div class="tb-group">
+          <div class="tb-row">
             <div id="export-menu-wrapper" class="menu-wrapper">
               <button id="btn-export" title="Export, or open in another app">
                 <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.8v7.6m0 0 3-3m-3 3-3-3"/><path d="M2.6 11.2v2.6h10.8v-2.6"/></svg>
@@ -620,6 +675,28 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
         <div id="fi-preview">
           <div id="fi-code"></div>
           <div id="fi-notes"></div>
+        </div>
+      </div>
+
+      <div id="combine-info">
+        <div class="fi-main">
+          <span class="fi-op" id="ci-op"></span>
+          <span class="ci-label">Target</span>
+          <select id="ci-target" title="The body that survives, keeping its name and colour"></select>
+          <span class="ci-label">Tools</span>
+          <span id="ci-chips"></span>
+          <select id="ci-add" title="Add a tool body \u2014 or click one in the view"></select>
+          <label id="ci-keep" title="Fusion's Keep Tools: leave the tool bodies in the parts list">
+            <input type="checkbox" id="ci-keep-toggle">
+            <span>Keep tools</span>
+          </label>
+          <span class="fi-rule"></span>
+          <button id="ci-apply" title="Write this into the file">Apply</button>
+          <button id="ci-cancel" title="Cancel (Esc)">&#10005;</button>
+        </div>
+        <div id="ci-preview">
+          <div id="ci-code"></div>
+          <div id="ci-notes"></div>
         </div>
       </div>
 

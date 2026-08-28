@@ -7,7 +7,7 @@
  * (script execution, tessellation, measurement, export) is identical.
  */
 
-import type { ParamDef, PreviewDelta, PreviewFaceOp } from "@shapeitup/shared";
+import type { ParamDef, PreviewCombine, PreviewDelta, PreviewFaceOp } from "@shapeitup/shared";
 import { executeScript } from "./executor";
 export { extractParamsStatic, extractConfigStatic, extractExpectedContactsStatic } from "./executor";
 import { describeFaces, normalizeParts, tessellatePart, type MeshQuality, type PartInput, type PartStatsLevel, type TessellatedPart } from "./tessellate";
@@ -36,6 +36,13 @@ import {
   filletFace,
   probeMaxRadius,
 } from "./stdlib/faces";
+import {
+  cutBodies,
+  intersectBodies,
+  joinBodies,
+  type CombineStats,
+} from "./stdlib/booleans";
+import type { Shape3D } from "replicad";
 import {
   drainCutAtOutcomes,
   drainExtrudeHints,
@@ -98,6 +105,11 @@ export interface ExecutionResult {
    * asked for. Measured against OCCT rather than guessed — see probeMaxRadius.
    */
   previewLimit?: number;
+  /**
+   * What a previewed combine measured about itself — volumes moved, and
+   * whether the bodies turned out not to touch. See {@link CombineStats}.
+   */
+  combineStats?: CombineStats;
   params: ParamDef[];
   execTimeMs: number;
   tessTimeMs: number;
@@ -747,6 +759,8 @@ export interface Core {
       partStats?: PartStatsLevel;
       /** See the matching field on the implementation. */
       previewOp?: PreviewFaceOp;
+      /** See {@link PreviewCombine} — a combine applied without writing it. */
+      previewCombine?: PreviewCombine;
     },
   ): Promise<ExecutionResult>;
   /**
@@ -954,6 +968,92 @@ export async function initCore(
     }
   }
 
+  /**
+   * Apply a combine to the parts list without it being in the source — the
+   * viewer's Combine preview.
+   *
+   * Mutates `parts` in place, exactly as the committed edit would change the
+   * file: the target's shape is replaced by the boolean result, and each tool
+   * is spliced out of the list unless the user asked to keep it. Everything
+   * downstream — tessellation, measurement, export — then sees the model the
+   * file would have produced, which is the whole reason the preview can be
+   * trusted.
+   *
+   * Silent about the operation's own warnings: a preview the user has not
+   * committed to should not push "the bodies do not touch" into the render's
+   * warning list on every keystroke. The same facts come back as
+   * {@link CombineStats} instead, for the viewer to show in place.
+   */
+  function applyPreviewCombine(
+    parts: PartInput[],
+    preview: PreviewCombine,
+  ): { stats?: CombineStats; delta?: PreviewDelta } {
+    const targetIndex = parts.findIndex((p) => p.name === preview.targetName);
+    if (targetIndex < 0) return {};
+    const target = parts[targetIndex]!;
+
+    const tools: Shape3D[] = [];
+    const toolIndices: number[] = [];
+    for (const name of preview.toolNames) {
+      const i = parts.findIndex((p) => p.name === name);
+      // A tool that is not there is not a preview worth showing: the committed
+      // edit would fail on the same name, so a partial result would be a
+      // promise the Apply cannot keep.
+      if (i < 0 || i === targetIndex) return {};
+      tools.push(parts[i]!.shape as Shape3D);
+      toolIndices.push(i);
+    }
+    if (tools.length === 0) return {};
+
+    let stats: CombineStats | undefined;
+    let deltaShape: Shape3D | undefined;
+    let deltaMode: "added" | "removed" = "added";
+    const opts = {
+      silent: true,
+      onStats: (s: CombineStats) => { stats = s; },
+      onDelta: (d: Shape3D, mode: "added" | "removed") => {
+        deltaShape = d;
+        deltaMode = mode;
+      },
+    };
+
+    try {
+      target.shape =
+        preview.op === "join"
+          ? joinBodies(target.shape as Shape3D, tools, opts)
+          : preview.op === "cut"
+            ? cutBodies(target.shape as Shape3D, tools, opts)
+            : intersectBodies(target.shape as Shape3D, tools, opts);
+    } catch {
+      // The helpers swallow their own failures; a preview must never take the
+      // render down with it.
+      return {};
+    }
+
+    if (!preview.keepTools) {
+      // Descending, so each splice leaves the remaining indices valid.
+      for (const i of [...toolIndices].sort((a, b) => b - a)) parts.splice(i, 1);
+    }
+
+    let delta: PreviewDelta | undefined;
+    if (deltaShape) {
+      try {
+        // Coarse on purpose — a translucent ghost, not a surface anyone measures.
+        const m = (deltaShape as any).mesh({ tolerance: 0.4, angularTolerance: 0.4 });
+        delta = {
+          mode: deltaMode,
+          vertices: new Float32Array(m.vertices),
+          normals: new Float32Array(m.normals),
+          triangles: new Uint32Array(m.triangles),
+        };
+      } catch {
+        // No ghost rather than a wrong one.
+      }
+    }
+
+    return { stats, delta };
+  }
+
   async function execute(
     js: string,
     paramOverrides?: Record<string, number | boolean | string>,
@@ -967,6 +1067,11 @@ export async function initCore(
        * the source. Drives the viewer's live preview — see applyPreviewOp.
        */
       previewOp?: PreviewFaceOp;
+      /**
+       * Combine bodies in the result of `main()` without it being in the
+       * source. Drives the viewer's Combine preview — see applyPreviewCombine.
+       */
+      previewCombine?: PreviewCombine;
     },
   ): Promise<ExecutionResult> {
     cleanup();
@@ -1015,9 +1120,15 @@ export async function initCore(
     // The viewer's live preview: apply the pending operation to the part it
     // targets, so the user sees the geometry before committing it to the file.
     const previewOut: { limit?: number } = {};
-    const previewDelta = streaming?.previewOp
+    let previewDelta = streaming?.previewOp
       ? applyPreviewOp(parts, streaming.previewOp, previewOut)
       : undefined;
+    let combineStats: CombineStats | undefined;
+    if (streaming?.previewCombine) {
+      const outcome = applyPreviewCombine(parts, streaming.previewCombine);
+      combineStats = outcome.stats;
+      previewDelta = outcome.delta ?? previewDelta;
+    }
     lastParts = parts;
     const execTime = performance.now() - execStart;
 
@@ -1250,6 +1361,7 @@ export async function initCore(
       parts: executed,
       previewDelta,
       previewLimit: previewOut.limit,
+      combineStats,
       params,
       execTimeMs: Math.round(execTime),
       tessTimeMs: Math.round(tessTime),

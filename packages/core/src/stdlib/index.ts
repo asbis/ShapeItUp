@@ -10,6 +10,7 @@ import * as holes from "./holes";
 import * as mounts from "./mounts";
 import * as cosmetic from "./cosmetic";
 import { chamferEdge, chamferFace, extrudeFace, filletEdge, filletFace } from "./faces";
+import { cutBodies, intersectBodies, joinBodies } from "./booleans";
 import * as printHints from "./printHints";
 import * as bearings from "./bearings";
 import * as extrusions from "./extrusions";
@@ -59,6 +60,10 @@ export type { MetricSize, FitStyle } from "./standards";
 // `const rows: Placement[] = [...]`.
 export type { Placement } from "./patterns";
 
+// Re-exported so a script that wants the measurements behind a Combine
+// warning can type its callback without reaching into the module.
+export type { CombineOp, CombineOptions, CombineStats } from "./booleans";
+
 // User-facing view of the standards namespace. Unknown-key reads throw with
 // a did-you-mean suggestion so `standards.NEMA17.pilotDiameter` (typo for
 // `pilotDia`) fails fast instead of returning undefined and propagating as
@@ -86,6 +91,9 @@ export {
   chamferFace,
   filletEdge,
   chamferEdge,
+  joinBodies,
+  cutBodies,
+  intersectBodies,
   printHints,
   bearings,
   extrusions,
@@ -144,6 +152,9 @@ export const shapeitupStdlib = {
   chamferFace,
   filletEdge,
   chamferEdge,
+  joinBodies,
+  cutBodies,
+  intersectBodies,
   screws,
   bolts,
   washers,

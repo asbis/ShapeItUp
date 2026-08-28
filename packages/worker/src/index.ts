@@ -7,7 +7,7 @@
  */
 
 import { initCore, type Core, type MeshQuality } from "@shapeitup/core";
-import type { PreviewFaceOp } from "@shapeitup/shared";
+import type { PreviewCombine, PreviewFaceOp } from "@shapeitup/shared";
 import { loadManifoldBrowser, loadOCCTBrowser } from "./browser-loader";
 
 let core: Core | null = null;
@@ -26,6 +26,7 @@ let pendingExecute: {
   paramOverrides?: Record<string, number>;
   meshQuality?: MeshQuality;
   previewOp?: PreviewFaceOp;
+  previewCombine?: PreviewCombine;
 } | null = null;
 
 self.onmessage = async (event: MessageEvent) => {
@@ -74,6 +75,7 @@ self.onmessage = async (event: MessageEvent) => {
             queued.paramOverrides,
             queued.meshQuality,
             queued.previewOp,
+            queued.previewCombine,
           );
         }
         break;
@@ -91,10 +93,17 @@ self.onmessage = async (event: MessageEvent) => {
             paramOverrides: msg.paramOverrides,
             meshQuality: msg.meshQuality,
             previewOp: msg.previewOp,
+            previewCombine: msg.previewCombine,
           };
           return;
         }
-        await executeUserScript(msg.js, msg.paramOverrides, msg.meshQuality, msg.previewOp);
+        await executeUserScript(
+          msg.js,
+          msg.paramOverrides,
+          msg.meshQuality,
+          msg.previewOp,
+          msg.previewCombine,
+        );
         break;
       case "export":
         await handleExport(msg.format);
@@ -144,6 +153,7 @@ async function executeUserScript(
   paramOverrides?: Record<string, number>,
   meshQuality?: MeshQuality,
   previewOp?: PreviewFaceOp,
+  previewCombine?: PreviewCombine,
 ) {
   if (!core) {
     // Bug #2: with the pending-execute queue in place the only way to reach
@@ -178,7 +188,17 @@ async function executeUserScript(
       // A face operation the user is sizing but has not committed. Applied to
       // the executed parts so the viewer can show it; never written anywhere.
       previewOp,
+      // A combine the user has armed but not committed. Same contract as
+      // previewOp: applied to the executed parts, never written anywhere.
+      previewCombine,
     });
+
+    // What the combine measured — volumes moved, and whether the bodies
+    // turned out not to touch. Sent before mesh-done so the bar can report it
+    // by the time the render settles.
+    if (result.combineStats) {
+      self.postMessage({ type: "preview-combine", stats: result.combineStats });
+    }
 
     // The ceiling for a rounding operation, when one was asked for.
     if (typeof result.previewLimit === "number") {

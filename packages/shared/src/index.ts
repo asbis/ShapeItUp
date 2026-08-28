@@ -5,3 +5,4 @@ export * from "./bundle-spec.js";
 export * from "./param-edit.js";
 export * from "./face-edit.js";
 export * from "./ts-scan.js";
+export * from "./combine-edit.js";

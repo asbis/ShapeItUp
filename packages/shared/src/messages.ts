@@ -111,7 +111,10 @@ export interface ParamCommitResult {
 }
 
 /**
- * Outcome of a `face-op` commit, host → viewer.
+ * Outcome of a `face-op` or `combine` commit, host → viewer.
+ *
+ * Shared by both because the outcome really is the same shape: a request id, a
+ * yes or no, the line that was written, and prose when the answer was no.
  *
  * Separate from ParamCommitResult because the failure surface is different in
  * kind: a parameter commit can only fail on ONE number it already located,
@@ -121,6 +124,8 @@ export interface ParamCommitResult {
  */
 export interface FaceOpResultMessage {
   type: "face-op-result";
+  /** Which command this answers. Absent means the face operations, for compatibility. */
+  kind?: "face-op" | "combine";
   /** Echoed back so a stale reply cannot be attributed to a newer request. */
   requestId: number;
   ok: boolean;
@@ -217,6 +222,27 @@ export type WebviewToExt =
       /** Signed for extrude; a positive radius / setback for the other two. */
       distance: number;
     }
+  /**
+   * Combine two or more bodies — Fusion 360's Modify → Combine, written into
+   * the `.shape.ts`.
+   *
+   * Unlike `face-op` this needs no synthesised selector: bodies already have
+   * names in the file, and a name is the most durable handle there is. So the
+   * viewer sends names, and the host does the rewrite.
+   *
+   * The target keeps its entry, its name and its colour. Each tool's entry is
+   * removed unless `keepTools` — which is exactly Fusion's checkbox, expressed
+   * as the presence or absence of a line in the file rather than as hidden
+   * feature state.
+   */
+  | {
+      type: "combine";
+      requestId: number;
+      op: "join" | "cut" | "intersect";
+      targetName: string;
+      toolNames: string[];
+      keepTools?: boolean;
+    }
   | { type: "ready" }
   // Webview asks the extension for the cached OCCT (+ optional Manifold) bytes
   // on worker init. The extension replies with a `wasm-assets` message
@@ -250,6 +276,42 @@ export interface PreviewFaceOp {
   probeLimit?: boolean;
 }
 
+/**
+ * A combine applied to the result of `main()` WITHOUT writing it to the file.
+ *
+ * The same trick as {@link PreviewFaceOp}, and honest for the same reason: the
+ * committed edit puts the call at the outermost position of the target's
+ * `shape:` expression, so applying it to the finished parts list produces the
+ * geometry the file would.
+ *
+ * Names rather than geometry, because that is what the committed edit uses
+ * too — there is no selector to resolve and nothing to go stale between the
+ * preview and the write.
+ */
+export interface PreviewCombine {
+  op: "join" | "cut" | "intersect";
+  targetName: string;
+  toolNames: string[];
+  /** Leave the tool bodies in the list. Fusion's "Keep Tools". */
+  keepTools?: boolean;
+}
+
+/** What a previewed combine measured about itself. Mirrors core's CombineStats. */
+export interface CombineStatsMessage {
+  op: "join" | "cut" | "intersect";
+  /** mm³, or undefined when OCCT could not measure. */
+  targetVolume?: number;
+  resultVolume?: number;
+  /** The material the operation moved. */
+  deltaVolume?: number;
+  /** A join in which at least one tool merged nothing — it never touched. */
+  disjoint?: boolean;
+  /** Which tools those were, as positions in the `toolNames` that were sent. */
+  disjointTools?: number[];
+  /** Nothing left: an empty intersect, or a cut that ate the whole target. */
+  empty?: boolean;
+}
+
 // Webview → Worker
 export type WebviewToWorker =
   | {
@@ -275,6 +337,8 @@ export type WebviewToWorker =
       meshQuality?: "preview" | "final";
       /** See {@link PreviewFaceOp} — a face operation applied without writing it. */
       previewOp?: PreviewFaceOp;
+      /** See {@link PreviewCombine} — a combine applied without writing it. */
+      previewCombine?: PreviewCombine;
     }
   | { type: "export"; format: ExportFormat };
 
@@ -365,6 +429,8 @@ export type WorkerToWebview =
   | { type: "preview-delta"; delta: PreviewDelta }
   /** The largest radius the armed operation can take, measured against OCCT. */
   | { type: "preview-limit"; max: number }
+  /** What a previewed combine measured. See {@link CombineStatsMessage}. */
+  | { type: "preview-combine"; stats: CombineStatsMessage }
   // Streaming mesh protocol: mesh-start announces the batch and its params so
   // the viewer can clear the scene and update sliders immediately. Each
   // mesh-part delivers one fully-tessellated part with its mesh buffers as

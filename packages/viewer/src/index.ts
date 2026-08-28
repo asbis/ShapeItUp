@@ -31,7 +31,7 @@ import {
 import { initMessageHandler, onMessage, postToExtension } from "./message-handler";
 import type { WorkerToWebview, TessellatedPart, DetectedApp } from "@shapeitup/shared";
 import { synthesizeEdgeSelector, synthesizeFaceSelector } from "@shapeitup/shared";
-import type { PreviewDelta, PreviewFaceOp } from "@shapeitup/shared";
+import type { CombineStatsMessage, PreviewCombine, PreviewDelta, PreviewFaceOp } from "@shapeitup/shared";
 import { PART_COLORS } from "./theme";
 import { setupSim, updateSim, clearSim, initSimPanel, toggleSimPanel } from "./sim-panel";
 
@@ -502,6 +502,13 @@ function placeDragHandle(): void {
 let lastArmedAxis: [number, number, number] = [0, 0, 1];
 
 function updateFaceInfoPanel(): void {
+  // Combine owns the model while it is armed. Falling through here would
+  // reach `setActiveOp(null)` below, whose job is to put a face operation's
+  // preview back — and it would put the COMBINE preview back too, one frame
+  // after it rendered. That is exactly what happened: the measurements
+  // arrived and were correct, the bodies merged, and the revert undid it
+  // before anyone saw it.
+  if (combineOp) return;
   const sel = facePicker.getSelection();
   if (!sel) {
     // A preview rebuilds the model and so clears the picker. An armed
@@ -755,7 +762,7 @@ function clearDeltaGhost(): void {
 function showDeltaGhost(delta: PreviewDelta): void {
   clearDeltaGhost();
   // A ghost with no operation behind it belongs to a render since superseded.
-  if (!activeOp || !armedTarget) return;
+  if (!combineOp && (!activeOp || !armedTarget)) return;
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(delta.vertices, 3));
   geometry.setAttribute("normal", new THREE.BufferAttribute(delta.normals, 3));
@@ -788,7 +795,19 @@ let lastPreviewKey = "";
  * leave the model showing a value the user has already dragged past.
  */
 let previewInFlight = false;
-let queuedPreview: { payload: PreviewFaceOp; key: string } | null = null;
+/**
+ * What a preview run asks the worker for.
+ *
+ * Two shapes, because there are two kinds of pending operation and they are
+ * genuinely different requests — but ONE runner, so the debounce, the
+ * latest-wins queue, the coarse-mesh-while-dragging rule and the "remember
+ * what to go back to" bookkeeping are shared rather than reimplemented.
+ */
+type PreviewRequest =
+  | { kind: "face"; op: PreviewFaceOp }
+  | { kind: "combine"; combine: PreviewCombine };
+
+let queuedPreview: { request: PreviewRequest; key: string } | null = null;
 
 /**
  * The largest radius the armed rounding operation can take, measured against
@@ -863,19 +882,28 @@ function previewPayload(): PreviewFaceOp | null {
 
 function schedulePreview(): void {
   clearTimeout(previewTimer);
-  const payload = previewPayload();
-  if (!payload) return;
-  const key = JSON.stringify(payload);
+  // Combine takes precedence: arming it clears the face selection, so the two
+  // can never both be live, and asking in this order keeps that invariant in
+  // one place instead of at every call site.
+  const combine = combinePayload();
+  const request: PreviewRequest | null = combine
+    ? { kind: "combine", combine }
+    : (() => {
+        const op = previewPayload();
+        return op ? ({ kind: "face", op } as const) : null;
+      })();
+  if (!request) return;
+  const key = JSON.stringify(request);
   if (key === lastPreviewKey) return;
-  previewTimer = setTimeout(() => runPreview(payload, key), PREVIEW_DEBOUNCE_MS);
+  previewTimer = setTimeout(() => runPreview(request, key), PREVIEW_DEBOUNCE_MS);
 }
 
-function runPreview(payload: PreviewFaceOp, key: string): void {
+function runPreview(request: PreviewRequest, key: string): void {
   if (!worker || !lastScriptJs) return;
   if (previewInFlight) {
     // Latest wins: an intermediate value the user has already dragged past is
     // not worth rendering.
-    queuedPreview = { payload, key };
+    queuedPreview = { request, key };
     return;
   }
   previewInFlight = true;
@@ -895,7 +923,9 @@ function runPreview(payload: PreviewFaceOp, key: string): void {
     // smoothness mid-drag. Released or typed, it re-renders at full quality,
     // so what you settle on is what you see.
     meshQuality: handleDrag ? "preview" : "final",
-    previewOp: payload,
+    ...(request.kind === "face"
+      ? { previewOp: request.op }
+      : { previewCombine: request.combine }),
   });
 }
 
@@ -1067,6 +1097,441 @@ fiClearEl.addEventListener("click", () => {
   faceInfoEl.classList.remove("visible");
 });
 
+// ── Combine: joining, cutting and intersecting whole bodies ───────────────
+//
+// Fusion 360's Modify → Combine, with the same three operations and the same
+// "Keep Tools" option. What is different is where the result lives: Fusion
+// records a feature in a hidden timeline, and this writes a call into your
+// `.shape.ts`, so the file stays the only description of the model.
+//
+// Bodies are chosen by NAME, which is the one handle in this whole feature
+// that needs no synthesis and cannot go stale — the file already names them,
+// and the committed edit looks them up the same way the preview does.
+//
+// Why a dropdown as well as clicking in the view: a combine REMOVES the tool
+// from the model, so the moment the preview lands the body you would click to
+// add a second tool is no longer on screen. The list is captured when the
+// command is armed and stays put, so picking three bodies works the same as
+// picking two.
+
+const combineInfoEl = document.getElementById("combine-info")!;
+const ciOpEl = document.getElementById("ci-op")!;
+const ciTargetEl = document.getElementById("ci-target") as HTMLSelectElement;
+const ciChipsEl = document.getElementById("ci-chips")!;
+const ciAddEl = document.getElementById("ci-add") as HTMLSelectElement;
+const ciKeepEl = document.getElementById("ci-keep-toggle") as HTMLInputElement;
+const ciApplyEl = document.getElementById("ci-apply") as HTMLButtonElement;
+const ciCancelEl = document.getElementById("ci-cancel") as HTMLButtonElement;
+const ciCodeEl = document.getElementById("ci-code")!;
+const ciNotesEl = document.getElementById("ci-notes")!;
+
+type CombineKind = "join" | "cut" | "intersect";
+
+const COMBINE_LABEL: Record<CombineKind, string> = {
+  join: "Join",
+  cut: "Cut",
+  intersect: "Intersect",
+};
+
+const COMBINE_HELPER: Record<CombineKind, string> = {
+  join: "joinBodies",
+  cut: "cutBodies",
+  intersect: "intersectBodies",
+};
+
+let combineOp: CombineKind | null = null;
+/**
+ * The bodies that existed when the command was armed.
+ *
+ * Frozen for the reason in the section note: the preview deletes bodies, and a
+ * menu rebuilt from the previewed model would lose the very entries the user
+ * still needs to pick from.
+ */
+let combineBodies: string[] = [];
+let combineTarget: string | null = null;
+let combineTools: string[] = [];
+/** The last measurement the worker sent back for the armed combine. */
+let combineStats: CombineStatsMessage | null = null;
+
+/**
+ * Selected bodies are tinted rather than outlined.
+ *
+ * An outline would have to be built per body and rebuilt on every preview;
+ * `emissive` is one assignment on a material that already exists, and it
+ * survives nothing — which is the point, since every preview replaces the
+ * meshes and the tint is simply reapplied by name.
+ *
+ * Two hues because the two roles are not interchangeable: cutting A with B is
+ * a different model from cutting B with A, and a single "selected" colour
+ * would leave that decision invisible.
+ */
+const TARGET_TINT = 0x1d3f66;
+const TOOL_TINT = 0x5a3c0a;
+
+function applyCombineTint(): void {
+  for (const part of currentParts) {
+    const mat = part.mesh.material as THREE.MeshPhongMaterial;
+    if (!mat.emissive) continue;
+    const tint =
+      combineOp === null
+        ? 0x000000
+        : part.name === combineTarget
+          ? TARGET_TINT
+          : combineTools.includes(part.name)
+            ? TOOL_TINT
+            : 0x000000;
+    mat.emissive.setHex(tint);
+  }
+}
+
+/** Body names to choose from: frozen while armed, live otherwise. */
+function combineCandidates(): string[] {
+  return combineOp ? combineBodies : currentParts.map((p) => p.name);
+}
+
+function setCombineOp(op: CombineKind | null): void {
+  if (op !== null && currentParts.length < 2 && combineBodies.length < 2) {
+    setParamsStatus("Combine needs at least two bodies.", true);
+    return;
+  }
+
+  if (op === null) {
+    combineOp = null;
+    combineTarget = null;
+    combineTools = [];
+    combineBodies = [];
+    combineStats = null;
+    combineInfoEl.classList.remove("visible");
+    dragHandle.hide();
+    clearDeltaGhost();
+    // Put the model back the way the file describes it, exactly as cancelling
+    // a face operation does.
+    revertPreview();
+    applyCombineTint();
+    updateCombineButtons();
+    return;
+  }
+
+  // Re-arming while a preview is showing would capture the PREVIEWED body
+  // list — one short — as the frozen menu. Go back to the file's model first.
+  if (combineOp === null && previewShowing) revertPreview();
+
+  // A face selection and a body selection would both be reading the same
+  // click. One at a time.
+  setActiveOp(null);
+  facePicker.setSelection(null);
+  faceInfoEl.classList.remove("visible");
+
+  const wasArmed = combineOp !== null;
+  combineOp = op;
+  if (!wasArmed) {
+    combineBodies = currentParts.map((p) => p.name);
+    combineStats = null;
+    const picked = facePicker.getSelection()?.partName;
+    combineTarget =
+      picked && combineBodies.includes(picked) ? picked : (combineBodies[0] ?? null);
+    // With exactly two bodies the second one is the only thing the tool could
+    // be, so choosing it saves a click and takes nothing away — any other
+    // count is a real decision and stays the user's.
+    combineTools =
+      combineBodies.length === 2
+        ? combineBodies.filter((n) => n !== combineTarget)
+        : [];
+  }
+
+  combineInfoEl.classList.add("visible");
+  renderCombineBar();
+  applyCombineTint();
+  updateCombineButtons();
+  schedulePreview();
+}
+
+/** Reflect which of the three commands is armed, and whether any can be. */
+function updateCombineButtons(): void {
+  const enough = currentParts.length >= 2 || combineBodies.length >= 2;
+  for (const kind of ["join", "cut", "intersect"] as const) {
+    const btn = document.getElementById(`btn-${kind}`) as HTMLButtonElement | null;
+    if (!btn) continue;
+    btn.disabled = !enough;
+    btn.classList.toggle("active", combineOp === kind);
+    btn.title = enough
+      ? btn.dataset.baseTitle ?? btn.title
+      : "Needs at least two bodies";
+  }
+}
+
+function renderCombineBar(): void {
+  if (!combineOp) return;
+  ciOpEl.textContent = COMBINE_LABEL[combineOp];
+
+  const names = combineCandidates();
+  ciTargetEl.innerHTML = "";
+  for (const name of names) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    opt.selected = name === combineTarget;
+    ciTargetEl.appendChild(opt);
+  }
+
+  ciChipsEl.innerHTML = "";
+  for (const name of combineTools) {
+    const chip = document.createElement("span");
+    chip.className = "ci-chip";
+    const label = document.createElement("span");
+    label.textContent = name;
+    const drop = document.createElement("button");
+    drop.textContent = "×";
+    drop.title = `Remove ${name}`;
+    drop.addEventListener("click", () => {
+      combineTools = combineTools.filter((n) => n !== name);
+      renderCombineBar();
+      applyCombineTint();
+      schedulePreview();
+    });
+    chip.append(label, drop);
+    ciChipsEl.appendChild(chip);
+  }
+  if (combineTools.length === 0) {
+    const hint = document.createElement("span");
+    hint.className = "ci-label";
+    hint.textContent = "click a body";
+    ciChipsEl.appendChild(hint);
+  }
+
+  const available = names.filter(
+    (n) => n !== combineTarget && !combineTools.includes(n),
+  );
+  ciAddEl.innerHTML = "";
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = "+ body…";
+  ciAddEl.appendChild(placeholder);
+  for (const name of available) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    ciAddEl.appendChild(opt);
+  }
+  ciAddEl.value = "";
+  ciAddEl.disabled = available.length === 0;
+
+  ciKeepEl.checked = combineKeepTools();
+  ciApplyEl.disabled = !combineTarget || combineTools.length === 0 || pendingCombine !== null;
+  renderCombinePreview();
+}
+
+function combineKeepTools(): boolean {
+  return ciKeepEl.checked;
+}
+
+/**
+ * The line that will be written, shown before it is written.
+ *
+ * Same contract as the face operations' preview: you see the code you are
+ * about to commit. The tool argument is rendered as its NAME here even where
+ * the committed edit will inline or hoist an expression — the file decides
+ * that, and guessing at it in the bar would show a line the host may not
+ * write.
+ */
+function renderCombinePreview(): void {
+  if (!combineOp) return;
+  ciCodeEl.textContent = "";
+  ciNotesEl.innerHTML = "";
+  if (!combineTarget || combineTools.length === 0) {
+    ciCodeEl.textContent = "…";
+    return;
+  }
+  const arg =
+    combineTools.length === 1 ? combineTools[0]! : `[${combineTools.join(", ")}]`;
+  ciCodeEl.textContent = `${COMBINE_HELPER[combineOp]}(${combineTarget}, ${arg})`;
+
+  const notes: Array<{ text: string; warn?: boolean }> = [];
+  if (!combineKeepTools()) {
+    notes.push({
+      text:
+        combineTools.length === 1
+          ? `removes the "${combineTools[0]}" body`
+          : `removes ${combineTools.length} bodies`,
+    });
+  }
+
+  const stats = combineStats;
+  if (stats) {
+    if (stats.disjoint) {
+      // Named, not numbered. The worker reports positions because it never
+      // sees names, but "island" is what the user picked and what they have to
+      // go and move.
+      const missed = (stats.disjointTools ?? [])
+        .map((i) => combineTools[i])
+        .filter((n): n is string => !!n);
+      notes.push({
+        text:
+          missed.length === 0 || missed.length === combineTools.length
+            ? "⚠ the bodies do not touch — nothing would be merged"
+            : `⚠ ${missed.join(", ")} ${missed.length === 1 ? "does" : "do"} not touch — that part would not merge`,
+        warn: true,
+      });
+    } else if (stats.empty) {
+      notes.push({
+        text:
+          combineOp === "intersect"
+            ? "⚠ the bodies do not overlap — there is nothing to keep"
+            : "⚠ this removes the whole body",
+        warn: true,
+      });
+    } else if (stats.deltaVolume !== undefined) {
+      // Measured on the actual result, not estimated from bounding boxes —
+      // the one number that says whether the operation did what was meant.
+      //
+      // Zero is the case worth being loudest about: the operation succeeds,
+      // the file gets a line, and the model is unchanged. It is the silent
+      // no-op this whole module exists to make impossible to miss, and it
+      // used to leave the note line simply blank.
+      const moved =
+        stats.deltaVolume > (stats.targetVolume ?? 1) * 1e-6 && stats.deltaVolume > 0;
+      notes.push(
+        moved
+          ? {
+              text: `${combineOp === "join" ? "adds" : "removes"} ${formatVolume(stats.deltaVolume)}`,
+            }
+          : {
+              text:
+                combineOp === "join"
+                  ? "⚠ nothing would be added — the tool is already inside the target"
+                  : "⚠ nothing would be removed — the bodies do not overlap",
+              warn: true,
+            },
+      );
+    }
+  }
+
+  for (const n of notes) {
+    const el = document.createElement("span");
+    if (n.warn) el.className = "warn";
+    el.textContent = n.text;
+    ciNotesEl.appendChild(el);
+  }
+}
+
+function combinePayload(): PreviewCombine | null {
+  if (!combineOp || !combineTarget || combineTools.length === 0) return null;
+  return {
+    op: combineOp,
+    targetName: combineTarget,
+    toolNames: [...combineTools],
+    keepTools: combineKeepTools(),
+  };
+}
+
+/**
+ * Toggle a body's membership in the tool set from a click in the 3D view.
+ *
+ * Arming always settles a target, so a click in the view can only ever mean
+ * "also this one" — and clicking the target is a no-op rather than a removal,
+ * because a combine without a target is not a state worth reaching by
+ * accident. Changing the target is the dropdown's job, where it is an explicit
+ * choice rather than a side effect of aiming.
+ */
+function combineClickBody(name: string): void {
+  if (!combineOp) return;
+  if (!combineBodies.includes(name)) return;
+  if (name === combineTarget) return;
+  combineTools = combineTools.includes(name)
+    ? combineTools.filter((n) => n !== name)
+    : [...combineTools, name];
+  renderCombineBar();
+  applyCombineTint();
+  schedulePreview();
+}
+
+let combineRequestId = 0;
+let pendingCombine: number | null = null;
+/**
+ * Set when a combine has been written and we are waiting for the rebuild.
+ *
+ * The write succeeding is not the same as the operation doing anything: the
+ * stdlib helpers warn and return the target unchanged when the bodies do not
+ * overlap, so without this a successful Apply could add a line and visibly
+ * change nothing.
+ */
+let awaitingCombineRebuild = false;
+
+/** Prefixes the stdlib boolean helpers put on their runtime warnings. */
+const COMBINE_WARNING = /^(joinBodies|cutBodies|intersectBodies):\s*/;
+
+function reportCombineWarnings(warnings: string[] | undefined): boolean {
+  if (!awaitingCombineRebuild) return false;
+  awaitingCombineRebuild = false;
+  const mine = (warnings ?? []).filter((w) => COMBINE_WARNING.test(w));
+  if (mine.length === 0) return false;
+  setParamsStatus(`Nothing changed — ${mine[0]!.replace(COMBINE_WARNING, "")}`, true);
+  return true;
+}
+
+function applyCombine(): void {
+  const payload = combinePayload();
+  if (!payload) {
+    setParamsStatus("Pick a target body and at least one tool.", true);
+    return;
+  }
+  if (pendingCombine !== null) return;
+
+  combineRequestId += 1;
+  pendingCombine = combineRequestId;
+  ciApplyEl.disabled = true;
+  setParamsStatus(`${COMBINE_LABEL[payload.op]}…`);
+  awaitingCombineRebuild = true;
+  postToExtension({
+    type: "combine",
+    requestId: combineRequestId,
+    op: payload.op,
+    targetName: payload.targetName,
+    toolNames: payload.toolNames,
+    keepTools: payload.keepTools,
+  });
+  // The commit rebuilds from the file, which supersedes any preview.
+  clearDeltaGhost();
+  clearTimeout(previewTimer);
+  previewShowing = false;
+  previewBaseJs = null;
+  lastPreviewKey = "";
+}
+
+for (const kind of ["join", "cut", "intersect"] as const) {
+  const btn = document.getElementById(`btn-${kind}`) as HTMLButtonElement | null;
+  if (!btn) continue;
+  btn.dataset.baseTitle = btn.title;
+  btn.addEventListener("click", () => setCombineOp(combineOp === kind ? null : kind));
+}
+
+ciTargetEl.addEventListener("change", () => {
+  combineTarget = ciTargetEl.value || null;
+  // A body cannot be its own tool, and the host refuses the request outright
+  // rather than guessing which role was meant.
+  combineTools = combineTools.filter((n) => n !== combineTarget);
+  renderCombineBar();
+  applyCombineTint();
+  schedulePreview();
+});
+
+ciAddEl.addEventListener("change", () => {
+  const name = ciAddEl.value;
+  if (!name) return;
+  if (!combineTools.includes(name)) combineTools.push(name);
+  renderCombineBar();
+  applyCombineTint();
+  schedulePreview();
+});
+
+ciKeepEl.addEventListener("change", () => {
+  renderCombineBar();
+  schedulePreview();
+});
+
+ciApplyEl.addEventListener("click", applyCombine);
+ciCancelEl.addEventListener("click", () => setCombineOp(null));
+
 // Hover is advisory, so it is the first thing to give up: skip it entirely
 // while the user is orbiting (a raycast per pointermove during a drag is both
 // wasted work and visually noisy), and while the measure tool owns the cursor.
@@ -1133,6 +1598,22 @@ function pickAt(clientX: number, clientY: number) {
   const edge = facePicker.pickEdge(clientX, clientY, renderer.domElement, edgeGrabRadius());
   if (edge) return edge;
   return facePicker.pick(clientX, clientY, renderer.domElement);
+}
+
+/**
+ * Which body is under the pointer.
+ *
+ * A plain raycast against the part meshes rather than a reuse of `pickAt`,
+ * because Combine works on bodies that have no B-Rep faces at all — a mesh
+ * part imported or produced by Manifold renders and combines perfectly well,
+ * and it would be invisible to the face picker.
+ */
+function pickBodyAt(clientX: number, clientY: number): string | null {
+  if (!aimRaycaster(clientX, clientY)) return null;
+  const meshes = currentParts.filter((p) => p.visible).map((p) => p.mesh);
+  const hit = handleRaycaster.intersectObjects(meshes, false)[0];
+  if (!hit) return null;
+  return currentParts.find((p) => p.mesh === hit.object)?.name ?? null;
 }
 
 // ── Dragging the arrow ────────────────────────────────────────────────────
@@ -1272,6 +1753,15 @@ renderer.domElement.addEventListener("pointercancel", endHandleDrag);
 
 renderer.domElement.addEventListener("pointermove", (event) => {
   if (orbiting || measureMode || handleDrag) return;
+  // Combine picks bodies, so highlighting a FACE under the cursor would
+  // advertise a selection the click is not going to make.
+  if (combineOp) {
+    facePicker.setHover(null);
+    renderer.domElement.style.cursor = pickBodyAt(event.clientX, event.clientY)
+      ? "pointer"
+      : "";
+    return;
+  }
   const sel = pickAt(event.clientX, event.clientY);
   facePicker.setHover(sel);
   renderer.domElement.style.cursor = sel ? "pointer" : "";
@@ -1701,6 +2191,14 @@ function handleWorkerMessage(msg: WorkerToWebview) {
     case "preview-delta":
       showDeltaGhost(msg.delta);
       break;
+    case "preview-combine":
+      // Belongs to whatever is armed NOW; a reply for a superseded selection
+      // would report on bodies the user has already changed.
+      if (combineOp) {
+        combineStats = msg.stats;
+        renderCombinePreview();
+      }
+      break;
     case "preview-limit":
       // Belongs to whatever is armed NOW; a reply for a superseded operation
       // would silently cap the wrong thing.
@@ -1740,13 +2238,14 @@ function handleWorkerMessage(msg: WorkerToWebview) {
         // A face operation the user just applied may have declined at build
         // time — surface that before anything else overwrites the status line.
         reportFaceOpWarnings(msg.warnings);
+        reportCombineWarnings(msg.warnings);
         // A cancelled preview leaves a selection to restore.
         applyPendingReselect();
         // The worker is free again; send whatever the drag moved on to.
         previewInFlight = false;
         const queued = queuedPreview;
         queuedPreview = null;
-        if (queued) runPreview(queued.payload, queued.key);
+        if (queued) runPreview(queued.request, queued.key);
 
         // Track what the file declares, for the selection bar's selector
         // preview. `declared` is only present when an override is in force.
@@ -1755,6 +2254,11 @@ function handleWorkerMessage(msg: WorkerToWebview) {
         updateParamsUI(msg.params || []);
         // A rebuild replaced every face; the bar is showing a stale one.
         updateFaceInfoPanel();
+        // Every mesh is new, so the selection tint has to be put back — and
+        // the ribbon has to re-decide whether Combine is even possible, since
+        // a model that just became single-body cannot be combined.
+        applyCombineTint();
+        updateCombineButtons();
         // Motion sim: if the script exported a `sim` block, resolve it against
         // the parts we just rendered and show the timeline. No-op otherwise.
         // Async (the dynamics engine awaits Rapier's WASM); fire-and-forget with
@@ -2209,6 +2713,29 @@ onMessage("param-commit-result", (msg) => {
 });
 
 onMessage("face-op-result", (msg) => {
+  // The host answers both commands on this channel — the outcome really is
+  // the same shape — so route by `kind` before anything else.
+  if (msg.kind === "combine") {
+    if (msg.requestId !== pendingCombine) return;
+    pendingCombine = null;
+    ciApplyEl.disabled = false;
+    if (!msg.ok) {
+      awaitingCombineRebuild = false;
+      setParamsStatus(`Not applied — ${msg.reason ?? "unknown reason"}`, true);
+      return;
+    }
+    setParamsStatus(msg.addedImport ? "Written — and added the shapeitup import" : "Written");
+    // The file changed, so the watcher's rebuild is on its way. Close the bar
+    // rather than leave it holding a body list the new model may not have.
+    combineOp = null;
+    combineTarget = null;
+    combineTools = [];
+    combineBodies = [];
+    combineStats = null;
+    combineInfoEl.classList.remove("visible");
+    updateCombineButtons();
+    return;
+  }
   // A reply to a superseded request would report on work the user has already
   // moved past, so only the outstanding one is allowed to speak.
   if (msg.requestId !== pendingFaceOp) return;
@@ -2890,6 +3417,15 @@ renderer.domElement.addEventListener("click", (event) => {
   if (tryGnomonClick(event)) return;
   if (!measureMode) {
     if (Math.hypot(event.clientX - pressX, event.clientY - pressY) > CLICK_SLOP_PX) return;
+    // While Combine is armed a click means "this body", not "this face".
+    // Empty space does NOT clear here: the command is a multi-step selection,
+    // and losing it to a stray click on the background would be the single
+    // most irritating way to lose work in this bar.
+    if (combineOp) {
+      const body = pickBodyAt(event.clientX, event.clientY);
+      if (body) combineClickBody(body);
+      return;
+    }
     // Clicking empty space clears — the standard CAD gesture, and the only
     // way to deselect without reaching for the keyboard.
     facePicker.setSelection(pickAt(event.clientX, event.clientY));
@@ -2945,6 +3481,14 @@ window.addEventListener("keydown", (event) => {
   // Escape clears the selection. Checked before the lowercase fold because
   // "Escape".toLowerCase() is "escape", which would collide with nothing today
   // but is a needless thing to depend on.
+  //
+  // Combine goes first: it is the more modal of the two, and an Escape pressed
+  // with it open plainly means "not this", not "clear my face selection".
+  if (event.key === "Escape" && combineOp) {
+    setCombineOp(null);
+    event.preventDefault();
+    return;
+  }
   if (event.key === "Escape" && facePicker.getSelection()) {
     facePicker.setSelection(null);
     updateFaceInfoPanel();

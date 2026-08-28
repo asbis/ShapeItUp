@@ -8464,6 +8464,33 @@ These are what the viewer writes when you select a face and press Extrude,
 Fillet or Chamfer — the GUI produces a code edit rather than hidden state, so
 the file stays the only description of the model.
 
+---
+
+## Combining bodies — \`joinBodies\`, \`cutBodies\`, \`intersectBodies\`
+
+Fusion 360's Modify → Combine, as three functions over whole bodies.
+
+\`\`\`typescript
+import { joinBodies, cutBodies, intersectBodies } from "shapeitup";
+
+joinBodies(base, bracket)            // union
+cutBodies(block, pocket)             // subtract
+intersectBodies(blank, envelope)     // keep only the shared volume
+joinBodies(base, [leftRib, rightRib]) // several tools at once
+\`\`\`
+
+Prefer these over a bare \`.fuse\` / \`.cut\` / \`.intersect\` when two bodies are
+MEANT to interact, because they measure the result and say when it went
+nowhere: a join of bodies that never touch (which returns one "body" of two
+separate lumps), a cut that consumed the whole target, and an intersect with no
+overlap (which returns the target unchanged rather than an empty solid nothing
+downstream can render, measure or export).
+
+Fusion's "Keep Tools" checkbox has no argument here. A tool that should survive
+keeps its entry in the returned parts list; one that should not, has its entry
+removed. This is what the viewer writes when you select two bodies and press
+Join, Cut or Intersect.
+
 All three name the same picked FACE, and the finder must resolve to exactly
 one planar face. Anything else — no match, several matches, a curved face, a
 size OCCT rejects — returns the shape unchanged with a runtime warning rather

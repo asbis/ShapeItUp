@@ -5,6 +5,8 @@ import * as crypto from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import {
   buildFaceOpCall,
+  computeCombineEdit,
+  describeCombineFailure,
   renderViewerHtml,
   computeParamEdit,
   type FaceOpResultMessage,
@@ -417,6 +419,73 @@ export class ViewerHost {
     };
   }
 
+  /**
+   * Apply a combine to the `.shape.ts`.
+   *
+   * Same read → compute → re-stat → write shape as `commitFaceOp`, and the same
+   * deliberate omission: this is NOT marked as a self-write, because the change
+   * is geometry that exists nowhere but the file. Suppressing the watcher echo
+   * would leave the model on screen looking exactly as it did before.
+   */
+  private async commitCombine(msg: CombineMessage): Promise<FaceOpResultMessage> {
+    const fail = (reason: string): FaceOpResultMessage => ({
+      type: "face-op-result",
+      kind: "combine",
+      requestId: msg.requestId,
+      ok: false,
+      reason,
+    });
+
+    const file = this.currentFile;
+    if (!file) return fail("no file open");
+
+    let source: string;
+    let statBefore: fs.Stats;
+    try {
+      statBefore = fs.statSync(file);
+      source = fs.readFileSync(file, "utf-8");
+    } catch (e: any) {
+      return fail(`could not read ${path.basename(file)}: ${e?.message ?? e}`);
+    }
+
+    const built = computeCombineEdit(source, {
+      op: msg.op,
+      targetName: msg.targetName,
+      toolNames: msg.toolNames,
+      keepTools: msg.keepTools,
+    });
+    if (!built.ok) return fail(describeCombineFailure(built.reason, built.detail));
+
+    let next = source;
+    for (const e of [...built.edits].sort((a, b) => b.start - a.start)) {
+      next = next.slice(0, e.start) + e.text + next.slice(e.end);
+    }
+
+    try {
+      if (fs.statSync(file).mtimeMs !== statBefore.mtimeMs) {
+        return fail("file changed while writing — nothing was saved");
+      }
+      fs.writeFileSync(file, next, "utf-8");
+    } catch (e: any) {
+      return fail(`could not write ${path.basename(file)}: ${e?.message ?? e}`);
+    }
+
+    this.log(
+      `${msg.op} ${msg.toolNames.join(", ")} into ${msg.targetName} → ${path.basename(file)}` +
+        (built.removed.length ? ` (removed ${built.removed.join(", ")})` : "") +
+        (built.hoisted.length ? ` (hoisted ${built.hoisted.join(", ")})` : "") +
+        (built.addedImport ? " (added the shapeitup import)" : ""),
+    );
+    return {
+      type: "face-op-result",
+      kind: "combine",
+      requestId: msg.requestId,
+      ok: true,
+      applied: built.applied,
+      addedImport: built.addedImport,
+    };
+  }
+
   private handleHttp(req: http.IncomingMessage, res: http.ServerResponse) {
     const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
 
@@ -498,6 +567,18 @@ export class ViewerHost {
         });
         return;
       }
+      if (msg?.type === "combine") {
+        const req = parseCombine(msg);
+        if (!req) {
+          this.log("combine ignored: malformed message");
+          return;
+        }
+        void this.commitCombine(req).then((r) => {
+          if (!r.ok) this.log(`${req.op} declined: ${r.reason}`);
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(r));
+        });
+        return;
+      }
       if (msg?.type === "request-wasm-assets") {
         // The extension answers this from a pre-read cache to save the worker
         // a fetch. We have no cache and need none — the assets are same-origin
@@ -561,5 +642,33 @@ function parseFaceOp(msg: Record<string, any>): FaceOpMessage | null {
     partName: msg.partName,
     target,
     distance: msg.distance,
+  };
+}
+
+type CombineMessage = Extract<WebviewToExt, { type: "combine" }>;
+
+/**
+ * Validate a `combine` off the wire.
+ *
+ * Sibling of {@link parseFaceOp}, and untrusted for the same reason. The field
+ * that matters here is the name list: the names are looked up in the source,
+ * so a non-string would reach the scanner as `undefined` and match whichever
+ * entry happened to have no `name`.
+ */
+function parseCombine(msg: Record<string, any>): CombineMessage | null {
+  if (msg.op !== "join" && msg.op !== "cut" && msg.op !== "intersect") return null;
+  if (typeof msg.requestId !== "number" || !Number.isFinite(msg.requestId)) return null;
+  if (typeof msg.targetName !== "string" || msg.targetName.length === 0) return null;
+  if (!Array.isArray(msg.toolNames) || msg.toolNames.length === 0) return null;
+  if (!msg.toolNames.every((n: any) => typeof n === "string" && n.length > 0)) return null;
+  if (msg.keepTools !== undefined && typeof msg.keepTools !== "boolean") return null;
+
+  return {
+    type: "combine",
+    requestId: msg.requestId,
+    op: msg.op,
+    targetName: msg.targetName,
+    toolNames: msg.toolNames,
+    keepTools: msg.keepTools === true,
   };
 }

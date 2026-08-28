@@ -5,6 +5,8 @@ import * as fs from "fs";
 import {
   BUNDLE_EXTERNALS,
   buildFaceOpCall,
+  computeCombineEdit,
+  describeCombineFailure,
   renderViewerHtml,
   computeParamEdit,
   type ExportFormat,
@@ -14,6 +16,7 @@ import {
 } from "@shapeitup/shared";
 
 type FaceOpMessage = Extract<WebviewToExt, { type: "face-op" }>;
+type CombineMessage = Extract<WebviewToExt, { type: "combine" }>;
 import { clearSidecarParam } from "@shapeitup/shared/sidecar";
 import type { DetectedApp } from "./app-detector";
 import { getDetectedApps } from "./app-detector";
@@ -353,6 +356,12 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       case "face-op":
         void this.commitFaceOp(msg).then((r) => {
           if (!r.ok) this.output.appendLine(`[face] declined: ${r.reason}`);
+          this.getActiveWebview()?.postMessage(r);
+        });
+        break;
+      case "combine":
+        void this.commitCombine(msg).then((r) => {
+          if (!r.ok) this.output.appendLine(`[combine] declined: ${r.reason}`);
           this.getActiveWebview()?.postMessage(r);
         });
         break;
@@ -898,6 +907,85 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     );
     return {
       type: "face-op-result",
+      requestId: msg.requestId,
+      ok: true,
+      applied: built.applied,
+      addedImport: built.addedImport,
+    };
+  }
+
+  /**
+   * Apply a combine to the `.shape.ts` through the editor.
+   *
+   * Same reasoning as `commitFaceOp`: a WorkspaceEdit composes with unsaved
+   * work and lands on the undo stack, so Cmd-Z takes back a merge of two
+   * bodies exactly as it takes back anything else the user typed. That matters
+   * more here than for a face operation — a combine deletes a line, and the
+   * cheapest way to be comfortable trying one is knowing undo brings it back.
+   */
+  private async commitCombine(msg: CombineMessage): Promise<FaceOpResultMessage> {
+    const fail = (reason: string): FaceOpResultMessage => ({
+      type: "face-op-result",
+      kind: "combine",
+      requestId: msg.requestId,
+      ok: false,
+      reason,
+    });
+
+    const file = this.lastExecutedFile;
+    if (!file) return fail("no file open");
+
+    let doc: vscode.TextDocument;
+    try {
+      doc = await vscode.workspace.openTextDocument(file);
+    } catch (e: any) {
+      return fail(`could not open ${path.basename(file)}: ${e?.message ?? e}`);
+    }
+
+    const built = computeCombineEdit(doc.getText(), {
+      op: msg.op,
+      targetName: msg.targetName,
+      toolNames: msg.toolNames,
+      keepTools: msg.keepTools,
+    });
+    if (!built.ok) return fail(describeCombineFailure(built.reason, built.detail));
+
+    const edit = new vscode.WorkspaceEdit();
+    // Descending, so an inserted import or hoisted const cannot shift the
+    // offsets of the edits that follow it.
+    for (const e of [...built.edits].sort((a, b) => b.start - a.start)) {
+      edit.replace(
+        doc.uri,
+        new vscode.Range(doc.positionAt(e.start), doc.positionAt(e.end)),
+        e.text,
+      );
+    }
+    if (!(await vscode.workspace.applyEdit(edit))) {
+      return fail("the editor rejected the edit");
+    }
+
+    const visible = vscode.window.visibleTextEditors.some(
+      (e) => e.document.uri.toString() === doc.uri.toString(),
+    );
+    if (!visible) {
+      try {
+        await doc.save();
+      } catch (e: any) {
+        return fail(`edit applied but save failed: ${e?.message ?? e}`);
+      }
+    }
+
+    this.output.appendLine(
+      `[combine] ${msg.op} ${msg.toolNames.join(", ")} into ${msg.targetName} in ` +
+        `${path.basename(file)}` +
+        (visible ? " (unsaved — yours to save)" : " (saved)") +
+        (built.removed.length ? ` — removed ${built.removed.join(", ")}` : "") +
+        (built.hoisted.length ? ` — hoisted ${built.hoisted.join(", ")}` : "") +
+        (built.addedImport ? " — added the shapeitup import" : ""),
+    );
+    return {
+      type: "face-op-result",
+      kind: "combine",
       requestId: msg.requestId,
       ok: true,
       applied: built.applied,

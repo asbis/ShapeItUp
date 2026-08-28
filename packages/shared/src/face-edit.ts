@@ -391,16 +391,47 @@ type SpanResult =
   | { ok: false; reason: FaceOpFailure };
 
 /**
- * Locate the `shape:` value of the object literal that declares
- * `name: "<partName>"`.
+ * Where a named part lives in the source: the whole `{ shape, name, … }`
+ * literal, and the `shape:` value inside it.
+ *
+ * The face operations only ever need the inner span — they wrap one
+ * expression. Combining two bodies needs the outer one too, because the tool's
+ * entry has to be removed from the parts list once its geometry has moved into
+ * the target.
+ */
+export interface PartSpan {
+  /** The `{` of the object literal, and one past its `}`. */
+  objStart: number;
+  objEnd: number;
+  /** The `shape:` value expression. */
+  start: number;
+  end: number;
+}
+
+/**
+ * Narrower than {@link FaceOpFailure}: locating a part cannot fail for want of
+ * a `return`, because it never looks for one.
+ */
+export type PartSpanFailure = Extract<
+  FaceOpFailure,
+  "part-not-found" | "part-has-no-shape" | "unparseable"
+>;
+
+export type PartSpanResult =
+  | { ok: true; span: PartSpan }
+  | { ok: false; reason: PartSpanFailure };
+
+/**
+ * Locate the object literal that declares `name: "<partName>"`, and the
+ * `shape:` value inside it.
  *
  * Scans every object literal in the file rather than trying to find the
  * `return` first: a part can be built in a helper, spread in from a factory,
  * or listed in a const above the return, and the `{ shape, name }` pairing is
  * the thing that is actually invariant.
  */
-function findPartShapeSpan(source: string, partName: string): SpanResult {
-  let found: { start: number; end: number } | null = null;
+export function findPartSpan(source: string, partName: string): PartSpanResult {
+  let found: PartSpan | null = null;
   let matches = 0;
   let noShape = false;
 
@@ -436,7 +467,12 @@ function findPartShapeSpan(source: string, partName: string): SpanResult {
       const shapeEntry = pairs.find((p) => p.name === "shape");
       if (shapeEntry) {
         matches++;
-        found = { start: shapeEntry.valueStart, end: shapeEntry.valueEnd };
+        found = {
+          objStart: i,
+          objEnd: end,
+          start: shapeEntry.valueStart,
+          end: shapeEntry.valueEnd,
+        };
       } else {
         noShape = true;
       }
@@ -452,7 +488,13 @@ function findPartShapeSpan(source: string, partName: string): SpanResult {
   // Two objects claiming the same part name means the file does something we
   // do not model; picking either is a coin flip on the user's geometry.
   if (matches > 1) return { ok: false, reason: "unparseable" };
-  return { ok: true, ...found };
+  return { ok: true, span: found };
+}
+
+/** The `shape:` span alone — what the face operations wrap. */
+function findPartShapeSpan(source: string, partName: string): SpanResult {
+  const r = findPartSpan(source, partName);
+  return r.ok ? { ok: true, start: r.span.start, end: r.span.end } : r;
 }
 
 /**
