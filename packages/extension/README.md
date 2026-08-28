@@ -110,19 +110,47 @@ export default function main() {
 | Button | Action |
 |--------|--------|
 | **Fit** | Reset camera to fit model |
-| **Edges** | Toggle edge line display |
-| **Wire** | Toggle wireframe mode |
+| **Edges** / **Wire** | Toggle edge lines / wireframe |
 | **Dims** | Show bounding box dimensions |
 | **Section** | Cross-section clip plane |
 | **Measure** | Click two points to measure distance |
-| **STEP** | Export as STEP file |
-| **STL** | Export as STL file |
+| **Join** / **Cut** / **Intersect** | Combine two bodies |
+| **Move** / **Rotate** | Position a body with a drag handle |
+| **Export** | STEP, STL, 3MF |
 
 **Navigation:** Left-click drag = orbit, Right-click drag = pan, Scroll = zoom
 
-**ViewCube:** Quick preset views (Top, Front, Right, Isometric)
+**ViewCube:** The cube in the bottom-right corner turns with the model. Click a
+face for the orthogonal view, an edge for the 45° between two, a corner for an
+isometric — drag it to orbit, or press the house to go home. Keys `1`–`7` do the
+six sides and the iso.
 
-**Parts panel:** Click the hamburger menu to toggle. Click any part to show/hide it.
+**Parts panel:** Click the hamburger menu to toggle. Expand a body for its
+volume, surface area and centre of mass; the eye shows and hides it.
+
+## Editing in the viewport
+
+The viewer is a way of writing the file, not a second source of truth. Every
+direct-manipulation command produces a code edit you can read, review and undo —
+nothing is stored in hidden state, and the `.shape.ts` stays the only
+description of the model.
+
+- **Click a face** (or a single edge) to arm **Extrude**, **Fillet** or
+  **Chamfer**, then drag the arrow to size it. The model updates live as you
+  drag; blue shows material being added, red material being removed.
+- The selectors that get written are **parameterised where the geometry proves
+  which parameter it is** — `inPlane("XY", thickness)`, not `inPlane("XY", 8)` —
+  so the feature survives you moving a slider. Where it can't prove one, it says
+  so instead of writing something brittle.
+- **Fillet and chamfer limits are measured against OpenCascade**, not guessed,
+  so dragging cannot land on a radius the kernel refuses.
+- **Join / Cut / Intersect** two bodies, with a per-tool warning when one of
+  them does not actually touch the target.
+- **Move / Rotate** a body with a Fusion-style triad, with **Copy** to leave the
+  original in place. Rotation pivots are written as expressions
+  (`shape.boundingBox.center`), never as frozen coordinates.
+
+Nothing is written until you press **Apply**.
 
 ## AI Integration (Claude Code)
 

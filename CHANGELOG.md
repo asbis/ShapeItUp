@@ -6,6 +6,44 @@ its own versions in `packages/mcp-server/CHANGELOG.md`.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project follows semantic versioning at the extension level.
 
+## [1.27.0] - 2026-08-28
+
+Extension `1.27.0` / mcp-server `1.27.0` — direct manipulation in the viewport.
+The viewer becomes a way of WRITING the `.shape.ts`, not a second source of
+truth: every command below produces a code edit you can read, review and undo.
+
+### Added
+- **Pick a face or a single edge**, then Extrude, Fillet or Chamfer it by
+  dragging an arrow. The model rebuilds live as you drag; blue shows material
+  being added, red material being removed. Nothing is written until Apply.
+- **Selectors are parameterised where the geometry proves which parameter it
+  is** — `inPlane("XY", thickness)` rather than `inPlane("XY", 8)` — so the
+  feature survives a slider move. Where no parameter can be proven, the bar
+  says so rather than writing something brittle.
+- **Fillet/chamfer ceilings are measured against OpenCascade** by bisection
+  (~50 ms, once per armed operation) instead of guessed from a heuristic.
+  Dragging clamps to the real limit; a typed value over it warns rather than
+  being silently rewritten.
+- **Join / Cut / Intersect** two bodies (`joinBodies`, `cutBodies`,
+  `intersectBodies`), with Keep tools, a live delta preview, and a per-tool
+  warning when one of them does not actually touch the target.
+- **Move / Rotate** a body with a Fusion-style triad, plus **Copy** to leave
+  the original in place. The preview is exact and needs no kernel round trip —
+  a rigid transform is a matrix.
+- **A real ViewCube**: all 26 directions rather than the previous seven text
+  buttons, turning with the model, drag-to-orbit, and a home button.
+
+### Fixed
+- **Rotation pivots are written as expressions, never as coordinates.**
+  `shape.boundingBox.center` recomputes; frozen coordinates are correct the day
+  they are written and silently wrong once a parameter moves the body —
+  measured at 20 mm of drift on a test that changes one width.
+- **`.translate` / `.rotate` / `.mirror` / `.scale` consume their receiver**
+  (`this.delete()`); the booleans do not. Generated code now clones when the
+  shape is still needed elsewhere, which is what a copy always requires.
+- Toolbar overflow ran off the left edge of a narrow pane, taking Fit and the
+  display toggles with it. It scrolls now.
+
 ## [1.10.0] - 2026-04-22
 
 Extension `1.10.0` / mcp-server `1.9.0` — warning signal-to-noise overhaul
