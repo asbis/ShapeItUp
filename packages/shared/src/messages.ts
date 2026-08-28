@@ -125,7 +125,7 @@ export interface ParamCommitResult {
 export interface FaceOpResultMessage {
   type: "face-op-result";
   /** Which command this answers. Absent means the face operations, for compatibility. */
-  kind?: "face-op" | "combine";
+  kind?: "face-op" | "combine" | "transform";
   /** Echoed back so a stale reply cannot be attributed to a newer request. */
   requestId: number;
   ok: boolean;
@@ -242,6 +242,33 @@ export type WebviewToExt =
       targetName: string;
       toolNames: string[];
       keepTools?: boolean;
+    }
+  /**
+   * Move and/or turn one body — Fusion 360's Modify → Move/Copy, written into
+   * the `.shape.ts` as the `.translate` / `.rotate` a replicad user would type.
+   *
+   * No preview counterpart, unlike `face-op` and `combine`: a rigid transform
+   * needs no kernel. The viewer applies it to the part's group matrix at frame
+   * rate, which is both exact and free, so the only round trip is the commit.
+   */
+  | {
+      type: "transform";
+      requestId: number;
+      partName: string;
+      /**
+       * Applied first, about `pivot`. Degrees.
+       *
+       * The pivot is a NAME, not a coordinate: "origin" is a constant and
+       * "self" is written as the body's own `boundingBox.center` expression.
+       * Sending the numbers the manipulator measured would freeze today's
+       * geometry into the file — the trap the face selectors exist to avoid.
+       */
+      rotate?: {
+        angle: number;
+        axis: [number, number, number];
+        pivot: "origin" | "self";
+      };
+      translate?: [number, number, number];
     }
   | { type: "ready" }
   // Webview asks the extension for the cached OCCT (+ optional Manifold) bytes
@@ -392,6 +419,13 @@ export interface TessellatedPart {
   faceInfo?: FaceInfo[];
   /** `[start, count, …]` spans of `edgeVertices`, in POINT units (3 floats each). */
   edgeGroups?: Uint32Array;
+  /**
+   * Centre of the OCCT bounding box — the value `shape.boundingBox.center`
+   * evaluates to in a script. The Rotate command's default pivot, and it has
+   * to be this rather than the mesh's own bounds because that expression is
+   * what gets written into the file.
+   */
+  boundsCenter?: [number, number, number];
   // Geometric properties computed from the original OCCT shape (not the mesh).
   // Optional because measurement can fail on degenerate geometry.
   volume?: number;

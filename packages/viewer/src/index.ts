@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { TransformControls } from "three/examples/jsm/controls/TransformControls.js";
 import { createScene, setAxesVisible } from "./scene";
 import {
   createCamera,
@@ -298,6 +299,13 @@ interface PartInfo {
   edgeLines?: THREE.LineSegments;
   edgeVertices?: Float32Array;
   edgeGroups?: Uint32Array;
+  /**
+   * Centre of the OCCT bounding box — what `shape.boundingBox.center` returns
+   * in the file. The Rotate command's pivot, and it has to be OCCT's number
+   * rather than the mesh's own bounds so the live preview turns about exactly
+   * the point the written expression will.
+   */
+  boundsCenter?: [number, number, number];
   /** Measured on the OCCT shape, not the mesh. Absent on degenerate geometry. */
   volume?: number;
   surfaceArea?: number;
@@ -508,7 +516,7 @@ function updateFaceInfoPanel(): void {
   // after it rendered. That is exactly what happened: the measurements
   // arrived and were correct, the bodies merged, and the revert undid it
   // before anyone saw it.
-  if (combineOp) return;
+  if (combineOp || moveMode) return;
   const sel = facePicker.getSelection();
   if (!sel) {
     // A preview rebuilds the model and so clears the picker. An armed
@@ -1216,8 +1224,9 @@ function setCombineOp(op: CombineKind | null): void {
   // list — one short — as the frozen menu. Go back to the file's model first.
   if (combineOp === null && previewShowing) revertPreview();
 
-  // A face selection and a body selection would both be reading the same
-  // click. One at a time.
+  // A face selection, a body selection and a gizmo drag would all be reading
+  // the same click. One at a time.
+  setMoveMode(null);
   setActiveOp(null);
   facePicker.setSelection(null);
   faceInfoEl.classList.remove("visible");
@@ -1532,6 +1541,544 @@ ciKeepEl.addEventListener("change", () => {
 ciApplyEl.addEventListener("click", applyCombine);
 ciCancelEl.addEventListener("click", () => setCombineOp(null));
 
+// ── Move and Rotate: positioning whole bodies ─────────────────────────────
+//
+// Fusion 360's Modify → Move/Copy: a triad you drag to slide a body along an
+// axis or in a plane, and arcs you drag to turn it. What gets written is the
+// call a replicad user would have typed —
+//
+//     { shape: plate.rotate(90, plate.boundingBox.center, [0, 0, 1]), … }
+//
+// so the file keeps describing the model rather than acquiring a hidden
+// transform the way a CAD feature tree does.
+//
+// ## The preview needs no kernel
+//
+// Extrude, fillet and combine all change topology, so previewing them means a
+// round trip through OCCT. A rigid transform does not: sliding a body is a
+// matrix, and Three.js already applies one to every part group — it is how the
+// motion simulation moves things. So this preview runs at frame rate, costs
+// nothing, and is EXACT rather than approximate. The only round trip is the
+// commit.
+//
+// ## Which is why the pivot is measured by OCCT and not by the mesh
+//
+// The one number the viewer cannot make up is where "the body's centre" is.
+// The file will say `boundingBox.center`, and the mesh's own bounds are close
+// to that but not equal — a tessellated cylinder is inscribed in its true
+// surface. So the core sends OCCT's bounding-box centre along with the mesh,
+// and the drag turns about exactly the point the written expression resolves
+// to.
+
+const moveInfoEl = document.getElementById("move-info")!;
+const miOpEl = document.getElementById("mi-op")!;
+const miBodyEl = document.getElementById("mi-body") as HTMLSelectElement;
+const miTranslateEl = document.getElementById("mi-translate") as HTMLElement;
+const miRotateEl = document.getElementById("mi-rotate") as HTMLElement;
+const miXEl = document.getElementById("mi-x") as HTMLInputElement;
+const miYEl = document.getElementById("mi-y") as HTMLInputElement;
+const miZEl = document.getElementById("mi-z") as HTMLInputElement;
+const miAngleEl = document.getElementById("mi-angle") as HTMLInputElement;
+const miAxisEl = document.getElementById("mi-axis") as HTMLSelectElement;
+const miPivotEl = document.getElementById("mi-pivot") as HTMLSelectElement;
+const miResetEl = document.getElementById("mi-reset") as HTMLButtonElement;
+const miApplyEl = document.getElementById("mi-apply") as HTMLButtonElement;
+const miCancelEl = document.getElementById("mi-cancel") as HTMLButtonElement;
+const miCodeEl = document.getElementById("mi-code")!;
+const miNotesEl = document.getElementById("mi-notes")!;
+
+type MoveMode = "translate" | "rotate";
+
+const MOVE_LABEL: Record<MoveMode, string> = {
+  translate: "Move",
+  rotate: "Rotate",
+};
+
+/**
+ * Drag increments.
+ *
+ * Round enough that a drag lands on a number a person would have typed, fine
+ * enough to reach anything worth reaching. Holding Shift turns them off for
+ * the rare case that wants a raw value; typing is always exact.
+ */
+const MOVE_SNAP_MM = 0.5;
+const ROTATE_SNAP_DEG = 5;
+
+let moveMode: MoveMode | null = null;
+let movePartName: string | null = null;
+/** The gizmo's home: the body's centre when the command was armed. */
+const moveAnchor = new THREE.Vector3();
+/** Accumulated translation, in model units. */
+const moveDelta = new THREE.Vector3();
+/** Accumulated rotation, about the resolved pivot. */
+const moveQuat = new THREE.Quaternion();
+
+const AXIS_VECTORS: Record<string, THREE.Vector3> = {
+  x: new THREE.Vector3(1, 0, 0),
+  y: new THREE.Vector3(0, 1, 0),
+  z: new THREE.Vector3(0, 0, 1),
+};
+
+/**
+ * The object the gizmo actually drags.
+ *
+ * Not the part group itself: the gizmo rotates whatever it is attached to
+ * about that object's own origin, and the pivot this command writes is a
+ * choice — the body's centre or the world origin. Reading the gizmo's
+ * transform off a proxy and applying it to the part with the chosen pivot
+ * keeps those two things separate, which is what lets "turn about the world
+ * origin" mean what it says.
+ */
+const moveProxy = new THREE.Object3D();
+scene.add(moveProxy);
+
+const transformControls = new TransformControls(camera, renderer.domElement);
+const transformHelper = transformControls.getHelper();
+transformHelper.visible = false;
+transformControls.enabled = false;
+scene.add(transformHelper);
+
+// The gizmo and the orbit controls both want the drag. The gizmo wins while it
+// has one, exactly as it does for the extrude arrow.
+transformControls.addEventListener("dragging-changed", (e: any) => {
+  controls.enabled = !e.value;
+  if (!e.value) {
+    // A drag ends with a click on the canvas; without this the release
+    // re-picks a face, or clears the selection, the instant you let go.
+    suppressNextClick = true;
+    syncMoveGizmo();
+  }
+});
+
+transformControls.addEventListener("objectChange", () => {
+  if (!moveMode) return;
+  if (moveMode === "translate") {
+    moveDelta.copy(moveProxy.position).sub(moveAnchor);
+  } else {
+    moveQuat.copy(moveProxy.quaternion);
+  }
+  applyMoveTransform();
+  renderMoveFields();
+  renderMovePreview();
+});
+
+/** The body being moved, if it is still in the scene. */
+function movePart(): PartInfo | undefined {
+  return currentParts.find((p) => p.name === movePartName);
+}
+
+/**
+ * Where the rotation turns, in model coordinates.
+ *
+ * "self" resolves to OCCT's bounding-box centre — the value the written
+ * `boundingBox.center` will evaluate to — and falls back to the origin for a
+ * part the core could not measure, because an unmeasured body is better turned
+ * about a known point than about a guess.
+ */
+function movePivotPoint(): THREE.Vector3 {
+  if (miPivotEl.value === "origin") return new THREE.Vector3(0, 0, 0);
+  const c = movePart()?.boundsCenter;
+  return c ? new THREE.Vector3(c[0], c[1], c[2]) : new THREE.Vector3(0, 0, 0);
+}
+
+/**
+ * Put the body where the accumulated transform says.
+ *
+ * world = translate(T) ∘ rotateAbout(P, q), which for a group whose geometry
+ * is already in world coordinates means quaternion = q and
+ * position = T + P − qP. The same arithmetic the committed
+ * `.rotate(a, P, axis).translate(T)` performs, checked against OCCT in
+ * transform-agreement.test.ts.
+ */
+function applyMoveTransform(): void {
+  const part = movePart();
+  if (!part) return;
+  const p = movePivotPoint();
+  const rotated = p.clone().applyQuaternion(moveQuat);
+  part.group.quaternion.copy(moveQuat);
+  part.group.position.copy(p).sub(rotated).add(moveDelta);
+}
+
+/** Put every body back where the file has it. */
+function clearMoveTransforms(): void {
+  for (const p of currentParts) {
+    p.group.position.set(0, 0, 0);
+    p.group.quaternion.set(0, 0, 0, 1);
+  }
+}
+
+/** The signed turn a quaternion represents about a known axis, in degrees. */
+function angleAboutAxis(q: THREE.Quaternion, axis: THREE.Vector3): number {
+  const along = q.x * axis.x + q.y * axis.y + q.z * axis.z;
+  const deg = (2 * Math.atan2(along, q.w) * 180) / Math.PI;
+  // atan2 already gives (-180, 180]; normalise the wrap so a drag past half a
+  // turn reads as -170 rather than 190.
+  return Number(((deg + 540) % 360 - 180).toFixed(4));
+}
+
+/** Aim the gizmo at the body's current position, without disturbing a drag. */
+function syncMoveGizmo(): void {
+  const part = movePart();
+  if (!moveMode || !part) {
+    transformHelper.visible = false;
+    transformControls.enabled = false;
+    transformControls.detach();
+    return;
+  }
+  if (transformControls.dragging) return;
+
+  transformControls.mode = moveMode;
+  if (moveMode === "translate") {
+    moveProxy.position.copy(moveAnchor).add(moveDelta);
+    moveProxy.quaternion.set(0, 0, 0, 1);
+    transformControls.showX = true;
+    transformControls.showY = true;
+    transformControls.showZ = true;
+  } else {
+    // The gizmo follows the body so the arcs stay on the thing they turn, but
+    // its position is read by nothing — only the quaternion is.
+    const p = movePivotPoint();
+    const rotated = p.clone().applyQuaternion(moveQuat);
+    moveProxy.position
+      .copy(moveAnchor)
+      .applyQuaternion(moveQuat)
+      .add(p)
+      .sub(rotated)
+      .add(moveDelta)
+      .sub(moveAnchor.clone().applyQuaternion(moveQuat))
+      .add(moveAnchor.clone().applyQuaternion(moveQuat));
+    moveProxy.quaternion.copy(moveQuat);
+    // One axis at a time. Three arcs at once compose into a rotation with no
+    // principal axis, which cannot be written as one `rotate(angle, …)` call —
+    // and the file is the point.
+    const axis = miAxisEl.value;
+    transformControls.showX = axis === "x";
+    transformControls.showY = axis === "y";
+    transformControls.showZ = axis === "z";
+  }
+  transformControls.attach(moveProxy);
+  transformControls.enabled = true;
+  transformHelper.visible = true;
+}
+
+function setMoveMode(mode: MoveMode | null): void {
+  if (mode !== null && currentParts.length === 0) return;
+
+  if (mode === null) {
+    moveMode = null;
+    movePartName = null;
+    moveDelta.set(0, 0, 0);
+    moveQuat.set(0, 0, 0, 1);
+    clearMoveTransforms();
+    transformControls.detach();
+    transformControls.enabled = false;
+    transformHelper.visible = false;
+    moveInfoEl.classList.remove("visible");
+    updateMoveButtons();
+    return;
+  }
+
+  // One modal command at a time: Combine reads clicks as body selection and
+  // this one hands them to a gizmo.
+  setCombineOp(null);
+  setActiveOp(null);
+  facePicker.setSelection(null);
+  faceInfoEl.classList.remove("visible");
+
+  const rearming = moveMode !== null;
+  moveMode = mode;
+  if (!rearming) {
+    const picked = facePicker.getSelection()?.partName;
+    movePartName =
+      picked && currentParts.some((p) => p.name === picked)
+        ? picked
+        : (currentParts[0]?.name ?? null);
+    moveDelta.set(0, 0, 0);
+    moveQuat.set(0, 0, 0, 1);
+    captureMoveAnchor();
+  }
+
+  miOpEl.textContent = MOVE_LABEL[mode];
+  miTranslateEl.hidden = mode !== "translate";
+  miRotateEl.hidden = mode !== "rotate";
+  moveInfoEl.classList.add("visible");
+  renderMoveBar();
+  syncMoveGizmo();
+  updateMoveButtons();
+}
+
+/** The gizmo's home, taken from the body as the file currently builds it. */
+function captureMoveAnchor(): void {
+  const part = movePart();
+  if (!part) {
+    moveAnchor.set(0, 0, 0);
+    return;
+  }
+  const c = part.boundsCenter;
+  if (c) {
+    moveAnchor.set(c[0], c[1], c[2]);
+    return;
+  }
+  // No OCCT bounds — a mesh part. Its own geometry is the next best thing.
+  part.mesh.geometry.computeBoundingBox();
+  part.mesh.geometry.boundingBox?.getCenter(moveAnchor);
+}
+
+function updateMoveButtons(): void {
+  const enough = currentParts.length >= 1;
+  for (const mode of ["move", "rotate"] as const) {
+    const btn = document.getElementById(`btn-${mode}`) as HTMLButtonElement | null;
+    if (!btn) continue;
+    btn.disabled = !enough;
+    const armed = moveMode === (mode === "move" ? "translate" : "rotate");
+    btn.classList.toggle("active", armed);
+  }
+}
+
+function renderMoveBar(): void {
+  if (!moveMode) return;
+  miBodyEl.innerHTML = "";
+  for (const part of currentParts) {
+    const opt = document.createElement("option");
+    opt.value = part.name;
+    opt.textContent = part.name;
+    opt.selected = part.name === movePartName;
+    miBodyEl.appendChild(opt);
+  }
+  renderMoveFields();
+  renderMovePreview();
+}
+
+/** State → the numeric fields. Skipped for whichever field has focus. */
+function renderMoveFields(): void {
+  const set = (el: HTMLInputElement, v: number) => {
+    if (document.activeElement === el) return;
+    el.value = String(Number(v.toFixed(3)));
+  };
+  set(miXEl, moveDelta.x);
+  set(miYEl, moveDelta.y);
+  set(miZEl, moveDelta.z);
+  set(miAngleEl, angleAboutAxis(moveQuat, AXIS_VECTORS[miAxisEl.value] ?? AXIS_VECTORS.z!));
+  miApplyEl.disabled = !moveHasChange() || pendingTransform !== null;
+}
+
+function moveHasChange(): boolean {
+  if (moveDelta.lengthSq() > 1e-12) return true;
+  return Math.abs(angleAboutAxis(moveQuat, AXIS_VECTORS[miAxisEl.value] ?? AXIS_VECTORS.z!)) > 1e-6;
+}
+
+/**
+ * The suffix that will be appended to the body's shape expression.
+ *
+ * Written against the body's NAME, which is what the file usually holds there.
+ * Where it holds an expression instead, the host writes the same chain onto
+ * that expression — and hoists it to a const first when a self-pivot needs to
+ * name it twice. The note says so rather than the line pretending otherwise.
+ */
+function renderMovePreview(): void {
+  if (!moveMode) return;
+  miCodeEl.textContent = "";
+  miNotesEl.innerHTML = "";
+  const name = movePartName ?? "shape";
+  const axisName = miAxisEl.value;
+  const angle = angleAboutAxis(moveQuat, AXIS_VECTORS[axisName] ?? AXIS_VECTORS.z!);
+  const selfPivot = miPivotEl.value === "self";
+
+  let code = name;
+  let wrote = false;
+  const turning = Math.abs(angle) > 1e-6;
+  if (turning) {
+    const axis = AXIS_VECTORS[axisName]!;
+    const axisLit = `[${axis.x}, ${axis.y}, ${axis.z}]`;
+    if (!selfPivot && axisName === "z") {
+      code += `.rotate(${trimNum(angle)})`;
+    } else {
+      code += `.rotate(${trimNum(angle)}, ${selfPivot ? `${name}.boundingBox.center` : "[0, 0, 0]"}, ${axisLit})`;
+    }
+    wrote = true;
+  }
+  if (moveDelta.lengthSq() > 1e-12) {
+    code += `.translate(${trimNum(moveDelta.x)}, ${trimNum(moveDelta.y)}, ${trimNum(moveDelta.z)})`;
+    wrote = true;
+  }
+  miCodeEl.textContent = wrote ? code : "…";
+
+  const notes: Array<{ text: string; warn?: boolean }> = [];
+  // Only when there IS a turn. A pure translate has no pivot, and saying where
+  // it would have turned describes something that is not happening.
+  if (turning) {
+    // Both pivots are durable BY CONSTRUCTION — one is a constant, the other
+    // is the expression that recomputes the centre — so unlike the face
+    // selectors there is nothing to warn about. Say which, so the choice is
+    // understood rather than merely made.
+    notes.push({
+      text: selfPivot
+        ? "turns about the body's own centre, recomputed as the model changes"
+        : "turns about the world origin",
+    });
+    if (!movePart()?.boundsCenter && selfPivot) {
+      notes.push({
+        text: "⚠ this body has no measured bounds — turning about the origin instead",
+        warn: true,
+      });
+    }
+  }
+  for (const n of notes) {
+    const el = document.createElement("span");
+    if (n.warn) el.className = "warn";
+    el.textContent = n.text;
+    miNotesEl.appendChild(el);
+  }
+}
+
+function trimNum(v: number): string {
+  return String(Number(v.toFixed(3)));
+}
+
+/** A numeric field, or null when it does not hold a usable number. */
+function readField(el: HTMLInputElement): number | null {
+  const raw = el.value.trim().replace(",", ".");
+  if (raw === "" || raw === "-") return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function onMoveFieldInput(): void {
+  if (!moveMode) return;
+  if (moveMode === "translate") {
+    moveDelta.set(
+      readField(miXEl) ?? moveDelta.x,
+      readField(miYEl) ?? moveDelta.y,
+      readField(miZEl) ?? moveDelta.z,
+    );
+  } else {
+    const deg = readField(miAngleEl);
+    if (deg !== null) {
+      const axis = AXIS_VECTORS[miAxisEl.value] ?? AXIS_VECTORS.z!;
+      moveQuat.setFromAxisAngle(axis, (deg * Math.PI) / 180);
+    }
+  }
+  applyMoveTransform();
+  syncMoveGizmo();
+  renderMovePreview();
+  miApplyEl.disabled = !moveHasChange() || pendingTransform !== null;
+}
+
+let transformRequestId = 0;
+let pendingTransform: number | null = null;
+
+function applyMove(): void {
+  if (!moveMode || !movePartName || !moveHasChange()) {
+    setParamsStatus("Move the body first — nothing to write.", true);
+    return;
+  }
+  if (pendingTransform !== null) return;
+
+  const axisName = miAxisEl.value;
+  const axis = AXIS_VECTORS[axisName] ?? AXIS_VECTORS.z!;
+  const angle = angleAboutAxis(moveQuat, axis);
+
+  transformRequestId += 1;
+  pendingTransform = transformRequestId;
+  miApplyEl.disabled = true;
+  setParamsStatus(`${MOVE_LABEL[moveMode]}…`);
+  postToExtension({
+    type: "transform",
+    requestId: transformRequestId,
+    partName: movePartName,
+    ...(Math.abs(angle) > 1e-6
+      ? {
+          rotate: {
+            angle,
+            axis: [axis.x, axis.y, axis.z] as [number, number, number],
+            // A name, not a coordinate: the host writes the expression that
+            // recomputes it, so the edit stays true as the model changes.
+            pivot: (miPivotEl.value === "origin" ? "origin" : "self") as "origin" | "self",
+          },
+        }
+      : {}),
+    ...(moveDelta.lengthSq() > 1e-12
+      ? { translate: [moveDelta.x, moveDelta.y, moveDelta.z] as [number, number, number] }
+      : {}),
+  });
+}
+
+for (const [id, mode] of [
+  ["btn-move", "translate"],
+  ["btn-rotate", "rotate"],
+] as const) {
+  const btn = document.getElementById(id) as HTMLButtonElement | null;
+  if (!btn) continue;
+  btn.addEventListener("click", () => setMoveMode(moveMode === mode ? null : mode));
+}
+
+miBodyEl.addEventListener("change", () => {
+  movePartName = miBodyEl.value || null;
+  clearMoveTransforms();
+  moveDelta.set(0, 0, 0);
+  moveQuat.set(0, 0, 0, 1);
+  captureMoveAnchor();
+  applyMoveTransform();
+  syncMoveGizmo();
+  renderMoveBar();
+});
+
+miAxisEl.addEventListener("change", () => {
+  // The angle was measured about the OLD axis; carrying the number over would
+  // silently turn the body somewhere else. Start the new axis at zero.
+  moveQuat.set(0, 0, 0, 1);
+  applyMoveTransform();
+  syncMoveGizmo();
+  renderMoveFields();
+  renderMovePreview();
+});
+
+miPivotEl.addEventListener("change", () => {
+  applyMoveTransform();
+  syncMoveGizmo();
+  renderMovePreview();
+});
+
+for (const el of [miXEl, miYEl, miZEl, miAngleEl]) {
+  el.addEventListener("input", onMoveFieldInput);
+  el.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      applyMove();
+      e.preventDefault();
+    } else if (e.key === "Escape") {
+      setMoveMode(null);
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  });
+}
+
+miResetEl.addEventListener("click", () => {
+  moveDelta.set(0, 0, 0);
+  moveQuat.set(0, 0, 0, 1);
+  applyMoveTransform();
+  syncMoveGizmo();
+  renderMoveFields();
+  renderMovePreview();
+});
+
+miApplyEl.addEventListener("click", applyMove);
+miCancelEl.addEventListener("click", () => setMoveMode(null));
+
+// Snapping is on by default so a drag lands on a round number; Shift lifts it
+// for the occasional value that is not round.
+function setMoveSnapping(on: boolean): void {
+  transformControls.translationSnap = on ? MOVE_SNAP_MM : null;
+  transformControls.rotationSnap = on ? (ROTATE_SNAP_DEG * Math.PI) / 180 : null;
+}
+setMoveSnapping(true);
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Shift") setMoveSnapping(false);
+});
+window.addEventListener("keyup", (e) => {
+  if (e.key === "Shift") setMoveSnapping(true);
+});
+
 // Hover is advisory, so it is the first thing to give up: skip it entirely
 // while the user is orbiting (a raycast per pointermove during a drag is both
 // wasted work and visually noisy), and while the measure tool owns the cursor.
@@ -1755,11 +2302,14 @@ renderer.domElement.addEventListener("pointermove", (event) => {
   if (orbiting || measureMode || handleDrag) return;
   // Combine picks bodies, so highlighting a FACE under the cursor would
   // advertise a selection the click is not going to make.
-  if (combineOp) {
+  if (combineOp || moveMode) {
     facePicker.setHover(null);
-    renderer.domElement.style.cursor = pickBodyAt(event.clientX, event.clientY)
-      ? "pointer"
-      : "";
+    // The gizmo sets its own cursor while it is hovered; do not fight it.
+    if (!transformControls.axis) {
+      renderer.domElement.style.cursor = pickBodyAt(event.clientX, event.clientY)
+        ? "pointer"
+        : "";
+    }
     return;
   }
   const sel = pickAt(event.clientX, event.clientY);
@@ -1854,6 +2404,7 @@ function addPart(part: TessellatedPart) {
     edgeLines,
     edgeVertices: part.edgeVertices,
     edgeGroups: part.edgeGroups,
+    boundsCenter: part.boundsCenter,
     volume: part.volume,
     surfaceArea: part.surfaceArea,
     centerOfMass: part.centerOfMass,
@@ -2259,6 +2810,16 @@ function handleWorkerMessage(msg: WorkerToWebview) {
         // a model that just became single-body cannot be combined.
         applyCombineTint();
         updateCombineButtons();
+        // A parameter dragged under an open Move bar re-executes the script,
+        // which replaces every group and with it the transform standing in for
+        // the un-committed move. Put it back rather than have the body snap
+        // home mid-edit.
+        if (moveMode) {
+          applyMoveTransform();
+          syncMoveGizmo();
+          renderMoveBar();
+        }
+        updateMoveButtons();
         // Motion sim: if the script exported a `sim` block, resolve it against
         // the parts we just rendered and show the timeline. No-op otherwise.
         // Async (the dynamics engine awaits Rapier's WASM); fire-and-forget with
@@ -2713,8 +3274,22 @@ onMessage("param-commit-result", (msg) => {
 });
 
 onMessage("face-op-result", (msg) => {
-  // The host answers both commands on this channel — the outcome really is
-  // the same shape — so route by `kind` before anything else.
+  // The host answers all three commands on this channel — the outcome really
+  // is the same shape — so route by `kind` before anything else.
+  if (msg.kind === "transform") {
+    if (msg.requestId !== pendingTransform) return;
+    pendingTransform = null;
+    miApplyEl.disabled = false;
+    if (!msg.ok) {
+      setParamsStatus(`Not applied — ${msg.reason ?? "unknown reason"}`, true);
+      return;
+    }
+    setParamsStatus(`Written — ${msg.applied ?? "moved"}`);
+    // The rebuild from the file carries the move, so the group transform that
+    // was standing in for it has to go — otherwise it would be applied twice.
+    setMoveMode(null);
+    return;
+  }
   if (msg.kind === "combine") {
     if (msg.requestId !== pendingCombine) return;
     pendingCombine = null;
@@ -3426,6 +4001,18 @@ renderer.domElement.addEventListener("click", (event) => {
       if (body) combineClickBody(body);
       return;
     }
+    // With the gizmo up, a click on another body retargets it — the same
+    // gesture Fusion uses to change which body a Move applies to. A click on
+    // nothing is left alone: losing the command to a stray background click
+    // would be the most irritating way to lose an un-applied move.
+    if (moveMode) {
+      const body = pickBodyAt(event.clientX, event.clientY);
+      if (body && body !== movePartName) {
+        miBodyEl.value = body;
+        miBodyEl.dispatchEvent(new Event("change"));
+      }
+      return;
+    }
     // Clicking empty space clears — the standard CAD gesture, and the only
     // way to deselect without reaching for the keyboard.
     facePicker.setSelection(pickAt(event.clientX, event.clientY));
@@ -3484,6 +4071,11 @@ window.addEventListener("keydown", (event) => {
   //
   // Combine goes first: it is the more modal of the two, and an Escape pressed
   // with it open plainly means "not this", not "clear my face selection".
+  if (event.key === "Escape" && moveMode) {
+    setMoveMode(null);
+    event.preventDefault();
+    return;
+  }
   if (event.key === "Escape" && combineOp) {
     setCombineOp(null);
     event.preventDefault();

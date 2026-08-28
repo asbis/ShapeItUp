@@ -6,7 +6,9 @@ import { WebSocketServer, WebSocket } from "ws";
 import {
   buildFaceOpCall,
   computeCombineEdit,
+  computeTransformEdit,
   describeCombineFailure,
+  describeTransformFailure,
   renderViewerHtml,
   computeParamEdit,
   type FaceOpResultMessage,
@@ -486,6 +488,70 @@ export class ViewerHost {
     };
   }
 
+  /**
+   * Apply a move / turn to the `.shape.ts`.
+   *
+   * Third sibling of `commitFaceOp` and `commitCombine`, with the same
+   * read → compute → re-stat → write shape and the same deliberate omission of
+   * the self-write marker: the geometry exists nowhere but the file, so the
+   * watcher's reload is the only thing that will show it.
+   */
+  private async commitTransform(msg: TransformMessage): Promise<FaceOpResultMessage> {
+    const fail = (reason: string): FaceOpResultMessage => ({
+      type: "face-op-result",
+      kind: "transform",
+      requestId: msg.requestId,
+      ok: false,
+      reason,
+    });
+
+    const file = this.currentFile;
+    if (!file) return fail("no file open");
+
+    let source: string;
+    let statBefore: fs.Stats;
+    try {
+      statBefore = fs.statSync(file);
+      source = fs.readFileSync(file, "utf-8");
+    } catch (e: any) {
+      return fail(`could not read ${path.basename(file)}: ${e?.message ?? e}`);
+    }
+
+    const built = computeTransformEdit(source, {
+      partName: msg.partName,
+      rotate: msg.rotate,
+      translate: msg.translate,
+    });
+    if (!built.ok) return fail(describeTransformFailure(built.reason, msg.partName));
+
+    let next = source;
+    for (const e of [...built.edits].sort((a, b) => b.start - a.start)) {
+      next = next.slice(0, e.start) + e.text + next.slice(e.end);
+    }
+
+    try {
+      if (fs.statSync(file).mtimeMs !== statBefore.mtimeMs) {
+        return fail("file changed while writing — nothing was saved");
+      }
+      fs.writeFileSync(file, next, "utf-8");
+    } catch (e: any) {
+      return fail(`could not write ${path.basename(file)}: ${e?.message ?? e}`);
+    }
+
+    this.log(
+      `moved ${msg.partName} → ${path.basename(file)}: ${built.applied}` +
+        (built.parenthesised ? " (bracketed the expression)" : "") +
+        (built.hoistedAs ? ` (hoisted to ${built.hoistedAs})` : ""),
+    );
+    return {
+      type: "face-op-result",
+      kind: "transform",
+      requestId: msg.requestId,
+      ok: true,
+      applied: built.applied,
+    };
+  }
+
   private handleHttp(req: http.IncomingMessage, res: http.ServerResponse) {
     const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
 
@@ -575,6 +641,18 @@ export class ViewerHost {
         }
         void this.commitCombine(req).then((r) => {
           if (!r.ok) this.log(`${req.op} declined: ${r.reason}`);
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(r));
+        });
+        return;
+      }
+      if (msg?.type === "transform") {
+        const req = parseTransform(msg);
+        if (!req) {
+          this.log("transform ignored: malformed message");
+          return;
+        }
+        void this.commitTransform(req).then((r) => {
+          if (!r.ok) this.log(`transform declined: ${r.reason}`);
           if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(r));
         });
         return;
@@ -670,5 +748,40 @@ function parseCombine(msg: Record<string, any>): CombineMessage | null {
     targetName: msg.targetName,
     toolNames: msg.toolNames,
     keepTools: msg.keepTools === true,
+  };
+}
+
+type TransformMessage = Extract<WebviewToExt, { type: "transform" }>;
+
+/**
+ * Validate a `transform` off the wire.
+ *
+ * The numbers matter most here: they go straight into generated source, and a
+ * NaN or an Infinity would write a call that cannot be parsed back.
+ */
+function parseTransform(msg: Record<string, any>): TransformMessage | null {
+  const triple = (v: any): v is [number, number, number] =>
+    Array.isArray(v) && v.length === 3 && v.every((n) => typeof n === "number" && Number.isFinite(n));
+
+  if (typeof msg.requestId !== "number" || !Number.isFinite(msg.requestId)) return null;
+  if (typeof msg.partName !== "string" || msg.partName.length === 0) return null;
+
+  let rotate: TransformMessage["rotate"];
+  if (msg.rotate !== undefined) {
+    const r = msg.rotate;
+    if (!r || typeof r.angle !== "number" || !Number.isFinite(r.angle)) return null;
+    if (!triple(r.axis)) return null;
+    if (r.pivot !== "origin" && r.pivot !== "self") return null;
+    rotate = { angle: r.angle, axis: r.axis, pivot: r.pivot };
+  }
+  if (msg.translate !== undefined && !triple(msg.translate)) return null;
+  if (!rotate && !msg.translate) return null;
+
+  return {
+    type: "transform",
+    requestId: msg.requestId,
+    partName: msg.partName,
+    ...(rotate ? { rotate } : {}),
+    ...(msg.translate ? { translate: msg.translate } : {}),
   };
 }

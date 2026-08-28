@@ -8491,6 +8491,32 @@ keeps its entry in the returned parts list; one that should not, has its entry
 removed. This is what the viewer writes when you select two bodies and press
 Join, Cut or Intersect.
 
+---
+
+## Positioning a body — \`.translate\` / \`.rotate\`
+
+Plain replicad; no import needed. This is what the viewer writes when you drag
+a body's Move triad or Rotate arc.
+
+\`\`\`typescript
+plate.translate(12, 0, -5)                                // slide
+plate.rotate(90)                                          // about +Z through the origin
+plate.rotate(45, plate.boundingBox.center, [0, 0, 1])     // about its OWN centre
+plate.rotate(90, [0, 0, 0], [1, 0, 0]).translate(0, 0, 8) // turn, then slide
+\`\`\`
+
+**Never freeze a pivot as coordinates.** \`rotate(45, [20, 5, 3], …)\` is correct
+the day you write it and silently wrong the moment a parameter moves the body —
+the model still renders, the feature is still there, and it is in the wrong
+place. Write \`shape.boundingBox.center\` instead: it recomputes, so the body
+keeps turning about its own centre whatever the model becomes. That needs the
+shape to have a NAME, so give it a \`const\` rather than rotating an inline
+expression.
+
+Order matters: \`.rotate(…).translate(…)\` turns first and then slides, which is
+what a manipulator does. The other order makes the translation part of the
+radius.
+
 All three name the same picked FACE, and the finder must resolve to exactly
 one planar face. Anything else — no match, several matches, a curved face, a
 size OCCT rejects — returns the shape unchanged with a runtime warning rather

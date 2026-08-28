@@ -177,6 +177,16 @@ export interface TessellatedPart {
   surfaceArea?: number;
   centerOfMass?: [number, number, number];
   /**
+   * The centre of the OCCT bounding box — exactly what `shape.boundingBox.center`
+   * evaluates to in a user's script.
+   *
+   * Distinct from `centerOfMass`, which is the true centroid when the part was
+   * measured in full and only falls back to this. The viewer's Rotate command
+   * needs the value the FILE will compute, not the one that is geometrically
+   * nicer, because the pivot it writes is that expression.
+   */
+  boundsCenter?: [number, number, number];
+  /**
    * Derived mass in grams. Only populated when the script exports a
    * `material` with a positive `density` (g/cm³). Computed as
    * `density * volume / 1000` to convert mm³ → cm³.
@@ -331,6 +341,31 @@ export function normalizeParts(
  * coarser, fewer triangles). Clamped to [0.005, 1.0] so pathological inputs
  * (zero-size or astronomically large shapes) stay in a sensible range.
  */
+/**
+ * The centre of a shape's OCCT bounding box, or undefined when it has none.
+ *
+ * Deliberately the same quantity `shape.boundingBox.center` returns, since
+ * that is the expression the Rotate command writes as its pivot — reading it
+ * from the mesh instead would be close but not equal, and "close" in a pivot
+ * is a body that lands somewhere slightly wrong.
+ */
+function boundsCenterOf(shape: any): [number, number, number] | undefined {
+  try {
+    const c = shape?.boundingBox?.center;
+    if (
+      Array.isArray(c) &&
+      c.length === 3 &&
+      c.every((n: unknown) => typeof n === "number" && Number.isFinite(n))
+    ) {
+      return [c[0], c[1], c[2]];
+    }
+  } catch {
+    // A shape without a usable bbox simply gets no pivot; the viewer falls
+    // back to the origin rather than to a guess.
+  }
+  return undefined;
+}
+
 function chooseTolerance(shape: any): number {
   try {
     const bb = shape.boundingBox;
@@ -570,6 +605,8 @@ export function tessellatePart(part: PartInput, opts: TessellateOptions = {}): T
     edgeVertices = new Float32Array(0);
   }
 
+  const boundsCenter = boundsCenterOf(part.shape);
+
   return {
     name: part.name,
     color: part.color,
@@ -577,6 +614,7 @@ export function tessellatePart(part: PartInput, opts: TessellateOptions = {}): T
     normals,
     triangles,
     edgeVertices,
+    ...(boundsCenter ? { boundsCenter } : {}),
     ...(faceGroups ? { faceGroups } : {}),
     ...(edgeGroups ? { edgeGroups } : {}),
     // Propagate optional BOM metadata. Omit when absent so downstream

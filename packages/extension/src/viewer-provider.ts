@@ -6,7 +6,9 @@ import {
   BUNDLE_EXTERNALS,
   buildFaceOpCall,
   computeCombineEdit,
+  computeTransformEdit,
   describeCombineFailure,
+  describeTransformFailure,
   renderViewerHtml,
   computeParamEdit,
   type ExportFormat,
@@ -17,6 +19,7 @@ import {
 
 type FaceOpMessage = Extract<WebviewToExt, { type: "face-op" }>;
 type CombineMessage = Extract<WebviewToExt, { type: "combine" }>;
+type TransformMessage = Extract<WebviewToExt, { type: "transform" }>;
 import { clearSidecarParam } from "@shapeitup/shared/sidecar";
 import type { DetectedApp } from "./app-detector";
 import { getDetectedApps } from "./app-detector";
@@ -362,6 +365,12 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       case "combine":
         void this.commitCombine(msg).then((r) => {
           if (!r.ok) this.output.appendLine(`[combine] declined: ${r.reason}`);
+          this.getActiveWebview()?.postMessage(r);
+        });
+        break;
+      case "transform":
+        void this.commitTransform(msg).then((r) => {
+          if (!r.ok) this.output.appendLine(`[move] declined: ${r.reason}`);
           this.getActiveWebview()?.postMessage(r);
         });
         break;
@@ -990,6 +999,77 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       ok: true,
       applied: built.applied,
       addedImport: built.addedImport,
+    };
+  }
+
+  /**
+   * Apply a move / turn to the `.shape.ts` through the editor.
+   *
+   * Third sibling of `commitFaceOp` and `commitCombine`. Undo matters here as
+   * much as anywhere: dragging a body is the easiest of these commands to do
+   * by accident, and Cmd-Z is the thing that makes trying one cheap.
+   */
+  private async commitTransform(msg: TransformMessage): Promise<FaceOpResultMessage> {
+    const fail = (reason: string): FaceOpResultMessage => ({
+      type: "face-op-result",
+      kind: "transform",
+      requestId: msg.requestId,
+      ok: false,
+      reason,
+    });
+
+    const file = this.lastExecutedFile;
+    if (!file) return fail("no file open");
+
+    let doc: vscode.TextDocument;
+    try {
+      doc = await vscode.workspace.openTextDocument(file);
+    } catch (e: any) {
+      return fail(`could not open ${path.basename(file)}: ${e?.message ?? e}`);
+    }
+
+    const built = computeTransformEdit(doc.getText(), {
+      partName: msg.partName,
+      rotate: msg.rotate,
+      translate: msg.translate,
+    });
+    if (!built.ok) return fail(describeTransformFailure(built.reason, msg.partName));
+
+    const edit = new vscode.WorkspaceEdit();
+    for (const e of [...built.edits].sort((a, b) => b.start - a.start)) {
+      edit.replace(
+        doc.uri,
+        new vscode.Range(doc.positionAt(e.start), doc.positionAt(e.end)),
+        e.text,
+      );
+    }
+    if (!(await vscode.workspace.applyEdit(edit))) {
+      return fail("the editor rejected the edit");
+    }
+
+    const visible = vscode.window.visibleTextEditors.some(
+      (e) => e.document.uri.toString() === doc.uri.toString(),
+    );
+    if (!visible) {
+      try {
+        await doc.save();
+      } catch (e: any) {
+        return fail(`edit applied but save failed: ${e?.message ?? e}`);
+      }
+    }
+
+    this.output.appendLine(
+      `[move] ${msg.partName} in ${path.basename(file)}: ${built.applied}` +
+        (visible ? " (unsaved — yours to save)" : " (saved)") +
+        (built.parenthesised ? " — bracketed the expression" : "") +
+        (built.hoistedAs ? ` — hoisted to ${built.hoistedAs}` : ""),
+    );
+    return {
+      type: "face-op-result",
+      kind: "transform",
+      requestId: msg.requestId,
+      ok: true,
+      applied: built.applied,
     };
   }
 

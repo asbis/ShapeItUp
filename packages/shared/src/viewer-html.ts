@@ -161,7 +161,20 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
       padding: 4px 3px 2px; border-radius: 6px; border: 1px solid #3c3c3c;
       backdrop-filter: blur(8px);
       box-shadow: 0 2px 10px rgba(0,0,0,0.35);
+      /* Anchored right, so a ribbon wider than the viewport used to run off
+         the LEFT edge and take Fit and the display toggles with it — the
+         groups you reach for most, silently unreachable in a narrow pane.
+         Now it scrolls instead. */
+      max-width: calc(100% - 16px);
+      overflow-x: auto;
+      scrollbar-width: thin;
     }
+    #toolbar::-webkit-scrollbar { height: 5px; }
+    #toolbar::-webkit-scrollbar-thumb { background: #4a4a4e; border-radius: 3px; }
+    #toolbar::-webkit-scrollbar-track { background: transparent; }
+    /* A group must not shrink to fit — squeezed captions and clipped icons are
+       worse than a scrollbar. */
+    .tb-group { flex: 0 0 auto; }
     .tb-group { display: flex; flex-direction: column; align-items: center; padding: 0 5px; }
     .tb-group + .tb-group { border-left: 1px solid #383838; }
     .tb-row { display: flex; gap: 1px; }
@@ -398,14 +411,14 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
        72px clears the command ribbon above it (measured at 64.5px tall);
        #measure-info sits higher, at 40px, but the two can never be on screen
        together — entering measure mode clears the selection. */
-    #face-info, #combine-info {
+    #face-info, #combine-info, #move-info {
       position: absolute; top: 72px; left: 50%; transform: translateX(-50%);
       z-index: 23; display: none; max-width: calc(100% - 32px);
       background: rgba(37,37,38,0.96); border: 1px solid #3c3c3c;
       border-radius: 4px; box-shadow: 0 4px 14px rgba(0,0,0,0.35);
       font-size: 11px; color: #ccc;
     }
-    #face-info.visible, #combine-info.visible { display: block; }
+    #face-info.visible, #combine-info.visible, #move-info.visible { display: block; }
     .fi-main {
       display: flex; align-items: center; gap: 8px;
       padding: 4px 5px 4px 9px; white-space: nowrap;
@@ -414,15 +427,15 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
     .fi-meta { color: #8a8a8a; font-variant-numeric: tabular-nums; }
     .fi-meta b { color: #4fc1ff; font-weight: 400; }
     .fi-rule { width: 1px; align-self: stretch; background: #3c3c3c; margin: 0 1px; }
-    #face-info button, #combine-info button {
+    #face-info button, #combine-info button, #move-info button {
       background: transparent; border: 1px solid transparent; color: #bbb;
       border-radius: 3px; padding: 3px 7px; font-size: 11px; cursor: pointer;
     }
-    #face-info button:hover, #combine-info button:hover { background: #3d3d41; color: #fff; border-color: #4a4a4e; }
-    #face-info button:disabled, #combine-info button:disabled { opacity: 0.3; cursor: default; }
-    #face-info button:disabled:hover, #combine-info button:disabled:hover { background: transparent; color: #bbb; border-color: transparent; }
-    #fi-apply, #ci-apply { background: #0e639c; border-color: #1177bb; color: #fff; }
-    #fi-apply:hover, #ci-apply:hover { background: #1177bb; border-color: #1a8ad4; }
+    #face-info button:hover, #combine-info button:hover, #move-info button:hover { background: #3d3d41; color: #fff; border-color: #4a4a4e; }
+    #face-info button:disabled, #combine-info button:disabled, #move-info button:disabled { opacity: 0.3; cursor: default; }
+    #face-info button:disabled:hover, #combine-info button:disabled:hover, #move-info button:disabled:hover { background: transparent; color: #bbb; border-color: transparent; }
+    #fi-apply, #ci-apply, #mi-apply { background: #0e639c; border-color: #1177bb; color: #fff; }
+    #fi-apply:hover, #ci-apply:hover, #mi-apply:hover { background: #1177bb; border-color: #1a8ad4; }
     #fi-dist {
       width: 52px; background: #1e1e1e; border: 1px solid #4a4a4e; color: #4fc1ff;
       border-radius: 3px; padding: 3px 5px; font-size: 11px; text-align: right;
@@ -475,6 +488,36 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
     .ci-chip button:hover { color: #fff !important; background: none !important; }
     #ci-keep { display: inline-flex; align-items: center; gap: 3px; color: #8a8a8a; cursor: pointer; }
     #ci-keep input { accent-color: #0e639c; margin: 0; }
+
+    /* The Move / Rotate bar. Third of the same kind of object, so it borrows
+       the same chrome; what is its own is the numeric row, which is three
+       fields rather than one and wants tighter spacing than the others. */
+    #mi-preview {
+      border-top: 1px solid #333; padding: 4px 9px 5px; max-width: 100%;
+    }
+    #mi-code {
+      font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+      font-size: 10px; color: #7ea36f; white-space: nowrap;
+      overflow-x: auto; max-width: 100%;
+    }
+    #mi-notes { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 3px; font-size: 10px; color: #8a8a8a; }
+    #mi-notes .warn { color: #e0b060; }
+    #move-info select {
+      background: #1e1e1e; border: 1px solid #4a4a4e; color: #4fc1ff;
+      border-radius: 3px; padding: 2px 4px; font-size: 11px; font-family: inherit;
+      max-width: 130px;
+    }
+    #move-info select:focus { outline: none; border-color: #0e639c; }
+    #move-info input[type="text"] {
+      width: 52px; background: #1e1e1e; border: 1px solid #4a4a4e; color: #4fc1ff;
+      border-radius: 3px; padding: 3px 5px; font-size: 11px; text-align: right;
+      font-family: inherit; font-variant-numeric: tabular-nums;
+    }
+    #move-info input[type="text"]:focus { outline: none; border-color: #0e639c; }
+    /* The axis letter in front of each field. Dimmed and narrow: it is a label
+       on a number, not a heading. */
+    .mi-axis { color: #6f6f6f; margin-left: 3px; }
+    .mi-label { color: #8a8a8a; }
     /* The call itself never wraps — a line of code broken mid-token is harder
        to read than one you scroll. */
     #fi-code {
@@ -608,6 +651,20 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
 
         <div class="tb-group">
           <div class="tb-row">
+            <button id="btn-move" title="Drag a body along the axes \u2014 Fusion's Move/Copy" disabled>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.8v12.4M1.8 8h12.4"/><path d="M8 1.8 6.2 3.6M8 1.8l1.8 1.8M8 14.2l-1.8-1.8M8 14.2l1.8-1.8M1.8 8l1.8-1.8M1.8 8l1.8 1.8M14.2 8l-1.8-1.8M14.2 8l-1.8 1.8"/></svg>
+              <span>Move</span>
+            </button>
+            <button id="btn-rotate" title="Turn a body about an axis \u2014 Fusion's Move/Copy, rotate" disabled>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.2 8a5.2 5.2 0 1 1-1.9-4"/><path d="M13.4 1.4v2.8h-2.8"/></svg>
+              <span>Rotate</span>
+            </button>
+          </div>
+          <div class="tb-caption">Position</div>
+        </div>
+
+        <div class="tb-group">
+          <div class="tb-row">
             <div id="export-menu-wrapper" class="menu-wrapper">
               <button id="btn-export" title="Export, or open in another app">
                 <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.8v7.6m0 0 3-3m-3 3-3-3"/><path d="M2.6 11.2v2.6h10.8v-2.6"/></svg>
@@ -697,6 +754,43 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
         <div id="ci-preview">
           <div id="ci-code"></div>
           <div id="ci-notes"></div>
+        </div>
+      </div>
+
+      <div id="move-info">
+        <div class="fi-main">
+          <span class="fi-op" id="mi-op"></span>
+          <span class="mi-label">Body</span>
+          <select id="mi-body" title="The body the handle moves"></select>
+          <span id="mi-translate">
+            <span class="mi-axis">X</span><input id="mi-x" type="text" inputmode="decimal" value="0">
+            <span class="mi-axis">Y</span><input id="mi-y" type="text" inputmode="decimal" value="0">
+            <span class="mi-axis">Z</span><input id="mi-z" type="text" inputmode="decimal" value="0">
+            <span class="fi-unit">mm</span>
+          </span>
+          <span id="mi-rotate" hidden>
+            <input id="mi-angle" type="text" inputmode="decimal" value="0">
+            <span class="fi-unit">\u00B0</span>
+            <span class="mi-label">about</span>
+            <select id="mi-axis" title="The axis to turn about">
+              <option value="x">X</option>
+              <option value="y">Y</option>
+              <option value="z" selected>Z</option>
+            </select>
+            <span class="mi-label">at</span>
+            <select id="mi-pivot" title="Where the turn happens">
+              <option value="self" selected>body centre</option>
+              <option value="origin">world origin</option>
+            </select>
+          </span>
+          <span class="fi-rule"></span>
+          <button id="mi-reset" title="Put the body back where the file has it">Reset</button>
+          <button id="mi-apply" title="Write this into the file">Apply</button>
+          <button id="mi-cancel" title="Cancel (Esc)">&#10005;</button>
+        </div>
+        <div id="mi-preview">
+          <div id="mi-code"></div>
+          <div id="mi-notes"></div>
         </div>
       </div>
 
