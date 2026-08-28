@@ -203,3 +203,32 @@ function main({ w, d, t }) {
     expect(away).toBeGreaterThan(15);
   });
 });
+
+describe("a copy leaves the original where it was", () => {
+  it("writes a second body at the moved position and does not touch the first", async () => {
+    const rot = { angle: 90, axis: [0, 0, 1] as Triple, pivot: "self" as TransformPivot };
+    const t: Triple = [40, 0, 12];
+    const edit = computeTransformEdit(SOURCE, {
+      partName: "block",
+      rotate: rot,
+      translate: t,
+      copyAs: "block copy",
+    });
+    expect(edit.ok).toBe(true);
+    if (!edit.ok) return;
+
+    const r = await core.execute(applyEdits(SOURCE, edit.edits), undefined, {
+      partStats: "full",
+    });
+    expect(r.parts.map((p: any) => p.name)).toEqual(["block", "block copy"]);
+    // The body that was dragged from has not moved a micron.
+    close(r.parts[0]!.centerOfMass as Triple, START);
+    // And the copy is exactly where the manipulator said it would be.
+    close(
+      r.parts[1]!.centerOfMass as Triple,
+      predict(START, { ...rot, pivot: START }, t),
+    );
+    // Same solid, not a re-derived one.
+    expect(r.parts[1]!.volume).toBeCloseTo(r.parts[0]!.volume!, 4);
+  });
+});

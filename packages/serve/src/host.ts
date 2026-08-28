@@ -521,8 +521,13 @@ export class ViewerHost {
       partName: msg.partName,
       rotate: msg.rotate,
       translate: msg.translate,
+      copyAs: msg.copyAs,
     });
-    if (!built.ok) return fail(describeTransformFailure(built.reason, msg.partName));
+    if (!built.ok) {
+      // A name clash reports the NAME, not the body that was dragged.
+      const detail = built.reason === "name-taken" ? msg.copyAs : msg.partName;
+      return fail(describeTransformFailure(built.reason, detail));
+    }
 
     let next = source;
     for (const e of [...built.edits].sort((a, b) => b.start - a.start)) {
@@ -539,7 +544,8 @@ export class ViewerHost {
     }
 
     this.log(
-      `moved ${msg.partName} → ${path.basename(file)}: ${built.applied}` +
+      `${built.copiedAs ? `copied ${msg.partName} as ${built.copiedAs}` : `moved ${msg.partName}`}` +
+        ` → ${path.basename(file)}: ${built.applied}` +
         (built.parenthesised ? " (bracketed the expression)" : "") +
         (built.hoistedAs ? ` (hoisted to ${built.hoistedAs})` : ""),
     );
@@ -776,6 +782,7 @@ function parseTransform(msg: Record<string, any>): TransformMessage | null {
   }
   if (msg.translate !== undefined && !triple(msg.translate)) return null;
   if (!rotate && !msg.translate) return null;
+  if (msg.copyAs !== undefined && (typeof msg.copyAs !== "string" || !msg.copyAs)) return null;
 
   return {
     type: "transform",
@@ -783,5 +790,6 @@ function parseTransform(msg: Record<string, any>): TransformMessage | null {
     partName: msg.partName,
     ...(rotate ? { rotate } : {}),
     ...(msg.translate ? { translate: msg.translate } : {}),
+    ...(msg.copyAs ? { copyAs: msg.copyAs } : {}),
   };
 }

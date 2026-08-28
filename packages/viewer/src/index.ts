@@ -1581,6 +1581,7 @@ const miZEl = document.getElementById("mi-z") as HTMLInputElement;
 const miAngleEl = document.getElementById("mi-angle") as HTMLInputElement;
 const miAxisEl = document.getElementById("mi-axis") as HTMLSelectElement;
 const miPivotEl = document.getElementById("mi-pivot") as HTMLSelectElement;
+const miCopyEl = document.getElementById("mi-copy-toggle") as HTMLInputElement;
 const miResetEl = document.getElementById("mi-reset") as HTMLButtonElement;
 const miApplyEl = document.getElementById("mi-apply") as HTMLButtonElement;
 const miCancelEl = document.getElementById("mi-cancel") as HTMLButtonElement;
@@ -1668,6 +1669,59 @@ function movePart(): PartInfo | undefined {
 }
 
 /**
+ * The second body a copy will produce, shown while the drag is still open.
+ *
+ * A clone of the part's meshes rather than a translucent hint, because that is
+ * literally what the commit writes — the same solid, somewhere else. Geometry
+ * and materials are SHARED with the original, so tearing this down must remove
+ * it without disposing anything: disposing here would take the real body's
+ * buffers with it.
+ */
+let moveCopyGhost: THREE.Group | null = null;
+
+function clearMoveCopyGhost(): void {
+  if (!moveCopyGhost) return;
+  overlayGroup.remove(moveCopyGhost);
+  moveCopyGhost = null;
+}
+
+function updateMoveCopyGhost(): void {
+  const part = movePart();
+  if (!moveMode || !miCopyEl.checked || !part) {
+    clearMoveCopyGhost();
+    return;
+  }
+  if (!moveCopyGhost) {
+    const group = new THREE.Group();
+    const mesh = part.mesh.clone();
+    // The picker raycasts the real parts; a ghost that answered would let you
+    // select a face of a body that does not exist yet.
+    mesh.raycast = () => {};
+    group.add(mesh);
+    if (part.edgeLines) {
+      const edges = part.edgeLines.clone();
+      edges.raycast = () => {};
+      group.add(edges);
+    }
+    overlayGroup.add(group);
+    moveCopyGhost = group;
+  }
+  moveCopyGhost.position.copy(part.group.position);
+  moveCopyGhost.quaternion.copy(part.group.quaternion);
+}
+
+/** The name a copy would take: the body's, plus enough to make it unique. */
+function copyName(): string {
+  const base = `${movePartName ?? "body"} copy`;
+  const taken = new Set(currentParts.map((p) => p.name));
+  if (!taken.has(base)) return base;
+  for (let i = 2; i < 100; i++) {
+    if (!taken.has(`${base} ${i}`)) return `${base} ${i}`;
+  }
+  return `${base} ${Date.now()}`;
+}
+
+/**
  * Where the rotation turns, in model coordinates.
  *
  * "self" resolves to OCCT's bounding-box centre — the value the written
@@ -1697,6 +1751,17 @@ function applyMoveTransform(): void {
   const rotated = p.clone().applyQuaternion(moveQuat);
   part.group.quaternion.copy(moveQuat);
   part.group.position.copy(p).sub(rotated).add(moveDelta);
+
+  if (miCopyEl.checked) {
+    // Copying does not move the body it was dragged from. Show the transform
+    // on the ghost and put the original back, so what is on screen is what the
+    // two entries in the file will be.
+    updateMoveCopyGhost();
+    part.group.position.set(0, 0, 0);
+    part.group.quaternion.set(0, 0, 0, 1);
+  } else {
+    clearMoveCopyGhost();
+  }
 }
 
 /** Put every body back where the file has it. */
@@ -1729,6 +1794,8 @@ function syncMoveGizmo(): void {
 
   transformControls.mode = moveMode;
   if (moveMode === "translate") {
+    // The handle tracks the thing being moved, which when copying is the
+    // ghost, not the body it came from.
     moveProxy.position.copy(moveAnchor).add(moveDelta);
     moveProxy.quaternion.set(0, 0, 0, 1);
     transformControls.showX = true;
@@ -1770,6 +1837,7 @@ function setMoveMode(mode: MoveMode | null): void {
     moveDelta.set(0, 0, 0);
     moveQuat.set(0, 0, 0, 1);
     clearMoveTransforms();
+    clearMoveCopyGhost();
     transformControls.detach();
     transformControls.enabled = false;
     transformHelper.visible = false;
@@ -1884,7 +1952,8 @@ function renderMovePreview(): void {
   const angle = angleAboutAxis(moveQuat, AXIS_VECTORS[axisName] ?? AXIS_VECTORS.z!);
   const selfPivot = miPivotEl.value === "self";
 
-  let code = name;
+  const copying = miCopyEl.checked;
+  let code = copying ? `${name}.clone()` : name;
   let wrote = false;
   const turning = Math.abs(angle) > 1e-6;
   if (turning) {
@@ -1922,6 +1991,9 @@ function renderMovePreview(): void {
         warn: true,
       });
     }
+  }
+  if (wrote && copying) {
+    notes.push({ text: `adds a second body named "${copyName()}" — the original stays put` });
   }
   for (const n of notes) {
     const el = document.createElement("span");
@@ -2000,6 +2072,7 @@ function applyMove(): void {
     ...(moveDelta.lengthSq() > 1e-12
       ? { translate: [moveDelta.x, moveDelta.y, moveDelta.z] as [number, number, number] }
       : {}),
+    ...(miCopyEl.checked ? { copyAs: copyName() } : {}),
   });
 }
 
@@ -2015,6 +2088,7 @@ for (const [id, mode] of [
 miBodyEl.addEventListener("change", () => {
   movePartName = miBodyEl.value || null;
   clearMoveTransforms();
+  clearMoveCopyGhost();
   moveDelta.set(0, 0, 0);
   moveQuat.set(0, 0, 0, 1);
   captureMoveAnchor();
@@ -2052,6 +2126,16 @@ for (const el of [miXEl, miYEl, miZEl, miAngleEl]) {
     }
   });
 }
+
+miCopyEl.addEventListener("change", () => {
+  // Switching sides moves the transform between the body and the ghost, so
+  // both have to be put back before it is re-applied.
+  clearMoveTransforms();
+  clearMoveCopyGhost();
+  applyMoveTransform();
+  syncMoveGizmo();
+  renderMovePreview();
+});
 
 miResetEl.addEventListener("click", () => {
   moveDelta.set(0, 0, 0);
@@ -2815,6 +2899,8 @@ function handleWorkerMessage(msg: WorkerToWebview) {
         // the un-committed move. Put it back rather than have the body snap
         // home mid-edit.
         if (moveMode) {
+          // The ghost holds clones of meshes this render has just replaced.
+          clearMoveCopyGhost();
           applyMoveTransform();
           syncMoveGizmo();
           renderMoveBar();

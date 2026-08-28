@@ -518,6 +518,8 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
        on a number, not a heading. */
     .mi-axis { color: #6f6f6f; margin-left: 3px; }
     .mi-label { color: #8a8a8a; }
+    #mi-copy { display: inline-flex; align-items: center; gap: 3px; color: #8a8a8a; cursor: pointer; }
+    #mi-copy input { accent-color: #0e639c; margin: 0; }
     /* The call itself never wraps — a line of code broken mid-token is harder
        to read than one you scroll. */
     #fi-code {
@@ -783,6 +785,10 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
               <option value="origin">world origin</option>
             </select>
           </span>
+          <label id="mi-copy" title="Fusion's Create Copy: leave the body where it is and add the moved result as a new one">
+            <input type="checkbox" id="mi-copy-toggle">
+            <span>Copy</span>
+          </label>
           <span class="fi-rule"></span>
           <button id="mi-reset" title="Put the body back where the file has it">Reset</button>
           <button id="mi-apply" title="Write this into the file">Apply</button>

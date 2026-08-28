@@ -8464,6 +8464,45 @@ These are what the viewer writes when you select a face and press Extrude,
 Fillet or Chamfer — the GUI produces a code edit rather than hidden state, so
 the file stays the only description of the model.
 
+All three name the same picked FACE, and the finder must resolve to exactly
+one planar face. Anything else — no match, several matches, a curved face, a
+size OCCT rejects — returns the shape unchanged with a runtime warning rather
+than throwing.
+
+**Why fillet takes a FaceFinder and not an EdgeFinder.** The obvious hand-written
+form is \`shape.fillet(2, (e) => e.inPlane("XY", thickness))\`, and on a simple
+part it is equivalent. On a part whose top has already been filleted it is not:
+\`EdgeFinder.inPlane\` also returns arcs that merely START in that plane and
+curve away out of it, and OCCT then rejects the whole operation. \`filletFace\`
+reads the face's own outer and inner wires instead, so it gets the boundary
+exactly — including hole rims.
+
+## One edge at a time — \`filletEdge\`, \`chamferEdge\`
+
+\`\`\`typescript
+import { filletEdge, chamferEdge } from "shapeitup";
+
+filletEdge(plate, (e) => e.containsPoint([0, -depth / 2, thickness]), 2)
+\`\`\`
+
+An edge is named by a POINT that lies on it. \`containsPoint\` is the only
+predicate that reliably isolates one edge — intersecting two planes does not:
+replicad's edge \`inPlane\` over-matches and returns the edge on the opposite
+face plus a corner arc that is merely tangent to the plane.
+
+Write the coordinates as expressions, not numbers. A point frozen at the
+values you picked stops lying on the edge as soon as the part changes size:
+\`containsPoint([0, -30, 8])\` finds the edge on a 60-deep plate and nothing at
+all on a 90-deep one, so the fillet silently disappears. The same point as
+\`[0, -depth / 2, thickness]\` follows both.
+
+**A fillet carries across edges that meet smoothly.** That is OCCT's rule and
+standard CAD behaviour, not something these helpers add. On a plate with a
+ROUNDED outline the straight edges are tangent to the corner arcs, so picking
+one 68 mm edge rounds the whole 269.7 mm boundary. On the same plate with a
+SHARP outline, the same pick rounds exactly that edge. The viewer previews the
+chain, so what lights up is what changes.
+
 ---
 
 ## Combining bodies — \`joinBodies\`, \`cutBodies\`, \`intersectBodies\`
@@ -8517,44 +8556,22 @@ Order matters: \`.rotate(…).translate(…)\` turns first and then slides, whic
 what a manipulator does. The other order makes the translation part of the
 radius.
 
-All three name the same picked FACE, and the finder must resolve to exactly
-one planar face. Anything else — no match, several matches, a curved face, a
-size OCCT rejects — returns the shape unchanged with a runtime warning rather
-than throwing.
-
-**Why fillet takes a FaceFinder and not an EdgeFinder.** The obvious hand-written
-form is \`shape.fillet(2, (e) => e.inPlane("XY", thickness))\`, and on a simple
-part it is equivalent. On a part whose top has already been filleted it is not:
-\`EdgeFinder.inPlane\` also returns arcs that merely START in that plane and
-curve away out of it, and OCCT then rejects the whole operation. \`filletFace\`
-reads the face's own outer and inner wires instead, so it gets the boundary
-exactly — including hole rims.
-
-## One edge at a time — \`filletEdge\`, \`chamferEdge\`
+**Transforms CONSUME the shape they are called on.** \`.translate\`, \`.rotate\`,
+\`.mirror\` and \`.scale\` all end with \`this.delete()\` — unlike \`.fuse\`,
+\`.cut\` and \`.intersect\`, which leave both operands alive. So the moment a
+transformed shape is named anywhere else, that other use reads a freed object
+and the render dies with "This object has been deleted", pointing at a line
+that looks fine. Reach for \`.clone()\` whenever the shape is still needed:
 
 \`\`\`typescript
-import { filletEdge, chamferEdge } from "shapeitup";
-
-filletEdge(plate, (e) => e.containsPoint([0, -depth / 2, thickness]), 2)
+return [
+  { shape: boss, name: "boss" },
+  { shape: boss.clone().translate(-40, 0, 0), name: "boss copy" },  // clone, or the entry above is gone
+];
 \`\`\`
 
-An edge is named by a POINT that lies on it. \`containsPoint\` is the only
-predicate that reliably isolates one edge — intersecting two planes does not:
-replicad's edge \`inPlane\` over-matches and returns the edge on the opposite
-face plus a corner arc that is merely tangent to the plane.
-
-Write the coordinates as expressions, not numbers. A point frozen at the
-values you picked stops lying on the edge as soon as the part changes size:
-\`containsPoint([0, -30, 8])\` finds the edge on a 60-deep plate and nothing at
-all on a 90-deep one, so the fillet silently disappears. The same point as
-\`[0, -depth / 2, thickness]\` follows both.
-
-**A fillet carries across edges that meet smoothly.** That is OCCT's rule and
-standard CAD behaviour, not something these helpers add. On a plate with a
-ROUNDED outline the straight edges are tangent to the corner arcs, so picking
-one 68 mm edge rounds the whole 269.7 mm boundary. On the same plate with a
-SHARP outline, the same pick rounds exactly that edge. The viewer previews the
-chain, so what lights up is what changes.
+That pattern — one body copied to a second position — is what the viewer's
+Move bar writes when "Copy" is ticked.
 
 ---
 

@@ -1032,8 +1032,12 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       partName: msg.partName,
       rotate: msg.rotate,
       translate: msg.translate,
+      copyAs: msg.copyAs,
     });
-    if (!built.ok) return fail(describeTransformFailure(built.reason, msg.partName));
+    if (!built.ok) {
+      const detail = built.reason === "name-taken" ? msg.copyAs : msg.partName;
+      return fail(describeTransformFailure(built.reason, detail));
+    }
 
     const edit = new vscode.WorkspaceEdit();
     for (const e of [...built.edits].sort((a, b) => b.start - a.start)) {
@@ -1059,7 +1063,8 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     }
 
     this.output.appendLine(
-      `[move] ${msg.partName} in ${path.basename(file)}: ${built.applied}` +
+      `[move] ${built.copiedAs ? `${msg.partName} → ${built.copiedAs}` : msg.partName}` +
+        ` in ${path.basename(file)}: ${built.applied}` +
         (visible ? " (unsaved — yours to save)" : " (saved)") +
         (built.parenthesised ? " — bracketed the expression" : "") +
         (built.hoistedAs ? ` — hoisted to ${built.hoistedAs}` : ""),

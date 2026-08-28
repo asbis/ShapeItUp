@@ -269,6 +269,15 @@ export type WebviewToExt =
         pivot: "origin" | "self";
       };
       translate?: [number, number, number];
+      /**
+       * Fusion's "Create Copy": leave the body where it is and write the moved
+       * result as a NEW entry under this name.
+       *
+       * The name comes from the viewer, which is the side that knows what is
+       * on screen; the host still refuses one the file already uses rather
+       * than writing two bodies that answer to the same name.
+       */
+      copyAs?: string;
     }
   | { type: "ready" }
   // Webview asks the extension for the cached OCCT (+ optional Manifold) bytes

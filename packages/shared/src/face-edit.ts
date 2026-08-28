@@ -406,6 +406,17 @@ export interface PartSpan {
   /** The `shape:` value expression. */
   start: number;
   end: number;
+  /**
+   * The `name:` value, quotes included.
+   *
+   * Copying a body means writing a second entry that differs from the first in
+   * exactly two places — its shape and its name — so the copy is built by
+   * splicing those two spans of the original rather than by reconstructing an
+   * object literal and losing the colour, quantity and material that were on
+   * it.
+   */
+  nameStart: number;
+  nameEnd: number;
 }
 
 /**
@@ -472,6 +483,8 @@ export function findPartSpan(source: string, partName: string): PartSpanResult {
           objEnd: end,
           start: shapeEntry.valueStart,
           end: shapeEntry.valueEnd,
+          nameStart: nameEntry.valueStart,
+          nameEnd: nameEntry.valueEnd,
         };
       } else {
         noShape = true;
@@ -489,6 +502,50 @@ export function findPartSpan(source: string, partName: string): PartSpanResult {
   // do not model; picking either is a coin flip on the user's geometry.
   if (matches > 1) return { ok: false, reason: "unparseable" };
   return { ok: true, span: found };
+}
+
+/**
+ * Every body the file names.
+ *
+ * Same walker as {@link findPartSpan}, and trivia-aware for the same reason: a
+ * `name:` inside a comment or a doc example is not a body, and treating one as
+ * taken would push a copy to a number it did not need.
+ */
+export function listPartNames(source: string): string[] {
+  const names: string[] = [];
+  let i = 0;
+  while (i < source.length) {
+    const before = i;
+    i = skipTrivia(source, i);
+    if (i !== before) continue;
+    const c = source[i];
+    if (c === undefined) break;
+    if (c === '"' || c === "'" || c === "`") {
+      const end = skipString(source, i);
+      if (end === -1) break;
+      i = end;
+      continue;
+    }
+    if (c !== "{") {
+      i++;
+      continue;
+    }
+    const end = skipBalanced(source, i, "{", "}");
+    if (end === -1) {
+      i++;
+      continue;
+    }
+    const pairs = scanObjectPairs(source, i + 1, end - 1);
+    const nameEntry = pairs.find((p) => p.name === "name");
+    const shapeEntry = pairs.find((p) => p.name === "shape");
+    if (nameEntry && shapeEntry) {
+      const value = stringLiteralValue(nameEntry.raw);
+      if (value !== null && !names.includes(value)) names.push(value);
+    }
+    // Step INTO the object: parts nest one level down inside an assembly.
+    i++;
+  }
+  return names;
 }
 
 /** The `shape:` span alone — what the face operations wrap. */

@@ -173,3 +173,136 @@ describe("refusals", () => {
     if (!r.ok) expect(r.reason).toBe("part-not-found");
   });
 });
+
+describe("copying", () => {
+  it("leaves the original alone and writes a second entry below it", () => {
+    const { out, copiedAs } = run(SOURCE, {
+      partName: "base",
+      translate: [30, 0, 0],
+      copyAs: "base copy",
+    });
+    expect(copiedAs).toBe("base copy");
+    // The body that was dragged from is untouched.
+    expect(out).toContain('{ shape: base, name: "base", color: "#888" },');
+    expect(out).toContain('{ shape: base.clone().translate(30, 0, 0), name: "base copy", color: "#888" },');
+    expect(parses(out)).toBe(true);
+  });
+
+  it("carries the rest of the entry across rather than rebuilding it", () => {
+    // colour, quantity and material are none of this module's business — a
+    // copy that dropped them would be a different body wearing the same shape.
+    const rich = SOURCE.replace(
+      '{ shape: base, name: "base", color: "#888" },',
+      '{ shape: base, name: "base", color: "#888", qty: 4, material: { density: 1.24 } },',
+    );
+    const { out } = run(rich, { partName: "base", translate: [1, 0, 0], copyAs: "b2" });
+    expect(out).toContain('name: "b2", color: "#888", qty: 4, material: { density: 1.24 } }');
+    expect(parses(out)).toBe(true);
+  });
+
+  it("lines the copy up with the entry it came from", () => {
+    const { out } = run(SOURCE, { partName: "base", translate: [1, 0, 0], copyAs: "b2" });
+    expect(out).toMatch(/\n {4}\{ shape: base\.clone\(\)\.translate\(1, 0, 0\), name: "b2"/);
+  });
+
+  it("adds the comma the last entry was missing", () => {
+    const noTrailing = SOURCE.replace(
+      '    { shape: base, name: "base", color: "#888" },\n',
+      '    { shape: base, name: "base", color: "#888" }\n',
+    );
+    const { out } = run(noTrailing, { partName: "base", translate: [1, 0, 0], copyAs: "b2" });
+    expect(parses(out)).toBe(true);
+    expect(out).toContain('{ shape: base, name: "base", color: "#888" },');
+  });
+
+  it("hoists an inline expression so the two entries share one solid", () => {
+    const inline = SOURCE.replace("{ shape: base,", '{ shape: base.mirror("XZ"),');
+    const { out, hoistedAs } = run(inline, {
+      partName: "base",
+      translate: [5, 0, 0],
+      copyAs: "b2",
+    });
+    expect(hoistedAs).toBe("base2");
+    expect(out).toContain('const base2 = base.mirror("XZ");');
+    expect(out).toContain('{ shape: base2, name: "base"');
+    expect(out).toContain('{ shape: base2.clone().translate(5, 0, 0), name: "b2"');
+    // Built once, used by both.
+    expect(out.match(/base\.mirror/g)?.length).toBe(1);
+    expect(parses(out)).toBe(true);
+  });
+
+  it("copies a turn as readily as a move", () => {
+    const { out } = run(SOURCE, {
+      partName: "base",
+      rotate: { angle: 180, axis: [0, 0, 1], pivot: "self" },
+      copyAs: "mirrored",
+    });
+    expect(out).toContain('{ shape: base.clone().rotate(180, base.boundingBox.center, [0, 0, 1]), name: "mirrored"');
+    expect(parses(out)).toBe(true);
+  });
+
+  it("clones, because replicad's transforms delete the shape they are given", () => {
+    // `.translate` ends with `this.delete()`. Without the clone the original
+    // entry — evaluated first, but read again at tessellation — points at a
+    // freed solid, and the render dies on a line that looks fine.
+    const { out } = run(SOURCE, { partName: "base", translate: [1, 0, 0], copyAs: "b2" });
+    expect(out).toContain("base.clone().translate(1, 0, 0)");
+  });
+
+  it("refuses a name the file already gives to a body", () => {
+    // Two entries answering to one name is a model where every later lookup —
+    // this editor's included — becomes a coin flip.
+    const r = computeTransformEdit(SOURCE, {
+      partName: "base",
+      translate: [1, 0, 0],
+      copyAs: "base",
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("name-taken");
+  });
+
+  it("does not count a name that only appears in a comment as taken", () => {
+    const decoy = SOURCE.replace(
+      "export default function main",
+      '// { shape: x, name: "b2" }\nexport default function main',
+    );
+    const r = computeTransformEdit(decoy, {
+      partName: "base",
+      translate: [1, 0, 0],
+      copyAs: "b2",
+    });
+    expect(r.ok).toBe(true);
+  });
+});
+
+describe("cloning a move that is not a copy", () => {
+  it("leaves the common case clean — nothing else names the body", () => {
+    // `base` appears in its own declaration and inside the entry being edited,
+    // and `name: "base"` is a string. None of those is a later read.
+    const { out } = run(SOURCE, { partName: "base", translate: [1, 0, 0] });
+    expect(out).toContain("base.translate(1, 0, 0)");
+    expect(out).not.toContain(".clone()");
+  });
+
+  it("clones when a later line still needs the body", () => {
+    const shared = SOURCE.replace(
+      '    { shape: base, name: "base", color: "#888" },\n',
+      '    { shape: base, name: "base", color: "#888" },\n' +
+        '    { shape: base.fuse(base), name: "twin", color: "#888" },\n',
+    );
+    const { out } = run(shared, { partName: "base", translate: [1, 0, 0] });
+    // Transforming `base` in place would delete it before `twin` is built.
+    expect(out).toContain("base.clone().translate(1, 0, 0)");
+    expect(parses(out)).toBe(true);
+  });
+
+  it("does not clone a hoisted const, which nothing else can name", () => {
+    const inline = SOURCE.replace("{ shape: base,", '{ shape: base.mirror("XZ"),');
+    const { out } = run(inline, {
+      partName: "base",
+      rotate: { angle: 10, axis: [0, 0, 1], pivot: "self" },
+    });
+    expect(out).toContain("base2.rotate(10, base2.boundingBox.center, [0, 0, 1])");
+    expect(out).not.toContain("base2.clone()");
+  });
+});
