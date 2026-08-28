@@ -652,3 +652,85 @@ export function tangentChain(
   }
   return [...chain].sort((x, y) => x - y);
 }
+
+/**
+ * Which way an operation on this selection acts, for the drag arrow.
+ *
+ * A face has a normal, and that is the answer for all three operations: an
+ * extrude moves along it, and a fillet on the face's boundary is most legibly
+ * described by the face it belongs to.
+ *
+ * An edge has no normal. The direction used is the outward radial at that
+ * point — from the part's centre to the edge, with the component along the
+ * edge removed. For a convex edge on a roughly centred part that is close to
+ * the true bisector of the two adjacent faces, which is where the fillet
+ * actually cuts. It is an approximation, and it is only ever used to aim a
+ * handle: the number it produces is what the operation consumes, not the
+ * vector.
+ */
+export function operationAxis(part: PickablePart, sel: Selection): [number, number, number] {
+  if (sel.kind === "face") {
+    return sel.info.normal ?? [0, 0, 1];
+  }
+
+  const v = part.edgeVertices;
+  if (!v) return [0, 0, 1];
+
+  // Edge direction, from its first segment.
+  const a: [number, number, number] = [
+    v[sel.start * 3]!,
+    v[sel.start * 3 + 1]!,
+    v[sel.start * 3 + 2]!,
+  ];
+  const b: [number, number, number] = [
+    v[(sel.start + 1) * 3]!,
+    v[(sel.start + 1) * 3 + 1]!,
+    v[(sel.start + 1) * 3 + 2]!,
+  ];
+  const t = normalize([b[0] - a[0], b[1] - a[1], b[2] - a[2]]);
+
+  const c = partCentre(part);
+  const radial: [number, number, number] = [
+    sel.point[0] - c[0],
+    sel.point[1] - c[1],
+    sel.point[2] - c[2],
+  ];
+  // Strip the along-edge component so the handle is perpendicular to the edge.
+  const along = radial[0] * t[0] + radial[1] * t[1] + radial[2] * t[2];
+  const out = normalize([
+    radial[0] - along * t[0],
+    radial[1] - along * t[1],
+    radial[2] - along * t[2],
+  ]);
+  // A degenerate radial (the edge passes through the centre) leaves nothing to
+  // point along; fall back to +Z rather than emitting a zero vector.
+  return Number.isFinite(out[0]) && (out[0] !== 0 || out[1] !== 0 || out[2] !== 0)
+    ? out
+    : [0, 0, 1];
+}
+
+/** Bounding-box centre of a part's mesh vertices. */
+function partCentre(part: PickablePart): [number, number, number] {
+  const v = part.vertices;
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < v.length; i += 3) {
+    for (let k = 0; k < 3; k++) {
+      const c = v[i + k]!;
+      if (c < min[k]!) min[k] = c;
+      if (c > max[k]!) max[k] = c;
+    }
+  }
+  return [(min[0]! + max[0]!) / 2, (min[1]! + max[1]!) / 2, (min[2]! + max[2]!) / 2];
+}
+
+function normalize(v: number[]): [number, number, number] {
+  const L = Math.hypot(v[0]!, v[1]!, v[2]!);
+  if (!(L > 0)) return [0, 0, 0];
+  return [v[0]! / L, v[1]! / L, v[2]! / L];
+}
+
+/** Where the drag arrow attaches for this selection. */
+export function operationOrigin(sel: Selection): [number, number, number] {
+  return sel.kind === "face" ? sel.info.center : sel.point;
+}

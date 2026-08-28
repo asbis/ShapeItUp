@@ -10,6 +10,7 @@ import {
 } from "./camera";
 import { buildMesh, buildEdges } from "./mesh-builder";
 import { syncEdgeHighlightWidths } from "./theme";
+import { DragHandle, projectRayOntoAxis } from "./drag-handle";
 import {
   FacePicker,
   buildEdgesHighlight,
@@ -17,6 +18,8 @@ import {
   describePlacement,
   edgesInPlane,
   faceBounds,
+  operationAxis,
+  operationOrigin,
   tangentChain,
   formatFaceArea,
   formatTriple,
@@ -91,6 +94,15 @@ scene.add(overlayGroup);
 
 /** Scratch vector for reading the drawing-buffer size each frame. */
 const renderSize = new THREE.Vector2();
+/** Scratch vector for the camera's forward direction, read each frame. */
+const cameraForward = new THREE.Vector3();
+
+/**
+ * The drag arrow. It sits in the overlay group so it is disposed and hidden
+ * with everything else when the model is replaced.
+ */
+const dragHandle = new DragHandle();
+overlayGroup.add(dragHandle.group);
 
 // --- Compass / gnomon overlay --------------------------------------------
 // A small RGB axis indicator pinned to the lower-right corner so agents can
@@ -373,7 +385,10 @@ function setActiveOp(op: FaceOpKind | null): void {
   fiToolsEl.hidden = op !== null;
   fiFormEl.hidden = op === null;
   clearEdgePreview();
-  if (!op) return;
+  if (!op) {
+    dragHandle.hide();
+    return;
+  }
 
   fiOpEl.textContent = OP_LABEL[op];
   fiDistEl.value = OP_DEFAULTS[op];
@@ -384,8 +399,35 @@ function setActiveOp(op: FaceOpKind | null): void {
   // Render before focusing: the preview IS the feature, and leaving it blank
   // until the user types means the first thing they see is an empty promise.
   renderOpPreview();
+  placeDragHandle();
   fiDistEl.focus();
   fiDistEl.select();
+}
+
+/**
+ * Aim the drag arrow at the current selection, or hide it when there is
+ * nothing to aim at.
+ *
+ * The anchor is transformed by the part's world matrix for the same reason the
+ * highlight overlays are: the overlay group is a sibling of the part groups,
+ * so a part the motion sim has moved would otherwise leave its handle behind.
+ */
+function placeDragHandle(): void {
+  const sel = facePicker.getSelection();
+  const part = sel ? (currentParts[sel.partIndex] as PickablePart | undefined) : undefined;
+  if (!sel || !part || !activeOp) {
+    dragHandle.hide();
+    return;
+  }
+  const m = part.mesh.matrixWorld;
+  const origin = new THREE.Vector3(...operationOrigin(sel)).applyMatrix4(m);
+  const axis = new THREE.Vector3(...operationAxis(part, sel))
+    .transformDirection(m)
+    .normalize();
+  dragHandle.show({
+    origin: [origin.x, origin.y, origin.z],
+    axis: [axis.x, axis.y, axis.z],
+  });
 }
 
 function updateFaceInfoPanel(): void {
@@ -442,7 +484,10 @@ function updateFaceInfoPanel(): void {
     btn.title = why ?? tip;
   }
 
-  if (activeOp) renderOpPreview();
+  if (activeOp) {
+    renderOpPreview();
+    placeDragHandle();
+  }
   faceInfoEl.classList.add("visible");
 }
 
@@ -728,16 +773,25 @@ for (const ev of ["pointerup", "pointercancel", "pointerleave"] as const) {
  */
 const EDGE_GRAB_PX = 7;
 
-function edgeGrabRadius(): number {
+/**
+ * How much world space one screen pixel covers at the model's distance.
+ *
+ * The unit that lets screen-sized things — an edge grab radius, the drag
+ * arrow — keep a constant apparent size while the camera moves.
+ */
+function worldPerPixel(): number {
   const h = renderer.domElement.clientHeight || 1;
-  const dist = camera.position.distanceTo(controls.target);
   if (camera instanceof THREE.PerspectiveCamera) {
-    const worldPerPixel = (2 * dist * Math.tan((camera.fov * Math.PI) / 360)) / h;
-    return EDGE_GRAB_PX * worldPerPixel;
+    const dist = camera.position.distanceTo(controls.target);
+    return (2 * dist * Math.tan((camera.fov * Math.PI) / 360)) / h;
   }
   // Orthographic: the view height IS the world height, no distance term.
   const ortho = camera as THREE.OrthographicCamera;
-  return (EDGE_GRAB_PX * (ortho.top - ortho.bottom)) / ortho.zoom / h;
+  return (ortho.top - ortho.bottom) / ortho.zoom / h;
+}
+
+function edgeGrabRadius(): number {
+  return EDGE_GRAB_PX * worldPerPixel();
 }
 
 /**
@@ -755,8 +809,127 @@ function pickAt(clientX: number, clientY: number) {
   return facePicker.pick(clientX, clientY, renderer.domElement);
 }
 
+// ── Dragging the arrow ────────────────────────────────────────────────────
+// The gesture a CAD user reaches for once something is selected: grab the
+// handle and pull. It edits the NUMBER, not the file — Apply still commits,
+// so what you see in the preview line is still what gets written.
+
+interface HandleDrag {
+  /** Distance the operation had when the drag started. */
+  startValue: number;
+  /** Where along the axis the pointer ray first landed. */
+  startAlong: number;
+  origin: THREE.Vector3;
+  axis: THREE.Vector3;
+  pointerId: number;
+}
+
+let handleDrag: HandleDrag | null = null;
+/**
+ * A drag ends with a `click` on the canvas, and a short one passes the
+ * click-vs-drag slop test — which would re-pick, or clear the selection, the
+ * instant the user let go of the arrow.
+ */
+let suppressNextClick = false;
+const handleRaycaster = new THREE.Raycaster();
+const handleNdc = new THREE.Vector2();
+
+/** Set the raycaster from a pointer position, and return true if it worked. */
+function aimRaycaster(clientX: number, clientY: number): boolean {
+  const rect = renderer.domElement.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return false;
+  handleNdc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+  handleNdc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+  handleRaycaster.setFromCamera(handleNdc, camera);
+  return true;
+}
+
+/** Begin a drag if the pointer is on the arrow. Returns true if it started. */
+function tryStartHandleDrag(event: PointerEvent): boolean {
+  // An arrow pointing at the camera cannot be dragged meaningfully — it is
+  // faded for exactly that reason, and letting the press through means the
+  // user can orbit away instead of fighting a dead handle.
+  if (!dragHandle.visible || !dragHandle.isUsable || !activeOp) return false;
+  if (!aimRaycaster(event.clientX, event.clientY)) return false;
+  if (handleRaycaster.intersectObject(dragHandle.hitTarget, false).length === 0) return false;
+
+  const anchor = dragHandle.getAnchor();
+  if (!anchor) return false;
+  const value = parseDistance() ?? 0;
+  const origin = new THREE.Vector3(...anchor.origin);
+  const axis = dragHandle.worldAxis(value);
+  const startAlong = projectRayOntoAxis(handleRaycaster.ray, origin, axis);
+  if (startAlong === null) return false;
+
+  handleDrag = { startValue: value, startAlong, origin, axis, pointerId: event.pointerId };
+  suppressNextClick = true;
+  // The orbit controls would otherwise spin the camera under the drag.
+  controls.enabled = false;
+  try {
+    // Keeps the drag alive when the pointer leaves the canvas. Not essential —
+    // and it throws for a pointer the browser does not consider active — so a
+    // failure here must not take the drag down with it.
+    renderer.domElement.setPointerCapture(event.pointerId);
+  } catch {
+    /* capture is a convenience, not a requirement */
+  }
+  renderer.domElement.style.cursor = "ns-resize";
+  return true;
+}
+
+/**
+ * Round to something a person would have typed.
+ *
+ * A raw projection produces 4.7382913 mm, which is both unusable as a
+ * dimension and unreadable in the preview line. The step follows the
+ * magnitude so a 0.5 mm fillet stays adjustable while a 40 mm extrude does not
+ * crawl.
+ */
+function snapDragValue(v: number): number {
+  const step = Math.abs(v) >= 20 ? 0.5 : Math.abs(v) >= 2 ? 0.1 : 0.05;
+  return Math.round(v / step) * step;
+}
+
+function updateHandleDrag(event: PointerEvent): void {
+  if (!handleDrag || event.pointerId !== handleDrag.pointerId) return;
+  if (!aimRaycaster(event.clientX, event.clientY)) return;
+
+  const along = projectRayOntoAxis(handleRaycaster.ray, handleDrag.origin, handleDrag.axis);
+  // Null means the view has swung nearly parallel to the axis, where the
+  // closest-approach point is unstable — hold the last value rather than
+  // letting a pixel of mouse movement throw the dimension across the room.
+  if (along === null) return;
+
+  const raw = handleDrag.startValue + (along - handleDrag.startAlong);
+  // Fillet and chamfer have no negative side; extrude does, and crossing zero
+  // is how you turn a pull into a push.
+  const clamped = activeOp === "extrude" ? raw : Math.max(0, raw);
+  const snapped = snapDragValue(clamped);
+  fiDistEl.value = String(Number(snapped.toFixed(2)));
+  renderOpPreview();
+}
+
+function endHandleDrag(event: PointerEvent): void {
+  if (!handleDrag || event.pointerId !== handleDrag.pointerId) return;
+  handleDrag = null;
+  controls.enabled = true;
+  renderer.domElement.style.cursor = "";
+  try {
+    renderer.domElement.releasePointerCapture(event.pointerId);
+  } catch {
+    // The capture may already be gone if the pointer was cancelled.
+  }
+}
+
+renderer.domElement.addEventListener("pointerdown", (event) => {
+  tryStartHandleDrag(event);
+}, true);
+renderer.domElement.addEventListener("pointermove", updateHandleDrag);
+renderer.domElement.addEventListener("pointerup", endHandleDrag);
+renderer.domElement.addEventListener("pointercancel", endHandleDrag);
+
 renderer.domElement.addEventListener("pointermove", (event) => {
-  if (orbiting || measureMode) return;
+  if (orbiting || measureMode || handleDrag) return;
   const sel = pickAt(event.clientX, event.clientY);
   facePicker.setHover(sel);
   renderer.domElement.style.cursor = sel ? "pointer" : "";
@@ -2329,6 +2502,10 @@ renderer.domElement.addEventListener("pointerdown", (event) => {
 });
 
 renderer.domElement.addEventListener("click", (event) => {
+  if (suppressNextClick) {
+    suppressNextClick = false;
+    return;
+  }
   // Gnomon click wins over everything else (including measure mode) so the
   // bottom-right nav widget is always responsive.
   if (tryGnomonClick(event)) return;
@@ -2788,6 +2965,12 @@ function animate() {
   // and back — and one sync per frame is correct for all of them.
   renderer.getSize(renderSize);
   syncEdgeHighlightWidths(overlayGroup, renderSize.x, renderSize.y);
+  // The arrow is sized in screen space, so it has to be rescaled whenever the
+  // camera moves — which is any frame at all.
+  if (dragHandle.visible) {
+    camera.getWorldDirection(cameraForward);
+    dragHandle.update(parseDistance() ?? 0, worldPerPixel(), cameraForward);
+  }
   // autoClear was flipped to false so the gnomon can composite on top. We
   // now have to clear the color + depth manually before the main render.
   renderer.clear();
