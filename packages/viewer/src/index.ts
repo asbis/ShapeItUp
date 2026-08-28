@@ -9,7 +9,7 @@ import {
   isAxisAligned,
 } from "./camera";
 import { buildMesh, buildEdges } from "./mesh-builder";
-import { syncEdgeHighlightWidths } from "./theme";
+import { createDeltaMaterial, syncEdgeHighlightWidths } from "./theme";
 import { DragHandle, projectRayOntoAxis } from "./drag-handle";
 import {
   FacePicker,
@@ -31,7 +31,7 @@ import {
 import { initMessageHandler, onMessage, postToExtension } from "./message-handler";
 import type { WorkerToWebview, TessellatedPart, DetectedApp } from "@shapeitup/shared";
 import { synthesizeEdgeSelector, synthesizeFaceSelector } from "@shapeitup/shared";
-import type { PreviewFaceOp } from "@shapeitup/shared";
+import type { PreviewDelta, PreviewFaceOp } from "@shapeitup/shared";
 import { PART_COLORS } from "./theme";
 import { setupSim, updateSim, clearSim, initSimPanel, toggleSimPanel } from "./sim-panel";
 
@@ -410,6 +410,7 @@ function setActiveOp(op: FaceOpKind | null): void {
   clearEdgePreview();
   if (!op) {
     dragHandle.hide();
+    clearDeltaGhost();
     const wasArmed = armedTarget;
     armedTarget = null;
     // A revert restores identical geometry, so the picked face is genuinely
@@ -710,6 +711,47 @@ function renderOpPreview(): void {
   }
 }
 
+// ── The added / removed ghost ─────────────────────────────────────────────
+// Blue for material appearing, red for material going away. Only extrude gets
+// one: its prism IS the delta, so showing it costs nothing. A fillet's delta
+// is a thin sliver whose `base.cut(result)` boolean measured ~690 ms on an
+// 80x60 plate — too slow to compute while someone is dragging, and the cyan
+// edge highlight already says which edges are affected.
+
+let deltaGhost: THREE.Mesh | null = null;
+
+function clearDeltaGhost(): void {
+  if (!deltaGhost) return;
+  overlayGroup.remove(deltaGhost);
+  deltaGhost.geometry.dispose();
+  (deltaGhost.material as THREE.Material).dispose();
+  deltaGhost = null;
+}
+
+/**
+ * Build the ghost for a delta the worker just produced.
+ *
+ * Dispatched from the WORKER switch, not `onMessage` — that one carries
+ * host→viewer traffic, and a handler registered there for a worker message is
+ * simply never called. Which is exactly what happened the first time.
+ */
+function showDeltaGhost(delta: PreviewDelta): void {
+  clearDeltaGhost();
+  // A ghost with no operation behind it belongs to a render since superseded.
+  if (!activeOp || !armedTarget) return;
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(delta.vertices, 3));
+  geometry.setAttribute("normal", new THREE.BufferAttribute(delta.normals, 3));
+  geometry.setIndex(new THREE.BufferAttribute(delta.triangles, 1));
+  const mesh = new THREE.Mesh(geometry, createDeltaMaterial(delta.mode));
+  mesh.raycast = () => {};
+  mesh.renderOrder = 1;
+  mesh.frustumCulled = false;
+  overlayGroup.add(mesh);
+  deltaGhost = mesh;
+}
+
+
 // ── Live preview of the pending operation ─────────────────────────────────
 // The arrow tells you how far; this tells you what it does. It costs one OCCT
 // run, so it is debounced and only fires when the number actually changed.
@@ -920,6 +962,7 @@ function applyOp(): void {
     distance: d,
   });
   // The commit rebuilds from the file, which supersedes any preview.
+  clearDeltaGhost();
   clearTimeout(previewTimer);
   previewShowing = false;
   previewBaseJs = null;
@@ -1584,6 +1627,9 @@ function handleWorkerMessage(msg: WorkerToWebview) {
       statusEl.textContent = "Ready";
       break;
 
+    case "preview-delta":
+      showDeltaGhost(msg.delta);
+      break;
     case "mesh-start":
       clearWorkerResponseTimer();
       try {

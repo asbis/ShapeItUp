@@ -288,6 +288,21 @@ export interface FaceInfo {
   area?: number;
 }
 
+/**
+ * The material a previewed operation adds or removes, tessellated for display.
+ *
+ * Blue for added, red for removed — the convention a CAD user already reads
+ * without being told. Only produced where the delta solid falls out of the
+ * operation for free; see `FaceOpOptions.onDelta` in @shapeitup/core for why
+ * the rounding operations do not get one.
+ */
+export interface PreviewDelta {
+  mode: "added" | "removed";
+  vertices: Float32Array;
+  normals: Float32Array;
+  triangles: Uint32Array;
+}
+
 // A single tessellated part
 export interface TessellatedPart {
   name: string;
@@ -340,6 +355,8 @@ export interface ParamDef {
 // Worker → Webview
 export type WorkerToWebview =
   | { type: "ready" }
+  /** The material a previewed operation adds or removes. See {@link PreviewDelta}. */
+  | { type: "preview-delta"; delta: PreviewDelta }
   // Streaming mesh protocol: mesh-start announces the batch and its params so
   // the viewer can clear the scene and update sliders immediately. Each
   // mesh-part delivers one fully-tessellated part with its mesh buffers as

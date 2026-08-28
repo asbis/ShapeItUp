@@ -46,6 +46,23 @@ async function run(js: string, previewOp?: any) {
   return r.parts;
 }
 
+async function runFull(js: string, previewOp?: any) {
+  return core.execute(js, undefined, { partStats: "full", previewOp });
+}
+
+/** Volume of a closed triangle mesh, by tetrahedron integration about origin. */
+function meshVolume(v: Float32Array, t: Uint32Array): number {
+  let total = 0;
+  for (let i = 0; i < t.length; i += 3) {
+    const a = t[i]! * 3, b = t[i + 1]! * 3, c = t[i + 2]! * 3;
+    total +=
+      (v[a]! * (v[b + 1]! * v[c + 2]! - v[b + 2]! * v[c + 1]!) -
+        v[a + 1]! * (v[b]! * v[c + 2]! - v[b + 2]! * v[c]!) +
+        v[a + 2]! * (v[b]! * v[c + 1]! - v[b + 1]! * v[c]!)) / 6;
+  }
+  return Math.abs(total);
+}
+
 describe("preview op", () => {
   it("does nothing when none is given", async () => {
     const base = await run(PLATE);
@@ -145,5 +162,77 @@ describe("preview op", () => {
     await run(PLATE, { op: "extrude", partName: null, target: TOP_FACE, distance: 20 });
     const after = await run(PLATE);
     expect(vol(after)).toBeCloseTo(vol(base), 1);
+  });
+
+  describe("the added / removed ghost", () => {
+    // 80 x 60 plate less a r=6 bore.
+    const AREA = 80 * 60 - Math.PI * 36;
+
+    it("reports a pull as added, and its volume is the material gained", () => {
+      // Checked against the model's own volume change, so the ghost cannot
+      // drift from what the operation actually did.
+      return (async () => {
+        const base = await run(PLATE);
+        const r = await runFull(PLATE, {
+          op: "extrude", partName: null, target: TOP_FACE, distance: 6,
+        });
+        expect(r.previewDelta?.mode).toBe("added");
+        const ghost = meshVolume(r.previewDelta!.vertices, r.previewDelta!.triangles);
+        const gained = (r.parts[0]!.volume ?? 0) - (base[0]!.volume ?? 0);
+        // Coarse tessellation, so a percent of slack on the round bore.
+        expect(ghost).toBeGreaterThan(gained * 0.97);
+        expect(ghost).toBeLessThan(gained * 1.03);
+        expect(gained).toBeCloseTo(AREA * 6, 0);
+      })();
+    });
+
+    it("reports a push as removed", () => {
+      return (async () => {
+        const base = await run(PLATE);
+        const r = await runFull(PLATE, {
+          op: "extrude", partName: null, target: TOP_FACE, distance: -3,
+        });
+        expect(r.previewDelta?.mode).toBe("removed");
+        const ghost = meshVolume(r.previewDelta!.vertices, r.previewDelta!.triangles);
+        const lost = (base[0]!.volume ?? 0) - (r.parts[0]!.volume ?? 0);
+        expect(ghost).toBeGreaterThan(lost * 0.97);
+        expect(ghost).toBeLessThan(lost * 1.03);
+      })();
+    });
+
+    it("produces none for fillet or chamfer, deliberately", () => {
+      // Their delta is a thin sliver, recoverable only through a
+      // `base.cut(result)` boolean measured at ~690 ms on this plate — too
+      // slow to compute while someone is dragging. The edge highlight carries
+      // that information instead.
+      return (async () => {
+        for (const op of ["fillet", "chamfer"] as const) {
+          const r = await runFull(PLATE, {
+            op, partName: null, target: TOP_FACE, distance: 2,
+          });
+          expect(r.previewDelta).toBeUndefined();
+          // The operation itself still happened.
+          expect(r.parts[0]!.volume).toBeLessThan(AREA * 8);
+        }
+      })();
+    });
+
+    it("produces none when the operation declined", () => {
+      return (async () => {
+        const r = await runFull(PLATE, {
+          op: "extrude",
+          partName: null,
+          target: { kind: "face", plane: "XY", offset: 999 },
+          distance: 5,
+        });
+        expect(r.previewDelta).toBeUndefined();
+      })();
+    });
+
+    it("produces none without a preview op at all", () => {
+      return (async () => {
+        expect((await runFull(PLATE)).previewDelta).toBeUndefined();
+      })();
+    });
   });
 });

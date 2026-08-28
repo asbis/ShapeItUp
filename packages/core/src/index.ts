@@ -7,7 +7,7 @@
  * (script execution, tessellation, measurement, export) is identical.
  */
 
-import type { ParamDef, PreviewFaceOp } from "@shapeitup/shared";
+import type { ParamDef, PreviewDelta, PreviewFaceOp } from "@shapeitup/shared";
 import { executeScript } from "./executor";
 export { extractParamsStatic, extractConfigStatic, extractExpectedContactsStatic } from "./executor";
 import { describeFaces, normalizeParts, tessellatePart, type MeshQuality, type PartInput, type PartStatsLevel, type TessellatedPart } from "./tessellate";
@@ -87,6 +87,11 @@ export interface ExecutedPart extends TessellatedPart {
 
 export interface ExecutionResult {
   parts: ExecutedPart[];
+  /**
+   * The material a previewed operation added or removed, when the operation
+   * produced it as a by-product. See {@link PreviewDelta}.
+   */
+  previewDelta?: PreviewDelta;
   params: ParamDef[];
   execTimeMs: number;
   tessTimeMs: number;
@@ -853,14 +858,14 @@ export async function initCore(
    * and pushes a runtime warning, which is exactly what a preview should do
    * when the operation would not have worked anyway.
    */
-  function applyPreviewOp(parts: PartInput[], preview: PreviewFaceOp): void {
+  function applyPreviewOp(parts: PartInput[], preview: PreviewFaceOp): PreviewDelta | undefined {
     // A named part when the script returns a list, otherwise the only one.
     const index = preview.partName
       ? parts.findIndex((p) => p.name === preview.partName)
       : parts.length === 1
         ? 0
         : -1;
-    if (index < 0) return;
+    if (index < 0) return undefined;
     const part = parts[index]!;
 
     // Bound to a local so the narrowing survives into the closures.
@@ -870,11 +875,15 @@ export async function initCore(
         ? (f: any) => f.inPlane(target.plane, target.offset)
         : (e: any) => e.containsPoint(target.point);
 
+    // Only extrude yields one for free — see FaceOpOptions.onDelta.
+    let deltaShape: any;
+    const capture = { onDelta: (d: any) => { deltaShape = d; } };
+
     try {
       switch (preview.op) {
         case "extrude":
-          if (target.kind !== "face") return;
-          part.shape = extrudeFace(part.shape, finder, preview.distance);
+          if (target.kind !== "face") return undefined;
+          part.shape = extrudeFace(part.shape, finder, preview.distance, capture);
           break;
         case "fillet":
           part.shape =
@@ -892,6 +901,22 @@ export async function initCore(
     } catch {
       // The helpers already swallow their own failures; anything reaching here
       // is unexpected, and a preview must never take the render down with it.
+      return undefined;
+    }
+
+    if (!deltaShape) return undefined;
+    try {
+      // Coarse on purpose: this is a translucent ghost, not a surface anyone
+      // measures, and it is re-tessellated on every step of a drag.
+      const m = deltaShape.mesh({ tolerance: 0.4, angularTolerance: 0.4 });
+      return {
+        mode: preview.distance > 0 ? "added" : "removed",
+        vertices: new Float32Array(m.vertices),
+        normals: new Float32Array(m.normals),
+        triangles: new Uint32Array(m.triangles),
+      };
+    } catch {
+      return undefined;
     }
   }
 
@@ -955,7 +980,9 @@ export async function initCore(
     const parts = normalizeParts(result, { scriptHasMaterial: !!material });
     // The viewer's live preview: apply the pending operation to the part it
     // targets, so the user sees the geometry before committing it to the file.
-    if (streaming?.previewOp) applyPreviewOp(parts, streaming.previewOp);
+    const previewDelta = streaming?.previewOp
+      ? applyPreviewOp(parts, streaming.previewOp)
+      : undefined;
     lastParts = parts;
     const execTime = performance.now() - execStart;
 
@@ -1186,6 +1213,7 @@ export async function initCore(
 
     return {
       parts: executed,
+      previewDelta,
       params,
       execTimeMs: Math.round(execTime),
       tessTimeMs: Math.round(tessTime),

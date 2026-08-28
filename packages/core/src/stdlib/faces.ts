@@ -21,6 +21,17 @@ import { pushRuntimeWarning } from "./warnings";
 export interface FaceOpOptions {
   /** Suppress the runtime warning when the operation cannot be applied. */
   silent?: boolean;
+  /**
+   * Receives the material the operation adds or removes, when that solid
+   * happens to exist as a by-product.
+   *
+   * Only {@link extrudeFace} calls it, and only because the prism it builds IS
+   * the delta — handing it over costs nothing. The rounding helpers do not:
+   * their delta is a thin sliver along the edges, and recovering it would mean
+   * a `base.cut(result)` boolean measured at ~690 ms on an 80x60 plate, which
+   * is not a price a live preview can pay.
+   */
+  onDelta?: (delta: Shape3D) => void;
 }
 
 /** @deprecated Use {@link FaceOpOptions}. Kept so existing scripts still type. */
@@ -141,6 +152,10 @@ export function extrudeFace(
         new Sketch(wire).extrude(distance, { extrusionDirection: dir }) as Shape3D,
       );
     }
+
+    // The prism IS the material this operation adds or removes, so a preview
+    // can colour it without recomputing anything.
+    opts.onDelta?.(prism);
 
     // A negative distance builds the prism back INTO the solid, so the same
     // geometry is subtracted rather than added.

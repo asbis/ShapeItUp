@@ -180,6 +180,17 @@ async function executeUserScript(
       previewOp,
     });
 
+    // The added/removed ghost, if the operation produced one. Sent before
+    // mesh-done so the viewer has it by the time the render settles.
+    if (result.previewDelta) {
+      const d = result.previewDelta;
+      self.postMessage({ type: "preview-delta", delta: d }, [
+        d.vertices.buffer,
+        d.normals.buffer,
+        d.triangles.buffer,
+      ] as any);
+    }
+
     self.postMessage({
       type: "mesh-done",
       params: result.params,

@@ -45,6 +45,18 @@ export const THEME = {
   edgeSelectWidth: 4,
   edgeHoverWidth: 3,
 
+  // The added / removed ghost. Blue for material appearing, red for material
+  // going away — the pairing a CAD user reads without being told, and the one
+  // Fusion uses for join versus cut.
+  // Saturated on purpose. The part palette is deliberately muted, so a ghost
+  // in the same register vanishes against it — a blue delta on the default
+  // blue-grey part was invisible the first time this was tried.
+  deltaAddedColor: 0x1e90ff,
+  deltaRemovedColor: 0xff3b30,
+  deltaAddedEmissive: 0x0b3a66,
+  deltaRemovedEmissive: 0x5a1512,
+  deltaOpacity: 0.55,
+
   // Lighting
   ambientColor: 0x404050,
   ambientIntensity: 0.5,
@@ -174,5 +186,26 @@ export function syncEdgeHighlightWidths(group: THREE.Object3D, width: number, he
   group.traverse((child) => {
     const material = (child as THREE.Mesh).material;
     if (material instanceof LineMaterial) material.resolution.set(width, height);
+  });
+}
+
+/**
+ * Material for the ghost of what an operation adds or removes.
+ *
+ * Drawn double-sided because a delta is often a thin shell you end up looking
+ * into, and with `depthWrite` off so it tints the model behind it rather than
+ * punching a hole in it.
+ */
+export function createDeltaMaterial(mode: "added" | "removed"): THREE.MeshPhongMaterial {
+  return new THREE.MeshPhongMaterial({
+    color: mode === "added" ? THEME.deltaAddedColor : THEME.deltaRemovedColor,
+    // Emissive so the ghost keeps its identity in shadow: an unlit face of a
+    // translucent overlay would otherwise go the same near-black as the model.
+    emissive: mode === "added" ? THEME.deltaAddedEmissive : THEME.deltaRemovedEmissive,
+    transparent: true,
+    opacity: THEME.deltaOpacity,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+    shininess: 20,
   });
 }
