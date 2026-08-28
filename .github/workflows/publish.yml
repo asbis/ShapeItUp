@@ -164,6 +164,13 @@ jobs:
         # NOTE: no `continue-on-error` here — a failed npm publish MUST abort
         # the workflow so the VSIX below never ships referencing a server
         # version that wasn't actually released.
+        #
+        # But "already on the registry" is not a failure, it is the goal state.
+        # Treating it as one is how v1.24.0 and v1.27.0 both ended with npm
+        # published and the Marketplace step never reached: the PAT below had
+        # expired, and re-running afterwards died here on a version that had
+        # succeeded the first time. The two channels have to be able to fail
+        # independently, or one broken credential silently strands the other.
         run: |
           set -euo pipefail
           npm install -g npm@latest
@@ -174,10 +181,24 @@ jobs:
             echo "::error::no pnpm-pack tarball found in packages/mcp-server" >&2
             exit 1
           fi
-          echo "Publishing $TGZ via OIDC trusted publishing"
-          npm publish "$TGZ" --access public
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if npm view "@shapeitup/mcp-server@$PKG_VERSION" version >/dev/null 2>&1; then
+            echo "@shapeitup/mcp-server@$PKG_VERSION is already published — skipping."
+            echo "This step is idempotent so a re-run can reach the Marketplace step."
+          else
+            echo "Publishing $TGZ via OIDC trusted publishing"
+            npm publish "$TGZ" --access public
+          fi
 
       - name: Publish to VS Marketplace
+        # The PAT is an Azure DevOps token and they EXPIRE — a year by default.
+        # When it lapses this step is the only thing that fails, and because
+        # npm has already published by then the release looks half-done rather
+        # than broken. The listing sat four versions behind before anyone
+        # noticed. If this step fails with "Personal Access Token used has
+        # expired", mint a new one at https://aka.ms/vscodepat and update the
+        # VSCE_PAT repository secret; the npm step above is idempotent, so
+        # re-running the same release afterwards will get here.
         run: cd packages/extension && npx @vscode/vsce publish
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
