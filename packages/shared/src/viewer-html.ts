@@ -845,7 +845,7 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
         <div class="fi-main">
           <span class="fi-op" id="ai-op"></span>
           <span class="ai-label">Body</span>
-          <select id="ai-body" title="The body to copy"></select>
+          <select id="ai-body" title="The body to copy \u2014 or click one in the view"></select>
 
           <span id="ai-mirror" hidden>
             <span class="ai-label">across</span>

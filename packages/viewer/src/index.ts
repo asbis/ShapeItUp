@@ -1215,6 +1215,10 @@ function applyCombineTint(): void {
   for (const part of currentParts) {
     const mat = part.mesh.material as THREE.MeshPhongMaterial;
     if (!mat.emissive) continue;
+    // Arrange owns the tint when it is armed. The two commands clear each
+    // other on arming, so this only matters for the incidental repaints —
+    // a rebuild, a body toggled — which can otherwise land in either order.
+    if (combineOp === null && arrangeMode !== null) continue;
     const tint =
       combineOp === null
         ? 0x000000
@@ -1224,6 +1228,29 @@ function applyCombineTint(): void {
             ? TOOL_TINT
             : 0x000000;
     mat.emissive.setHex(tint);
+  }
+}
+
+/**
+ * Light up the body Mirror / Pattern is acting on.
+ *
+ * Without this the command is invisible: the preview replaces the body with
+ * its own copies, and with several bodies on screen there is nothing to say
+ * which one they came from — or which one a change to the fields would affect.
+ * The dropdown knows, but the dropdown is not where anyone is looking.
+ */
+function applyArrangeTint(): void {
+  for (const part of currentParts) {
+    const mat = part.mesh.material as THREE.MeshPhongMaterial;
+    if (!mat.emissive) continue;
+    // Only touch what this command owns. Combine has its own tint and the two
+    // are mutually exclusive, but clearing indiscriminately here would still
+    // stomp on whatever set it last.
+    if (arrangeMode === null) {
+      if (combineOp === null) mat.emissive.setHex(0x000000);
+      continue;
+    }
+    mat.emissive.setHex(part.name === arrangePartName ? TARGET_TINT : 0x000000);
   }
 }
 
@@ -2311,6 +2338,7 @@ function setArrangeMode(mode: ArrangeMode | null): void {
     arrangeBodies = [];
     arrangeInfoEl.classList.remove("visible");
     revertPreview();
+    applyArrangeTint();
     updateArrangeButtons();
     return;
   }
@@ -2339,6 +2367,7 @@ function setArrangeMode(mode: ArrangeMode | null): void {
   aiPatternEl.hidden = mode !== "pattern";
   arrangeInfoEl.classList.add("visible");
   renderArrangeBar();
+  applyArrangeTint();
   updateArrangeButtons();
   scheduleArrangePreview();
 }
@@ -2482,6 +2511,7 @@ for (const [id, mode] of [
 
 aiBodyEl.addEventListener("change", () => {
   arrangePartName = aiBodyEl.value || null;
+  applyArrangeTint();
   renderArrangePreview();
   scheduleArrangePreview();
 });
@@ -2736,7 +2766,7 @@ renderer.domElement.addEventListener("pointermove", (event) => {
   if (orbiting || measureMode || handleDrag) return;
   // Combine picks bodies, so highlighting a FACE under the cursor would
   // advertise a selection the click is not going to make.
-  if (combineOp || moveMode) {
+  if (combineOp || moveMode || arrangeMode) {
     facePicker.setHover(null);
     // The gizmo sets its own cursor while it is hovered; do not fight it.
     if (!transformControls.axis) {
@@ -3256,6 +3286,9 @@ function handleWorkerMessage(msg: WorkerToWebview) {
           renderMoveBar();
         }
         updateMoveButtons();
+        // A rebuild replaces every mesh and so every material the tint was
+        // written onto. Re-apply, or the armed body goes dark mid-command.
+        applyArrangeTint();
         updateArrangeButtons();
         // Motion sim: if the script exported a `sim` block, resolve it against
         // the parts we just rendered and show the timeline. No-op otherwise.
@@ -4499,6 +4532,23 @@ renderer.domElement.addEventListener("click", (event) => {
     if (combineOp) {
       const body = pickBodyAt(event.clientX, event.clientY);
       if (body) combineClickBody(body);
+      return;
+    }
+    // Mirror and Pattern pick their body the same way — by clicking it. The
+    // dropdown alone left no way to tell WHICH body was armed, or to change
+    // it without hunting through a menu of names.
+    if (arrangeMode) {
+      const body = pickBodyAt(event.clientX, event.clientY);
+      // Only bodies the FILE has. A mirror previewed as a new body puts an
+      // extra one on screen, and arming the command on something that does not
+      // exist yet would fail at commit for a reason nothing on screen explains.
+      if (body && body !== arrangePartName && arrangeBodies.includes(body)) {
+        arrangePartName = body;
+        aiBodyEl.value = body;
+        applyArrangeTint();
+        renderArrangePreview();
+        scheduleArrangePreview();
+      }
       return;
     }
     // With the gizmo up, a click on another body retargets it — the same
