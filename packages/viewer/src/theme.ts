@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
 
 export const THEME = {
   background: 0x2d2d30,
@@ -39,6 +40,10 @@ export const THEME = {
   // anything, including the dark background.
   edgeSelectColor: 0x00e5ff,
   edgeHoverColor: 0x7fe9ff,
+  // Widths in PIXELS, not world units — see createEdgeHighlightMaterial for
+  // why these cannot be plain THREE.Line widths.
+  edgeSelectWidth: 4,
+  edgeHoverWidth: 3,
 
   // Lighting
   ambientColor: 0x404050,
@@ -122,5 +127,52 @@ export function createHighlightMaterial(mode: "hover" | "select"): THREE.MeshBas
     polygonOffset: true,
     polygonOffsetFactor: -2,
     polygonOffsetUnits: -2,
+  });
+}
+
+/**
+ * Material for a highlighted edge.
+ *
+ * A `THREE.LineBasicMaterial` cannot do this: its `linewidth` is WebGL's
+ * `lineWidth`, which nearly every implementation clamps to 1 px, so the
+ * property is silently ignored and every highlight comes out hairline. Three's
+ * `LineMaterial` sidesteps the clamp by expanding each segment into a
+ * camera-facing quad in the vertex shader, where `linewidth` is a real uniform
+ * measured in pixels.
+ *
+ * The cost is `resolution`: the shader converts pixels to clip space itself,
+ * so it has to be told the drawing-buffer size, and a stale value makes lines
+ * the wrong thickness. The render loop syncs it — see syncEdgeHighlightWidths.
+ */
+export function createEdgeHighlightMaterial(mode: "hover" | "select"): LineMaterial {
+  const selected = mode === "select";
+  return new LineMaterial({
+    color: selected ? THEME.edgeSelectColor : THEME.edgeHoverColor,
+    linewidth: selected ? THEME.edgeSelectWidth : THEME.edgeHoverWidth,
+    // Pixels, not millimetres: a highlight should stay legible at any zoom,
+    // where a world-unit width would vanish as you pull back.
+    worldUnits: false,
+    transparent: true,
+    opacity: selected ? 0.95 : 0.8,
+    // The point of a highlight is to be seen, including where the edge is
+    // behind the surface it belongs to.
+    depthTest: false,
+  });
+}
+
+/**
+ * Push the current drawing-buffer size into every edge-highlight material in
+ * `group`.
+ *
+ * Called once per frame rather than hooked to a resize event, because the
+ * renderer is resized from several places — the window handler, and the
+ * screenshot path that swaps in a fixed resolution and back. One sync in the
+ * render loop is correct for all of them, and the group holds at most a
+ * handful of objects.
+ */
+export function syncEdgeHighlightWidths(group: THREE.Object3D, width: number, height: number): void {
+  group.traverse((child) => {
+    const material = (child as THREE.Mesh).material;
+    if (material instanceof LineMaterial) material.resolution.set(width, height);
   });
 }

@@ -1,5 +1,12 @@
 import * as THREE from "three";
-import { THEME, createModelMaterial, createEdgeMaterial, createHighlightMaterial } from "./theme";
+import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
+import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
+import {
+  createEdgeHighlightMaterial,
+  createEdgeMaterial,
+  createHighlightMaterial,
+  createModelMaterial,
+} from "./theme";
 
 export function buildMesh(
   vertices: Float32Array,
@@ -66,25 +73,27 @@ export function buildFaceHighlight(
 /**
  * Overlay for the edges an operation is about to modify.
  *
- * Drawn on top of the model's own black edge lines, so it needs both a
- * depthTest waiver and a high renderOrder — a highlighted edge that vanishes
- * behind the surface it belongs to would defeat the point, which is letting
- * the user count what they are about to round.
+ * A `LineSegments2` rather than a plain `LineSegments`, because the whole
+ * point is to be thicker than the model's own hairline edges and WebGL will
+ * not draw a line wider than 1 px. See createEdgeHighlightMaterial.
+ *
+ * `positions` is in LineSegments pair layout — the same layout replicad's
+ * `meshEdges().lines` already uses, so spans can be handed straight through.
  */
 export function buildEdgeHighlight(
-  points: Float32Array,
+  positions: Float32Array,
   mode: "hover" | "select" = "select",
-): THREE.LineSegments {
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.BufferAttribute(points, 3));
-  const material = new THREE.LineBasicMaterial({
-    color: mode === "select" ? THEME.edgeSelectColor : THEME.edgeHoverColor,
-    depthTest: false,
-    transparent: true,
-    opacity: mode === "select" ? 0.95 : 0.7,
-  });
-  const lines = new THREE.LineSegments(geometry, material);
+): LineSegments2 {
+  const geometry = new LineSegmentsGeometry();
+  // setPositions wants a plain array-like of xyz; a Float32Array qualifies.
+  geometry.setPositions(positions as unknown as number[]);
+  const lines = new LineSegments2(geometry, createEdgeHighlightMaterial(mode));
+  // Never a raycast target: it sits on top of the very edge it describes.
   lines.raycast = () => {};
   lines.renderOrder = 2;
+  // LineSegments2 computes a bounding sphere lazily and warns without one when
+  // frustum culling runs; the overlay is small and always near the model, so
+  // skipping the test is cheaper than maintaining it.
+  lines.frustumCulled = false;
   return lines;
 }

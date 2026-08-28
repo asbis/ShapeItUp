@@ -463,7 +463,7 @@ export function buildEdgesHighlight(
   part: PickablePart,
   edgeIndices: number[],
   mode: "hover" | "select" = "select",
-): THREE.LineSegments | null {
+): THREE.Object3D | null {
   const { edgeVertices: v, edgeGroups: g } = part;
   if (!v || !g || edgeIndices.length === 0) return null;
 

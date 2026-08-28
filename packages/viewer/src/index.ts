@@ -9,6 +9,7 @@ import {
   isAxisAligned,
 } from "./camera";
 import { buildMesh, buildEdges } from "./mesh-builder";
+import { syncEdgeHighlightWidths } from "./theme";
 import {
   FacePicker,
   buildEdgesHighlight,
@@ -87,6 +88,9 @@ scene.add(modelGroup);
 // to know about them.
 const overlayGroup = new THREE.Group();
 scene.add(overlayGroup);
+
+/** Scratch vector for reading the drawing-buffer size each frame. */
+const renderSize = new THREE.Vector2();
 
 // --- Compass / gnomon overlay --------------------------------------------
 // A small RGB axis indicator pinned to the lower-right corner so agents can
@@ -445,13 +449,14 @@ function updateFaceInfoPanel(): void {
 // ── Edge preview ──────────────────────────────────────────────────────────
 // A fillet radius typed into a box is a guess about which edges you meant.
 // Highlighting them turns it into something you can count before committing.
-let edgePreview: THREE.LineSegments | null = null;
+let edgePreview: THREE.Object3D | null = null;
 
 function clearEdgePreview(): void {
   if (!edgePreview) return;
   overlayGroup.remove(edgePreview);
-  edgePreview.geometry.dispose();
-  (edgePreview.material as THREE.Material).dispose();
+  const mesh = edgePreview as THREE.Mesh;
+  mesh.geometry?.dispose?.();
+  if (mesh.material instanceof THREE.Material) mesh.material.dispose();
   edgePreview = null;
 }
 
@@ -702,6 +707,14 @@ controls.addEventListener("start", () => {
 controls.addEventListener("end", () => {
   orbiting = false;
 });
+// Belt and braces: a drag that ends without OrbitControls seeing it — a
+// cancelled touch, a pointer that leaves the window — would otherwise leave
+// `orbiting` stuck true and hover silently dead for the rest of the session.
+for (const ev of ["pointerup", "pointercancel", "pointerleave"] as const) {
+  renderer.domElement.addEventListener(ev, () => {
+    orbiting = false;
+  });
+}
 
 /**
  * The grab radius for edge picking, in world units, sized so it is roughly
@@ -1488,6 +1501,11 @@ onMessage("request-screenshot", (msg: any) => {
 
   try {
     controls.update();
+    // The screenshot path may have just resized the backbuffer, and fat-line
+    // widths are computed against it — sync before rendering, not only in the
+    // animation loop, which does not run for this render.
+    renderer.getSize(renderSize);
+    syncEdgeHighlightWidths(overlayGroup, renderSize.x, renderSize.y);
     // autoClear is off (see setup), so clear before compositing main + gnomon.
     renderer.clear();
     renderer.render(scene, captureCamera);
@@ -2763,6 +2781,13 @@ function animate() {
   controls.update();
   // Drive kinematic motion-sim playback (no-op unless a `sim` block is active).
   updateSim();
+  // Fat lines convert their pixel width to clip space in the shader, so they
+  // have to be told the drawing-buffer size. Synced here rather than on a
+  // resize event because the renderer is resized from several places — the
+  // window handler, and the screenshot path that swaps in a fixed resolution
+  // and back — and one sync per frame is correct for all of them.
+  renderer.getSize(renderSize);
+  syncEdgeHighlightWidths(overlayGroup, renderSize.x, renderSize.y);
   // autoClear was flipped to false so the gnomon can composite on top. We
   // now have to clear the color + depth manually before the main render.
   renderer.clear();
