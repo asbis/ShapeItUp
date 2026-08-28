@@ -734,3 +734,89 @@ function normalize(v: number[]): [number, number, number] {
 export function operationOrigin(sel: Selection): [number, number, number] {
   return sel.kind === "face" ? sel.info.center : sel.point;
 }
+
+/**
+ * Find the face or edge matching a descriptor in a freshly rebuilt part.
+ *
+ * Used after a preview is cancelled: the geometry has returned to exactly what
+ * it was, so the face the user picked is there again — but under a new mesh
+ * with new indices, and nothing carries across a rebuild except the geometry
+ * itself. Matching on that is the only honest way back.
+ *
+ * Only sound because a REVERT restores identical geometry. It is deliberately
+ * not offered for matching across an applied edit, where the face may have
+ * moved, split, or ceased to exist — that is the topological naming problem,
+ * and a near-match there would be a confident wrong answer.
+ */
+export function findMatchingFace(
+  part: PickablePart,
+  partIndex: number,
+  center: [number, number, number],
+  normal: [number, number, number] | undefined,
+  tolerance = 0.01,
+): FaceSelection | null {
+  const { faceGroups: g, faceInfo: info } = part;
+  if (!g || !info) return null;
+  for (let i = 0; i < info.length; i++) {
+    const f = info[i]!;
+    if (
+      Math.abs(f.center[0] - center[0]) > tolerance ||
+      Math.abs(f.center[1] - center[1]) > tolerance ||
+      Math.abs(f.center[2] - center[2]) > tolerance
+    ) {
+      continue;
+    }
+    if (normal && f.normal) {
+      const dot =
+        f.normal[0] * normal[0] + f.normal[1] * normal[1] + f.normal[2] * normal[2];
+      // Two coincident faces can share a centre and face opposite ways — the
+      // top and bottom of a zero-thickness sheet, say — so direction decides.
+      if (dot < 0.99) continue;
+    }
+    return {
+      kind: "face",
+      partIndex,
+      partName: part.name,
+      faceIndex: i,
+      info: f,
+      start: g[i * 2]!,
+      count: g[i * 2 + 1]!,
+    };
+  }
+  return null;
+}
+
+/** The edge counterpart of {@link findMatchingFace}, matched on its own point. */
+export function findMatchingEdge(
+  part: PickablePart,
+  partIndex: number,
+  point: [number, number, number],
+  tolerance = 0.01,
+): EdgeSelection | null {
+  const { edgeVertices: v, edgeGroups: g } = part;
+  if (!v || !g) return null;
+  for (let i = 0; i < g.length / 2; i++) {
+    const start = g[i * 2]!;
+    const count = g[i * 2 + 1]!;
+    const { point: p, length } = edgePointAndLength(v, start, count);
+    if (
+      Math.abs(p[0] - point[0]) > tolerance ||
+      Math.abs(p[1] - point[1]) > tolerance ||
+      Math.abs(p[2] - point[2]) > tolerance
+    ) {
+      continue;
+    }
+    return {
+      kind: "edge",
+      partIndex,
+      partName: part.name,
+      edgeIndex: i,
+      start,
+      count,
+      point: p,
+      length,
+      straight: count <= 2,
+    };
+  }
+  return null;
+}

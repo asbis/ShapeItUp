@@ -7,7 +7,7 @@
  * (script execution, tessellation, measurement, export) is identical.
  */
 
-import type { ParamDef } from "@shapeitup/shared";
+import type { ParamDef, PreviewFaceOp } from "@shapeitup/shared";
 import { executeScript } from "./executor";
 export { extractParamsStatic, extractConfigStatic, extractExpectedContactsStatic } from "./executor";
 import { describeFaces, normalizeParts, tessellatePart, type MeshQuality, type PartInput, type PartStatsLevel, type TessellatedPart } from "./tessellate";
@@ -28,6 +28,13 @@ import {
   instrumentReplicadExports,
 } from "./instrumentation";
 import { shapeitupStdlib } from "./stdlib";
+import {
+  chamferEdge,
+  chamferFace,
+  extrudeFace,
+  filletEdge,
+  filletFace,
+} from "./stdlib/faces";
 import {
   drainCutAtOutcomes,
   drainExtrudeHints,
@@ -727,6 +734,8 @@ export interface Core {
        * numbers (e.g. an aggregator computing total mass / CoM).
        */
       partStats?: PartStatsLevel;
+      /** See the matching field on the implementation. */
+      previewOp?: PreviewFaceOp;
     },
   ): Promise<ExecutionResult>;
   /**
@@ -828,6 +837,64 @@ export async function initCore(
     lastParts = [];
   }
 
+  /**
+   * Apply a not-yet-written face operation to the executed parts.
+   *
+   * This is the live preview behind the drag arrow. It is faithful rather than
+   * approximate: the generated source wraps the part's shape expression, so
+   * the operation is the outermost call there too, and applying it here to the
+   * same part's shape produces the same geometry the committed edit would.
+   *
+   * The selector arrives pre-resolved — a plane and a number, not a parameter
+   * name — because at preview time the parameters already hold the values that
+   * name would evaluate to.
+   *
+   * Failures are the helpers' own business: each returns the shape unchanged
+   * and pushes a runtime warning, which is exactly what a preview should do
+   * when the operation would not have worked anyway.
+   */
+  function applyPreviewOp(parts: PartInput[], preview: PreviewFaceOp): void {
+    // A named part when the script returns a list, otherwise the only one.
+    const index = preview.partName
+      ? parts.findIndex((p) => p.name === preview.partName)
+      : parts.length === 1
+        ? 0
+        : -1;
+    if (index < 0) return;
+    const part = parts[index]!;
+
+    // Bound to a local so the narrowing survives into the closures.
+    const target = preview.target;
+    const finder =
+      target.kind === "face"
+        ? (f: any) => f.inPlane(target.plane, target.offset)
+        : (e: any) => e.containsPoint(target.point);
+
+    try {
+      switch (preview.op) {
+        case "extrude":
+          if (target.kind !== "face") return;
+          part.shape = extrudeFace(part.shape, finder, preview.distance);
+          break;
+        case "fillet":
+          part.shape =
+            target.kind === "face"
+              ? filletFace(part.shape, finder, preview.distance)
+              : filletEdge(part.shape, finder, preview.distance);
+          break;
+        case "chamfer":
+          part.shape =
+            target.kind === "face"
+              ? chamferFace(part.shape, finder, preview.distance)
+              : chamferEdge(part.shape, finder, preview.distance);
+          break;
+      }
+    } catch {
+      // The helpers already swallow their own failures; anything reaching here
+      // is unexpected, and a preview must never take the render down with it.
+    }
+  }
+
   async function execute(
     js: string,
     paramOverrides?: Record<string, number | boolean | string>,
@@ -836,6 +903,11 @@ export async function initCore(
       onPart?: (part: TessellatedPart, index: number, total: number) => void;
       meshQuality?: MeshQuality;
       partStats?: PartStatsLevel;
+      /**
+       * Apply a face operation to the result of `main()` without it being in
+       * the source. Drives the viewer's live preview — see applyPreviewOp.
+       */
+      previewOp?: PreviewFaceOp;
     },
   ): Promise<ExecutionResult> {
     cleanup();
@@ -881,6 +953,9 @@ export async function initCore(
     }
 
     const parts = normalizeParts(result, { scriptHasMaterial: !!material });
+    // The viewer's live preview: apply the pending operation to the part it
+    // targets, so the user sees the geometry before committing it to the file.
+    if (streaming?.previewOp) applyPreviewOp(parts, streaming.previewOp);
     lastParts = parts;
     const execTime = performance.now() - execStart;
 

@@ -7,6 +7,7 @@
  */
 
 import { initCore, type Core, type MeshQuality } from "@shapeitup/core";
+import type { PreviewFaceOp } from "@shapeitup/shared";
 import { loadManifoldBrowser, loadOCCTBrowser } from "./browser-loader";
 
 let core: Core | null = null;
@@ -24,6 +25,7 @@ let pendingExecute: {
   js: string;
   paramOverrides?: Record<string, number>;
   meshQuality?: MeshQuality;
+  previewOp?: PreviewFaceOp;
 } | null = null;
 
 self.onmessage = async (event: MessageEvent) => {
@@ -67,7 +69,12 @@ self.onmessage = async (event: MessageEvent) => {
         if (pendingExecute) {
           const queued = pendingExecute;
           pendingExecute = null;
-          await executeUserScript(queued.js, queued.paramOverrides, queued.meshQuality);
+          await executeUserScript(
+            queued.js,
+            queued.paramOverrides,
+            queued.meshQuality,
+            queued.previewOp,
+          );
         }
         break;
       }
@@ -83,10 +90,11 @@ self.onmessage = async (event: MessageEvent) => {
             js: msg.js,
             paramOverrides: msg.paramOverrides,
             meshQuality: msg.meshQuality,
+            previewOp: msg.previewOp,
           };
           return;
         }
-        await executeUserScript(msg.js, msg.paramOverrides, msg.meshQuality);
+        await executeUserScript(msg.js, msg.paramOverrides, msg.meshQuality, msg.previewOp);
         break;
       case "export":
         await handleExport(msg.format);
@@ -135,6 +143,7 @@ async function executeUserScript(
   js: string,
   paramOverrides?: Record<string, number>,
   meshQuality?: MeshQuality,
+  previewOp?: PreviewFaceOp,
 ) {
   if (!core) {
     // Bug #2: with the pending-execute queue in place the only way to reach
@@ -166,6 +175,9 @@ async function executeUserScript(
       // P3-10: optional tessellation-quality knob. Undefined means "let core
       // auto-degrade based on part count" — preserves the pre-P3-10 default.
       meshQuality,
+      // A face operation the user is sizing but has not committed. Applied to
+      // the executed parts so the viewer can show it; never written anywhere.
+      previewOp,
     });
 
     self.postMessage({

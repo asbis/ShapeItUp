@@ -223,6 +223,27 @@ export type WebviewToExt =
   // (ExtToWebview). Sent once per worker (re)spawn.
   | { type: "request-wasm-assets" };
 
+/**
+ * A face operation applied to the result of `main()` WITHOUT writing it to the
+ * file — the live preview behind the drag arrow.
+ *
+ * Sent as part of an `execute`, so it costs one OCCT run and no re-bundle:
+ * the operation is the outermost call in the generated source too, so applying
+ * it after `main()` returns produces the same geometry the committed edit
+ * would. The numbers are pre-resolved — a `plane` and an `offset`, not a
+ * parameter name — because at preview time the parameters already hold the
+ * values the selector would evaluate to.
+ */
+export interface PreviewFaceOp {
+  op: "extrude" | "fillet" | "chamfer";
+  /** Null for a script returning a bare shape. */
+  partName: string | null;
+  target:
+    | { kind: "face"; plane: string; offset: number }
+    | { kind: "edge"; point: [number, number, number] };
+  distance: number;
+}
+
 // Webview → Worker
 export type WebviewToWorker =
   | {
@@ -246,6 +267,8 @@ export type WebviewToWorker =
       // forwards this into `core.execute` as-is; undefined means "use core's
       // auto-degrade heuristic", which is the pre-P3-10 default.
       meshQuality?: "preview" | "final";
+      /** See {@link PreviewFaceOp} — a face operation applied without writing it. */
+      previewOp?: PreviewFaceOp;
     }
   | { type: "export"; format: ExportFormat };
 

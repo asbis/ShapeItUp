@@ -18,6 +18,8 @@ import {
   describePlacement,
   edgesInPlane,
   faceBounds,
+  findMatchingEdge,
+  findMatchingFace,
   operationAxis,
   operationOrigin,
   tangentChain,
@@ -29,6 +31,7 @@ import {
 import { initMessageHandler, onMessage, postToExtension } from "./message-handler";
 import type { WorkerToWebview, TessellatedPart, DetectedApp } from "@shapeitup/shared";
 import { synthesizeEdgeSelector, synthesizeFaceSelector } from "@shapeitup/shared";
+import type { PreviewFaceOp } from "@shapeitup/shared";
 import { PART_COLORS } from "./theme";
 import { setupSim, updateSim, clearSim, initSimPanel, toggleSimPanel } from "./sim-panel";
 
@@ -365,6 +368,26 @@ type FaceOpKind = "extrude" | "fillet" | "chamfer";
  */
 let activeOp: FaceOpKind | null = null;
 
+/**
+ * The target an armed operation acts on, captured when it is armed.
+ *
+ * Held separately from the picker's live selection because a PREVIEW rebuilds
+ * the model, and a rebuilt model has no idea which face you had picked — the
+ * geometry it describes has just changed, which was the point. Freezing the
+ * descriptor here lets the preview redraw underneath an operation that stays
+ * open, sized, and committable.
+ */
+type ArmedTarget =
+  | { kind: "face"; partName: string; info: NonNullable<TessellatedPart["faceInfo"]>[number] }
+  | { kind: "edge"; partName: string; point: [number, number, number] };
+
+let armedTarget: ArmedTarget | null = null;
+
+/** The script last executed WITHOUT a preview, so a cancel can restore it. */
+let previewBaseJs: string | null = null;
+let previewShowing = false;
+let previewTimer: ReturnType<typeof setTimeout> | undefined;
+
 const OP_DEFAULTS: Record<FaceOpKind, string> = {
   extrude: "5",
   // A fillet or chamfer big enough to see, small enough to rarely fail on a
@@ -387,8 +410,23 @@ function setActiveOp(op: FaceOpKind | null): void {
   clearEdgePreview();
   if (!op) {
     dragHandle.hide();
+    const wasArmed = armedTarget;
+    armedTarget = null;
+    // A revert restores identical geometry, so the picked face is genuinely
+    // there again — just under a new mesh. Re-find it rather than making the
+    // user hunt for it because they changed their mind.
+    if (revertPreview()) pendingReselect = wasArmed;
     return;
   }
+
+  // Freeze what the operation acts on. Everything downstream reads this rather
+  // than the live selection, which a preview rebuild will wipe.
+  const sel = facePicker.getSelection();
+  armedTarget = !sel
+    ? null
+    : sel.kind === "face"
+      ? { kind: "face", partName: sel.partName, info: sel.info }
+      : { kind: "edge", partName: sel.partName, point: sel.point };
 
   fiOpEl.textContent = OP_LABEL[op];
   fiDistEl.value = OP_DEFAULTS[op];
@@ -400,6 +438,7 @@ function setActiveOp(op: FaceOpKind | null): void {
   // until the user types means the first thing they see is an empty promise.
   renderOpPreview();
   placeDragHandle();
+  schedulePreview();
   fiDistEl.focus();
   fiDistEl.select();
 }
@@ -412,27 +451,60 @@ function setActiveOp(op: FaceOpKind | null): void {
  * highlight overlays are: the overlay group is a sibling of the part groups,
  * so a part the motion sim has moved would otherwise leave its handle behind.
  */
+function armedPart(): PickablePart | undefined {
+  if (!armedTarget) return undefined;
+  // By NAME, not index: a preview rebuild replaces every part object, and an
+  // index that happened to survive would be luck rather than correctness.
+  const byName = currentParts.find((p) => p.name === armedTarget!.partName);
+  return (byName ?? currentParts[0]) as PickablePart | undefined;
+}
+
+/**
+ * Aim the drag arrow at the armed operation.
+ *
+ * The anchor stays where the drag started even as a preview moves the geometry
+ * under it — it marks the face you picked, not the face's current position,
+ * which is what keeps the handle from running away from the cursor.
+ */
 function placeDragHandle(): void {
   const sel = facePicker.getSelection();
-  const part = sel ? (currentParts[sel.partIndex] as PickablePart | undefined) : undefined;
-  if (!sel || !part || !activeOp) {
+  const part = armedPart();
+  if (!armedTarget || !part || !activeOp) {
     dragHandle.hide();
     return;
   }
   const m = part.mesh.matrixWorld;
-  const origin = new THREE.Vector3(...operationOrigin(sel)).applyMatrix4(m);
-  const axis = new THREE.Vector3(...operationAxis(part, sel))
-    .transformDirection(m)
-    .normalize();
+  const origin = new THREE.Vector3(
+    ...(armedTarget.kind === "face" ? armedTarget.info.center : armedTarget.point),
+  ).applyMatrix4(m);
+
+  // The axis needs the live selection's edge data; for a face the normal is
+  // already in the frozen descriptor.
+  const axisLocal =
+    armedTarget.kind === "face"
+      ? (armedTarget.info.normal ?? [0, 0, 1])
+      : sel && sel.kind === "edge"
+        ? operationAxis(part, sel)
+        : lastArmedAxis;
+  lastArmedAxis = axisLocal;
+
+  const axis = new THREE.Vector3(...axisLocal).transformDirection(m).normalize();
   dragHandle.show({
     origin: [origin.x, origin.y, origin.z],
     axis: [axis.x, axis.y, axis.z],
   });
 }
 
+/** Remembered so an edge's handle keeps its aim once the picker is cleared. */
+let lastArmedAxis: [number, number, number] = [0, 0, 1];
+
 function updateFaceInfoPanel(): void {
   const sel = facePicker.getSelection();
   if (!sel) {
+    // A preview rebuilds the model and so clears the picker. An armed
+    // operation outlives that: it holds its own frozen target, and closing the
+    // panel underneath the user mid-drag would be the opposite of a preview.
+    if (activeOp && armedTarget) return;
     faceInfoEl.classList.remove("visible");
     setActiveOp(null);
     return;
@@ -535,12 +607,16 @@ function showEdgePreview(sel: FaceSelection, plane: string, offset: number): num
  * time — so there is one selector, not one per operation.
  */
 function buildSelectorPreview(sel: FaceSelection) {
-  const r = synthesizeFaceSelector(sel.info, declaredParamValues);
+  return buildSelectorPreviewFor(sel.info);
+}
+
+function buildSelectorPreviewFor(info: FaceSelection["info"]) {
+  const r = synthesizeFaceSelector(info, declaredParamValues);
   return r.ok ? r.selector : null;
 }
 
 function renderOpPreview(): void {
-  const sel = facePicker.getSelection();
+  const sel = armedTarget;
   if (!sel || !activeOp) {
     fiCodeEl.textContent = "";
     fiNotesEl.textContent = "";
@@ -565,9 +641,14 @@ function renderOpPreview(): void {
 
     // OCCT carries a fillet along edges that meet smoothly, so on a rounded
     // outline one click rounds the whole loop. Show the chain, not the click.
-    const part = currentParts[sel.partIndex] as PickablePart | undefined;
-    const chain = part ? tangentChain(part, sel.edgeIndex) : [sel.edgeIndex];
-    showEdgeSet(sel.partIndex, chain);
+    // Only while the live selection still exists — a preview rebuild replaces
+    // the mesh those indices refer to, and the geometry itself now shows the
+    // result anyway.
+    const live = facePicker.getSelection();
+    const part = armedPart();
+    const chain =
+      live && live.kind === "edge" && part ? tangentChain(part, live.edgeIndex) : [];
+    if (part && chain.length > 0) showEdgeSet(currentParts.indexOf(part as any), chain);
     if (chain.length > 1) {
       notes.push({
         text: `→ ${chain.length} edges — they meet smoothly, so the round carries across`,
@@ -575,7 +656,7 @@ function renderOpPreview(): void {
       });
     }
   } else {
-    const selector = buildSelectorPreview(sel);
+    const selector = buildSelectorPreviewFor(sel.info);
     if (!selector) {
       fiCodeEl.textContent = "";
       clearEdgePreview();
@@ -592,12 +673,16 @@ function renderOpPreview(): void {
     } else {
       // The offset the VIEWER matches on is the raw number, not the parameter
       // name — the name is what gets written, the number is what it evaluates to.
-      const n = showEdgePreview(sel, selector.plane, selector.offset);
-      notes.push(
-        n === 0
-          ? { text: "⚠ this face has no boundary edges to round", warn: true }
-          : { text: `→ ${n} edge${n === 1 ? "" : "s"}`, warn: false },
-      );
+      const live = facePicker.getSelection();
+      const n =
+        live && live.kind === "face"
+          ? showEdgePreview(live, selector.plane, selector.offset)
+          : -1;
+      if (n === 0) {
+        notes.push({ text: "⚠ this face has no boundary edges to round", warn: true });
+      } else if (n > 0) {
+        notes.push({ text: `→ ${n} edge${n === 1 ? "" : "s"}`, warn: false });
+      }
     }
   }
 
@@ -623,6 +708,110 @@ function renderOpPreview(): void {
     el.textContent = n.text;
     fiNotesEl.appendChild(el);
   }
+}
+
+// ── Live preview of the pending operation ─────────────────────────────────
+// The arrow tells you how far; this tells you what it does. It costs one OCCT
+// run, so it is debounced and only fires when the number actually changed.
+//
+// Nothing is written. The operation is applied to the parts AFTER `main()`
+// returns, which is faithful rather than approximate: the generated source
+// wraps the part's shape expression, so the operation is the outermost call
+// there too.
+
+const PREVIEW_DEBOUNCE_MS = 260;
+let lastPreviewKey = "";
+
+/** What the worker needs to reproduce the pending operation. */
+function previewPayload(): PreviewFaceOp | null {
+  const d = parseDistance();
+  if (!armedTarget || !activeOp || d === null) return null;
+  if (activeOp === "extrude" && armedTarget.kind === "edge") return null;
+
+  if (armedTarget.kind === "edge") {
+    return {
+      op: activeOp,
+      partName: currentParts.length > 1 ? armedTarget.partName : null,
+      target: { kind: "edge", point: armedTarget.point },
+      distance: d,
+    };
+  }
+  // The plane and offset the host would write, resolved to numbers — at
+  // preview time the parameters already hold what the names evaluate to.
+  const selector = synthesizeFaceSelector(armedTarget.info, declaredParamValues);
+  if (!selector.ok) return null;
+  return {
+    op: activeOp,
+    partName: currentParts.length > 1 ? armedTarget.partName : null,
+    target: { kind: "face", plane: selector.selector.plane, offset: selector.selector.offset },
+    distance: d,
+  };
+}
+
+function schedulePreview(): void {
+  clearTimeout(previewTimer);
+  const payload = previewPayload();
+  if (!payload) return;
+  const key = JSON.stringify(payload);
+  if (key === lastPreviewKey) return;
+  previewTimer = setTimeout(() => runPreview(payload, key), PREVIEW_DEBOUNCE_MS);
+}
+
+function runPreview(payload: PreviewFaceOp, key: string): void {
+  if (!worker || !lastScriptJs) return;
+  // Remember what to go back to. Captured on the FIRST preview only, so a
+  // second one does not adopt the first preview as its baseline.
+  if (!previewShowing) previewBaseJs = lastScriptJs;
+  previewShowing = true;
+  lastPreviewKey = key;
+  statusEl.textContent = "Previewing…";
+  worker.postMessage({
+    type: "execute",
+    js: lastScriptJs,
+    paramOverrides: { ...currentParamValues },
+    previewOp: payload,
+  });
+}
+
+/**
+ * Put the model back the way the file describes it.
+ * Returns true when a rebuild was actually kicked off.
+ */
+function revertPreview(): boolean {
+  clearTimeout(previewTimer);
+  lastPreviewKey = "";
+  if (!previewShowing) return false;
+  previewShowing = false;
+  const js = previewBaseJs;
+  previewBaseJs = null;
+  if (!worker || !js) return false;
+  worker.postMessage({
+    type: "execute",
+    js,
+    paramOverrides: { ...currentParamValues },
+  });
+  return true;
+}
+
+/** A target to re-find once the revert's rebuild lands. */
+let pendingReselect: ArmedTarget | null = null;
+
+/** Re-select what was armed before a cancelled preview, if it is still there. */
+function applyPendingReselect(): void {
+  const target = pendingReselect;
+  pendingReselect = null;
+  if (!target) return;
+  const index = currentParts.findIndex((p) => p.name === target.partName);
+  const part = currentParts[index < 0 ? 0 : index] as PickablePart | undefined;
+  if (!part) return;
+
+  const found =
+    target.kind === "face"
+      ? findMatchingFace(part, index < 0 ? 0 : index, target.info.center, target.info.normal)
+      : findMatchingEdge(part, index < 0 ? 0 : index, target.point);
+  if (!found) return;
+  facePicker.setSelection(found);
+  updateFaceInfoPanel();
 }
 
 /** The distance field, or null when it does not hold a usable number. */
@@ -671,7 +860,7 @@ function reportFaceOpWarnings(warnings: string[] | undefined): boolean {
 }
 
 function applyOp(): void {
-  const sel = facePicker.getSelection();
+  const sel = armedTarget;
   const d = parseDistance();
   if (!sel || !activeOp || d === null) {
     setParamsStatus(
@@ -706,6 +895,11 @@ function applyOp(): void {
           },
     distance: d,
   });
+  // The commit rebuilds from the file, which supersedes any preview.
+  clearTimeout(previewTimer);
+  previewShowing = false;
+  previewBaseJs = null;
+  lastPreviewKey = "";
 }
 
 fiExtrudeEl.addEventListener("click", () => setActiveOp("extrude"));
@@ -714,7 +908,9 @@ fiChamferEl.addEventListener("click", () => setActiveOp("chamfer"));
 fiBackEl.addEventListener("click", () => setActiveOp(null));
 fiApplyEl.addEventListener("click", applyOp);
 fiDistEl.addEventListener("input", () => {
-  if (activeOp) renderOpPreview();
+  if (!activeOp) return;
+  renderOpPreview();
+  schedulePreview();
 });
 fiDistEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter") {
@@ -737,8 +933,9 @@ fiLookAtEl.addEventListener("click", () => {
 });
 
 fiClearEl.addEventListener("click", () => {
+  setActiveOp(null);
   facePicker.setSelection(null);
-  updateFaceInfoPanel();
+  faceInfoEl.classList.remove("visible");
 });
 
 // Hover is advisory, so it is the first thing to give up: skip it entirely
@@ -907,6 +1104,9 @@ function updateHandleDrag(event: PointerEvent): void {
   const snapped = snapDragValue(clamped);
   fiDistEl.value = String(Number(snapped.toFixed(2)));
   renderOpPreview();
+  // Debounced inside, so a drag costs one OCCT run per pause rather than one
+  // per pointer event.
+  schedulePreview();
 }
 
 function endHandleDrag(event: PointerEvent): void {
@@ -1372,6 +1572,8 @@ function handleWorkerMessage(msg: WorkerToWebview) {
         // A face operation the user just applied may have declined at build
         // time — surface that before anything else overwrites the status line.
         reportFaceOpWarnings(msg.warnings);
+        // A cancelled preview leaves a selection to restore.
+        applyPendingReselect();
 
         // Track what the file declares, for the selection bar's selector
         // preview. `declared` is only present when an override is in force.
