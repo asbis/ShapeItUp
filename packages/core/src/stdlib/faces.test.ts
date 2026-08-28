@@ -16,12 +16,14 @@ let filletFace: typeof import("./faces.js").filletFace;
 let chamferFace: typeof import("./faces.js").chamferFace;
 let filletEdge: typeof import("./faces.js").filletEdge;
 let chamferEdge: typeof import("./faces.js").chamferEdge;
+let probeMaxRadius: typeof import("./faces.js").probeMaxRadius;
 
 beforeAll(async () => {
   const oc = await loadOCCTForTest();
   rc = await import("replicad");
   rc.setOC(oc);
-  ({ extrudeFace, filletFace, chamferFace, filletEdge, chamferEdge } = await import("./faces.js"));
+  ({ extrudeFace, filletFace, chamferFace, filletEdge, chamferEdge, probeMaxRadius } =
+    await import("./faces.js"));
 }, 120_000);
 
 /** 80 x 60 x 8 plate, corners rounded r6, with a central Ø12 through-hole. */
@@ -328,3 +330,90 @@ describe("filletEdge / chamferEdge", () => {
     expect(drainRuntimeWarnings().join(" ")).toMatch(/^filletEdge:/);
   });
 });
+
+describe("probeMaxRadius", () => {
+  /**
+   * The contract is not "returns a plausible number" — it is that the number
+   * WORKS and that a step beyond it does not. Anything weaker would let the UI
+   * clamp a drag to a value OCCT still refuses, which is the whole failure
+   * this exists to prevent.
+   */
+  const top = (f: any) => f.inPlane("XY", 8);
+
+  it("returns a radius that actually fillets", () => {
+    const max = probeMaxRadius(build(), top, "face", 40);
+    expect(max).toBeGreaterThan(0);
+    // The edges must come from the SAME shape instance being filleted —
+    // `inList` matches objects, not geometry.
+    const s = build();
+    expect(() => s.fillet(max, (e: any) => e.inList(boundaryOf(s)))).not.toThrow();
+    // Sanity: the plate is 8 mm thick, so the ceiling is in that neighbourhood
+    // rather than an arbitrary large number.
+    expect(max).toBeLessThan(12);
+    expect(max).toBeGreaterThan(3);
+  });
+
+  it("finds a ceiling that a clear step beyond genuinely fails", () => {
+    const max = probeMaxRadius(build(), top, "face", 40);
+    let threw = false;
+    try {
+      const s = build();
+      s.fillet(max * 1.5, (e: any) => e.inList(boundaryOf(s)));
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+  });
+
+  it("tracks the material, not a constant", () => {
+    // Two thicknesses of the same outline: the ceiling must move with them.
+    // The minimum-edge-length heuristic this replaces returned the same
+    // number for both, which is why it was not usable.
+    const thin = probeMaxRadius(plateOfThickness(4), (f: any) => f.inPlane("XY", 4), "face", 40);
+    const thick = probeMaxRadius(plateOfThickness(16), (f: any) => f.inPlane("XY", 16), "face", 40);
+    expect(thick).toBeGreaterThan(thin * 1.5);
+  });
+
+  it("returns 0 when the selector finds nothing", () => {
+    expect(probeMaxRadius(build(), (f: any) => f.inPlane("XY", 999), "face", 40)).toBe(0);
+  });
+
+  it("returns 0 for an ambiguous selector rather than probing one of them", () => {
+    expect(probeMaxRadius(build(), (f: any) => f.parallelTo("XY"), "face", 40)).toBe(0);
+  });
+
+  it("never exceeds the bracket it was given", () => {
+    // The caller's bracket is a promise about the search space, not a hint.
+    const capped = probeMaxRadius(build(), top, "face", 1.5);
+    expect(capped).toBeLessThanOrEqual(1.5);
+    expect(capped).toBeGreaterThan(0);
+  });
+
+  it("refuses a nonsensical bracket", () => {
+    expect(probeMaxRadius(build(), top, "face", 0)).toBe(0);
+    expect(probeMaxRadius(build(), top, "face", NaN)).toBe(0);
+  });
+
+  it("probes a single edge too", () => {
+    const max = probeMaxRadius(
+      build(),
+      (e: any) => e.containsPoint([0, -30, 8]),
+      "edge",
+      40,
+    );
+    expect(max).toBeGreaterThan(0);
+    expect(max).toBeLessThan(12);
+  });
+});
+
+/** The boundary edges of the plate's top face, for verifying a probed radius. */
+function boundaryOf(shape: any): any[] {
+  const f = new rc.FaceFinder().inPlane("XY", 8).find(shape, { unique: true });
+  return [...f.clone().outerWire().edges, ...f.innerWires().flatMap((w: any) => w.edges)];
+}
+
+/** The same plate at another thickness. */
+function plateOfThickness(t: number): any {
+  const p = rc.drawRoundedRectangle(80, 60, 6).sketchOnPlane().extrude(t) as any;
+  return p.cut(rc.drawCircle(6).sketchOnPlane("XY", -1).extrude(t + 2) as any);
+}

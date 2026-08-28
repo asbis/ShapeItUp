@@ -180,6 +180,11 @@ async function executeUserScript(
       previewOp,
     });
 
+    // The ceiling for a rounding operation, when one was asked for.
+    if (typeof result.previewLimit === "number") {
+      self.postMessage({ type: "preview-limit", max: result.previewLimit });
+    }
+
     // The added/removed ghost, if the operation produced one. Sent before
     // mesh-done so the viewer has it by the time the render settles.
     if (result.previewDelta) {

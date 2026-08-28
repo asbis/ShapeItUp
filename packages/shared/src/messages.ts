@@ -242,6 +242,12 @@ export interface PreviewFaceOp {
     | { kind: "face"; plane: string; offset: number }
     | { kind: "edge"; point: [number, number, number] };
   distance: number;
+  /**
+   * Ask the worker for the largest radius this operation can actually take,
+   * found by probing OCCT. Requested once when the operation is armed, not on
+   * every drag step. Meaningless for `extrude`, which has no such limit.
+   */
+  probeLimit?: boolean;
 }
 
 // Webview → Worker
@@ -357,6 +363,8 @@ export type WorkerToWebview =
   | { type: "ready" }
   /** The material a previewed operation adds or removes. See {@link PreviewDelta}. */
   | { type: "preview-delta"; delta: PreviewDelta }
+  /** The largest radius the armed operation can take, measured against OCCT. */
+  | { type: "preview-limit"; max: number }
   // Streaming mesh protocol: mesh-start announces the batch and its params so
   // the viewer can clear the scene and update sliders immediately. Each
   // mesh-part delivers one fully-tessellated part with its mesh buffers as

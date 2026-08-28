@@ -34,6 +34,7 @@ import {
   extrudeFace,
   filletEdge,
   filletFace,
+  probeMaxRadius,
 } from "./stdlib/faces";
 import {
   drainCutAtOutcomes,
@@ -92,6 +93,11 @@ export interface ExecutionResult {
    * produced it as a by-product. See {@link PreviewDelta}.
    */
   previewDelta?: PreviewDelta;
+  /**
+   * The largest radius the previewed rounding operation can take, when one was
+   * asked for. Measured against OCCT rather than guessed — see probeMaxRadius.
+   */
+  previewLimit?: number;
   params: ParamDef[];
   execTimeMs: number;
   tessTimeMs: number;
@@ -858,7 +864,11 @@ export async function initCore(
    * and pushes a runtime warning, which is exactly what a preview should do
    * when the operation would not have worked anyway.
    */
-  function applyPreviewOp(parts: PartInput[], preview: PreviewFaceOp): PreviewDelta | undefined {
+  function applyPreviewOp(
+    parts: PartInput[],
+    preview: PreviewFaceOp,
+    out: { limit?: number },
+  ): PreviewDelta | undefined {
     // A named part when the script returns a list, otherwise the only one.
     const index = preview.partName
       ? parts.findIndex((p) => p.name === preview.partName)
@@ -874,6 +884,30 @@ export async function initCore(
       target.kind === "face"
         ? (f: any) => f.inPlane(target.plane, target.offset)
         : (e: any) => e.containsPoint(target.point);
+
+    // The largest radius that works, measured before the operation changes the
+    // shape. Rounding only: an extrude has no such ceiling.
+    if (preview.probeLimit && preview.op !== "extrude") {
+      try {
+        const bounds = readBoundsSafe(part.shape);
+        // Half the bounding-box diagonal is a generous bracket — comfortably
+        // above any radius that could fit, so the search is never capped below
+        // the truth by its own starting point.
+        const upper = bounds
+          ? Math.hypot(
+              bounds[1][0] - bounds[0][0],
+              bounds[1][1] - bounds[0][1],
+              bounds[1][2] - bounds[0][2],
+            ) / 2
+          : 0;
+        out.limit =
+          target.kind === "face"
+            ? probeMaxRadius(part.shape, finder as any, "face", upper)
+            : probeMaxRadius(part.shape, finder as any, "edge", upper);
+      } catch {
+        // No limit reported rather than a wrong one.
+      }
+    }
 
     // Only extrude yields one for free — see FaceOpOptions.onDelta.
     let deltaShape: any;
@@ -980,8 +1014,9 @@ export async function initCore(
     const parts = normalizeParts(result, { scriptHasMaterial: !!material });
     // The viewer's live preview: apply the pending operation to the part it
     // targets, so the user sees the geometry before committing it to the file.
+    const previewOut: { limit?: number } = {};
     const previewDelta = streaming?.previewOp
-      ? applyPreviewOp(parts, streaming.previewOp)
+      ? applyPreviewOp(parts, streaming.previewOp, previewOut)
       : undefined;
     lastParts = parts;
     const execTime = performance.now() - execStart;
@@ -1214,6 +1249,7 @@ export async function initCore(
     return {
       parts: executed,
       previewDelta,
+      previewLimit: previewOut.limit,
       params,
       execTimeMs: Math.round(execTime),
       tessTimeMs: Math.round(tessTime),

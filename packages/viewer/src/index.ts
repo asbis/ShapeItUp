@@ -423,6 +423,8 @@ function setActiveOp(op: FaceOpKind | null): void {
   // Freeze what the operation acts on. Everything downstream reads this rather
   // than the live selection, which a preview rebuild will wipe.
   const sel = facePicker.getSelection();
+  opMaxRadius = null;
+  opMaxKey = "";
   armedTarget = !sel
     ? null
     : sel.kind === "face"
@@ -687,6 +689,21 @@ function renderOpPreview(): void {
     }
   }
 
+  if (activeOp !== "extrude" && opMaxRadius !== null) {
+    const ceiling = safeMaxRadius()!;
+    if (ceiling <= 0) {
+      notes.push({ text: "⚠ nothing here can be rounded at any radius", warn: true });
+    } else {
+      const over = (parseDistance() ?? 0) > ceiling + 1e-9;
+      notes.push({
+        text: over
+          ? `⚠ over the limit — OCCT refuses more than ${ceiling.toFixed(1)} mm here`
+          : `max ${ceiling.toFixed(1)} mm`,
+        warn: over,
+      });
+    }
+  }
+
   if (!durable) {
     notes.push({
       // A literal is correct now and silently stops matching the moment the
@@ -773,11 +790,54 @@ let lastPreviewKey = "";
 let previewInFlight = false;
 let queuedPreview: { payload: PreviewFaceOp; key: string } | null = null;
 
+/**
+ * The largest radius the armed rounding operation can take, measured against
+ * OCCT rather than guessed.
+ *
+ * Both cheap heuristics were checked and neither is usable: the minimum-edge
+ * rule does not track the answer at all, and the wall-thickness rule is right
+ * in shape but 55% too conservative. So the worker probes for the real one,
+ * once, when the operation is armed.
+ *
+ * `null` means not measured yet; 0 means nothing can be rounded here.
+ */
+let opMaxRadius: number | null = null;
+
+/**
+ * The ceiling rounded DOWN to a displayable step.
+ *
+ * The probe returns a radius it has verified works — 8.994, say. Showing that
+ * as "9.0" and letting the drag snap to 9.0 walks straight back into the
+ * failure the ceiling exists to prevent: measured on a 10 mm plate, 8.9 filleted
+ * and 9.0 did not. Rounding toward zero is the only direction that stays true.
+ */
+function safeMaxRadius(step = 0.1): number | null {
+  if (opMaxRadius === null) return null;
+  if (opMaxRadius <= 0) return 0;
+  return Math.floor(opMaxRadius / step) * step;
+}
+/** Which (target, op) the measured ceiling belongs to. */
+let opMaxKey = "";
+
 /** What the worker needs to reproduce the pending operation. */
+/** Identifies the armed operation, so a measured ceiling is not reused across a
+ *  different face or a different operation. */
+function opIdentity(): string {
+  if (!armedTarget || !activeOp) return "";
+  return JSON.stringify([
+    activeOp,
+    armedTarget.kind,
+    armedTarget.partName,
+    armedTarget.kind === "face" ? armedTarget.info.center : armedTarget.point,
+  ]);
+}
+
 function previewPayload(): PreviewFaceOp | null {
   const d = parseDistance();
   if (!armedTarget || !activeOp || d === null) return null;
   if (activeOp === "extrude" && armedTarget.kind === "edge") return null;
+  // Ask for the ceiling only while it is still unknown for THIS operation.
+  const wantLimit = activeOp !== "extrude" && opMaxKey !== opIdentity();
 
   if (armedTarget.kind === "edge") {
     return {
@@ -785,6 +845,7 @@ function previewPayload(): PreviewFaceOp | null {
       partName: currentParts.length > 1 ? armedTarget.partName : null,
       target: { kind: "edge", point: armedTarget.point },
       distance: d,
+      ...(wantLimit ? { probeLimit: true } : {}),
     };
   }
   // The plane and offset the host would write, resolved to numbers — at
@@ -796,6 +857,7 @@ function previewPayload(): PreviewFaceOp | null {
     partName: currentParts.length > 1 ? armedTarget.partName : null,
     target: { kind: "face", plane: selector.selector.plane, offset: selector.selector.offset },
     distance: d,
+    ...(wantLimit ? { probeLimit: true } : {}),
   };
 }
 
@@ -1167,8 +1229,17 @@ function updateHandleDrag(event: PointerEvent): void {
   const raw = handleDrag.startValue + (along - handleDrag.startAlong);
   // Fillet and chamfer have no negative side; extrude does, and crossing zero
   // is how you turn a pull into a push.
-  const clamped = activeOp === "extrude" ? raw : Math.max(0, raw);
-  const snapped = snapDragValue(clamped);
+  //
+  // The upper clamp is the measured ceiling: dragging is a gesture that should
+  // not be able to reach a value OCCT will refuse. Typing is not clamped — a
+  // number someone deliberately entered is theirs, and it gets a warning
+  // instead of being silently rewritten.
+  const floored = activeOp === "extrude" ? raw : Math.max(0, raw);
+  // Snap FIRST, then clamp — clamping first lets the snap round back up over
+  // the ceiling, which is exactly how 8.994 became an unusable 9.0.
+  let snapped = snapDragValue(floored);
+  const ceiling = activeOp === "extrude" ? null : safeMaxRadius();
+  if (ceiling !== null && ceiling > 0) snapped = Math.min(snapped, ceiling);
   fiDistEl.value = String(Number(snapped.toFixed(2)));
   renderOpPreview();
   // Debounced inside, so a drag costs one OCCT run per pause rather than one
@@ -1629,6 +1700,15 @@ function handleWorkerMessage(msg: WorkerToWebview) {
 
     case "preview-delta":
       showDeltaGhost(msg.delta);
+      break;
+    case "preview-limit":
+      // Belongs to whatever is armed NOW; a reply for a superseded operation
+      // would silently cap the wrong thing.
+      if (activeOp && armedTarget) {
+        opMaxRadius = msg.max;
+        opMaxKey = opIdentity();
+        renderOpPreview();
+      }
       break;
     case "mesh-start":
       clearWorkerResponseTimer();

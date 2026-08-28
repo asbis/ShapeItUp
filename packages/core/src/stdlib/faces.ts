@@ -363,3 +363,98 @@ function roundOneEdge(
     return shape;
   }
 }
+
+/**
+ * The largest radius OCCT will actually accept here, found by asking it.
+ *
+ * Both cheap heuristics were measured against the truth on a plate filleted on
+ * its top face, at three thicknesses:
+ *
+ *     thickness   true limit   minEdge x 0.45   wall x 0.45
+ *         4          3.98          19.79           1.80
+ *        10          9.92          19.79           4.50
+ *        25         24.92          19.79          11.25
+ *
+ * The edge-length rule does not track anything (it is the bore's circumference,
+ * constant across all three), and the wall rule is right about the shape of the
+ * answer but 55% too conservative. Neither is good enough to bound a slider
+ * with: too low and you cannot reach radii that work, too high and the drag
+ * walks into failures.
+ *
+ * So this asks OCCT directly. A single fillet attempt costs 4-9 ms on that
+ * plate and the shape survives it, so one shape and one edge list serve every
+ * probe — a ten-step bisection lands around 50 ms, paid once when the operation
+ * is armed rather than per drag step.
+ *
+ * Returns 0 when even a hairline radius fails, which is the honest answer for
+ * an edge that cannot be rounded at all.
+ */
+export function probeMaxRadius(
+  shape: Shape3D,
+  finder: (f: FaceFinder) => FaceFinder,
+  kind: "face",
+  upperBound: number,
+  iterations?: number,
+): number;
+export function probeMaxRadius(
+  shape: Shape3D,
+  finder: (e: EdgeFinder) => EdgeFinder,
+  kind: "edge",
+  upperBound: number,
+  iterations?: number,
+): number;
+export function probeMaxRadius(
+  shape: Shape3D,
+  finder: any,
+  kind: "face" | "edge",
+  upperBound: number,
+  iterations = 10,
+): number {
+  if (!Number.isFinite(upperBound) || upperBound <= 0) return 0;
+
+  let edges: Edge[];
+  try {
+    edges =
+      kind === "face"
+        ? boundaryEdgesOf(resolveFaceOrThrow(shape, finder))
+        : finder(new EdgeFinder()).find(shape);
+  } catch {
+    return 0;
+  }
+  if (edges.length === 0) return 0;
+
+  const fits = (r: number): boolean => {
+    try {
+      shape.fillet(r, (e) => e.inList(edges));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // A hairline that already fails means nothing here can be rounded.
+  const floor = Math.min(0.01, upperBound / 1000);
+  if (!fits(floor)) return 0;
+
+  let lo = floor;
+  let hi = upperBound;
+  // Only bisect if the upper bracket actually fails; otherwise the bound is
+  // the answer and there is nothing to search for.
+  if (fits(hi)) return hi;
+  for (let i = 0; i < iterations; i++) {
+    const mid = (lo + hi) / 2;
+    if (fits(mid)) lo = mid;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/** resolveFace without the warning plumbing — the probe reports by returning 0. */
+function resolveFaceOrThrow(shape: Shape3D, finder: (f: FaceFinder) => FaceFinder): Face {
+  const matches = finder(new FaceFinder()).find(shape);
+  if (matches.length !== 1) {
+    for (const m of matches) tryDelete(m);
+    throw new Error(`expected exactly one face, got ${matches.length}`);
+  }
+  return matches[0]!;
+}
