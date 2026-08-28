@@ -11,8 +11,11 @@ import {
 import { buildMesh, buildEdges } from "./mesh-builder";
 import {
   FacePicker,
+  buildEdgesHighlight,
   describeKind,
   describePlacement,
+  edgesInPlane,
+  faceBounds,
   formatFaceArea,
   formatTriple,
   type FaceSelection,
@@ -271,6 +274,9 @@ interface PartInfo {
   triangles: Uint32Array;
   faceGroups?: Uint32Array;
   faceInfo?: TessellatedPart["faceInfo"];
+  /** Edge polylines and their spans — used to preview which edges a fillet hits. */
+  edgeVertices?: Float32Array;
+  edgeGroups?: Uint32Array;
   /** Measured on the OCCT shape, not the mesh. Absent on degenerate geometry. */
   volume?: number;
   surfaceArea?: number;
@@ -323,36 +329,63 @@ const fiToolsEl = document.getElementById("fi-tools") as HTMLElement;
 const fiFormEl = document.getElementById("fi-form") as HTMLElement;
 const fiDistEl = document.getElementById("fi-dist") as HTMLInputElement;
 const fiExtrudeEl = document.getElementById("fi-extrude") as HTMLButtonElement;
+const fiFilletEl = document.getElementById("fi-fillet") as HTMLButtonElement;
+const fiChamferEl = document.getElementById("fi-chamfer") as HTMLButtonElement;
+const fiOpEl = document.getElementById("fi-op")!;
 const fiApplyEl = document.getElementById("fi-apply") as HTMLButtonElement;
+const fiBackEl = document.getElementById("fi-back") as HTMLButtonElement;
 const fiLookAtEl = document.getElementById("fi-lookat") as HTMLButtonElement;
 const fiClearEl = document.getElementById("fi-clear") as HTMLButtonElement;
 
-/**
- * Extrude mode swaps the bar's tools for a distance field and shows the line
- * that will be written. It is a separate mode rather than an always-visible
- * field so the resting state stays one short line.
- */
-let extruding = false;
+type FaceOpKind = "extrude" | "fillet" | "chamfer";
 
-function setExtruding(on: boolean): void {
-  extruding = on;
-  faceInfoEl.classList.toggle("extruding", on);
-  fiToolsEl.hidden = on;
-  fiFormEl.hidden = !on;
-  if (on) {
-    // Render before focusing: the preview IS the feature, and leaving it blank
-    // until the user types means the first thing they see is an empty promise.
-    renderExtrudePreview();
-    fiDistEl.focus();
-    fiDistEl.select();
-  }
+/**
+ * Picking an operation swaps the bar's tools for a distance field and shows
+ * the line that will be written. A mode rather than three always-visible
+ * fields, so the resting state stays one short line.
+ */
+let activeOp: FaceOpKind | null = null;
+
+const OP_DEFAULTS: Record<FaceOpKind, string> = {
+  extrude: "5",
+  // A fillet or chamfer big enough to see, small enough to rarely fail on a
+  // first try — an over-large radius is the usual reason OCCT refuses one.
+  fillet: "2",
+  chamfer: "1",
+};
+
+const OP_LABEL: Record<FaceOpKind, string> = {
+  extrude: "Extrude",
+  fillet: "Fillet",
+  chamfer: "Chamfer",
+};
+
+function setActiveOp(op: FaceOpKind | null): void {
+  activeOp = op;
+  faceInfoEl.classList.toggle("extruding", op !== null);
+  fiToolsEl.hidden = op !== null;
+  fiFormEl.hidden = op === null;
+  clearEdgePreview();
+  if (!op) return;
+
+  fiOpEl.textContent = OP_LABEL[op];
+  fiDistEl.value = OP_DEFAULTS[op];
+  fiDistEl.title =
+    op === "extrude"
+      ? "Positive pulls the face out, negative pushes it in"
+      : "Radius, in millimetres";
+  // Render before focusing: the preview IS the feature, and leaving it blank
+  // until the user types means the first thing they see is an empty promise.
+  renderOpPreview();
+  fiDistEl.focus();
+  fiDistEl.select();
 }
 
 function updateFaceInfoPanel(): void {
   const sel = facePicker.getSelection();
   if (!sel) {
     faceInfoEl.classList.remove("visible");
-    setExtruding(false);
+    setActiveOp(null);
     return;
   }
   const { info } = sel;
@@ -372,47 +405,96 @@ function updateFaceInfoPanel(): void {
 
   fiLookAtEl.disabled = !info.normal;
   // Only an axis-aligned plane can be named by a selector we are willing to
-  // write, so anything else cannot be extruded from here. Saying why in the
-  // tooltip beats a button that silently does nothing.
-  const selector = buildSelectorPreview(sel);
-  fiExtrudeEl.disabled = selector === null;
-  fiExtrudeEl.title = selector
-    ? "Push or pull this face along its normal"
+  // write, so nothing can be modelled from anything else. Saying why in the
+  // tooltip beats three buttons that silently do nothing.
+  const writable = buildSelectorPreview(sel) !== null;
+  const why = writable
+    ? null
     : "This face is not parallel to a standard plane, so there is no stable way to name it in code yet";
+  for (const [btn, tip] of [
+    [fiExtrudeEl, "Push or pull this face along its normal"],
+    [fiFilletEl, "Round the edges around this face"],
+    [fiChamferEl, "Bevel the edges around this face"],
+  ] as const) {
+    btn.disabled = !writable;
+    btn.title = why ?? tip;
+  }
 
-  if (extruding) renderExtrudePreview();
+  if (activeOp) renderOpPreview();
   faceInfoEl.classList.add("visible");
 }
 
+// ── Edge preview ──────────────────────────────────────────────────────────
+// A fillet radius typed into a box is a guess about which edges you meant.
+// Highlighting them turns it into something you can count before committing.
+let edgePreview: THREE.LineSegments | null = null;
+
+function clearEdgePreview(): void {
+  if (!edgePreview) return;
+  overlayGroup.remove(edgePreview);
+  edgePreview.geometry.dispose();
+  (edgePreview.material as THREE.Material).dispose();
+  edgePreview = null;
+}
+
+/** Highlight the edges a fillet/chamfer would touch; returns how many. */
+function showEdgePreview(sel: FaceSelection, plane: string, offset: number): number {
+  clearEdgePreview();
+  const part = currentParts[sel.partIndex] as PickablePart | undefined;
+  if (!part) return 0;
+  const indices = edgesInPlane(part, plane, offset, faceBounds(part, sel));
+  const lines = buildEdgesHighlight(part, indices);
+  if (lines) {
+    lines.applyMatrix4(part.mesh.matrixWorld);
+    overlayGroup.add(lines);
+    edgePreview = lines;
+  }
+  return indices.length;
+}
+
 /**
- * The selector the host would synthesise for this face — computed here too, so
- * the bar can show it BEFORE the user commits and can grey out Extrude when
- * there is nothing writable.
- *
- * `declaredParams` is what the viewer knows from the last render, which is the
- * same set the host reads out of the file. If the two ever disagreed, the host
- * is authoritative — it re-derives from the source at commit time.
+ * The selector the host would synthesise for this face. All three operations
+ * name the FACE — fillet and chamfer resolve its boundary at build time — so
+ * there is one selector, not one per operation.
  */
 function buildSelectorPreview(sel: FaceSelection) {
   const r = synthesizeFaceSelector(sel.info, declaredParamValues);
   return r.ok ? r.selector : null;
 }
 
-function renderExtrudePreview(): void {
+function renderOpPreview(): void {
   const sel = facePicker.getSelection();
   const selector = sel ? buildSelectorPreview(sel) : null;
-  if (!sel || !selector) {
+  if (!sel || !selector || !activeOp) {
     fiPreviewEl.textContent = "";
+    clearEdgePreview();
     return;
   }
   const d = parseDistance();
   const target = currentParts.length > 1 ? sel.partName : "shape";
   const dist = d === null ? "…" : String(d);
-  fiPreviewEl.textContent = `extrudeFace(${target}, ${selector.code}, ${dist})`;
+  const fn =
+    activeOp === "extrude" ? "extrudeFace" : activeOp === "fillet" ? "filletFace" : "chamferFace";
+  fiPreviewEl.textContent = `${fn}(${target}, ${selector.code}, ${dist})`;
+
+  if (activeOp === "extrude") {
+    clearEdgePreview();
+  } else {
+    // The offset the VIEWER matches on is the raw number, not the parameter
+    // name — the name is what gets written, the number is what it evaluates to.
+    const n = showEdgePreview(sel, selector.plane, selector.offset);
+    const note = document.createElement("span");
+    if (n === 0) {
+      // replicad throws on an empty selector, so this would break the render.
+      note.className = "warn";
+      note.textContent = "   ⚠ this face has no boundary edges to round";
+    } else {
+      note.textContent = `   → ${n} edge${n === 1 ? "" : "s"}`;
+    }
+    fiPreviewEl.appendChild(note);
+  }
+
   if (!selector.durable) {
-    // A literal offset is correct now and silently stops matching the moment
-    // that dimension changes. The user is about to write it into their file;
-    // they should know which kind of line they are getting.
     const warn = document.createElement("span");
     warn.className = "warn";
     warn.textContent = "   ⚠ fixed offset — no parameter matched, so this breaks if the model moves";
@@ -425,17 +507,56 @@ function parseDistance(): number | null {
   const raw = fiDistEl.value.trim().replace(",", ".");
   if (raw === "" || raw === "-") return null;
   const n = Number(raw);
-  return Number.isFinite(n) && n !== 0 ? n : null;
+  if (!Number.isFinite(n) || n === 0) return null;
+  // A negative radius is not a thing; only extrude reads a sign.
+  if (activeOp !== "extrude" && n < 0) return null;
+  return n;
 }
 
 let faceOpRequestId = 0;
 let pendingFaceOp: number | null = null;
+/**
+ * Set when a face operation has been written and we are waiting for the
+ * rebuild it triggers.
+ *
+ * The write succeeding is not the same as the operation doing anything. A
+ * fillet radius OCCT cannot apply is caught by the stdlib helper, which warns
+ * and returns the shape unchanged — so without this, pressing Apply would add
+ * a line to the file and visibly change nothing, which is the silent no-op
+ * this whole feature exists to avoid.
+ */
+let awaitingFaceOpRebuild: FaceOpKind | null = null;
 
-function applyExtrude(): void {
+/** Prefixes the stdlib helpers put on their runtime warnings. */
+const FACE_OP_WARNING = /^(extrudeFace|filletFace|chamferFace):\s*/;
+
+/**
+ * Report a warning raised by the operation the user just applied.
+ * Returns true when one was found, so the caller can leave the success
+ * message alone otherwise.
+ */
+function reportFaceOpWarnings(warnings: string[] | undefined): boolean {
+  if (!awaitingFaceOpRebuild) return false;
+  awaitingFaceOpRebuild = null;
+  const mine = (warnings ?? []).filter((w) => FACE_OP_WARNING.test(w));
+  if (mine.length === 0) return false;
+  // The helper's message ends with "Returning shape unchanged." — true, but
+  // the status line is short and the reason is the useful half.
+  const text = mine[0]!.replace(FACE_OP_WARNING, "").replace(/\s*Returning shape unchanged\.$/, "");
+  setParamsStatus(`Nothing changed — ${text}`, true);
+  return true;
+}
+
+function applyOp(): void {
   const sel = facePicker.getSelection();
   const d = parseDistance();
-  if (!sel || d === null) {
-    setParamsStatus("Enter a non-zero distance.", true);
+  if (!sel || !activeOp || d === null) {
+    setParamsStatus(
+      activeOp === "extrude"
+        ? "Enter a non-zero distance."
+        : "Enter a positive radius.",
+      true,
+    );
     return;
   }
   if (pendingFaceOp !== null) return;
@@ -443,11 +564,12 @@ function applyExtrude(): void {
   faceOpRequestId += 1;
   pendingFaceOp = faceOpRequestId;
   fiApplyEl.disabled = true;
-  setParamsStatus(`Extruding ${d} mm…`);
+  setParamsStatus(`${OP_LABEL[activeOp]}…`);
+  awaitingFaceOpRebuild = activeOp;
   postToExtension({
     type: "face-op",
     requestId: faceOpRequestId,
-    op: "extrude",
+    op: activeOp,
     // A single-part script returns a bare shape and has no name to match on.
     partName: currentParts.length > 1 ? sel.partName : null,
     face: {
@@ -459,17 +581,20 @@ function applyExtrude(): void {
   });
 }
 
-fiExtrudeEl.addEventListener("click", () => setExtruding(true));
-fiApplyEl.addEventListener("click", applyExtrude);
+fiExtrudeEl.addEventListener("click", () => setActiveOp("extrude"));
+fiFilletEl.addEventListener("click", () => setActiveOp("fillet"));
+fiChamferEl.addEventListener("click", () => setActiveOp("chamfer"));
+fiBackEl.addEventListener("click", () => setActiveOp(null));
+fiApplyEl.addEventListener("click", applyOp);
 fiDistEl.addEventListener("input", () => {
-  if (extruding) renderExtrudePreview();
+  if (activeOp) renderOpPreview();
 });
 fiDistEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter") {
-    applyExtrude();
+    applyOp();
     e.preventDefault();
   } else if (e.key === "Escape") {
-    setExtruding(false);
+    setActiveOp(null);
     e.preventDefault();
     e.stopPropagation();
   }
@@ -581,6 +706,8 @@ function addPart(part: TessellatedPart) {
     triangles: part.triangles,
     faceGroups: part.faceGroups,
     faceInfo: part.faceInfo,
+    edgeVertices: part.edgeVertices,
+    edgeGroups: part.edgeGroups,
     volume: part.volume,
     surfaceArea: part.surfaceArea,
     centerOfMass: part.centerOfMass,
@@ -937,6 +1064,10 @@ function handleWorkerMessage(msg: WorkerToWebview) {
           pendingVisibility = null;
           applyPartVisibility(intent.focusPart, intent.hideParts);
         }
+        // A face operation the user just applied may have declined at build
+        // time — surface that before anything else overwrites the status line.
+        reportFaceOpWarnings(msg.warnings);
+
         // Track what the file declares, for the selection bar's selector
         // preview. `declared` is only present when an override is in force.
         declaredParamValues = {};
@@ -1401,15 +1532,13 @@ onMessage("face-op-result", (msg) => {
     setParamsStatus(`Not applied — ${msg.reason ?? "unknown reason"}`, true);
     return;
   }
-  setParamsStatus(
-    msg.addedImport
-      ? "Extruded — and added the shapeitup import"
-      : "Extruded",
-  );
+  // The file is written; whether the operation actually changed the geometry
+  // is only knowable after the rebuild. reportFaceOpWarnings has the last word.
+  setParamsStatus(msg.addedImport ? "Written — and added the shapeitup import" : "Written");
   // The file changed, so a re-render is on its way from the watcher. The
   // selection indexes into buffers that render is about to replace, and there
   // is no honest way to re-find "the same face" across a topology change.
-  setExtruding(false);
+  setActiveOp(null);
   facePicker.setSelection(null);
   updateFaceInfoPanel();
 });

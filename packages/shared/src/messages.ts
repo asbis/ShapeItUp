@@ -182,7 +182,11 @@ export type WebviewToExt =
     }
   | { type: "param-changed"; params: Record<string, number> }
   /**
-   * Push or pull a picked face, writing the operation into the `.shape.ts`.
+   * Apply an operation to a picked face, writing it into the `.shape.ts`.
+   *
+   * `extrude` pushes or pulls the face itself; `fillet` and `chamfer` act on
+   * the edges around it. All three are driven by the same picked face because
+   * one plane predicate names the face and its boundary equally well.
    *
    * The viewer sends the FACE, not a finder: synthesising the selector needs
    * the file's declared parameters in order to bind an offset to a name, and
@@ -192,9 +196,10 @@ export type WebviewToExt =
   | {
       type: "face-op";
       requestId: number;
-      op: "extrude";
+      op: "extrude" | "fillet" | "chamfer";
       partName: string | null;
       face: { kind: string; center: [number, number, number]; normal?: [number, number, number] };
+      /** Signed for extrude; a positive radius / setback for the other two. */
       distance: number;
     }
   | { type: "ready" }

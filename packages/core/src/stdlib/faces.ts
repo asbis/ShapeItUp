@@ -15,12 +15,69 @@
  * every generated call takes one.
  */
 
-import { FaceFinder, Sketch, type Shape3D, type Face } from "replicad";
+import { FaceFinder, Sketch, type Edge, type Shape3D, type Face } from "replicad";
 import { pushRuntimeWarning } from "./warnings";
 
-export interface ExtrudeFaceOptions {
-  /** Suppress the runtime warning when the face cannot be resolved. */
+export interface FaceOpOptions {
+  /** Suppress the runtime warning when the operation cannot be applied. */
   silent?: boolean;
+}
+
+/** @deprecated Use {@link FaceOpOptions}. Kept so existing scripts still type. */
+export type ExtrudeFaceOptions = FaceOpOptions;
+
+/**
+ * Resolve a face finder to exactly one face, or explain why not.
+ *
+ * "Exactly one" is the contract for every operation here. Acting on one of
+ * several matches would be a coin flip that silently changes which face it
+ * touches as the model evolves — the failure mode these helpers exist to
+ * avoid.
+ */
+function resolveFace(
+  label: string,
+  shape: Shape3D,
+  finder: (f: FaceFinder) => FaceFinder,
+  warn: (msg: string) => void,
+): Face | null {
+  let matches: Face[];
+  try {
+    matches = finder(new FaceFinder()).find(shape);
+  } catch (err) {
+    warn(`could not evaluate the selector — ${errText(err)}.`);
+    return null;
+  }
+  if (matches.length === 0) {
+    warn("no face matched the selector.");
+    return null;
+  }
+  if (matches.length > 1) {
+    warn(`the selector matched ${matches.length} faces, but it must match exactly one.`);
+    for (const m of matches) tryDelete(m);
+    return null;
+  }
+  return matches[0]!;
+}
+
+/**
+ * The edges bounding a face: its outer wire plus the wire of every hole in it.
+ *
+ * This is what "the edges around this face" means, and it is worth getting
+ * from the face itself rather than from a plane predicate. On a plate whose
+ * top has already been filleted, `EdgeFinder.inPlane("XY", 6)` returns 16
+ * edges — the 12 that bound the face, plus 4 fillet arcs that merely START in
+ * that plane and curve away to z = 2. Filleting those is meaningless, and OCCT
+ * rejects the whole operation because of them.
+ *
+ * `outerWire()` and `innerWires()` each CONSUME the Face they are called on,
+ * so the outer wire is taken from a clone. See extrudeFace for the same dance.
+ */
+function boundaryEdgesOf(face: Face): Edge[] {
+  const outer = face.clone().outerWire();
+  const inners = face.innerWires();
+  const edges: Edge[] = [...outer.edges];
+  for (const wire of inners) edges.push(...wire.edges);
+  return edges;
 }
 
 /**
@@ -43,7 +100,7 @@ export function extrudeFace(
   shape: Shape3D,
   finder: (f: FaceFinder) => FaceFinder,
   distance: number,
-  opts: ExtrudeFaceOptions = {},
+  opts: FaceOpOptions = {},
 ): Shape3D {
   // A zero push is a no-op, not an error — it is what a slider passes through
   // on its way somewhere else.
@@ -53,25 +110,8 @@ export function extrudeFace(
     if (!opts.silent) pushRuntimeWarning(`extrudeFace: ${msg} Returning shape unchanged.`);
   };
 
-  let face: Face;
-  try {
-    const matches = finder(new FaceFinder()).find(shape);
-    if (matches.length === 0) {
-      warn("no face matched the selector.");
-      return shape;
-    }
-    if (matches.length > 1) {
-      // Extruding "one of" several matches would be a coin flip that silently
-      // changes which face it acts on as the model evolves.
-      warn(`the selector matched ${matches.length} faces, but it must match exactly one.`);
-      for (const m of matches) tryDelete(m);
-      return shape;
-    }
-    face = matches[0];
-  } catch (err) {
-    warn(`could not evaluate the selector — ${errText(err)}.`);
-    return shape;
-  }
+  const face = resolveFace("extrudeFace", shape, finder, warn);
+  if (!face) return shape;
 
   try {
     if (face.geomType !== "PLANE") {
@@ -123,5 +163,97 @@ function tryDelete(o: { delete?: () => void }): void {
     o.delete?.();
   } catch {
     /* freeing is best effort */
+  }
+}
+
+/**
+ * Round the edges around a picked face.
+ *
+ * Driven by the same FaceFinder as {@link extrudeFace}: the user picks one
+ * face, and the operation resolves its boundary at build time. That keeps the
+ * written line durable — `(f) => f.inPlane("XY", thickness)` follows the
+ * parameter — while the exact set of edges is recomputed from the geometry it
+ * actually finds, rather than frozen into the source.
+ *
+ * @example
+ *   filletFace(plate, (f) => f.inPlane("XY", thickness), 2)
+ */
+export function filletFace(
+  shape: Shape3D,
+  finder: (f: FaceFinder) => FaceFinder,
+  radius: number,
+  opts: FaceOpOptions = {},
+): Shape3D {
+  return roundBoundary("filletFace", shape, finder, radius, opts);
+}
+
+/**
+ * Bevel the edges around a picked face. The counterpart of {@link filletFace};
+ * `distance` is the setback from the edge, not a radius.
+ *
+ * @example
+ *   chamferFace(plate, (f) => f.inPlane("XY", thickness), 1)
+ */
+export function chamferFace(
+  shape: Shape3D,
+  finder: (f: FaceFinder) => FaceFinder,
+  distance: number,
+  opts: FaceOpOptions = {},
+): Shape3D {
+  return roundBoundary("chamferFace", shape, finder, distance, opts);
+}
+
+function roundBoundary(
+  label: "filletFace" | "chamferFace",
+  shape: Shape3D,
+  finder: (f: FaceFinder) => FaceFinder,
+  size: number,
+  opts: FaceOpOptions,
+): Shape3D {
+  if (!Number.isFinite(size) || size === 0) return shape;
+  const warn = (msg: string) => {
+    if (!opts.silent) pushRuntimeWarning(`${label}: ${msg} Returning shape unchanged.`);
+  };
+  if (size < 0) {
+    warn(`a negative ${label === "filletFace" ? "radius" : "setback"} is not meaningful.`);
+    return shape;
+  }
+
+  const face = resolveFace(label, shape, finder, warn);
+  if (!face) return shape;
+
+  let edges: Edge[];
+  try {
+    edges = boundaryEdgesOf(face);
+  } catch (err) {
+    warn(`could not read the face's boundary — ${errText(err)}.`);
+    return shape;
+  }
+  if (edges.length === 0) {
+    warn("the face has no boundary edges.");
+    return shape;
+  }
+
+  try {
+    // `inList` is exact: these are the edge objects themselves, so there is no
+    // predicate to be over- or under-inclusive about.
+    return label === "filletFace"
+      ? shape.fillet(size, (e) => e.inList(edges))
+      : shape.chamfer(size, (e) => e.inList(edges));
+  } catch (err) {
+    // Some of these arrive already explained — core's own fillet guard says
+    // things like "radius 40mm exceeds minimum filtered edge length 9.42mm.
+    // Reduce radius (try 4.24)". Appending a vaguer sentence to a message
+    // that good makes it worse, so the generic hint is added only when OCCT
+    // gave us nothing but a pointer.
+    const detail = errText(err);
+    const opaque = /^OCCT error \d+$/.test(detail);
+    warn(
+      opaque
+        ? `${detail}. The size is probably too large for the surrounding ` +
+            `material, or those edges have already been rounded.`
+        : detail,
+    );
+    return shape;
   }
 }

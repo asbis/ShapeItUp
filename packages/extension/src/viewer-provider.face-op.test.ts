@@ -135,11 +135,38 @@ describe("ViewerProvider.commitFaceOp", () => {
     expect(doc.text).toBe(SRC);
   });
 
+  it("writes filletFace and chamferFace, each with its own import", async () => {
+    for (const [op, fn] of [["fillet", "filletFace"], ["chamfer", "chamferFace"]] as const) {
+      __reset();
+      const doc = __addDoc(FILE, SRC, { visible: true });
+      const { provider } = makeProvider(FILE);
+      const r = await provider.commitFaceOp(request({ op, distance: 2 }));
+      expect(r.ok).toBe(true);
+      expect(doc.text).toContain(`import { ${fn} } from "shapeitup";`);
+      expect(doc.text).toContain(
+        `return ${fn}(drawRoundedRectangle(width, 60, 4).sketchOnPlane().extrude(thickness), (f) => f.inPlane("XY", thickness), 2);`,
+      );
+    }
+  });
+
+  it("declines a negative radius but allows a negative extrude", async () => {
+    __addDoc(FILE, SRC, { visible: true });
+    const { provider } = makeProvider(FILE);
+    for (const op of ["fillet", "chamfer"] as const) {
+      const r = await provider.commitFaceOp(request({ op, distance: -2 }));
+      expect(r.ok).toBe(false);
+      expect(r.reason).toMatch(/must be positive/);
+    }
+    expect((await provider.commitFaceOp(request({ distance: -2 }))).ok).toBe(true);
+  });
+
   it("declines a zero distance", async () => {
     __addDoc(FILE, SRC, { visible: true });
     const { provider } = makeProvider(FILE);
-    const r = await provider.commitFaceOp(request({ distance: 0 }));
-    expect(r.reason).toMatch(/non-zero/);
+    for (const op of ["extrude", "fillet", "chamfer"] as const) {
+      const r = await provider.commitFaceOp(request({ op, distance: 0 }));
+      expect(r.reason).toMatch(/non-zero/);
+    }
   });
 
   it("echoes the request id so a stale reply is identifiable", async () => {

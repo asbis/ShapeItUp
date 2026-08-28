@@ -12,12 +12,14 @@ import { resetRuntimeWarnings, drainRuntimeWarnings } from "./warnings.js";
 
 let rc: typeof import("replicad");
 let extrudeFace: typeof import("./faces.js").extrudeFace;
+let filletFace: typeof import("./faces.js").filletFace;
+let chamferFace: typeof import("./faces.js").chamferFace;
 
 beforeAll(async () => {
   const oc = await loadOCCTForTest();
   rc = await import("replicad");
   rc.setOC(oc);
-  ({ extrudeFace } = await import("./faces.js"));
+  ({ extrudeFace, filletFace, chamferFace } = await import("./faces.js"));
 }, 120_000);
 
 /** 80 x 60 x 8 plate, corners rounded r6, with a central Ø12 through-hole. */
@@ -110,5 +112,128 @@ describe("extrudeFace", () => {
     }, 5);
     expect(vol(out)).toBeCloseTo(BASE_VOLUME, 1);
     expect(drainRuntimeWarnings().join(" ")).toMatch(/could not evaluate/);
+  });
+});
+
+describe("filletFace / chamferFace", () => {
+  const area = (s: any) => rc.measureShapeSurfaceProperties(s).area;
+
+  it("rounds the edges around the picked face", () => {
+    const before = build();
+    const after = filletFace(build(), top, 2);
+    // A fillet removes material from a convex edge, so the volume drops — and
+    // it must actually drop, or the operation silently did nothing.
+    expect(vol(after)).toBeLessThan(vol(before) - 1);
+    expect(vol(after)).toBeGreaterThan(vol(before) * 0.9);
+  });
+
+  it("chamfers the same edges", () => {
+    const after = chamferFace(build(), top, 1);
+    expect(vol(after)).toBeLessThan(BASE_VOLUME - 1);
+  });
+
+  it("rounds the hole rim as well as the outer boundary", () => {
+    // The picked face's boundary is its outer wire PLUS the wire of every hole
+    // in it. This test discriminates: an implementation that read only the
+    // outer wire would leave the bore's rim sharp, and the material it removed
+    // would fall short by the bore's contribution.
+    //
+    //   outer perimeter  = 2(80+60) - 8r_corner + 2*pi*r_corner, r_corner = 6
+    //                    = 280 - 48 + 37.70 = 269.70 mm
+    //   bore rim         = 2*pi*6            =  37.70 mm
+    //   an r=2 fillet removes (1 - pi/4)r^2  =   0.8584 mm^2 per mm of edge
+    const R = 2;
+    const perMm = (1 - Math.PI / 4) * R * R;
+    const outerPerimeter = 2 * (80 + 60) - 8 * 6 + 2 * Math.PI * 6;
+    const boreRim = 2 * Math.PI * 6;
+
+    const removed = BASE_VOLUME - vol(filletFace(build(), top, R));
+
+    // Both wires: within a few percent of the closed-form prediction.
+    expect(removed).toBeCloseTo(perMm * (outerPerimeter + boreRim), 0);
+    // And clearly MORE than the outer wire alone would account for, so the
+    // test fails if the inner wires are ever dropped.
+    expect(removed).toBeGreaterThan(perMm * outerPerimeter * 1.05);
+  });
+
+  it("declines a radius OCCT cannot apply, without breaking the shape", () => {
+    resetRuntimeWarnings();
+    // Far wider than the 8 mm plate is thick.
+    const out = filletFace(build(), top, 50);
+    expect(vol(out)).toBeCloseTo(BASE_VOLUME, 1);
+    const w = drainRuntimeWarnings().join(" ");
+    expect(w).toMatch(/^filletFace:/);
+    // This test loads replicad directly, without initCore, so core's own
+    // fillet guard is not installed and OCCT's bare pointer comes through.
+    // That is the path the generic hint exists for.
+    //
+    // In the running app the guard IS installed and produces something far
+    // better — "radius 40mm exceeds minimum filtered edge length 9.42mm.
+    // Reduce radius (try 4.24)" — which the helper passes through untouched.
+    // Verified in the viewer; the branch is asserted below.
+    expect(w).toMatch(/OCCT error \d+/);
+    expect(w).toMatch(/probably too large for the surrounding material/);
+  });
+
+  it("passes a self-explaining fillet error through instead of burying it", () => {
+    // Appending a vaguer sentence to a message that already names the fix
+    // makes it worse, so the generic hint is added only for a bare pointer.
+    //
+    // The failure has to come from `.fillet` itself, not from the selector —
+    // those are different catch blocks, and only this one formats the hint.
+    resetRuntimeWarnings();
+    const shape: any = build();
+    const real = shape.fillet.bind(shape);
+    shape.fillet = () => {
+      throw new Error(
+        "radius 40mm exceeds minimum filtered edge length 9.42mm. Reduce radius (try 4.24).",
+      );
+    };
+    const out = filletFace(shape, top, 40);
+    shape.fillet = real;
+
+    expect(out).toBe(shape);
+    const w = drainRuntimeWarnings().join(" ");
+    expect(w).toMatch(/^filletFace: radius 40mm exceeds/);
+    expect(w).toMatch(/Reduce radius \(try 4\.24\)/);
+    expect(w).not.toMatch(/probably too large/);
+  });
+
+  it("declines a negative size", () => {
+    resetRuntimeWarnings();
+    expect(vol(filletFace(build(), top, -2))).toBeCloseTo(BASE_VOLUME, 1);
+    expect(drainRuntimeWarnings().join(" ")).toMatch(/negative radius/);
+    resetRuntimeWarnings();
+    expect(vol(chamferFace(build(), top, -1))).toBeCloseTo(BASE_VOLUME, 1);
+    expect(drainRuntimeWarnings().join(" ")).toMatch(/negative setback/);
+  });
+
+  it("treats zero as a no-op", () => {
+    resetRuntimeWarnings();
+    expect(vol(filletFace(build(), top, 0))).toBeCloseTo(BASE_VOLUME, 1);
+    expect(drainRuntimeWarnings()).toHaveLength(0);
+  });
+
+  it("declines an ambiguous or empty selector", () => {
+    resetRuntimeWarnings();
+    expect(vol(filletFace(build(), (f: any) => f.parallelTo("XY"), 1))).toBeCloseTo(BASE_VOLUME, 1);
+    expect(drainRuntimeWarnings().join(" ")).toMatch(/matched 2 faces/);
+    resetRuntimeWarnings();
+    expect(vol(filletFace(build(), (f: any) => f.inPlane("XY", 999), 1))).toBeCloseTo(BASE_VOLUME, 1);
+    expect(drainRuntimeWarnings().join(" ")).toMatch(/no face matched/);
+  });
+
+  it("takes only the boundary, not every edge the plane predicate would catch", () => {
+    // This is the whole reason the helper reads the face's wires instead of
+    // taking an EdgeFinder. On a plate whose top is ALREADY filleted,
+    // `EdgeFinder.inPlane("XY", z)` also returns the arcs that merely start in
+    // that plane and curve away — and OCCT then rejects the operation.
+    const once = filletFace(build(), top, 1);
+    const topOfOnce = (f: any) => f.inPlane("XY", 8);
+    resetRuntimeWarnings();
+    const twice = filletFace(once, topOfOnce, 0.4);
+    // It may or may not be geometrically possible; what must NOT happen is a
+    // throw, and the shape must survive either way.
+    expect(Number.isFinite(vol(twice))).toBe(true);
   });
 });

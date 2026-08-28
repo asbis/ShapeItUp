@@ -7,6 +7,7 @@
  */
 import { describe, it, expect } from "vitest";
 import {
+  buildFaceOpCall,
   computeFaceOpEdit,
   synthesizeFaceSelector,
   type SelectableFace,
@@ -40,6 +41,9 @@ describe("synthesizeFaceSelector", () => {
       ok: true,
       selector: {
         code: '(f) => f.inPlane("XY", thickness)',
+        plane: "XY",
+        offsetExpr: "thickness",
+        offset: 6,
         boundTo: "thickness",
         durable: true,
       },
@@ -62,17 +66,18 @@ describe("synthesizeFaceSelector", () => {
   it("falls back to a literal and says it is not durable", () => {
     // 30 is plateD / 2, but nothing here proves that rather than a coincidence.
     const r = synthesizeFaceSelector(planar([0, 1, 0], [0, 30, 0]), params);
-    expect(r).toEqual({
+    expect(r).toMatchObject({
       ok: true,
-      selector: { code: '(f) => f.inPlane("XZ", 30)', durable: false },
+      selector: { code: '(f) => f.inPlane("XZ", 30)', offsetExpr: "30", durable: false },
     });
+    expect(r.ok && "boundTo" in r.selector).toBe(false);
   });
 
   it("does not bind an offset of zero to a parameter that happens to be zero", () => {
     // A plane through the origin stays through the origin; binding it to
     // `someZeroParam` would move the selector the moment that param changed.
     const r = synthesizeFaceSelector(planar([0, 0, 1], [0, 0, 0]), { offset: 0 });
-    expect(r).toEqual({
+    expect(r).toMatchObject({
       ok: true,
       selector: { code: '(f) => f.inPlane("XY", 0)', durable: false },
     });
@@ -276,5 +281,99 @@ export default function main() {
       const r = computeFaceOpEdit(MULTI, name, CALL);
       expect(r.ok).toBe(false);
     }
+  });
+});
+
+describe("buildFaceOpCall — per-operation output", () => {
+  const TOP: SelectableFace = { kind: "PLANE", center: [0, 0, 6], normal: [0, 0, 1] };
+
+  /** Apply a built operation and return the resulting source. */
+  function build(source: string, req: Parameters<typeof buildFaceOpCall>[1]): string {
+    const r = buildFaceOpCall(source, req);
+    if (!r.ok) throw new Error(`expected a build, got: ${r.reason}`);
+    let out = source;
+    for (const e of [...r.edits].sort((a, b) => b.start - a.start)) {
+      out = out.slice(0, e.start) + e.text + out.slice(e.end);
+    }
+    return out;
+  }
+
+  it("names the same picked FACE for all three operations", () => {
+    // fillet and chamfer act on the edges around the face, but they resolve
+    // that boundary at build time from the face's own wires — so what goes in
+    // the source is a FaceFinder, not an edge predicate.
+    const out = build(SINGLE, { op: "fillet", partName: null, face: TOP, distance: 2 });
+    expect(out).toContain(
+      'return filletFace(drawCircle(d / 2).sketchOnPlane().extrude(h), (f) => f.inPlane("XY", 6), 2);',
+    );
+  });
+
+  it("emits chamfer the same way", () => {
+    const out = build(SINGLE, { op: "chamfer", partName: null, face: TOP, distance: 1 });
+    expect(out).toContain('chamferFace(drawCircle(d / 2).sketchOnPlane().extrude(h), (f) => f.inPlane("XY", 6), 1);');
+  });
+
+  it("imports the helper each operation names", () => {
+    const wanted = { extrude: "extrudeFace", fillet: "filletFace", chamfer: "chamferFace" } as const;
+    for (const [op, fn] of Object.entries(wanted) as [keyof typeof wanted, string][]) {
+      const out = build(SINGLE, { op, partName: null, face: TOP, distance: 2 });
+      expect(out).toContain(`import { ${fn} } from "shapeitup";`);
+    }
+  });
+
+  it("binds the offset to a parameter for all three operations", () => {
+    const src = SINGLE.replace("{ d: 20, h: 8 }", "{ d: 20, h: 6 }");
+    for (const op of ["extrude", "fillet", "chamfer"] as const) {
+      const r = buildFaceOpCall(src, { op, partName: null, face: TOP, distance: 2 });
+      expect(r.ok && r.applied).toContain('inPlane("XY", h)');
+    }
+  });
+
+  it("needs no parentheses, because every template passes the shape as an argument", () => {
+    // A suffix form (`$SHAPE.fillet(…)`) would bind to `squareOne()` alone here
+    // and silently compute something else. Wrapping cannot.
+    const ternary = `export default function main({ round }) {
+  return round ? roundOne() : squareOne();
+}
+`;
+    const out = build(ternary, { op: "fillet", partName: null, face: TOP, distance: 2 });
+    expect(out).toContain("filletFace(round ? roundOne() : squareOne(), ");
+  });
+
+  it("passes a plain chain through untouched", () => {
+    const ternary = `export default function main({ round }) {
+  return round ? roundOne() : squareOne();
+}
+`;
+    const out = build(ternary, { op: "extrude", partName: null, face: TOP, distance: 2 });
+    expect(out).toContain("extrudeFace(round ? roundOne() : squareOne(), ");
+  });
+
+  it("refuses a negative fillet or chamfer but allows a negative extrude", () => {
+    // Pushing a face in is meaningful; a negative radius is not.
+    for (const op of ["fillet", "chamfer"] as const) {
+      const r = buildFaceOpCall(SINGLE, { op, partName: null, face: TOP, distance: -2 });
+      expect(r).toMatchObject({ ok: false });
+      expect(!r.ok && r.reason).toMatch(/must be positive/);
+    }
+    const ex = buildFaceOpCall(SINGLE, { op: "extrude", partName: null, face: TOP, distance: -2 });
+    expect(ex.ok).toBe(true);
+  });
+
+  it("refuses a zero distance for every operation", () => {
+    for (const op of ["extrude", "fillet", "chamfer"] as const) {
+      expect(buildFaceOpCall(SINGLE, { op, partName: null, face: TOP, distance: 0 })).toMatchObject({
+        ok: false,
+      });
+    }
+  });
+
+  it("stacks operations, each applying to the result of the last", () => {
+    const once = build(SINGLE, { op: "extrude", partName: null, face: TOP, distance: 5 });
+    const twice = build(once, { op: "fillet", partName: null, face: TOP, distance: 1 });
+    expect(twice).toContain("filletFace(extrudeFace(drawCircle(d / 2)");
+    // One import statement, carrying both helpers.
+    expect(twice.match(/from "shapeitup"/g)).toHaveLength(1);
+    expect(twice).toContain('import { extrudeFace, filletFace } from "shapeitup";');
   });
 });

@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { createModelMaterial, createEdgeMaterial, createHighlightMaterial } from "./theme";
+import { THEME, createModelMaterial, createEdgeMaterial, createHighlightMaterial } from "./theme";
 
 export function buildMesh(
   vertices: Float32Array,
@@ -61,4 +61,27 @@ export function buildFaceHighlight(
   mesh.raycast = () => {};
   mesh.renderOrder = 1;
   return mesh;
+}
+
+/**
+ * Overlay for the edges an operation is about to modify.
+ *
+ * Drawn on top of the model's own black edge lines, so it needs both a
+ * depthTest waiver and a high renderOrder — a highlighted edge that vanishes
+ * behind the surface it belongs to would defeat the point, which is letting
+ * the user count what they are about to round.
+ */
+export function buildEdgeHighlight(points: Float32Array): THREE.LineSegments {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(points, 3));
+  const material = new THREE.LineBasicMaterial({
+    color: THEME.selectColor,
+    depthTest: false,
+    transparent: true,
+    opacity: 0.95,
+  });
+  const lines = new THREE.LineSegments(geometry, material);
+  lines.raycast = () => {};
+  lines.renderOrder = 2;
+  return lines;
 }

@@ -8447,25 +8447,35 @@ warning when a no-op is expected.
 
 ---
 
-## extrudeFace — push or pull one face
+## Face operations — \`extrudeFace\`, \`filletFace\`, \`chamferFace\`
 
 \`\`\`typescript
-import { extrudeFace } from "shapeitup";
+import { extrudeFace, filletFace, chamferFace } from "shapeitup";
 
-// Pull the top face 5 mm outward. Holes in the face are preserved.
+// Pull the top face 5 mm outward (negative pushes it in). Holes are preserved.
 extrudeFace(plate, (f) => f.inPlane("XY", thickness), 5)
 
-// A negative distance pushes inward, removing material.
-extrudeFace(plate, (f) => f.inPlane("XY", thickness), -3)
+// Round, then bevel, the edges AROUND that same face.
+filletFace(plate,  (f) => f.inPlane("XY", thickness), 2)
+chamferFace(plate, (f) => f.inPlane("XY", thickness), 1)
 \`\`\`
 
-This is what the viewer writes when you select a face and press **Extrude** —
-the GUI produces a code edit rather than hidden state, so the file stays the
-only description of the model.
+These are what the viewer writes when you select a face and press Extrude,
+Fillet or Chamfer — the GUI produces a code edit rather than hidden state, so
+the file stays the only description of the model.
 
-The face is named by a FINDER, and the finder must resolve to exactly ONE
-planar face. Anything else (no match, several matches, a curved face) returns
-the shape unchanged with a runtime warning rather than throwing.
+All three name the same picked FACE, and the finder must resolve to exactly
+one planar face. Anything else — no match, several matches, a curved face, a
+size OCCT rejects — returns the shape unchanged with a runtime warning rather
+than throwing.
+
+**Why fillet takes a FaceFinder and not an EdgeFinder.** The obvious hand-written
+form is \`shape.fillet(2, (e) => e.inPlane("XY", thickness))\`, and on a simple
+part it is equivalent. On a part whose top has already been filleted it is not:
+\`EdgeFinder.inPlane\` also returns arcs that merely START in that plane and
+curve away out of it, and OCCT then rejects the whole operation. \`filletFace\`
+reads the face's own outer and inner wires instead, so it gets the boundary
+exactly — including hole rims.
 
 **Bind the offset to a parameter.** \`inPlane("XY", thickness)\` keeps working
 when \`thickness\` changes; \`inPlane("XY", 8)\` silently stops matching and the

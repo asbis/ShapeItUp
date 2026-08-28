@@ -430,6 +430,7 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
     }
     #fi-dist:focus { outline: none; border-color: #0e639c; }
     .fi-unit { color: #6f6f6f; }
+    .fi-op { color: #e8e8e8; font-weight: 600; }
     /* The generated line, shown before it is written. This is the whole
        contract of the feature: you see the code you are about to commit. */
     #fi-preview {
@@ -589,12 +590,16 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
           <span class="fi-rule"></span>
           <span id="fi-tools">
             <button id="fi-extrude" title="Push or pull this face along its normal">Extrude</button>
+            <button id="fi-fillet" title="Round the edges around this face">Fillet</button>
+            <button id="fi-chamfer" title="Bevel the edges around this face">Chamfer</button>
             <button id="fi-lookat" title="Orient the camera down this face's normal">Look at</button>
           </span>
           <span id="fi-form" hidden>
-            <input id="fi-dist" type="text" inputmode="decimal" value="5" title="Positive adds material, negative removes it">
+            <span class="fi-op" id="fi-op"></span>
+            <input id="fi-dist" type="text" inputmode="decimal" value="5">
             <span class="fi-unit">mm</span>
             <button id="fi-apply" title="Write this into the file">Apply</button>
+            <button id="fi-back" title="Back to the tools">&#8592;</button>
           </span>
           <button id="fi-clear" title="Clear selection (Esc)">&#10005;</button>
         </div>

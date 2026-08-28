@@ -27,7 +27,7 @@
  */
 import * as THREE from "three";
 import type { FaceInfo } from "@shapeitup/shared";
-import { buildFaceHighlight } from "./mesh-builder";
+import { buildEdgeHighlight, buildFaceHighlight } from "./mesh-builder";
 
 /** Everything the picker needs about one rendered part. */
 export interface PickablePart {
@@ -38,6 +38,9 @@ export interface PickablePart {
   triangles: Uint32Array;
   faceGroups?: Uint32Array;
   faceInfo?: FaceInfo[];
+  /** Edge line points, and the `[start, count]` spans that divide them. */
+  edgeVertices?: Float32Array;
+  edgeGroups?: Uint32Array;
   /** Mirrors the parts panel's eye toggle; hidden parts are not pickable. */
   visible: boolean;
 }
@@ -266,4 +269,142 @@ export class FacePicker {
 function sameFace(a: FaceSelection | null, b: FaceSelection | null): boolean {
   if (a === null || b === null) return a === b;
   return a.partIndex === b.partIndex && a.faceIndex === b.faceIndex;
+}
+
+// ---------------------------------------------------------------------------
+// Which edges will a fillet touch?
+// ---------------------------------------------------------------------------
+
+/** Index of the axis a standard plane's offset is measured along. */
+const PLANE_AXIS: Record<string, 0 | 1 | 2> = { YZ: 0, XZ: 1, XY: 2 };
+
+/**
+ * The edges of `part` that lie in the given standard plane.
+ *
+ * This is the viewer's own answer to the question `EdgeFinder.inPlane(plane,
+ * offset)` will be asked at build time, computed from the mesh alone: an edge
+ * lies in the plane exactly when every point of its polyline does. No OCCT
+ * call, no extra data over the wire — `edgeGroups` was already being carried.
+ *
+ * It exists so a fillet can be SHOWN before it is written. A radius typed into
+ * a box is a guess about which edges you meant; nine highlighted edges are not.
+ *
+ * The tolerance is generous (0.01 mm) because these points made a Float32 round
+ * trip from OCCT, and an edge missing its own plane by a rounding error would
+ * be dropped from the preview while the real fillet still rounded it.
+ */
+export function edgesInPlane(
+  part: PickablePart,
+  plane: string,
+  offset: number,
+  /**
+   * Optional: keep only edges within the picked face's extent. Two separate
+   * bosses at the same height share a plane but not a boundary, and rounding
+   * one should not light up the other.
+   */
+  bounds?: FaceBounds,
+  tolerance = 0.01,
+): number[] {
+  const axis = PLANE_AXIS[plane];
+  const { edgeVertices: v, edgeGroups: g } = part;
+  if (axis === undefined || !v || !g) return [];
+
+  const found: number[] = [];
+  for (let i = 0; i < g.length; i += 2) {
+    const start = g[i]!;
+    const count = g[i + 1]!;
+    if (count === 0) continue;
+    let keep = true;
+    for (let p = start; p < start + count; p++) {
+      const x = v[p * 3]!;
+      const y = v[p * 3 + 1]!;
+      const z = v[p * 3 + 2]!;
+      const along = axis === 0 ? x : axis === 1 ? y : z;
+      if (Math.abs(along - offset) > tolerance) {
+        keep = false;
+        break;
+      }
+      if (bounds && !withinBounds(bounds, x, y, z)) {
+        keep = false;
+        break;
+      }
+    }
+    if (keep) found.push(i / 2);
+  }
+  return found;
+}
+
+/** An axis-aligned box, in world mm, with a little slack. */
+export interface FaceBounds {
+  min: [number, number, number];
+  max: [number, number, number];
+}
+
+function withinBounds(b: FaceBounds, x: number, y: number, z: number): boolean {
+  return (
+    x >= b.min[0] && x <= b.max[0] &&
+    y >= b.min[1] && y <= b.max[1] &&
+    z >= b.min[2] && z <= b.max[2]
+  );
+}
+
+/**
+ * The bounding box of one face's triangles, padded so an edge that grazes the
+ * boundary is not excluded by float noise.
+ *
+ * Used to scope the fillet preview to the face the user actually picked. It is
+ * an approximation of "the boundary of this face" — the authoritative answer
+ * comes from the face's own wires at build time — but it is the right
+ * approximation: it can only ever be too generous for a concave face, never
+ * wrong about which face is meant.
+ */
+export function faceBounds(part: PickablePart, sel: FaceSelection, pad = 0.05): FaceBounds {
+  const min: [number, number, number] = [Infinity, Infinity, Infinity];
+  const max: [number, number, number] = [-Infinity, -Infinity, -Infinity];
+  for (let t = sel.start; t < sel.start + sel.count; t++) {
+    const v = part.triangles[t]! * 3;
+    for (let k = 0; k < 3; k++) {
+      const c = part.vertices[v + k]!;
+      if (c < min[k]!) min[k] = c;
+      if (c > max[k]!) max[k] = c;
+    }
+  }
+  for (let k = 0; k < 3; k++) {
+    min[k] -= pad;
+    max[k] += pad;
+  }
+  return { min, max };
+}
+
+/**
+ * Build one LineSegments covering the given edges of a part, for the fillet
+ * preview. Returns null when there is nothing to draw.
+ */
+export function buildEdgesHighlight(
+  part: PickablePart,
+  edgeIndices: number[],
+): THREE.LineSegments | null {
+  const { edgeVertices: v, edgeGroups: g } = part;
+  if (!v || !g || edgeIndices.length === 0) return null;
+
+  // Each edge is a polyline of N points, which is N-1 segments, which is
+  // 2(N-1) endpoints in a LineSegments buffer.
+  let segments = 0;
+  for (const e of edgeIndices) segments += Math.max(0, g[e * 2 + 1]! - 1);
+  if (segments === 0) return null;
+
+  const out = new Float32Array(segments * 6);
+  let w = 0;
+  for (const e of edgeIndices) {
+    const start = g[e * 2]!;
+    const count = g[e * 2 + 1]!;
+    for (let p = start; p < start + count - 1; p++) {
+      for (const q of [p, p + 1]) {
+        out[w++] = v[q * 3]!;
+        out[w++] = v[q * 3 + 1]!;
+        out[w++] = v[q * 3 + 2]!;
+      }
+    }
+  }
+  return buildEdgeHighlight(out);
 }

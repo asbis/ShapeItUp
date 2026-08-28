@@ -51,6 +51,12 @@ export interface SelectableFace {
 export interface FaceSelector {
   /** e.g. `(f) => f.inPlane("XY", thickness)` — ready to paste as an argument. */
   code: string;
+  /** "XY" | "XZ" | "YZ" — the standard plane the face lies in. */
+  plane: string;
+  /** The offset as it appears in `code`: a parameter name, `-name`, or a literal. */
+  offsetExpr: string;
+  /** The offset as a number, for the viewer's own edge matching. */
+  offset: number;
   /** The parameter the offset was bound to, when one matched exactly. */
   boundTo?: string;
   /**
@@ -87,6 +93,13 @@ const BIND_EPSILON = 1e-4;
 export function synthesizeFaceSelector(
   face: SelectableFace,
   params: Record<string, number> = {},
+  /**
+   * The finder's parameter name. Conventionally `f` for a FaceFinder and `e`
+   * for an EdgeFinder — the same plane predicate names both, which is why
+   * filleting the edges AROUND a face reuses this synthesiser rather than
+   * needing one of its own.
+   */
+  varName: "f" | "e" = "f",
 ): FaceSelectorResult {
   if (face.kind !== "PLANE") return { ok: false, reason: "not-planar" };
   if (!face.normal) return { ok: false, reason: "no-normal" };
@@ -108,10 +121,14 @@ export function synthesizeFaceSelector(
   }
 
   const bound = bindOffset(offset, params);
+  const offsetExpr = bound?.expr ?? formatNumber(offset);
   return {
     ok: true,
     selector: {
-      code: `(f) => f.inPlane("${plane}", ${bound?.expr ?? formatNumber(offset)})`,
+      code: `(${varName}) => ${varName}.inPlane("${plane}", ${offsetExpr})`,
+      plane,
+      offsetExpr,
+      offset,
       ...(bound ? { boundTo: bound.name } : {}),
       durable: bound !== null,
     },
@@ -165,8 +182,10 @@ export type FaceOpResult =
        * edit's offsets still refer to the text it was computed against.
        */
       edits: FaceOpEdit[];
-      /** The expression that was wrapped — shown in the preview. */
+      /** The expression the operation was applied to. */
       wrapped: string;
+      /** The final source text of that expression, after the operation. */
+      applied: string;
       /** True when an `import { extrudeFace } from "shapeitup"` had to be added. */
       addedImport: boolean;
     }
@@ -197,6 +216,9 @@ export function computeFaceOpEdit(
   if (!span.ok) return span;
 
   const original = source.slice(span.start, span.end);
+  // Every template is a WRAP — `op($SHAPE, …)` — which passes the expression
+  // as an argument. That sidesteps operator precedence entirely: a suffix form
+  // (`$SHAPE.fillet(…)`) would bind to `b` alone in `cond ? a : b`.
   const wrap: FaceOpEdit = {
     start: span.start,
     end: span.end,
@@ -210,7 +232,13 @@ export function computeFaceOpEdit(
   const importEdit = helper ? ensureStdlibImport(source, helper) : null;
 
   const edits = importEdit ? [importEdit, wrap].sort((a, b) => a.start - b.start) : [wrap];
-  return { ok: true, edits, wrapped: original, addedImport: importEdit !== null };
+  return {
+    ok: true,
+    edits,
+    wrapped: original,
+    applied: wrap.text,
+    addedImport: importEdit !== null,
+  };
 }
 
 /** The function name a `$SHAPE` call template invokes, e.g. `extrudeFace`. */
@@ -490,10 +518,17 @@ function stringLiteralValue(raw: string): string | null {
 // The whole commit, in one call
 // ---------------------------------------------------------------------------
 
+export type FaceOp = "extrude" | "fillet" | "chamfer";
+
 export interface FaceOpRequest {
-  op: "extrude";
+  op: FaceOp;
   partName: string | null;
   face: SelectableFace;
+  /**
+   * Millimetres. For `extrude` it is signed — positive pulls the face out,
+   * negative pushes it in. For `fillet` and `chamfer` it is the radius or
+   * setback, and must be positive: a negative fillet is not a thing.
+   */
   distance: number;
 }
 
@@ -515,6 +550,10 @@ export type BuiltFaceOp =
  * "part-not-found" is not a sentence.
  */
 export function buildFaceOpCall(source: string, req: FaceOpRequest): BuiltFaceOp {
+  // All three operations name the same picked FACE. `fillet` and `chamfer`
+  // act on the edges around it, but they resolve that boundary from the face's
+  // own wires at build time rather than from an edge predicate written into
+  // the source — see stdlib/faces.ts for why an edge predicate gets it wrong.
   const selector = synthesizeFaceSelector(req.face, declaredParams(source));
   if (!selector.ok) {
     return { ok: false, reason: SELECTOR_PROSE[selector.reason] };
@@ -523,17 +562,44 @@ export function buildFaceOpCall(source: string, req: FaceOpRequest): BuiltFaceOp
   if (!Number.isFinite(req.distance) || req.distance === 0) {
     return { ok: false, reason: "distance must be a non-zero number" };
   }
+  if (req.op !== "extrude" && req.distance < 0) {
+    return { ok: false, reason: `a ${req.op} radius must be positive` };
+  }
 
-  const call = `extrudeFace($SHAPE, ${selector.selector.code}, ${formatNumber(req.distance)})`;
+  const d = formatNumber(req.distance);
+  const call = buildCallTemplate(req.op, selector.selector.code, d);
   const edit = computeFaceOpEdit(source, req.partName, call);
   if (!edit.ok) return { ok: false, reason: EDIT_PROSE[edit.reason] };
 
   return {
     ok: true,
     edits: edit.edits,
-    applied: call.replace("$SHAPE", edit.wrapped),
+    applied: edit.applied,
     addedImport: edit.addedImport,
   };
+}
+
+/**
+ * The source template for one operation, with `$SHAPE` standing in for the
+ * expression it applies to.
+ *
+ * All three go through a stdlib helper rather than a raw replicad call. The
+ * tempting alternative for fillet — emitting `.fillet(2, (e) => e.inPlane(…))`,
+ * the exact line a user writes by hand and which already appears in this
+ * repo's examples — was tried and rejected on evidence:
+ *
+ *   - `EdgeFinder.inPlane` over-matches on an already-filleted face, returning
+ *     arcs that merely START in the plane and curve out of it.
+ *   - replicad's `.fillet` THROWS on a radius OCCT cannot apply, and on a
+ *     realistic bracket it does. A GUI button that can replace a working model
+ *     with `OCCT error 10117192` is not an acceptable trade for idiom.
+ *
+ * The helpers resolve the boundary exactly and degrade to a warning, which is
+ * the same choice the repo's own `cosmetic.*` namespace already makes.
+ */
+function buildCallTemplate(op: FaceOp, selector: string, distance: string): string {
+  const fn = op === "extrude" ? "extrudeFace" : op === "fillet" ? "filletFace" : "chamferFace";
+  return `${fn}($SHAPE, ${selector}, ${distance})`;
 }
 
 const SELECTOR_PROSE: Record<SelectorFailure, string> = {
