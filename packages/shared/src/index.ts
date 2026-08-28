@@ -8,3 +8,4 @@ export * from "./ts-scan.js";
 export * from "./hoist.js";
 export * from "./combine-edit.js";
 export * from "./transform-edit.js";
+export * from "./arrange-edit.js";

@@ -307,12 +307,15 @@ function referencedElsewhere(
 /**
  * The edit that writes a second entry just below the original.
  *
+ * Exported because Mirror wants the same thing: "leave the original and add
+ * the transformed result as its own body" is one behaviour, not two.
+ *
  * Built by SPLICING the original's own text rather than by composing a fresh
  * object literal: an entry can carry a colour, a quantity, a material and a
  * `qty` this module has no business knowing about, and a copy that silently
  * dropped them would be a different body wearing the same shape.
  */
-function copyEntryEdit(
+export function copyEntryEdit(
   source: string,
   span: { objStart: number; objEnd: number; start: number; end: number; nameStart: number; nameEnd: number },
   shapeText: string,

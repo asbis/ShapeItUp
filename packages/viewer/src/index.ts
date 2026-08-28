@@ -33,7 +33,13 @@ import {
 import { initMessageHandler, onMessage, postToExtension } from "./message-handler";
 import type { WorkerToWebview, TessellatedPart, DetectedApp } from "@shapeitup/shared";
 import { synthesizeEdgeSelector, synthesizeFaceSelector } from "@shapeitup/shared";
-import type { CombineStatsMessage, PreviewCombine, PreviewDelta, PreviewFaceOp } from "@shapeitup/shared";
+import type {
+  CombineStatsMessage,
+  PreviewArrange,
+  PreviewCombine,
+  PreviewDelta,
+  PreviewFaceOp,
+} from "@shapeitup/shared";
 import { PART_COLORS } from "./theme";
 import { setupSim, updateSim, clearSim, initSimPanel, toggleSimPanel } from "./sim-panel";
 
@@ -529,7 +535,7 @@ function updateFaceInfoPanel(): void {
   // after it rendered. That is exactly what happened: the measurements
   // arrived and were correct, the bodies merged, and the revert undid it
   // before anyone saw it.
-  if (combineOp || moveMode) return;
+  if (combineOp || moveMode || arrangeMode) return;
   const sel = facePicker.getSelection();
   if (!sel) {
     // A preview rebuilds the model and so clears the picker. An armed
@@ -835,7 +841,8 @@ let previewInFlight = false;
  */
 type PreviewRequest =
   | { kind: "face"; op: PreviewFaceOp }
-  | { kind: "combine"; combine: PreviewCombine };
+  | { kind: "combine"; combine: PreviewCombine }
+  | { kind: "arrange"; arrange: PreviewArrange };
 
 let queuedPreview: { request: PreviewRequest; key: string } | null = null;
 
@@ -912,16 +919,19 @@ function previewPayload(): PreviewFaceOp | null {
 
 function schedulePreview(): void {
   clearTimeout(previewTimer);
-  // Combine takes precedence: arming it clears the face selection, so the two
-  // can never both be live, and asking in this order keeps that invariant in
-  // one place instead of at every call site.
+  // The modal commands clear each other when armed, so at most one of these
+  // can be live. Asking in a fixed order keeps that invariant in one place
+  // instead of at every call site.
+  const arrange = arrangePayload();
   const combine = combinePayload();
-  const request: PreviewRequest | null = combine
-    ? { kind: "combine", combine }
-    : (() => {
-        const op = previewPayload();
-        return op ? ({ kind: "face", op } as const) : null;
-      })();
+  const request: PreviewRequest | null = arrange
+    ? { kind: "arrange", arrange }
+    : combine
+      ? { kind: "combine", combine }
+      : (() => {
+          const op = previewPayload();
+          return op ? ({ kind: "face", op } as const) : null;
+        })();
   if (!request) return;
   const key = JSON.stringify(request);
   if (key === lastPreviewKey) return;
@@ -955,7 +965,9 @@ function runPreview(request: PreviewRequest, key: string): void {
     meshQuality: handleDrag ? "preview" : "final",
     ...(request.kind === "face"
       ? { previewOp: request.op }
-      : { previewCombine: request.combine }),
+      : request.kind === "combine"
+        ? { previewCombine: request.combine }
+        : { previewArrange: request.arrange }),
   });
 }
 
@@ -1249,6 +1261,7 @@ function setCombineOp(op: CombineKind | null): void {
 
   // A face selection, a body selection and a gizmo drag would all be reading
   // the same click. One at a time.
+  setArrangeMode(null);
   setMoveMode(null);
   setActiveOp(null);
   facePicker.setSelection(null);
@@ -1871,6 +1884,7 @@ function setMoveMode(mode: MoveMode | null): void {
 
   // One modal command at a time: Combine reads clicks as body selection and
   // this one hands them to a gizmo.
+  setArrangeMode(null);
   setCombineOp(null);
   setActiveOp(null);
   facePicker.setSelection(null);
@@ -2185,6 +2199,319 @@ window.addEventListener("keydown", (e) => {
 window.addEventListener("keyup", (e) => {
   if (e.key === "Shift") setMoveSnapping(true);
 });
+
+// ── Mirror and Pattern ────────────────────────────────────────────────────
+//
+// Fusion's Create → Mirror and Create → Pattern. Both make copies of a body,
+// which is why they share a bar: the only real difference is how many and
+// where.
+//
+// Mirror is the one operation in the whole viewport with nothing in it that
+// can go stale. `shape.mirror("XZ")` names a standard plane through the
+// origin — not a pivot, not an offset, not a measured coordinate — so it means
+// the same thing whatever the model becomes. Everything else we write has to
+// argue for its durability; this one has nothing to argue about.
+//
+// The preview goes through the kernel, unlike Move's. A mirror fuses two
+// solids and a pattern fuses N, so the topology genuinely changes and there is
+// nothing a matrix on the part group could stand in for.
+
+const arrangeInfoEl = document.getElementById("arrange-info")!;
+const aiOpEl = document.getElementById("ai-op")!;
+const aiBodyEl = document.getElementById("ai-body") as HTMLSelectElement;
+const aiMirrorEl = document.getElementById("ai-mirror") as HTMLElement;
+const aiPatternEl = document.getElementById("ai-pattern") as HTMLElement;
+const aiPlaneEl = document.getElementById("ai-plane") as HTMLSelectElement;
+const aiNewBodyEl = document.getElementById("ai-newbody-toggle") as HTMLInputElement;
+const aiKindEl = document.getElementById("ai-kind") as HTMLSelectElement;
+const aiGridEl = document.getElementById("ai-grid") as HTMLElement;
+const aiPolarEl = document.getElementById("ai-polar") as HTMLElement;
+const aiNxEl = document.getElementById("ai-nx") as HTMLInputElement;
+const aiNyEl = document.getElementById("ai-ny") as HTMLInputElement;
+const aiDxEl = document.getElementById("ai-dx") as HTMLInputElement;
+const aiDyEl = document.getElementById("ai-dy") as HTMLInputElement;
+const aiGPlaneEl = document.getElementById("ai-gplane") as HTMLSelectElement;
+const aiCountEl = document.getElementById("ai-count") as HTMLInputElement;
+const aiRadiusEl = document.getElementById("ai-radius") as HTMLInputElement;
+const aiAxisEl = document.getElementById("ai-axis") as HTMLSelectElement;
+const aiApplyEl = document.getElementById("ai-apply") as HTMLButtonElement;
+const aiCancelEl = document.getElementById("ai-cancel") as HTMLButtonElement;
+const aiCodeEl = document.getElementById("ai-code")!;
+const aiNotesEl = document.getElementById("ai-notes")!;
+
+type ArrangeMode = "mirror" | "pattern";
+
+let arrangeMode: ArrangeMode | null = null;
+let arrangePartName: string | null = null;
+/**
+ * The body list frozen when the command was armed.
+ *
+ * Same reason the combine bar freezes one: a preview REBUILDS the model, and a
+ * mirror previewed as a new body puts an extra entry in `currentParts`. Read
+ * live, the menu would grow an option for a body that does not exist in the
+ * file yet.
+ */
+let arrangeBodies: string[] = [];
+
+let arrangeRequestId = 0;
+let pendingArrange: number | null = null;
+
+/** A numeric field, or null when it does not hold a usable number. */
+function readArrangeField(el: HTMLInputElement, whole: boolean): number | null {
+  const raw = el.value.trim().replace(",", ".");
+  if (raw === "" || raw === "-") return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return null;
+  if (whole && (!Number.isInteger(n) || n < 1)) return null;
+  return n;
+}
+
+/** What the bar currently describes, or null when the fields do not add up. */
+function arrangeSpec(): PreviewArrange["spec"] | null {
+  if (arrangeMode === "mirror") {
+    return { kind: "mirror", plane: aiPlaneEl.value as "XY" | "XZ" | "YZ" };
+  }
+  if (aiKindEl.value === "polar") {
+    const count = readArrangeField(aiCountEl, true);
+    const radius = readArrangeField(aiRadiusEl, false);
+    if (count === null || radius === null || count < 2 || radius <= 0) return null;
+    return { kind: "polar", count, radius, axis: aiAxisEl.value as "X" | "Y" | "Z" };
+  }
+  const nx = readArrangeField(aiNxEl, true);
+  const ny = readArrangeField(aiNyEl, true);
+  const dx = readArrangeField(aiDxEl, false);
+  const dy = readArrangeField(aiDyEl, false);
+  if (nx === null || ny === null || dx === null || dy === null) return null;
+  // 1 x 1 is a no-op wearing a pattern's clothes.
+  if (nx * ny < 2) return null;
+  return { kind: "grid", nx, ny, dx, dy, plane: aiGPlaneEl.value as "XY" | "XZ" | "YZ" };
+}
+
+/** The name a mirrored new body would take, made unique against what exists. */
+function arrangeNewBodyName(): string {
+  const base = `${arrangePartName ?? "body"} mirrored`;
+  const taken = new Set(arrangeBodies);
+  if (!taken.has(base)) return base;
+  for (let i = 2; i < 100; i++) if (!taken.has(`${base} ${i}`)) return `${base} ${i}`;
+  return `${base} ${arrangeRequestId}`;
+}
+
+function arrangeAsNewBody(): string | undefined {
+  // Only a mirror offers it: a pattern's copies are already fused into one
+  // solid, so "as a new body" would mean a body containing the original.
+  return arrangeMode === "mirror" && aiNewBodyEl.checked ? arrangeNewBodyName() : undefined;
+}
+
+function setArrangeMode(mode: ArrangeMode | null): void {
+  if (mode !== null && currentParts.length === 0) return;
+
+  if (mode === null) {
+    arrangeMode = null;
+    arrangePartName = null;
+    arrangeBodies = [];
+    arrangeInfoEl.classList.remove("visible");
+    revertPreview();
+    updateArrangeButtons();
+    return;
+  }
+
+  // Re-arming while a preview is showing would freeze the PREVIEWED body list.
+  if (arrangeMode === null && previewShowing) revertPreview();
+
+  // One modal command at a time.
+  setMoveMode(null);
+  setCombineOp(null);
+  setActiveOp(null);
+  facePicker.setSelection(null);
+  faceInfoEl.classList.remove("visible");
+
+  const rearming = arrangeMode !== null;
+  arrangeMode = mode;
+  if (!rearming) {
+    arrangeBodies = currentParts.map((p) => p.name);
+    const picked = facePicker.getSelection()?.partName;
+    arrangePartName =
+      picked && arrangeBodies.includes(picked) ? picked : (arrangeBodies[0] ?? null);
+  }
+
+  aiOpEl.textContent = mode === "mirror" ? "Mirror" : "Pattern";
+  aiMirrorEl.hidden = mode !== "mirror";
+  aiPatternEl.hidden = mode !== "pattern";
+  arrangeInfoEl.classList.add("visible");
+  renderArrangeBar();
+  updateArrangeButtons();
+  scheduleArrangePreview();
+}
+
+function updateArrangeButtons(): void {
+  for (const [id, mode] of [
+    ["btn-mirror", "mirror"],
+    ["btn-pattern", "pattern"],
+  ] as const) {
+    const btn = document.getElementById(id) as HTMLButtonElement | null;
+    if (!btn) continue;
+    btn.disabled = currentParts.length === 0;
+    btn.classList.toggle("active", arrangeMode === mode);
+  }
+}
+
+function renderArrangeBar(): void {
+  if (!arrangeMode) return;
+  aiBodyEl.innerHTML = "";
+  for (const name of arrangeBodies) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    opt.selected = name === arrangePartName;
+    aiBodyEl.appendChild(opt);
+  }
+  aiGridEl.hidden = aiKindEl.value !== "grid";
+  aiPolarEl.hidden = aiKindEl.value !== "polar";
+  renderArrangePreview();
+}
+
+/**
+ * The line that will be written.
+ *
+ * Against the body's NAME, which is what the file usually holds in the entry.
+ * Where it holds an expression instead, the host writes the same call onto
+ * that expression, hoisting it to a const first — every form here names the
+ * shape at least twice.
+ */
+function renderArrangePreview(): void {
+  if (!arrangeMode) return;
+  aiCodeEl.textContent = "";
+  aiNotesEl.innerHTML = "";
+  const name = arrangePartName ?? "shape";
+  const spec = arrangeSpec();
+  const notes: Array<{ text: string; warn?: boolean }> = [];
+
+  if (!spec) {
+    aiCodeEl.textContent = "…";
+    notes.push({
+      text: "⚠ counts must be whole numbers, and at least one copy has to move",
+      warn: true,
+    });
+  } else if (spec.kind === "mirror") {
+    const reflected = `${name}.clone().mirror("${spec.plane}")`;
+    aiCodeEl.textContent = aiNewBodyEl.checked
+      ? reflected
+      : `joinBodies(${name}, ${reflected})`;
+    notes.push({
+      text: aiNewBodyEl.checked
+        ? `adds a second body named "${arrangeNewBodyName()}" — the original stays put`
+        : "fuses the reflection into the original, making one symmetric body",
+    });
+    // Worth saying out loud, because every other command in this viewport has
+    // to qualify its durability and this one does not.
+    notes.push({ text: "a standard plane through the origin — nothing here to go stale" });
+  } else {
+    const args =
+      spec.kind === "grid"
+        ? `patterns.grid(${spec.nx}, ${spec.ny}, ${trimNum(spec.dx)}, ${trimNum(spec.dy)}` +
+          (spec.plane === "XY" ? ")" : `, { plane: "${spec.plane}" })`)
+        : `patterns.polar(${spec.count}, ${trimNum(spec.radius)}` +
+          (spec.axis === "Z" ? ")" : `, { axis: "${spec.axis}" })`);
+    aiCodeEl.textContent = `patterns.repeat(${name}, ${args})`;
+    const n = spec.kind === "grid" ? spec.nx * spec.ny : spec.count;
+    notes.push({ text: `${n} copies, fused into one body` });
+    if (n > 60) {
+      // Every copy is an OCCT fuse. Say so before the render stalls rather
+      // than after.
+      notes.push({ text: "⚠ that many fuses will be slow to build", warn: true });
+    }
+  }
+
+  for (const nt of notes) {
+    const el = document.createElement("span");
+    if (nt.warn) el.className = "warn";
+    el.textContent = nt.text;
+    aiNotesEl.appendChild(el);
+  }
+  aiApplyEl.disabled = !spec || pendingArrange !== null;
+}
+
+/** What the armed Mirror / Pattern would preview, or null when nothing is. */
+function arrangePayload(): PreviewArrange | null {
+  if (!arrangeMode || !arrangePartName) return null;
+  const spec = arrangeSpec();
+  if (!spec) return null;
+  const asNewBody = arrangeAsNewBody();
+  return {
+    partName: arrangePartName,
+    spec,
+    ...(asNewBody ? { asNewBody } : {}),
+  };
+}
+
+function scheduleArrangePreview(): void {
+  if (arrangePayload()) schedulePreview();
+}
+
+function applyArrange(): void {
+  if (!arrangeMode || !arrangePartName) return;
+  const spec = arrangeSpec();
+  if (!spec) {
+    setParamsStatus("Those numbers do not describe a pattern.", true);
+    return;
+  }
+  if (pendingArrange !== null) return;
+
+  arrangeRequestId += 1;
+  pendingArrange = arrangeRequestId;
+  aiApplyEl.disabled = true;
+  setParamsStatus(`${arrangeMode === "mirror" ? "Mirror" : "Pattern"}…`);
+  const asNewBody = arrangeAsNewBody();
+  postToExtension({
+    type: "arrange",
+    requestId: arrangeRequestId,
+    partName: arrangePartName,
+    spec,
+    ...(asNewBody ? { asNewBody } : {}),
+  });
+}
+
+for (const [id, mode] of [
+  ["btn-mirror", "mirror"],
+  ["btn-pattern", "pattern"],
+] as const) {
+  const btn = document.getElementById(id) as HTMLButtonElement | null;
+  if (!btn) continue;
+  btn.addEventListener("click", () => setArrangeMode(arrangeMode === mode ? null : mode));
+}
+
+aiBodyEl.addEventListener("change", () => {
+  arrangePartName = aiBodyEl.value || null;
+  renderArrangePreview();
+  scheduleArrangePreview();
+});
+
+for (const el of [aiPlaneEl, aiKindEl, aiGPlaneEl, aiAxisEl, aiNewBodyEl]) {
+  el.addEventListener("change", () => {
+    renderArrangeBar();
+    scheduleArrangePreview();
+  });
+}
+
+for (const el of [aiNxEl, aiNyEl, aiDxEl, aiDyEl, aiCountEl, aiRadiusEl]) {
+  el.addEventListener("input", () => {
+    renderArrangePreview();
+    scheduleArrangePreview();
+  });
+  el.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      applyArrange();
+      e.preventDefault();
+    } else if (e.key === "Escape") {
+      setArrangeMode(null);
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  });
+}
+
+aiApplyEl.addEventListener("click", applyArrange);
+aiCancelEl.addEventListener("click", () => setArrangeMode(null));
 
 // Hover is advisory, so it is the first thing to give up: skip it entirely
 // while the user is orbiting (a raycast per pointermove during a drag is both
@@ -2929,6 +3256,7 @@ function handleWorkerMessage(msg: WorkerToWebview) {
           renderMoveBar();
         }
         updateMoveButtons();
+        updateArrangeButtons();
         // Motion sim: if the script exported a `sim` block, resolve it against
         // the parts we just rendered and show the timeline. No-op otherwise.
         // Async (the dynamics engine awaits Rapier's WASM); fire-and-forget with
@@ -3385,6 +3713,20 @@ onMessage("param-commit-result", (msg) => {
 onMessage("face-op-result", (msg) => {
   // The host answers all three commands on this channel — the outcome really
   // is the same shape — so route by `kind` before anything else.
+  if (msg.kind === "arrange") {
+    if (msg.requestId !== pendingArrange) return;
+    pendingArrange = null;
+    aiApplyEl.disabled = false;
+    if (!msg.ok) {
+      setParamsStatus(`Not applied — ${msg.reason ?? "unknown reason"}`, true);
+      return;
+    }
+    setParamsStatus(`Written — ${msg.applied ?? "arranged"}`);
+    // The rebuild from the file carries it now, so the preview standing in for
+    // it has to go or the geometry would be applied twice.
+    setArrangeMode(null);
+    return;
+  }
   if (msg.kind === "transform") {
     if (msg.requestId !== pendingTransform) return;
     pendingTransform = null;
@@ -4229,6 +4571,11 @@ window.addEventListener("keydown", (event) => {
   //
   // Combine goes first: it is the more modal of the two, and an Escape pressed
   // with it open plainly means "not this", not "clear my face selection".
+  if (event.key === "Escape" && arrangeMode) {
+    setArrangeMode(null);
+    event.preventDefault();
+    return;
+  }
   if (event.key === "Escape" && moveMode) {
     setMoveMode(null);
     event.preventDefault();

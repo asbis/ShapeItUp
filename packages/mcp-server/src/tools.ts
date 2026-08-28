@@ -8561,6 +8561,40 @@ Join, Cut or Intersect.
 
 ---
 
+## Copies — mirror and pattern
+
+\`\`\`typescript
+import { joinBodies, patterns } from "shapeitup";
+
+// One symmetric part from one half.
+joinBodies(arm, arm.clone().mirror("YZ"))
+
+// Or as a separate body — a left hand and a right hand.
+{ shape: arm, name: "arm" },
+{ shape: arm.clone().mirror("YZ"), name: "arm mirrored" },
+
+patterns.repeat(boss, patterns.grid(3, 2, 30, 25))   // rectangular
+patterns.repeat(rib,  patterns.polar(8, 40))         // circular
+\`\`\`
+
+**Mirror carries no coordinates at all** — a standard plane through the origin
+means the same thing whatever the model becomes. Of everything the viewer can
+write, it is the only operation with nothing in it that can go stale.
+
+The \`.clone()\` is not optional: \`.mirror\` consumes what it is called on, and
+the original is still needed — by the fuse on the same line, or by the entry
+that stays.
+
+**Use \`patterns.repeat\`, not \`patterns.spread\`, when you already have the
+body.** \`spread\` takes a factory, which makes the obvious call wrong:
+
+\`\`\`typescript
+patterns.spread(() => body, patterns.grid(3, 1, 30))   // throws, two placements later
+\`\`\`
+
+The first placement frees \`body\` and the second reads a deleted handle.
+\`repeat\` clones per copy and leaves the input intact.
+
 ## Positioning a body — \`.translate\` / \`.rotate\`
 
 Plain replicad; no import needed. This is what the viewer writes when you drag

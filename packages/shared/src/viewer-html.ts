@@ -415,14 +415,14 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
        72px clears the command ribbon above it (measured at 64.5px tall);
        #measure-info sits higher, at 40px, but the two can never be on screen
        together — entering measure mode clears the selection. */
-    #face-info, #combine-info, #move-info {
+    #face-info, #combine-info, #move-info, #arrange-info {
       position: absolute; top: 72px; left: 50%; transform: translateX(-50%);
       z-index: 23; display: none; max-width: calc(100% - 32px);
       background: rgba(37,37,38,0.96); border: 1px solid #3c3c3c;
       border-radius: 4px; box-shadow: 0 4px 14px rgba(0,0,0,0.35);
       font-size: 11px; color: #ccc;
     }
-    #face-info.visible, #combine-info.visible, #move-info.visible { display: block; }
+    #face-info.visible, #combine-info.visible, #move-info.visible, #arrange-info.visible { display: block; }
     .fi-main {
       display: flex; align-items: center; gap: 8px;
       padding: 4px 5px 4px 9px; white-space: nowrap;
@@ -431,15 +431,15 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
     .fi-meta { color: #8a8a8a; font-variant-numeric: tabular-nums; }
     .fi-meta b { color: #4fc1ff; font-weight: 400; }
     .fi-rule { width: 1px; align-self: stretch; background: #3c3c3c; margin: 0 1px; }
-    #face-info button, #combine-info button, #move-info button {
+    #face-info button, #combine-info button, #move-info button, #arrange-info button {
       background: transparent; border: 1px solid transparent; color: #bbb;
       border-radius: 3px; padding: 3px 7px; font-size: 11px; cursor: pointer;
     }
-    #face-info button:hover, #combine-info button:hover, #move-info button:hover { background: #3d3d41; color: #fff; border-color: #4a4a4e; }
-    #face-info button:disabled, #combine-info button:disabled, #move-info button:disabled { opacity: 0.3; cursor: default; }
-    #face-info button:disabled:hover, #combine-info button:disabled:hover, #move-info button:disabled:hover { background: transparent; color: #bbb; border-color: transparent; }
-    #fi-apply, #ci-apply, #mi-apply { background: #0e639c; border-color: #1177bb; color: #fff; }
-    #fi-apply:hover, #ci-apply:hover, #mi-apply:hover { background: #1177bb; border-color: #1a8ad4; }
+    #face-info button:hover, #combine-info button:hover, #move-info button:hover, #arrange-info button:hover { background: #3d3d41; color: #fff; border-color: #4a4a4e; }
+    #face-info button:disabled, #combine-info button:disabled, #move-info button:disabled, #arrange-info button:disabled { opacity: 0.3; cursor: default; }
+    #face-info button:disabled:hover, #combine-info button:disabled:hover, #move-info button:disabled:hover, #arrange-info button:disabled:hover { background: transparent; color: #bbb; border-color: transparent; }
+    #fi-apply, #ci-apply, #mi-apply, #ai-apply { background: #0e639c; border-color: #1177bb; color: #fff; }
+    #fi-apply:hover, #ci-apply:hover, #mi-apply:hover, #ai-apply:hover { background: #1177bb; border-color: #1a8ad4; }
     #fi-dist {
       width: 52px; background: #1e1e1e; border: 1px solid #4a4a4e; color: #4fc1ff;
       border-radius: 3px; padding: 3px 5px; font-size: 11px; text-align: right;
@@ -524,6 +524,35 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
     .mi-label { color: #8a8a8a; }
     #mi-copy { display: inline-flex; align-items: center; gap: 3px; color: #8a8a8a; cursor: pointer; }
     #mi-copy input { accent-color: #0e639c; margin: 0; }
+
+    /* Mirror / Pattern. Fourth bar of the same kind; what is its own is that
+       the field set CHANGES with the mode — a grid asks for four numbers, a
+       circular pattern for two — so the groups are shown and hidden rather
+       than all laid out at once and mostly disabled. */
+    #ai-preview { border-top: 1px solid #333; padding: 4px 9px 5px; max-width: 100%; }
+    #ai-code {
+      font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+      font-size: 10px; color: #7ea36f; white-space: nowrap;
+      overflow-x: auto; max-width: 100%;
+    }
+    #ai-notes { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 3px; font-size: 10px; color: #8a8a8a; }
+    #ai-notes .warn { color: #e0b060; }
+    #arrange-info select {
+      background: #1e1e1e; border: 1px solid #4a4a4e; color: #4fc1ff;
+      border-radius: 3px; padding: 2px 4px; font-size: 11px; font-family: inherit;
+      max-width: 130px;
+    }
+    #arrange-info select:focus { outline: none; border-color: #0e639c; }
+    #arrange-info input[type="text"] {
+      width: 44px; background: #1e1e1e; border: 1px solid #4a4a4e; color: #4fc1ff;
+      border-radius: 3px; padding: 3px 5px; font-size: 11px; text-align: right;
+      font-family: inherit; font-variant-numeric: tabular-nums;
+    }
+    #arrange-info input[type="text"]:focus { outline: none; border-color: #0e639c; }
+    .ai-label { color: #8a8a8a; }
+    .ai-times { color: #6f6f6f; }
+    #ai-newbody { display: inline-flex; align-items: center; gap: 3px; color: #8a8a8a; cursor: pointer; }
+    #ai-newbody input { accent-color: #0e639c; margin: 0; }
     /* The call itself never wraps — a line of code broken mid-token is harder
        to read than one you scroll. */
     #fi-code {
@@ -671,6 +700,20 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
 
         <div class="tb-group">
           <div class="tb-row">
+            <button id="btn-mirror" title="Reflect a body across a standard plane \u2014 Fusion's Mirror" disabled>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.4v13.2" stroke-dasharray="2 2"/><path d="M6.4 4.2 2.2 8l4.2 3.8z"/><path d="M9.6 4.2 13.8 8l-4.2 3.8z"/></svg>
+              <span>Mirror</span>
+            </button>
+            <button id="btn-pattern" title="Repeat a body in a grid or around an axis \u2014 Fusion's Pattern" disabled>
+              <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.6" y="1.6" width="4" height="4" rx="0.6"/><rect x="10.4" y="1.6" width="4" height="4" rx="0.6"/><rect x="1.6" y="10.4" width="4" height="4" rx="0.6"/><rect x="10.4" y="10.4" width="4" height="4" rx="0.6"/></svg>
+              <span>Pattern</span>
+            </button>
+          </div>
+          <div class="tb-caption">Create</div>
+        </div>
+
+        <div class="tb-group">
+          <div class="tb-row">
             <div id="export-menu-wrapper" class="menu-wrapper">
               <button id="btn-export" title="Export, or open in another app">
                 <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.8v7.6m0 0 3-3m-3 3-3-3"/><path d="M2.6 11.2v2.6h10.8v-2.6"/></svg>
@@ -795,6 +838,70 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
         <div id="mi-preview">
           <div id="mi-code"></div>
           <div id="mi-notes"></div>
+        </div>
+      </div>
+
+      <div id="arrange-info">
+        <div class="fi-main">
+          <span class="fi-op" id="ai-op"></span>
+          <span class="ai-label">Body</span>
+          <select id="ai-body" title="The body to copy"></select>
+
+          <span id="ai-mirror" hidden>
+            <span class="ai-label">across</span>
+            <select id="ai-plane" title="The plane to reflect across">
+              <option value="YZ" selected>YZ</option>
+              <option value="XZ">XZ</option>
+              <option value="XY">XY</option>
+            </select>
+            <label id="ai-newbody" title="Leave the original and add the reflection as its own body">
+              <input type="checkbox" id="ai-newbody-toggle">
+              <span>New body</span>
+            </label>
+          </span>
+
+          <span id="ai-pattern" hidden>
+            <select id="ai-kind" title="Rectangular repeats on two axes; circular goes around one">
+              <option value="grid" selected>Rectangular</option>
+              <option value="polar">Circular</option>
+            </select>
+            <span id="ai-grid">
+              <input id="ai-nx" type="text" inputmode="numeric" value="3">
+              <span class="ai-times">&#215;</span>
+              <input id="ai-ny" type="text" inputmode="numeric" value="1">
+              <span class="ai-label">every</span>
+              <input id="ai-dx" type="text" inputmode="decimal" value="30">
+              <span class="ai-times">&#215;</span>
+              <input id="ai-dy" type="text" inputmode="decimal" value="30">
+              <span class="fi-unit">mm</span>
+              <span class="ai-label">on</span>
+              <select id="ai-gplane" title="The plane the grid lies in">
+                <option value="XY" selected>XY</option>
+                <option value="XZ">XZ</option>
+                <option value="YZ">YZ</option>
+              </select>
+            </span>
+            <span id="ai-polar" hidden>
+              <input id="ai-count" type="text" inputmode="numeric" value="6">
+              <span class="ai-label">at r</span>
+              <input id="ai-radius" type="text" inputmode="decimal" value="40">
+              <span class="fi-unit">mm</span>
+              <span class="ai-label">about</span>
+              <select id="ai-axis" title="The axis to go around">
+                <option value="Z" selected>Z</option>
+                <option value="X">X</option>
+                <option value="Y">Y</option>
+              </select>
+            </span>
+          </span>
+
+          <span class="fi-rule"></span>
+          <button id="ai-apply" title="Write this into the file">Apply</button>
+          <button id="ai-cancel" title="Cancel (Esc)">&#10005;</button>
+        </div>
+        <div id="ai-preview">
+          <div id="ai-code"></div>
+          <div id="ai-notes"></div>
         </div>
       </div>
 

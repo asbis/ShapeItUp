@@ -622,6 +622,36 @@ export function linearAlongAxis(
  * @param placements Array of placements from `polar` / `grid` / `linear`.
  * @returns Single fused Shape3D containing all copies.
  */
+/**
+ * Repeat one shape across a set of placements, fused into a single solid.
+ *
+ * The shape-taking sibling of {@link spread}, and the one to reach for when
+ * you already have the body in hand.
+ *
+ * `spread` takes a FACTORY, which is right when each copy should be built
+ * fresh — but it makes the obvious call wrong in a way that is hard to see:
+ *
+ *     patterns.spread(() => body, patterns.grid(3, 1, 30))   // throws
+ *
+ * replicad's transforms consume their input, so the first placement frees
+ * `body` and the second reads a deleted handle. The fix is a clone per call,
+ * and forgetting it is not the user's mistake to make. This does it for them.
+ *
+ * The input shape is left intact, so the body can still be used afterwards —
+ * including in the `shape:` entry the pattern replaces.
+ *
+ * @example
+ *   patterns.repeat(boss, patterns.grid(3, 2, 30, 25))
+ *   patterns.repeat(rib, patterns.polar(6, 40))
+ */
+export function repeat(shape: Shape3D, placements: Placement[]): Shape3D {
+  const cloneable = shape as unknown as { clone?: () => Shape3D };
+  return spread(
+    () => (typeof cloneable.clone === "function" ? cloneable.clone() : shape),
+    placements,
+  );
+}
+
 export function spread(makeShape: () => Shape3D, placements: Placement[]): Shape3D {
   if (placements.length === 0) {
     throw new Error("patterns.spread: placements array is empty");

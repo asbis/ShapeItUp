@@ -7,7 +7,7 @@
  * (script execution, tessellation, measurement, export) is identical.
  */
 
-import type { ParamDef, PreviewCombine, PreviewDelta, PreviewFaceOp } from "@shapeitup/shared";
+import type { ParamDef, PreviewArrange, PreviewCombine, PreviewDelta, PreviewFaceOp } from "@shapeitup/shared";
 import { executeScript } from "./executor";
 export { extractParamsStatic, extractConfigStatic, extractExpectedContactsStatic } from "./executor";
 import { describeFaces, normalizeParts, tessellatePart, type MeshQuality, type PartInput, type PartStatsLevel, type TessellatedPart } from "./tessellate";
@@ -38,6 +38,7 @@ import {
   probeMaxShell,
   shellFace,
 } from "./stdlib/faces";
+import * as patterns from "./stdlib/patterns";
 import {
   cutBodies,
   intersectBodies,
@@ -763,6 +764,8 @@ export interface Core {
       previewOp?: PreviewFaceOp;
       /** See {@link PreviewCombine} — a combine applied without writing it. */
       previewCombine?: PreviewCombine;
+      /** See applyPreviewArrange — a mirror or pattern applied without writing it. */
+      previewArrange?: PreviewArrange;
     },
   ): Promise<ExecutionResult>;
   /**
@@ -1008,6 +1011,54 @@ export async function initCore(
    * warning list on every keystroke. The same facts come back as
    * {@link CombineStats} instead, for the viewer to show in place.
    */
+  /**
+   * Apply a mirror or a pattern to the result of `main()` without writing it.
+   *
+   * Unlike the Move preview, this one has to run in the kernel: a mirror fuses
+   * two solids and a pattern fuses N, so the topology genuinely changes and no
+   * matrix on a part group could stand in for it.
+   *
+   * Mirrors the arrange EDITOR's semantics exactly — including the clone, since
+   * `.mirror` consumes what it is called on and the original is still needed by
+   * the fuse on the same line. A preview that leaked that difference would show
+   * geometry the commit does not produce.
+   */
+  function applyPreviewArrange(parts: PartInput[], preview: PreviewArrange): void {
+    const index = parts.findIndex((p) => p.name === preview.partName);
+    if (index < 0) return;
+    const part = parts[index]!;
+
+    let result: Shape3D;
+    try {
+      const spec = preview.spec;
+      if (spec.kind === "mirror") {
+        const reflected = (part.shape as any).clone().mirror(spec.plane);
+        result = preview.asNewBody ? reflected : joinBodies(part.shape, reflected);
+      } else {
+        const placements =
+          spec.kind === "grid"
+            ? patterns.grid(spec.nx, spec.ny, spec.dx, spec.dy, { plane: spec.plane })
+            : patterns.polar(spec.count, spec.radius, { axis: spec.axis });
+        result = patterns.repeat(part.shape, placements);
+      }
+    } catch {
+      // A preview must never take the render down with it.
+      return;
+    }
+
+    if (preview.asNewBody) {
+      // Beside the original, not instead of it — the same two bodies the
+      // committed edit produces.
+      parts.splice(index + 1, 0, {
+        ...part,
+        name: preview.asNewBody,
+        shape: result,
+      });
+    } else {
+      part.shape = result;
+    }
+  }
+
   function applyPreviewCombine(
     parts: PartInput[],
     preview: PreviewCombine,
@@ -1096,6 +1147,8 @@ export async function initCore(
        * source. Drives the viewer's Combine preview — see applyPreviewCombine.
        */
       previewCombine?: PreviewCombine;
+      /** See applyPreviewArrange — a mirror or pattern applied without writing it. */
+      previewArrange?: PreviewArrange;
     },
   ): Promise<ExecutionResult> {
     cleanup();
@@ -1147,6 +1200,9 @@ export async function initCore(
     let previewDelta = streaming?.previewOp
       ? applyPreviewOp(parts, streaming.previewOp, previewOut)
       : undefined;
+    if (streaming?.previewArrange) {
+      applyPreviewArrange(parts, streaming.previewArrange);
+    }
     let combineStats: CombineStats | undefined;
     if (streaming?.previewCombine) {
       const outcome = applyPreviewCombine(parts, streaming.previewCombine);

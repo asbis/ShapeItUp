@@ -5,8 +5,11 @@ import * as fs from "fs";
 import {
   BUNDLE_EXTERNALS,
   buildFaceOpCall,
+  computeArrangeEdit,
   computeCombineEdit,
   computeTransformEdit,
+  describeArrangeFailure,
+  ensureStdlibImport,
   describeCombineFailure,
   describeTransformFailure,
   renderViewerHtml,
@@ -20,6 +23,7 @@ import {
 type FaceOpMessage = Extract<WebviewToExt, { type: "face-op" }>;
 type CombineMessage = Extract<WebviewToExt, { type: "combine" }>;
 type TransformMessage = Extract<WebviewToExt, { type: "transform" }>;
+type ArrangeMessage = Extract<WebviewToExt, { type: "arrange" }>;
 import { clearSidecarParam } from "@shapeitup/shared/sidecar";
 import type { DetectedApp } from "./app-detector";
 import { getDetectedApps } from "./app-detector";
@@ -365,6 +369,12 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
       case "combine":
         void this.commitCombine(msg).then((r) => {
           if (!r.ok) this.output.appendLine(`[combine] declined: ${r.reason}`);
+          this.getActiveWebview()?.postMessage(r);
+        });
+        break;
+      case "arrange":
+        void this.commitArrange(msg).then((r) => {
+          if (!r.ok) this.output.appendLine(`[arrange] declined: ${r.reason}`);
           this.getActiveWebview()?.postMessage(r);
         });
         break;
@@ -1072,6 +1082,87 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
     return {
       type: "face-op-result",
       kind: "transform",
+      requestId: msg.requestId,
+      ok: true,
+      applied: built.applied,
+    };
+  }
+
+  /**
+   * Apply a mirror or pattern to the `.shape.ts` through the editor.
+   *
+   * Fourth sibling of commitFaceOp / commitCombine / commitTransform. Undo
+   * matters here as much as anywhere: a pattern rewrites one line into
+   * something quite different, and Cmd-Z is what makes trying one cheap.
+   */
+  private async commitArrange(msg: ArrangeMessage): Promise<FaceOpResultMessage> {
+    const fail = (reason: string): FaceOpResultMessage => ({
+      type: "face-op-result",
+      kind: "arrange",
+      requestId: msg.requestId,
+      ok: false,
+      reason,
+    });
+
+    const file = this.lastExecutedFile;
+    if (!file) return fail("no file open");
+
+    let doc: vscode.TextDocument;
+    try {
+      doc = await vscode.workspace.openTextDocument(file);
+    } catch (e: any) {
+      return fail(`could not open ${path.basename(file)}: ${e?.message ?? e}`);
+    }
+
+    const source = doc.getText();
+    const built = computeArrangeEdit(source, {
+      partName: msg.partName,
+      spec: msg.spec,
+      asNewBody: msg.asNewBody,
+    });
+    if (!built.ok) {
+      const detail = built.reason === "name-taken" ? msg.asNewBody : msg.partName;
+      return fail(describeArrangeFailure(built.reason, detail));
+    }
+
+    const edits = [...built.edits];
+    if (built.needsImport) {
+      const imp = ensureStdlibImport(source, built.needsImport);
+      if (imp) edits.push(imp);
+    }
+
+    const edit = new vscode.WorkspaceEdit();
+    for (const e of edits.sort((a, b) => b.start - a.start)) {
+      edit.replace(
+        doc.uri,
+        new vscode.Range(doc.positionAt(e.start), doc.positionAt(e.end)),
+        e.text,
+      );
+    }
+    if (!(await vscode.workspace.applyEdit(edit))) {
+      return fail("the editor rejected the edit");
+    }
+
+    const visible = vscode.window.visibleTextEditors.some(
+      (e) => e.document.uri.toString() === doc.uri.toString(),
+    );
+    if (!visible) {
+      try {
+        await doc.save();
+      } catch (e: any) {
+        return fail(`edit applied but save failed: ${e?.message ?? e}`);
+      }
+    }
+
+    this.output.appendLine(
+      `[arrange] ${msg.spec.kind} ${msg.partName} in ${path.basename(file)}: ${built.applied}` +
+        (visible ? " (unsaved — yours to save)" : " (saved)") +
+        (built.copiedAs ? ` — as ${built.copiedAs}` : "") +
+        (built.hoistedAs ? ` — hoisted to ${built.hoistedAs}` : ""),
+    );
+    return {
+      type: "face-op-result",
+      kind: "arrange",
       requestId: msg.requestId,
       ok: true,
       applied: built.applied,

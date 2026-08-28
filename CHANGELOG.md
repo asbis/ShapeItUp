@@ -6,6 +6,24 @@ its own versions in `packages/mcp-server/CHANGELOG.md`.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project follows semantic versioning at the extension level.
 
+## [1.29.0] - 2026-08-28
+
+Extension `1.29.0` / mcp-server `1.29.0` — Mirror and Pattern in the viewport.
+
+### Added
+- **Mirror.** Reflect a body across XY, XZ or YZ. Joined it makes one
+  symmetric part (`joinBodies(arm, arm.clone().mirror("YZ"))`); as a new body
+  it makes a left hand and a right hand. It is the only operation the viewport
+  writes with nothing in it that can go stale — a standard plane through the
+  origin means the same thing whatever the model becomes.
+- **Pattern.** Rectangular (counts and spacings on two axes) and circular
+  (count, radius, axis), written as `patterns.repeat(body, patterns.grid(...))`.
+  Both preview through the kernel before anything is written.
+- **`patterns.repeat(shape, placements)`** — the shape-taking sibling of
+  `spread`. `spread` takes a factory, which makes the obvious call
+  `spread(() => body, …)` free the body on the first placement and throw two
+  placements later. `repeat` clones per copy and leaves the input intact.
+
 ## [1.28.0] - 2026-08-28
 
 Extension `1.28.0` / mcp-server `1.28.0` — Shell, and two bugs it uncovered.

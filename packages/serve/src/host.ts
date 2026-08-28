@@ -5,8 +5,11 @@ import * as crypto from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import {
   buildFaceOpCall,
+  computeArrangeEdit,
   computeCombineEdit,
   computeTransformEdit,
+  describeArrangeFailure,
+  ensureStdlibImport,
   describeCombineFailure,
   describeTransformFailure,
   renderViewerHtml,
@@ -558,6 +561,80 @@ export class ViewerHost {
     };
   }
 
+  /**
+   * Apply a mirror or pattern to the `.shape.ts`.
+   *
+   * Fourth sibling of commitFaceOp / commitCombine / commitTransform, with the
+   * same read → compute → re-stat → write shape and the same deliberate
+   * omission of the self-write marker.
+   */
+  private async commitArrange(msg: ArrangeMessage): Promise<FaceOpResultMessage> {
+    const fail = (reason: string): FaceOpResultMessage => ({
+      type: "face-op-result",
+      kind: "arrange",
+      requestId: msg.requestId,
+      ok: false,
+      reason,
+    });
+
+    const file = this.currentFile;
+    if (!file) return fail("no file open");
+
+    let source: string;
+    let statBefore: fs.Stats;
+    try {
+      statBefore = fs.statSync(file);
+      source = fs.readFileSync(file, "utf-8");
+    } catch (e: any) {
+      return fail(`could not read ${path.basename(file)}: ${e?.message ?? e}`);
+    }
+
+    const built = computeArrangeEdit(source, {
+      partName: msg.partName,
+      spec: msg.spec,
+      asNewBody: msg.asNewBody,
+    });
+    if (!built.ok) {
+      const detail = built.reason === "name-taken" ? msg.asNewBody : msg.partName;
+      return fail(describeArrangeFailure(built.reason, detail));
+    }
+
+    const edits = [...built.edits];
+    // The generated call names a stdlib helper, and a call to a helper that is
+    // not imported is a ReferenceError where a working model used to be.
+    if (built.needsImport) {
+      const imp = ensureStdlibImport(source, built.needsImport);
+      if (imp) edits.push(imp);
+    }
+
+    let next = source;
+    for (const e of edits.sort((a, b) => b.start - a.start)) {
+      next = next.slice(0, e.start) + e.text + next.slice(e.end);
+    }
+
+    try {
+      if (fs.statSync(file).mtimeMs !== statBefore.mtimeMs) {
+        return fail("file changed while writing — nothing was saved");
+      }
+      fs.writeFileSync(file, next, "utf-8");
+    } catch (e: any) {
+      return fail(`could not write ${path.basename(file)}: ${e?.message ?? e}`);
+    }
+
+    this.log(
+      `${msg.spec.kind} ${msg.partName} → ${path.basename(file)}: ${built.applied}` +
+        (built.copiedAs ? ` (as ${built.copiedAs})` : "") +
+        (built.hoistedAs ? ` (hoisted to ${built.hoistedAs})` : ""),
+    );
+    return {
+      type: "face-op-result",
+      kind: "arrange",
+      requestId: msg.requestId,
+      ok: true,
+      applied: built.applied,
+    };
+  }
+
   private handleHttp(req: http.IncomingMessage, res: http.ServerResponse) {
     const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
 
@@ -647,6 +724,18 @@ export class ViewerHost {
         }
         void this.commitCombine(req).then((r) => {
           if (!r.ok) this.log(`${req.op} declined: ${r.reason}`);
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(r));
+        });
+        return;
+      }
+      if (msg?.type === "arrange") {
+        const req = parseArrange(msg);
+        if (!req) {
+          this.log("arrange ignored: malformed message");
+          return;
+        }
+        void this.commitArrange(req).then((r) => {
+          if (!r.ok) this.log(`arrange declined: ${r.reason}`);
           if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(r));
         });
         return;
@@ -798,5 +887,53 @@ function parseTransform(msg: Record<string, any>): TransformMessage | null {
     ...(rotate ? { rotate } : {}),
     ...(msg.translate ? { translate: msg.translate } : {}),
     ...(msg.copyAs ? { copyAs: msg.copyAs } : {}),
+  };
+}
+
+type ArrangeMessage = Extract<WebviewToExt, { type: "arrange" }>;
+
+/**
+ * Validate an `arrange` off the wire.
+ *
+ * Counts become loop bounds and spacings become coordinates in generated
+ * source, so a NaN or a fractional count here writes a call that either fails
+ * to parse or loops forever.
+ */
+function parseArrange(msg: Record<string, any>): ArrangeMessage | null {
+  const PLANES = ["XY", "XZ", "YZ"];
+  const AXES = ["X", "Y", "Z"];
+  const num = (v: any): v is number => typeof v === "number" && Number.isFinite(v);
+  const whole = (v: any): v is number => num(v) && Number.isInteger(v) && v >= 1;
+
+  if (typeof msg.requestId !== "number" || !Number.isFinite(msg.requestId)) return null;
+  if (typeof msg.partName !== "string" || !msg.partName) return null;
+  if (msg.asNewBody !== undefined && (typeof msg.asNewBody !== "string" || !msg.asNewBody)) {
+    return null;
+  }
+
+  const raw = msg.spec;
+  if (!raw || typeof raw !== "object") return null;
+  let spec: ArrangeMessage["spec"];
+  if (raw.kind === "mirror") {
+    if (!PLANES.includes(raw.plane)) return null;
+    spec = { kind: "mirror", plane: raw.plane };
+  } else if (raw.kind === "grid") {
+    if (!whole(raw.nx) || !whole(raw.ny) || !num(raw.dx) || !num(raw.dy)) return null;
+    if (!PLANES.includes(raw.plane)) return null;
+    spec = { kind: "grid", nx: raw.nx, ny: raw.ny, dx: raw.dx, dy: raw.dy, plane: raw.plane };
+  } else if (raw.kind === "polar") {
+    if (!whole(raw.count) || !num(raw.radius)) return null;
+    if (!AXES.includes(raw.axis)) return null;
+    spec = { kind: "polar", count: raw.count, radius: raw.radius, axis: raw.axis };
+  } else {
+    return null;
+  }
+
+  return {
+    type: "arrange",
+    requestId: msg.requestId,
+    partName: msg.partName,
+    spec,
+    ...(msg.asNewBody ? { asNewBody: msg.asNewBody } : {}),
   };
 }

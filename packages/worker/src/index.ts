@@ -7,7 +7,7 @@
  */
 
 import { initCore, type Core, type MeshQuality } from "@shapeitup/core";
-import type { PreviewCombine, PreviewFaceOp } from "@shapeitup/shared";
+import type { PreviewArrange, PreviewCombine, PreviewFaceOp } from "@shapeitup/shared";
 import { loadManifoldBrowser, loadOCCTBrowser } from "./browser-loader";
 
 let core: Core | null = null;
@@ -27,6 +27,7 @@ let pendingExecute: {
   meshQuality?: MeshQuality;
   previewOp?: PreviewFaceOp;
   previewCombine?: PreviewCombine;
+  previewArrange?: PreviewArrange;
 } | null = null;
 
 self.onmessage = async (event: MessageEvent) => {
@@ -76,6 +77,7 @@ self.onmessage = async (event: MessageEvent) => {
             queued.meshQuality,
             queued.previewOp,
             queued.previewCombine,
+            queued.previewArrange,
           );
         }
         break;
@@ -94,6 +96,7 @@ self.onmessage = async (event: MessageEvent) => {
             meshQuality: msg.meshQuality,
             previewOp: msg.previewOp,
             previewCombine: msg.previewCombine,
+            previewArrange: msg.previewArrange,
           };
           return;
         }
@@ -103,6 +106,7 @@ self.onmessage = async (event: MessageEvent) => {
           msg.meshQuality,
           msg.previewOp,
           msg.previewCombine,
+          msg.previewArrange,
         );
         break;
       case "export":
@@ -154,6 +158,7 @@ async function executeUserScript(
   meshQuality?: MeshQuality,
   previewOp?: PreviewFaceOp,
   previewCombine?: PreviewCombine,
+  previewArrange?: PreviewArrange,
 ) {
   if (!core) {
     // Bug #2: with the pending-execute queue in place the only way to reach
@@ -191,6 +196,9 @@ async function executeUserScript(
       // A combine the user has armed but not committed. Same contract as
       // previewOp: applied to the executed parts, never written anywhere.
       previewCombine,
+      // A mirror or pattern the user has armed but not committed. Same
+      // contract again.
+      previewArrange,
     });
 
     // What the combine measured — volumes moved, and whether the bodies

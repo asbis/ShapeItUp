@@ -125,7 +125,7 @@ export interface ParamCommitResult {
 export interface FaceOpResultMessage {
   type: "face-op-result";
   /** Which command this answers. Absent means the face operations, for compatibility. */
-  kind?: "face-op" | "combine" | "transform";
+  kind?: "face-op" | "combine" | "transform" | "arrange";
   /** Echoed back so a stale reply cannot be attributed to a newer request. */
   requestId: number;
   ok: boolean;
@@ -244,6 +244,22 @@ export type WebviewToExt =
       keepTools?: boolean;
     }
   /**
+   * Mirror or pattern one body — Fusion 360's Create → Mirror and
+   * Create → Pattern.
+   *
+   * Both make copies, which is why they share a message. `asNewBody` names a
+   * separate body to write the result into instead of replacing the original's
+   * shape; it is only meaningful for a mirror, since a pattern's copies are
+   * already fused into one solid.
+   */
+  | {
+      type: "arrange";
+      requestId: number;
+      partName: string;
+      spec: ArrangeSpecMessage;
+      asNewBody?: string;
+    }
+  /**
    * Move and/or turn one body — Fusion 360's Modify → Move/Copy, written into
    * the `.shape.ts` as the `.translate` / `.rotate` a replicad user would type.
    *
@@ -333,6 +349,30 @@ export interface PreviewCombine {
   keepTools?: boolean;
 }
 
+/**
+ * What Mirror / Pattern is being asked to do. Mirrors `ArrangeSpec` in
+ * @shapeitup/shared's arrange editor; kept structural so the viewer and the
+ * hosts agree on the wire without either importing the other's internals.
+ */
+export type ArrangeSpecMessage =
+  | { kind: "mirror"; plane: "XY" | "XZ" | "YZ" }
+  | { kind: "grid"; nx: number; ny: number; dx: number; dy: number; plane: "XY" | "XZ" | "YZ" }
+  | { kind: "polar"; count: number; radius: number; axis: "X" | "Y" | "Z" };
+
+/**
+ * A mirror or pattern applied to the result of `main()` WITHOUT writing it.
+ *
+ * Unlike Move, this one does need the kernel: a mirror fuses two solids and a
+ * pattern fuses N, so the topology genuinely changes and there is nothing a
+ * matrix on the part group could stand in for.
+ */
+export interface PreviewArrange {
+  partName: string;
+  spec: ArrangeSpecMessage;
+  /** Preview it as a separate body rather than folded into the original. */
+  asNewBody?: string;
+}
+
 /** What a previewed combine measured about itself. Mirrors core's CombineStats. */
 export interface CombineStatsMessage {
   op: "join" | "cut" | "intersect";
@@ -376,6 +416,8 @@ export type WebviewToWorker =
       previewOp?: PreviewFaceOp;
       /** See {@link PreviewCombine} — a combine applied without writing it. */
       previewCombine?: PreviewCombine;
+      /** See {@link PreviewArrange} — a mirror or pattern applied without writing it. */
+      previewArrange?: PreviewArrange;
     }
   | { type: "export"; format: ExportFormat };
 
