@@ -692,7 +692,14 @@ function parseFaceOp(msg: Record<string, any>): FaceOpMessage | null {
   const triple = (v: any): v is [number, number, number] =>
     Array.isArray(v) && v.length === 3 && v.every((n) => typeof n === "number" && Number.isFinite(n));
 
-  if (msg.op !== "extrude" && msg.op !== "fillet" && msg.op !== "chamfer") return null;
+  if (
+    msg.op !== "extrude" &&
+    msg.op !== "fillet" &&
+    msg.op !== "chamfer" &&
+    msg.op !== "shell"
+  ) {
+    return null;
+  }
   if (typeof msg.requestId !== "number" || !Number.isFinite(msg.requestId)) return null;
   if (typeof msg.distance !== "number" || !Number.isFinite(msg.distance)) return null;
   if (msg.partName !== null && typeof msg.partName !== "string") return null;

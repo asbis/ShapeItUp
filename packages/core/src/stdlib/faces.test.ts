@@ -17,13 +17,23 @@ let chamferFace: typeof import("./faces.js").chamferFace;
 let filletEdge: typeof import("./faces.js").filletEdge;
 let chamferEdge: typeof import("./faces.js").chamferEdge;
 let probeMaxRadius: typeof import("./faces.js").probeMaxRadius;
+let shellFace: typeof import("./faces.js").shellFace;
+let probeMaxShell: typeof import("./faces.js").probeMaxShell;
 
 beforeAll(async () => {
   const oc = await loadOCCTForTest();
   rc = await import("replicad");
   rc.setOC(oc);
-  ({ extrudeFace, filletFace, chamferFace, filletEdge, chamferEdge, probeMaxRadius } =
-    await import("./faces.js"));
+  ({
+    extrudeFace,
+    filletFace,
+    chamferFace,
+    filletEdge,
+    chamferEdge,
+    probeMaxRadius,
+    shellFace,
+    probeMaxShell,
+  } = await import("./faces.js"));
 }, 120_000);
 
 /** 80 x 60 x 8 plate, corners rounded r6, with a central Ø12 through-hole. */
@@ -417,3 +427,125 @@ function plateOfThickness(t: number): any {
   const p = rc.drawRoundedRectangle(80, 60, 6).sketchOnPlane().extrude(t) as any;
   return p.cut(rc.drawCircle(6).sketchOnPlane("XY", -1).extrude(t + 2) as any);
 }
+
+describe("shellFace", () => {
+  /** A plain 40 x 30 x 10 block, so the cavity volume is arithmetic. */
+  const block = () => rc.drawRectangle(40, 30).sketchOnPlane().extrude(10) as any;
+  const blockTop = (f: any) => f.inPlane("XY", 10);
+
+  it("hollows the solid and leaves the picked face open", () => {
+    const out = shellFace(block(), blockTop, 2);
+    // Walls 2mm, top open: the cavity is 36 x 26 x 8, reaching the top face.
+    expect(vol(out)).toBeCloseTo(40 * 30 * 10 - 36 * 26 * 8, 3);
+  });
+
+  it("opens every face the selector matches, not just one", () => {
+    // A tube — open at both ends. More than one match is legitimate here,
+    // unlike the other operations in this module, because an enclosure open
+    // at both ends is a real part.
+    // `.either([...])` on the bare finder. Chaining it after a constraint
+    // ANDs instead, which is how the first draft of this test asked for the
+    // faces that are simultaneously at z=10 and z=0 and got none.
+    const out = shellFace(block(), (f: any) => f.either([
+      (g: any) => g.inPlane("XY", 10),
+      (g: any) => g.inPlane("XY", 0),
+    ]), 2);
+    // Cavity now runs clean through: 36 x 26 x 10.
+    expect(vol(out)).toBeCloseTo(40 * 30 * 10 - 36 * 26 * 10, 3);
+  });
+
+  it("warns and changes nothing when the selector matches no face", () => {
+    resetRuntimeWarnings();
+    const s = block();
+    const out = shellFace(s, (f: any) => f.inPlane("XY", 999), 2);
+    expect(vol(out)).toBeCloseTo(40 * 30 * 10, 3);
+    const w = drainRuntimeWarnings();
+    expect(w.join(" ")).toMatch(/no face matched/);
+  });
+
+  it("warns and changes nothing when OCCT refuses the thickness", () => {
+    resetRuntimeWarnings();
+    const out = shellFace(block(), blockTop, 40);
+    expect(vol(out)).toBeCloseTo(40 * 30 * 10, 3);
+    expect(drainRuntimeWarnings().join(" ")).toMatch(/refused a 40mm wall/);
+  });
+
+  it("treats a zero or negative wall as a no-op rather than an error", () => {
+    expect(vol(shellFace(block(), blockTop, 0))).toBeCloseTo(40 * 30 * 10, 3);
+    expect(vol(shellFace(block(), blockTop, -3))).toBeCloseTo(40 * 30 * 10, 3);
+  });
+});
+
+describe("probeMaxShell", () => {
+  const block = () => rc.drawRectangle(40, 30).sketchOnPlane().extrude(10) as any;
+  const blockTop = (f: any) => f.inPlane("XY", 10);
+
+  it("returns a thickness that actually shells", () => {
+    const max = probeMaxShell(block(), blockTop, 10);
+    expect(max).toBeGreaterThan(0);
+    const out = shellFace(block(), blockTop, max);
+    expect(vol(out)).toBeLessThan(40 * 30 * 10);
+  });
+
+  it("finds the limit the bounding-box rule got wrong", () => {
+    // The rule this replaced refused anything over 50% of the smallest
+    // dimension — 5.0 on this block. OCCT succeeds to just under 10, because
+    // the top face is removed and Z is therefore offset from one side only.
+    // Half the usable range used to be unreachable.
+    const max = probeMaxShell(block(), blockTop, 10);
+    expect(max).toBeGreaterThan(9);
+    // And 6 — squarely inside the old refusal — must genuinely work.
+    expect(vol(shellFace(block(), blockTop, 6))).toBeLessThan(40 * 30 * 10);
+  });
+
+  it("reports a clear step past the limit as unusable", () => {
+    const max = probeMaxShell(block(), blockTop, 10);
+    resetRuntimeWarnings();
+    const out = shellFace(block(), blockTop, max + 0.5);
+    expect(vol(out)).toBeCloseTo(40 * 30 * 10, 3);
+    drainRuntimeWarnings();
+  });
+
+  it("refuses a selector that opens nothing, rather than measuring a closed shell", () => {
+    // A finder matching no face does not fail — replicad builds a CLOSED
+    // shell, a different operation with a much lower limit (measured: exactly
+    // 5.0 on this block, against 9.9 with the top open). Returning that would
+    // be a correct number for an operation the user did not ask for.
+    expect(probeMaxShell(block(), (f: any) => f.inPlane("XY", 999), 10)).toBe(0);
+  });
+
+  it("and the closed-shell limit really is the 50% figure — on a CLOSED shell", () => {
+    // The evidence that the old rule was not wrong so much as over-applied:
+    // half the smallest dimension is exactly right when no face is removed,
+    // and half the truth when one is.
+    const s = block();
+    expect(() => s.shell(5.0, (f: any) => f.inPlane("XY", 999))).not.toThrow();
+    expect(() => block().shell(5.1, (f: any) => f.inPlane("XY", 999))).toThrow();
+  });
+});
+
+describe("why the shell limit has to be measured", () => {
+  // One box, one removed face, two corner treatments. The bounding box is
+  // identical in both cases — 60 x 45 x 24 — so any rule derived from it must
+  // give the same answer for both. The truth differs by more than 4x.
+  const rounded = () => rc.drawRoundedRectangle(60, 45, 5).sketchOnPlane("XY").extrude(24) as any;
+  const sharp = () => rc.drawRectangle(60, 45).sketchOnPlane("XY").extrude(24) as any;
+  const openTop = (f: any) => f.inPlane("XY", 24);
+
+  it("rounded corners cap it far below half the smallest dimension", () => {
+    // The inward offset eats the r5 corner before it touches any wall, so the
+    // limit is the CORNER RADIUS. The rule this replaced allowed 12mm here.
+    const max = probeMaxShell(rounded(), openTop, 24);
+    expect(max).toBeGreaterThan(4.5);
+    expect(max).toBeLessThan(5.1);
+    expect(() => rounded().shell(12, openTop)).toThrow();
+  });
+
+  it("sharp corners allow far more than it", () => {
+    // Same bounding box, no corner to eat: the limit is now most of the
+    // height. The old rule refused everything from 12 up, all of which works.
+    const max = probeMaxShell(sharp(), openTop, 24);
+    expect(max).toBeGreaterThan(20);
+    expect(() => sharp().shell(20, openTop)).not.toThrow();
+  });
+});

@@ -717,6 +717,7 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
             <button id="fi-extrude" title="Push or pull this face along its normal">Extrude</button>
             <button id="fi-fillet" title="Round the edges around this face">Fillet</button>
             <button id="fi-chamfer" title="Bevel the edges around this face">Chamfer</button>
+            <button id="fi-shell" title="Hollow the body, leaving this face open">Shell</button>
             <button id="fi-lookat" title="Orient the camera down this face's normal">Look at</button>
           </span>
           <span id="fi-form" hidden>

@@ -367,13 +367,14 @@ const fiDistEl = document.getElementById("fi-dist") as HTMLInputElement;
 const fiExtrudeEl = document.getElementById("fi-extrude") as HTMLButtonElement;
 const fiFilletEl = document.getElementById("fi-fillet") as HTMLButtonElement;
 const fiChamferEl = document.getElementById("fi-chamfer") as HTMLButtonElement;
+const fiShellEl = document.getElementById("fi-shell") as HTMLButtonElement;
 const fiOpEl = document.getElementById("fi-op")!;
 const fiApplyEl = document.getElementById("fi-apply") as HTMLButtonElement;
 const fiBackEl = document.getElementById("fi-back") as HTMLButtonElement;
 const fiLookAtEl = document.getElementById("fi-lookat") as HTMLButtonElement;
 const fiClearEl = document.getElementById("fi-clear") as HTMLButtonElement;
 
-type FaceOpKind = "extrude" | "fillet" | "chamfer";
+type FaceOpKind = "extrude" | "fillet" | "chamfer" | "shell";
 
 /**
  * Picking an operation swaps the bar's tools for a distance field and shows
@@ -404,6 +405,9 @@ let previewTimer: ReturnType<typeof setTimeout> | undefined;
 
 const OP_DEFAULTS: Record<FaceOpKind, string> = {
   extrude: "5",
+  // A wall you would actually print: three perimeters at 0.4mm, which is what
+  // most enclosures want and what a slicer will not thin out.
+  shell: "1.6",
   // A fillet or chamfer big enough to see, small enough to rarely fail on a
   // first try — an over-large radius is the usual reason OCCT refuses one.
   fillet: "2",
@@ -412,6 +416,7 @@ const OP_DEFAULTS: Record<FaceOpKind, string> = {
 
 const OP_LABEL: Record<FaceOpKind, string> = {
   extrude: "Extrude",
+  shell: "Shell",
   fillet: "Fillet",
   chamfer: "Chamfer",
 };
@@ -450,7 +455,9 @@ function setActiveOp(op: FaceOpKind | null): void {
   fiDistEl.title =
     op === "extrude"
       ? "Positive pulls the face out, negative pushes it in"
-      : "Radius, in millimetres";
+      : op === "shell"
+        ? "Wall thickness, in millimetres — the body is hollowed inward"
+        : "Radius, in millimetres";
   // Render before focusing: the preview IS the feature, and leaving it blank
   // until the user types means the first thing they see is an empty promise.
   renderOpPreview();
@@ -565,13 +572,16 @@ function updateFaceInfoPanel(): void {
 
   fiMetaEl.innerHTML = bits.join(" · ");
 
-  // An edge can be rounded but not extruded — pushing a line along "its
-  // normal" has no meaning.
-  fiExtrudeEl.disabled = !writable || sel.kind === "edge";
-  fiExtrudeEl.title =
-    sel.kind === "edge"
-      ? "An edge cannot be extruded — pick a face"
-      : (why ?? "Push or pull this face along its normal");
+  // An edge can be rounded but neither extruded nor shelled — pushing a line
+  // along "its normal" and hollowing a body "through a line" are both
+  // meaningless, so both buttons go grey rather than failing on click.
+  for (const [btn, edgeTip, faceTip] of [
+    [fiExtrudeEl, "An edge cannot be extruded — pick a face", "Push or pull this face along its normal"],
+    [fiShellEl, "An edge cannot be shelled — pick the face to open", "Hollow the body, leaving this face open"],
+  ] as const) {
+    btn.disabled = !writable || sel.kind === "edge";
+    btn.title = sel.kind === "edge" ? edgeTip : (why ?? faceTip);
+  }
   for (const [btn, tip] of [
     [fiFilletEl, sel.kind === "edge" ? "Round this edge" : "Round the edges around this face"],
     [fiChamferEl, sel.kind === "edge" ? "Bevel this edge" : "Bevel the edges around this face"],
@@ -687,7 +697,13 @@ function renderOpPreview(): void {
       return;
     }
     const fn =
-      activeOp === "extrude" ? "extrudeFace" : activeOp === "fillet" ? "filletFace" : "chamferFace";
+      activeOp === "extrude"
+        ? "extrudeFace"
+        : activeOp === "shell"
+          ? "shellFace"
+          : activeOp === "fillet"
+            ? "filletFace"
+            : "chamferFace";
     fiCodeEl.textContent = `${fn}(${target}, ${selector.code}, ${dist})`;
     durable = selector.durable;
     derived = selector.derived === true;
@@ -1078,6 +1094,7 @@ function applyOp(): void {
 fiExtrudeEl.addEventListener("click", () => setActiveOp("extrude"));
 fiFilletEl.addEventListener("click", () => setActiveOp("fillet"));
 fiChamferEl.addEventListener("click", () => setActiveOp("chamfer"));
+fiShellEl.addEventListener("click", () => setActiveOp("shell"));
 fiBackEl.addEventListener("click", () => setActiveOp(null));
 fiApplyEl.addEventListener("click", applyOp);
 fiDistEl.addEventListener("input", () => {

@@ -255,14 +255,23 @@ export function computeFaceOpEdit(
     ? findPartShapeSpan(source, partName)
     : findReturnExpressionSpan(source);
   if (!span.ok) return span;
+  const located: { start: number; end: number } = span;
+  // `partName` is null for a script that returns a bare shape — but it is also
+  // null when the viewer has only one part on screen, and a one-part script
+  // usually still returns a LIST. Wrapping the whole `return [...]` produced
+  // `shellFace([{ shape: body, name: "enclosure" }], …)`: the array handed to
+  // a function expecting a solid, which fails at run time on something that
+  // looks almost right. Narrow to the sole entry's shape when that is what we
+  // are actually looking at.
+  const target = partName ? located : narrowToSolePartShape(source, located);
 
-  const original = source.slice(span.start, span.end);
+  const original = source.slice(target.start, target.end);
   // Every template is a WRAP — `op($SHAPE, …)` — which passes the expression
   // as an argument. That sidesteps operator precedence entirely: a suffix form
   // (`$SHAPE.fillet(…)`) would bind to `b` alone in `cond ? a : b`.
   const wrap: FaceOpEdit = {
-    start: span.start,
-    end: span.end,
+    start: target.start,
+    end: target.end,
     text: call.replace("$SHAPE", original),
   };
 
@@ -280,6 +289,56 @@ export function computeFaceOpEdit(
     applied: wrap.text,
     addedImport: importEdit !== null,
   };
+}
+
+/**
+ * If this span is `[{ shape: X, … }]` — an array of exactly one part — return
+ * the span of `X` instead.
+ *
+ * Anything else is returned untouched: a bare shape has nothing to narrow to,
+ * and a list of several parts is genuinely ambiguous about which one was
+ * meant, so it is left for the caller to fail on rather than guessed at.
+ */
+function narrowToSolePartShape(
+  source: string,
+  span: { start: number; end: number },
+): { start: number; end: number } {
+  let i = skipTrivia(source, span.start);
+  if (source[i] !== "[") return span;
+  const close = skipBalanced(source, i, "[", "]");
+  if (close === -1 || close > span.end) return span;
+
+  let found: { start: number; end: number } | null = null;
+  let objects = 0;
+  let j = i + 1;
+  while (j < close - 1) {
+    const before = j;
+    j = skipTrivia(source, j);
+    if (j !== before) continue;
+    const c = source[j];
+    if (c === undefined) break;
+    if (c === '"' || c === "'" || c === "`") {
+      const end = skipString(source, j);
+      if (end === -1) return span;
+      j = end;
+      continue;
+    }
+    if (c !== "{") {
+      j++;
+      continue;
+    }
+    const objEnd = skipBalanced(source, j, "{", "}");
+    if (objEnd === -1) return span;
+    objects++;
+    const shapeEntry = scanObjectPairs(source, j + 1, objEnd - 1).find((p) => p.name === "shape");
+    if (shapeEntry) found = { start: shapeEntry.valueStart, end: shapeEntry.valueEnd };
+    // Over the object, not into it: a nested `{ shape }` belongs to something
+    // this function has no business rewriting.
+    j = objEnd;
+  }
+
+  if (objects !== 1 || !found) return span;
+  return found;
 }
 
 /** The function name a `$SHAPE` call template invokes, e.g. `extrudeFace`. */
@@ -716,11 +775,12 @@ export function synthesizeEdgeSelector(
 // The whole commit, in one call
 // ---------------------------------------------------------------------------
 
-export type FaceOp = "extrude" | "fillet" | "chamfer";
+export type FaceOp = "extrude" | "fillet" | "chamfer" | "shell";
 
 /**
- * What an operation acts on. A face drives all three operations; a single
- * edge can only be rounded, since "extrude an edge" has no meaning.
+ * What an operation acts on. A face drives all four operations; a single edge
+ * can only be rounded, since neither "extrude an edge" nor "shell an edge"
+ * means anything.
  */
 export type FaceOpTarget =
   | { kind: "face"; face: SelectableFace }
@@ -733,7 +793,7 @@ export interface FaceOpRequest {
   /**
    * Millimetres. For `extrude` it is signed — positive pulls the face out,
    * negative pushes it in. For `fillet` and `chamfer` it is the radius or
-   * setback, and must be positive: a negative fillet is not a thing.
+   * setback, and for `shell` the wall thickness; all three must be positive.
    */
   distance: number;
 }
@@ -761,6 +821,9 @@ export function buildFaceOpCall(source: string, req: FaceOpRequest): BuiltFaceOp
   }
   if (req.op !== "extrude" && req.distance < 0) {
     return { ok: false, reason: `a ${req.op} radius must be positive` };
+  }
+  if (req.op === "shell" && req.target.kind === "edge") {
+    return { ok: false, reason: "an edge cannot be shelled — pick the face to open" };
   }
   if (req.op === "extrude" && req.target.kind === "edge") {
     return { ok: false, reason: "an edge cannot be extruded — pick a face" };
@@ -820,13 +883,15 @@ function buildCallTemplate(
   const fn =
     op === "extrude"
       ? "extrudeFace"
-      : target === "edge"
-        ? op === "fillet"
-          ? "filletEdge"
-          : "chamferEdge"
-        : op === "fillet"
-          ? "filletFace"
-          : "chamferFace";
+      : op === "shell"
+        ? "shellFace"
+        : target === "edge"
+          ? op === "fillet"
+            ? "filletEdge"
+            : "chamferEdge"
+          : op === "fillet"
+            ? "filletFace"
+            : "chamferFace";
   return `${fn}($SHAPE, ${selector}, ${distance})`;
 }
 

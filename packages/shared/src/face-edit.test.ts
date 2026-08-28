@@ -484,3 +484,127 @@ export default function main({ depth, thickness }: typeof params) {
     expect(!r.ok && r.reason).toMatch(/must be positive/);
   });
 });
+
+describe("shell", () => {
+  /** The `thickness = 6` top face of MULTI's plate. */
+  const TOP_FACE = {
+    kind: "face" as const,
+    face: { kind: "PLANE", center: [0, 0, 6] as [number, number, number], normal: [0, 0, 1] as [number, number, number] },
+  };
+
+  it("writes shellFace and imports it", () => {
+    const r = buildFaceOpCall(MULTI, {
+      op: "shell",
+      partName: "plate",
+      target: TOP_FACE,
+      distance: 1.6,
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.applied).toContain("shellFace(plate.fillet(");
+    expect(r.applied).toContain('(f) => f.inPlane("XY", thickness), 1.6)');
+    expect(r.addedImport).toBe(true);
+  });
+
+  it("binds the offset to a parameter like the others do", () => {
+    // The face being opened has to keep being found after a slider move,
+    // exactly as for extrude and fillet — a shell that silently stops
+    // hollowing is the same failure as a fillet that silently vanishes.
+    const r = buildFaceOpCall(MULTI, {
+      op: "shell",
+      partName: "plate",
+      target: TOP_FACE,
+      distance: 2,
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.applied).toContain("thickness");
+  });
+
+  it("refuses an edge — there is no face to open", () => {
+    const r = buildFaceOpCall(MULTI, {
+      op: "shell",
+      partName: "plate",
+      target: { kind: "edge", point: [0, -30, 6] },
+      distance: 2,
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/cannot be shelled/);
+  });
+});
+
+describe("a script that returns a list of exactly one part", () => {
+  // The commonest shape a single-part file takes, and the one that was
+  // silently broken: the viewer sends partName: null whenever there is only
+  // one body on screen, and that used to mean "wrap the whole return".
+  const ONE = `import { drawRoundedRectangle } from "replicad";
+export const params = { height: 24 };
+export default function main({ height }: typeof params) {
+  const body = drawRoundedRectangle(60, 45, 5).sketchOnPlane("XY").extrude(height);
+  return [{ shape: body, name: "enclosure", color: "#7fa8d0" }];
+}
+`;
+
+  const TOP_FACE = {
+    kind: "face" as const,
+    face: {
+      kind: "PLANE",
+      center: [0, 0, 24] as [number, number, number],
+      normal: [0, 0, 1] as [number, number, number],
+    },
+  };
+
+  it("wraps the entry's shape, not the array around it", () => {
+    const r = buildFaceOpCall(ONE, {
+      op: "shell",
+      partName: null,
+      target: TOP_FACE,
+      distance: 1.6,
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    let out = ONE;
+    for (const e of [...r.edits].sort((a, b) => b.start - a.start)) {
+      out = out.slice(0, e.start) + e.text + out.slice(e.end);
+    }
+    // What it used to write: shellFace([{ shape: body, … }], …) — the array
+    // handed to a function that wants a solid, failing at run time on
+    // something that reads almost right.
+    expect(out).not.toContain("shellFace([");
+    expect(out).toContain('{ shape: shellFace(body, (f) => f.inPlane("XY", height), 1.6), name: "enclosure"');
+  });
+
+  it("does the same for the operations that predate shell", () => {
+    for (const op of ["extrude", "fillet", "chamfer"] as const) {
+      const r = buildFaceOpCall(ONE, { op, partName: null, target: TOP_FACE, distance: 2 });
+      expect(r.ok, op).toBe(true);
+      if (!r.ok) continue;
+      expect(r.applied, op).toContain("(body,");
+      expect(r.applied, op).not.toContain("[{");
+    }
+  });
+
+  it("still wraps the whole expression when the script returns a bare shape", () => {
+    const r = buildFaceOpCall(SINGLE, {
+      op: "fillet",
+      partName: null,
+      target: { kind: "face", face: { kind: "PLANE", center: [0, 0, 8], normal: [0, 0, 1] } },
+      distance: 2,
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.applied).toContain("filletFace(drawCircle(");
+  });
+
+  it("leaves a genuine multi-part list alone", () => {
+    // Two entries and no name is ambiguous about which was meant. Wrapping
+    // either would be a guess about the user's geometry.
+    const r = buildFaceOpCall(MULTI, {
+      op: "fillet",
+      partName: null,
+      target: TOP_FACE,
+      distance: 2,
+    });
+    if (r.ok) expect(r.applied).toContain("[");
+  });
+});

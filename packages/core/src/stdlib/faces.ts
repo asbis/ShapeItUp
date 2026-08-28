@@ -389,6 +389,67 @@ function roundOneEdge(
  * Returns 0 when even a hairline radius fails, which is the honest answer for
  * an edge that cannot be rounded at all.
  */
+/**
+ * Hollow a solid, leaving the picked face(s) open — Fusion 360's Shell.
+ *
+ * The finder names the faces to REMOVE, not the ones to keep. That reads
+ * backwards until you have done it once, and it is replicad's convention as
+ * well as Fusion's: you point at the opening.
+ *
+ * `thickness` is the wall left behind, offset INWARD. There is no outward
+ * form here — an outward shell grows the part past the size you designed it
+ * to be, which in a printed enclosure means it no longer fits what it was
+ * measured against.
+ *
+ * Returns the shape unchanged, with a runtime warning, when the finder
+ * resolves to nothing or OCCT refuses the thickness — same contract as the
+ * rest of this module, and for the same reason: a model that renders with a
+ * warning beats a render that throws.
+ *
+ * @example
+ *   shellFace(box, (f) => f.inPlane("XY", height), 2)
+ */
+export function shellFace(
+  shape: Shape3D,
+  finder: (f: FaceFinder) => FaceFinder,
+  thickness: number,
+  opts: FaceOpOptions = {},
+): Shape3D {
+  if (!Number.isFinite(thickness) || thickness <= 0) return shape;
+
+  const warn = (msg: string) => {
+    if (!opts.silent) pushRuntimeWarning(`shellFace: ${msg}`);
+  };
+
+  // Unlike the other operations here, MORE than one match is legitimate: an
+  // enclosure open at both ends is a real part, and Fusion lets you pick
+  // several faces too. Zero is still an error — it is the silent no-op the
+  // whole module exists to prevent.
+  let matched: number;
+  try {
+    const faces = finder(new FaceFinder()).find(shape);
+    matched = faces.length;
+    for (const f of faces) tryDelete(f);
+  } catch (err) {
+    warn(`could not evaluate the selector — ${errText(err)}.`);
+    return shape;
+  }
+  if (matched === 0) {
+    warn("no face matched the selector, so nothing would be opened.");
+    return shape;
+  }
+
+  try {
+    return shape.shell(thickness, finder);
+  } catch (err) {
+    warn(
+      `OpenCascade refused a ${thickness}mm wall — ${errText(err)}. ` +
+        "The limit is the thinnest region the offset passes through.",
+    );
+    return shape;
+  }
+}
+
 export function probeMaxRadius(
   shape: Shape3D,
   finder: (f: FaceFinder) => FaceFinder,
@@ -457,4 +518,62 @@ function resolveFaceOrThrow(shape: Shape3D, finder: (f: FaceFinder) => FaceFinde
     throw new Error(`expected exactly one face, got ${matches.length}`);
   }
   return matches[0]!;
+}
+
+/**
+ * The thickest wall this shell can actually take, found by asking OCCT.
+ *
+ * Same bisection as {@link probeMaxRadius} and for the same reason: every
+ * closed-form rule for this is wrong. The obvious one — half the smallest
+ * bounding-box dimension — describes a CLOSED shell, and shelling always
+ * removes a face. On a 40 x 30 x 10 box open at the top it predicts 5.0 where
+ * the truth is just under 10.
+ *
+ * A shell attempt is the expensive one of these probes, so the bracket starts
+ * at the smallest bounding-box dimension rather than at half the diagonal:
+ * no wall can exceed the part's own thinnest extent, and starting there saves
+ * several failing steps on every call.
+ */
+export function probeMaxShell(
+  shape: Shape3D,
+  finder: (f: FaceFinder) => FaceFinder,
+  upperBound: number,
+  iterations = 8,
+): number {
+  if (!Number.isFinite(upperBound) || upperBound <= 0) return 0;
+
+  // A finder that matches nothing does not fail — it builds a CLOSED shell,
+  // which is a different operation with a different (much lower) limit.
+  // Reporting that number as this operation's ceiling would be measuring the
+  // wrong thing, so agree with shellFace and refuse.
+  try {
+    const faces = finder(new FaceFinder()).find(shape);
+    const n = faces.length;
+    for (const f of faces) tryDelete(f);
+    if (n === 0) return 0;
+  } catch {
+    return 0;
+  }
+
+  const fits = (t: number): boolean => {
+    try {
+      shape.shell(t, finder);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const floor = Math.min(0.05, upperBound / 500);
+  if (!fits(floor)) return 0;
+  if (fits(upperBound)) return upperBound;
+
+  let lo = floor;
+  let hi = upperBound;
+  for (let i = 0; i < iterations; i++) {
+    const mid = (lo + hi) / 2;
+    if (fits(mid)) lo = mid;
+    else hi = mid;
+  }
+  return lo;
 }

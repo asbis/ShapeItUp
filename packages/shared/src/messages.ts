@@ -201,7 +201,7 @@ export type WebviewToExt =
   | {
       type: "face-op";
       requestId: number;
-      op: "extrude" | "fillet" | "chamfer";
+      op: "extrude" | "fillet" | "chamfer" | "shell";
       partName: string | null;
       /**
        * A face drives all three operations. A single edge can only be
@@ -297,7 +297,7 @@ export type WebviewToExt =
  * values the selector would evaluate to.
  */
 export interface PreviewFaceOp {
-  op: "extrude" | "fillet" | "chamfer";
+  op: "extrude" | "fillet" | "chamfer" | "shell";
   /** Null for a script returning a bare shape. */
   partName: string | null;
   target:
@@ -305,9 +305,10 @@ export interface PreviewFaceOp {
     | { kind: "edge"; point: [number, number, number] };
   distance: number;
   /**
-   * Ask the worker for the largest radius this operation can actually take,
+   * Ask the worker for the largest value this operation can actually take,
    * found by probing OCCT. Requested once when the operation is armed, not on
-   * every drag step. Meaningless for `extrude`, which has no such limit.
+   * every drag step. Meaningless for `extrude`, which has no such limit; for
+   * `shell` it is the thickest wall, not a radius.
    */
   probeLimit?: boolean;
 }

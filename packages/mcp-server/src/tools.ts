@@ -8477,6 +8477,35 @@ curve away out of it, and OCCT then rejects the whole operation. \`filletFace\`
 reads the face's own outer and inner wires instead, so it gets the boundary
 exactly — including hole rims.
 
+## Hollowing — \`shellFace\`
+
+\`\`\`typescript
+import { shellFace } from "shapeitup";
+
+// A box open at the top, 1.6mm walls.
+shellFace(body, (f) => f.inPlane("XY", height), 1.6)
+
+// Open at both ends — more than one match is legitimate here.
+shellFace(body, (f) => f.either([
+  (g) => g.inPlane("XY", height),
+  (g) => g.inPlane("XY", 0),
+]), 1.6)
+\`\`\`
+
+The finder names the faces to **remove**, not the ones to keep — you point at
+the opening. Thickness is the wall left behind, offset inward.
+
+**The thickness limit is not a fraction of the part's size.** It is set by the
+thinnest region the inward offset has to pass through, which is often a corner
+radius rather than a wall. Measured on one 60 x 45 x 24 box with the top face
+removed: with r5 corners it caps at 5.0mm (the corner eats first); with sharp
+corners the same box takes 23mm. Identical bounding box, 4x difference. Probe
+rather than predict — the viewer does, and reports the number in its bar.
+
+Note \`.either([...])\` goes on the bare finder. Chaining it after a constraint
+ANDs instead, which asks for the faces that are simultaneously at two different
+heights and finds none.
+
 ## One edge at a time — \`filletEdge\`, \`chamferEdge\`
 
 \`\`\`typescript

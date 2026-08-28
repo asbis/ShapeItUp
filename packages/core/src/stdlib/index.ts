@@ -9,7 +9,7 @@
 import * as holes from "./holes";
 import * as mounts from "./mounts";
 import * as cosmetic from "./cosmetic";
-import { chamferEdge, chamferFace, extrudeFace, filletEdge, filletFace } from "./faces";
+import { chamferEdge, chamferFace, extrudeFace, filletEdge, filletFace, shellFace } from "./faces";
 import { cutBodies, intersectBodies, joinBodies } from "./booleans";
 import * as printHints from "./printHints";
 import * as bearings from "./bearings";
@@ -91,6 +91,7 @@ export {
   chamferFace,
   filletEdge,
   chamferEdge,
+  shellFace,
   joinBodies,
   cutBodies,
   intersectBodies,
@@ -152,6 +153,7 @@ export const shapeitupStdlib = {
   chamferFace,
   filletEdge,
   chamferEdge,
+  shellFace,
   joinBodies,
   cutBodies,
   intersectBodies,

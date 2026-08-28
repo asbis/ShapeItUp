@@ -6,6 +6,36 @@ its own versions in `packages/mcp-server/CHANGELOG.md`.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project follows semantic versioning at the extension level.
 
+## [1.28.0] - 2026-08-28
+
+Extension `1.28.0` / mcp-server `1.28.0` — Shell, and two bugs it uncovered.
+
+### Added
+- **Shell.** Pick a face, press Shell, and the body hollows out with that face
+  left open — `shellFace(body, (f) => f.inPlane("XY", height), 1.6)`. The
+  finder names the faces to REMOVE; more than one match is legitimate, since a
+  tube open at both ends is a real part. Default 1.6mm is three 0.4mm
+  perimeters. The ceiling is measured against OpenCascade like the fillet one.
+
+### Fixed
+- **The shell thickness guard was wrong in both directions.** It refused
+  anything over 50% of the smallest bounding-box dimension, which describes a
+  CLOSED shell — and shelling always removes a face. Measured on one
+  60x45x24 box with the top open: with r5 corners the real limit is 5.0mm and
+  the rule allowed 12; with sharp corners the real limit is 23mm and the rule
+  refused everything from 12 up. Same bounding box, 4x difference, because
+  what actually caps a shell is the thinnest region the offset passes through
+  — often a corner radius, which a bounding box cannot see. The rule's only
+  job was turning an opaque OCCT pointer exception into readable text, so it
+  is now done reactively, on the failure that actually happened.
+- **A face operation on a single-part file wrapped the whole `return`.** The
+  viewer sends no part name when only one body is on screen, and that used to
+  mean "wrap the return expression" — correct for a script returning a bare
+  shape, wrong for the far commoner `return [{ shape: body, name: "..." }]`.
+  It produced `shellFace([{ shape: body, … }], …)`: an array handed to a
+  function expecting a solid. Present for extrude, fillet and chamfer since
+  they shipped.
+
 ## [1.27.0] - 2026-08-28
 
 Extension `1.27.0` / mcp-server `1.27.0` — direct manipulation in the viewport.

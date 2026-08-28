@@ -35,6 +35,8 @@ import {
   filletEdge,
   filletFace,
   probeMaxRadius,
+  probeMaxShell,
+  shellFace,
 } from "./stdlib/faces";
 import {
   cutBodies,
@@ -901,7 +903,24 @@ export async function initCore(
 
     // The largest radius that works, measured before the operation changes the
     // shape. Rounding only: an extrude has no such ceiling.
-    if (preview.probeLimit && preview.op !== "extrude") {
+    if (preview.probeLimit && preview.op === "shell") {
+      try {
+        // The bracket is the part's own thinnest extent: no wall can exceed
+        // it, and starting there saves several failing steps on a probe whose
+        // every attempt is a full offset solid.
+        const bounds = readBoundsSafe(part.shape);
+        const thinnest = bounds
+          ? Math.min(
+              bounds[1][0] - bounds[0][0],
+              bounds[1][1] - bounds[0][1],
+              bounds[1][2] - bounds[0][2],
+            )
+          : 0;
+        out.limit = probeMaxShell(part.shape, finder as any, thinnest);
+      } catch {
+        // No limit reported rather than a wrong one.
+      }
+    } else if (preview.probeLimit && preview.op !== "extrude") {
       try {
         const bounds = readBoundsSafe(part.shape);
         // Half the bounding-box diagonal is a generous bracket — comfortably
@@ -944,6 +963,11 @@ export async function initCore(
             target.kind === "face"
               ? chamferFace(part.shape, finder, preview.distance)
               : chamferEdge(part.shape, finder, preview.distance);
+          break;
+        case "shell":
+          // Only a face can be opened; "shell an edge" has no meaning.
+          if (target.kind !== "face") return undefined;
+          part.shape = shellFace(part.shape, finder, preview.distance);
           break;
       }
     } catch {

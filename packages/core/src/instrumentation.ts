@@ -358,20 +358,6 @@ const PROTO_VALIDATORS_RAW: Record<string, (self: any, ...args: any[]) => void> 
   shell: (self: any, thickness: unknown, finder?: unknown) => {
     if (typeof thickness === "number") {
       assertPositiveFinite("shell", "thickness", thickness);
-      // Wall-thickness-vs-bounding-box guard. Mirrors the fillet wall-
-      // thickness check: if the requested shell thickness exceeds 50% of the
-      // shape's minimum bounding-box dimension, the inward offset walls
-      // would meet or cross inside the solid — OCCT reports this as an
-      // opaque pointer exception deep inside BRepOffsetAPI_MakeThickSolid.
-      // The 50% threshold is the geometric cutoff: a uniform inward offset
-      // of `thickness` eats `thickness` from BOTH sides of the thinnest
-      // axis, so 2 * thickness must be strictly less than minDim.
-      const minDim = collectShapeMinDimension(self);
-      if (minDim !== null && thickness > minDim * 0.5) {
-        throw new Error(
-          `shell: thickness ${thickness}mm exceeds 50% of minimum part dimension ${minDim.toFixed(2)}mm. Reduce thickness to < ${(minDim * 0.5).toFixed(2)}mm, or filter faces to shell only a thicker region.`,
-        );
-      }
     }
     // W2 empty-finder guard: if the user passed a face-filter callback and
     // it evaluates to zero faces, the shell will silently no-op (or throw
@@ -1269,6 +1255,7 @@ function wrap(name: string, original: Function): Function {
             record(name, start);
             stack.pop();
             tagError(err);
+            if (name === "shell") explainShellFailure(err, self, args[0]);
             throw err;
           }
         );
@@ -1287,6 +1274,7 @@ function wrap(name: string, original: Function): Function {
       record(name, start);
       stack.pop();
       tagError(err);
+      if (name === "shell") explainShellFailure(err, this, args[0]);
       throw err;
     }
   };
@@ -1306,4 +1294,39 @@ function tagError(err: any) {
   if (outermost && !err.operation) {
     err.operation = outermost;
   }
+}
+
+/**
+ * Explain a shell failure AFTER OCCT has refused it, rather than predicting
+ * one before.
+ *
+ * This used to be a pre-call check: refuse any thickness over 50% of the
+ * smallest bounding-box dimension, on the reasoning that a uniform inward
+ * offset eats `thickness` from both sides of the thinnest axis.
+ *
+ * That reasoning describes a CLOSED shell. It is wrong whenever a face is
+ * removed, which is the entire point of the operation — the removed face's
+ * axis is offset from one side only. Measured on a 40 x 30 x 10 box with the
+ * top face removed: the rule refused anything over 5.0, while OCCT itself
+ * succeeded at 6, 7, 8, 9 and 9.9 and only failed at 10.0. Half the valid
+ * range was unreachable, and the message told the user to reduce a thickness
+ * that was fine.
+ *
+ * The rule's only job was to turn an opaque `BRepOffsetAPI_MakeThickSolid`
+ * pointer exception into readable text. Catching the real failure does that
+ * strictly better: it is never wrong about whether the operation failed, and
+ * it costs nothing until something actually breaks.
+ */
+function explainShellFailure(err: any, self: any, thickness: unknown): void {
+  if (!err || typeof thickness !== "number") return;
+  const raw = String(err?.message ?? err);
+  // A message that already reads as English is someone else's, and better.
+  if (/[a-z]{4}/.test(raw) && !/^\s*\d+\s*$/.test(raw)) return;
+  const minDim = collectShapeMinDimension(self);
+  const where = minDim === null ? "" : ` The part's smallest dimension is ${minDim.toFixed(2)}mm.`;
+  err.message =
+    `shell: OpenCascade could not build a ${thickness}mm wall on this part.${where} ` +
+    "The limit is set by the thinnest region the offset has to pass through, " +
+    "not by the overall size — try a smaller thickness, or remove a face so " +
+    "that direction is offset from one side only.";
 }
