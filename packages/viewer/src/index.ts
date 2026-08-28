@@ -3643,7 +3643,7 @@ onMessage("installed-apps", (msg) => {
 // through the perspective camera either way.
 
 /** Kept in sync with #viewcube / #vc-home in viewer-html.ts. */
-const VIEW_CUBE_SIZE = 96;
+const VIEW_CUBE_SIZE = 108;
 const VIEW_CUBE_MARGIN_RIGHT = 10;
 const VIEW_CUBE_MARGIN_BOTTOM = 96;
 

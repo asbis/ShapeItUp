@@ -257,10 +257,10 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
        Kept in sync with VIEW_CUBE_SIZE / VIEW_CUBE_MARGIN in the viewer. */
     #viewcube {
       position: absolute; right: 10px; bottom: 96px; z-index: 20;
-      width: 96px; height: 96px; touch-action: none;
+      width: 108px; height: 108px; touch-action: none;
     }
     #vc-home {
-      position: absolute; right: 106px; bottom: 166px; z-index: 21;
+      position: absolute; right: 118px; bottom: 180px; z-index: 21;
       width: 24px; height: 24px; padding: 0; line-height: 1;
       background: rgba(37,37,38,0.85); border: 1px solid #3c3c3c;
       border-radius: 4px; color: #9aa2ac; cursor: pointer; font-size: 13px;

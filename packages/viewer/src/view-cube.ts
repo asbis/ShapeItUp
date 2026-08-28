@@ -32,10 +32,20 @@ const EDGE_SPAN = 0.34;
 const FACE_SPAN = 2 - 2 * EDGE_SPAN;
 const CELL_OFFSET = FACE_SPAN / 2 + EDGE_SPAN / 2;
 
-const FACE_COLOR = 0xd7dbe0;
-const EDGE_COLOR = 0xc2c7ce;
-const HOVER_COLOR = 0x2f86d8;
-const LABEL_COLOR = "#2c3138";
+/**
+ * One colour for all twenty-six cells.
+ *
+ * The first version tinted the edge and corner cells a shade darker, which
+ * drew a grid over the whole thing and made it read as a stack of blocks
+ * rather than as a cube. The regions are not supposed to be visible at rest —
+ * they are supposed to appear under the cursor, which is the only moment they
+ * mean anything.
+ */
+const CUBE_COLOR = 0xe3e7eb;
+const HOVER_COLOR = 0x5aa9e6;
+/** The twelve silhouette edges. What makes it read as a solid rather than a blob. */
+const OUTLINE_COLOR = 0x5d666f;
+const LABEL_COLOR = "#3a4048";
 
 /**
  * The label each face carries, in this application's Z-up CAD frame.
@@ -67,9 +77,9 @@ export class ViewCube {
   private readonly scene = new THREE.Scene();
   private readonly camera: THREE.OrthographicCamera;
   private readonly cells: THREE.Mesh[] = [];
-  private readonly faceMaterial: THREE.MeshLambertMaterial;
-  private readonly edgeMaterial: THREE.MeshLambertMaterial;
+  private readonly cubeMaterial: THREE.MeshLambertMaterial;
   private readonly hoverMaterial: THREE.MeshLambertMaterial;
+  private readonly key: THREE.DirectionalLight;
   private readonly raycaster = new THREE.Raycaster();
   private readonly pointer = new THREE.Vector2();
   private hovered: THREE.Mesh | null = null;
@@ -92,25 +102,27 @@ export class ViewCube {
     const half = 1.78;
     this.camera = new THREE.OrthographicCamera(-half, half, half, -half, 0.1, 20);
 
-    this.faceMaterial = new THREE.MeshLambertMaterial({ color: FACE_COLOR });
-    this.edgeMaterial = new THREE.MeshLambertMaterial({ color: EDGE_COLOR });
-    this.hoverMaterial = new THREE.MeshLambertMaterial({
-      color: HOVER_COLOR,
-      emissive: 0x0d3a63,
-    });
+    this.cubeMaterial = new THREE.MeshLambertMaterial({ color: CUBE_COLOR });
+    // Pale rather than saturated, so the dark label on a hovered FACE stays
+    // readable. A strong blue highlights the region and hides what it names.
+    this.hoverMaterial = new THREE.MeshLambertMaterial({ color: HOVER_COLOR });
 
     this.buildCells();
+    this.buildOutline();
     this.buildLabels();
 
     // Lit rather than flat: without shading the cube reads as a hexagon, and
     // the whole point of it is to look like a solid you are turning over.
-    const key = new THREE.DirectionalLight(0xffffff, 2.1);
-    key.position.set(2, -3, 4);
-    this.scene.add(key);
-    const fill = new THREE.DirectionalLight(0xffffff, 0.9);
-    fill.position.set(-3, 2, -1);
-    this.scene.add(fill);
-    this.scene.add(new THREE.AmbientLight(0xffffff, 1.1));
+    //
+    // The key light FOLLOWS THE CAMERA, offset up and to the right. A rig
+    // fixed in cube space is the obvious thing and it is wrong here: as you
+    // orbit, it keeps finding orientations where two of the three visible
+    // faces land on the same value and the cube goes flat. Anchored to the
+    // view, the three faces you can see are always at three different angles
+    // to the light, so the form reads from every direction.
+    this.key = new THREE.DirectionalLight(0xffffff, 1.55);
+    this.scene.add(this.key);
+    this.scene.add(new THREE.AmbientLight(0xffffff, 0.78));
 
     this.attach();
   }
@@ -123,10 +135,9 @@ export class ViewCube {
       for (const j of [-1, 0, 1]) {
         for (const k of [-1, 0, 1]) {
           if (i === 0 && j === 0 && k === 0) continue;
-          const engaged = Number(i !== 0) + Number(j !== 0) + Number(k !== 0);
           const mesh = new THREE.Mesh(
             new THREE.BoxGeometry(span(i), span(j), span(k)),
-            engaged === 1 ? this.faceMaterial : this.edgeMaterial,
+            this.cubeMaterial,
           );
           mesh.position.set(at(i), at(j), at(k));
           mesh.userData.dir = [i, j, k] as [number, number, number];
@@ -135,6 +146,29 @@ export class ViewCube {
         }
       }
     }
+  }
+
+  /**
+   * The twelve edges of the cube, drawn as lines.
+   *
+   * A light cube on a dark background has a soft silhouette and no internal
+   * definition — the near corner where three faces meet disappears entirely
+   * when two of them happen to catch similar light. A thin dark outline gives
+   * it the crispness a drawn object has, and costs one geometry.
+   *
+   * Nudged outward rather than depth-offset: the lines sit on the surface they
+   * outline, and z-fighting on a shape this small flickers per pixel.
+   */
+  private buildOutline(): void {
+    const box = new THREE.BoxGeometry(2, 2, 2);
+    const lines = new THREE.LineSegments(
+      new THREE.EdgesGeometry(box),
+      new THREE.LineBasicMaterial({ color: OUTLINE_COLOR }),
+    );
+    lines.scale.setScalar(1.004);
+    lines.raycast = () => {};
+    this.scene.add(lines);
+    box.dispose();
   }
 
   /**
@@ -234,11 +268,7 @@ export class ViewCube {
 
   private setHover(mesh: THREE.Mesh | null): void {
     if (mesh === this.hovered) return;
-    if (this.hovered) {
-      const dir = this.hovered.userData.dir as [number, number, number];
-      const engaged = dir.filter((c) => c !== 0).length;
-      this.hovered.material = engaged === 1 ? this.faceMaterial : this.edgeMaterial;
-    }
+    if (this.hovered) this.hovered.material = this.cubeMaterial;
     this.hovered = mesh;
     if (mesh) mesh.material = this.hoverMaterial;
     this.hitEl.style.cursor = mesh ? "pointer" : "";
@@ -258,6 +288,16 @@ export class ViewCube {
     this.camera.up.copy(mainCamera.up);
     this.camera.lookAt(0, 0, 0);
     this.camera.updateMatrixWorld();
+
+    // Up and to the right of the eye — the standard key-light placement, and
+    // the reason all three visible faces stay at distinct values.
+    const right = new THREE.Vector3()
+      .crossVectors(this.camera.position, this.camera.up)
+      .normalize();
+    this.key.position
+      .copy(this.camera.position)
+      .addScaledVector(this.camera.up, 5)
+      .addScaledVector(right, 3);
   }
 
   /**
@@ -320,12 +360,21 @@ function makeLabelTexture(text: string): THREE.CanvasTexture {
   // then inherits that size.
   ctx.font = font(100);
   const widthAt100 = ctx.measureText(LONGEST_LABEL).width || 100;
-  const size = Math.floor((100 * px * 0.82) / widthAt100);
+  const size = Math.floor((100 * px * 0.76) / widthAt100);
 
   ctx.font = font(size);
   ctx.fillStyle = LABEL_COLOR;
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
+  // Tracked out a little, the way a label engraved on a tool is. Guarded
+  // because letterSpacing is a recent 2D-context property and an older
+  // webview would otherwise throw on the assignment.
+  try {
+    (ctx as unknown as { letterSpacing: string }).letterSpacing = `${Math.round(size * 0.06)}px`;
+    ctx.font = font(size);
+  } catch {
+    /* untracked is fine */
+  }
   ctx.fillText(text, px / 2, px / 2);
 
   const tex = new THREE.CanvasTexture(c);
