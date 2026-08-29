@@ -372,12 +372,6 @@ const facePicker = new FacePicker(
 let selectedBody: string | null = null;
 
 /**
- * When Body mode is on, a click in the viewport selects the whole body rather
- * than the face under the cursor — Fusion's selection filter.
- */
-let bodySelectMode = false;
-
-/**
  * The body a command should arm on: what you selected, else the body the
  * picked face belongs to, else nothing.
  *
@@ -3002,19 +2996,6 @@ function applyBodyTint(): void {
   updatePartsList();
 }
 
-function setBodySelectMode(on: boolean): void {
-  bodySelectMode = on;
-  document.getElementById("btn-bodysel")?.classList.toggle("active", on);
-  renderer.domElement.title = on ? "Click a body to select it" : "";
-  // Leaving the mode does not throw away what you selected in it — the whole
-  // point of selecting is to run a command next.
-  if (on) {
-    facePicker.setSelection(null);
-    faceInfoEl.classList.remove("visible");
-    updateFaceInfoPanel();
-  }
-}
-
 /**
  * Hand a body from the tree to whatever modal command is open.
  *
@@ -3110,7 +3091,12 @@ function updatePartsList() {
     const nameEl = document.createElement("span");
     nameEl.className = "part-name";
     nameEl.textContent = part.name;
-    nameEl.title = part.name;
+    // The row is the discoverable way to select a whole body; Alt-click in the
+    // view is the fast one. Say so here, since this is where people look.
+    nameEl.title =
+      combineOp || moveMode || arrangeMode
+        ? `${part.name} — click to use this body`
+        : `${part.name} — click to select the whole body (or Alt-click it in the view)`;
 
     const eyeEl = document.createElement("span");
     eyeEl.className = "part-eye";
@@ -4025,9 +4011,6 @@ onMessage("viewer-command", (msg) => {
 });
 
 // --- Toolbar buttons ---
-document.getElementById("btn-bodysel")!.addEventListener("click", () =>
-  setBodySelectMode(!bodySelectMode),
-);
 document.getElementById("btn-parts")!.addEventListener("click", togglePartsPanel);
 
 document.getElementById("btn-fit")!.addEventListener("click", () => {
@@ -4706,11 +4689,20 @@ renderer.domElement.addEventListener("click", (event) => {
       }
       return;
     }
-    // With the Body filter on, a click means the whole solid rather than the
-    // face under the cursor. Which one you meant is not something a click can
-    // infer — a face is what you want for Extrude or Shell, a body for Mirror,
-    // Pattern, Move or Combine — so it is a mode, as it is in Fusion.
-    if (bodySelectMode) {
+    // Alt-click means the whole solid; a plain click means the face under the
+    // cursor.
+    //
+    // This started as a MODE — a Body toggle in the ribbon — and that was the
+    // wrong shape for it. A mode that silently turns face picking off leaves
+    // you unable to select a wall or an edge until you find the button again,
+    // and the two selections are not alternatives you commit to for a while:
+    // you want a face for Extrude or Shell and a body for Mirror or Pattern,
+    // often one after the other. A modifier gives you both without choosing.
+    //
+    // Body commands do not need this at all — they already fall back to the
+    // body the picked FACE belongs to, so clicking any wall of a part is
+    // enough to arm Mirror on it. This is for saying "the body" outright.
+    if (event.altKey) {
       setSelectedBody(pickBodyAt(event.clientX, event.clientY));
       return;
     }

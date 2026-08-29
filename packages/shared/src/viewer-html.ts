@@ -649,10 +649,6 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
               <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3.5v9M13 3.5v9M3 8h10"/><path d="M5 6.4 3.2 8 5 9.6M11 6.4 12.8 8 11 9.6"/></svg>
               <span>Dims</span>
             </button>
-            <button id="btn-bodysel" title="Click selects a whole body instead of a face \u2014 Fusion's selection filter">
-              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.6 14.2 5v6L8 14.4 1.8 11V5z"/><path d="M1.8 5 8 8.4 14.2 5M8 8.4v6"/></svg>
-              <span>Body</span>
-            </button>
           </div>
           <div class="tb-caption">Display</div>
         </div>
