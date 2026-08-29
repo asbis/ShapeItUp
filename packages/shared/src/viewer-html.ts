@@ -267,6 +267,11 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
     }
     #vc-home:hover { background: #3c3c3c; color: #fff; border-color: #4a4a4e; }
 
+    /* The body an open command is acting on. The viewport tints it; the panel
+       has to agree, or the two disagree about what is selected. */
+    .tree-row.armed { background: rgba(14,99,156,0.32); }
+    .tree-row.armed .part-name { color: #cfe6ff; }
+
     /* Parameters panel (bottom of parts panel) */
     #params-panel {
       border-top: 1px solid #3c3c3c; padding: 0; max-height: 0; overflow: hidden;

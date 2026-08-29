@@ -1229,6 +1229,7 @@ function applyCombineTint(): void {
             : 0x000000;
     mat.emissive.setHex(tint);
   }
+  updatePartsList();
 }
 
 /**
@@ -1252,6 +1253,10 @@ function applyArrangeTint(): void {
     }
     mat.emissive.setHex(part.name === arrangePartName ? TARGET_TINT : 0x000000);
   }
+  // The panel marks the same body. Done here because this runs on every path
+  // that changes which one is armed — the dropdown, a viewport click, a tree
+  // click, arming and disarming.
+  updatePartsList();
 }
 
 /** Body names to choose from: frozen while armed, live otherwise. */
@@ -1930,6 +1935,7 @@ function setMoveMode(mode: MoveMode | null): void {
     captureMoveAnchor();
   }
 
+  updatePartsList();
   miOpEl.textContent = MOVE_LABEL[mode];
   miTranslateEl.hidden = mode !== "translate";
   miRotateEl.hidden = mode !== "rotate";
@@ -2151,6 +2157,7 @@ for (const [id, mode] of [
 
 miBodyEl.addEventListener("change", () => {
   movePartName = miBodyEl.value || null;
+  updatePartsList();
   clearMoveTransforms();
   clearMoveCopyGhost();
   moveDelta.set(0, 0, 0);
@@ -2922,6 +2929,41 @@ function formatArea(mm2: number): string {
 }
 
 /**
+ * Hand a body from the tree to whatever modal command is open.
+ *
+ * The Components panel is where a CAD user reaches to pick a body, and until
+ * now it did nothing but expand a row — so with a pattern's copies covering
+ * the viewport there was no way left to choose a different one at all.
+ *
+ * Returns true when the click was consumed, so the row's own expand/collapse
+ * does not also fire.
+ */
+function selectBodyForArmedCommand(name: string): boolean {
+  if (arrangeMode) {
+    if (arrangeBodies.includes(name) && name !== arrangePartName) {
+      arrangePartName = name;
+      aiBodyEl.value = name;
+      applyArrangeTint();
+      renderArrangePreview();
+      scheduleArrangePreview();
+    }
+    return true;
+  }
+  if (moveMode) {
+    if (name !== movePartName) {
+      miBodyEl.value = name;
+      miBodyEl.dispatchEvent(new Event("change"));
+    }
+    return true;
+  }
+  if (combineOp) {
+    if (combineCandidates().includes(name)) combineClickBody(name);
+    return true;
+  }
+  return false;
+}
+
+/**
  * The browser tree.
  *
  * A flat list said only which parts exist. Every CAD browser is a tree because
@@ -2960,7 +3002,13 @@ function updatePartsList() {
       part.centerOfMass !== undefined;
 
     const row = document.createElement("div");
-    row.className = `tree-row tree-leaf part-item${part.visible ? "" : " hidden"}`;
+    const armed =
+      (arrangeMode && part.name === arrangePartName) ||
+      (moveMode && part.name === movePartName) ||
+      (combineOp && part.name === combineTarget);
+    row.className =
+      `tree-row tree-leaf part-item${part.visible ? "" : " hidden"}` +
+      (armed ? " armed" : "");
 
     const twisty = document.createElement("span");
     twisty.className = "tree-twisty";
@@ -3032,14 +3080,16 @@ function updatePartsList() {
       eyeEl.title = part.visible ? "Hide this body" : "Show this body";
     });
 
-    if (hasStats) {
-      row.addEventListener("click", () => {
-        part.expanded = !part.expanded;
-        props.style.display = part.expanded ? "" : "none";
-        twisty.textContent = part.expanded ? "\u25BE" : "\u25B8";
-        twisty.classList.toggle("open", !!part.expanded);
-      });
-    }
+    // The row is a body first and a disclosure second. With a command open it
+    // hands the body over; otherwise it expands, as before.
+    row.addEventListener("click", () => {
+      if (selectBodyForArmedCommand(part.name)) return;
+      if (!hasStats) return;
+      part.expanded = !part.expanded;
+      props.style.display = part.expanded ? "" : "none";
+      twisty.textContent = part.expanded ? "\u25BE" : "\u25B8";
+      twisty.classList.toggle("open", !!part.expanded);
+    });
 
     bodyList.append(row, props);
   });
@@ -4607,14 +4657,17 @@ const KEY_TO_PRESET: Record<string, [number, number, number]> = {
 window.addEventListener("keydown", (event) => {
   if (event.ctrlKey || event.metaKey || event.altKey) return;
   const active = document.activeElement;
-  if (
-    active &&
+  const typing =
+    !!active &&
     (active.tagName === "INPUT" ||
       active.tagName === "TEXTAREA" ||
-      (active as HTMLElement).isContentEditable)
-  ) {
-    return;
-  }
+      (active as HTMLElement).isContentEditable);
+  // Escape is the exception to "keys belong to the field you are typing in".
+  // It means "not this", and the thing it is refusing is the COMMAND, not the
+  // character. Returning early here left Escape dead in exactly the situation
+  // where it is reached for most — a bar open with the cursor in one of its
+  // fields — and every command below had to wire its own copy to compensate.
+  if (typing && event.key !== "Escape") return;
   // Escape clears the selection. Checked before the lowercase fold because
   // "Escape".toLowerCase() is "escape", which would collide with nothing today
   // but is a needless thing to depend on.
