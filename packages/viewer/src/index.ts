@@ -360,6 +360,36 @@ const facePicker = new FacePicker(
  * parameter without committing it and the two diverge, and previewing the
  * effective one would promise a binding the host will not make.
  */
+/**
+ * A whole body, selected as one thing.
+ *
+ * Distinct from the face picker, which selects a FACE or an EDGE. Fusion lets
+ * you pick either, and which one you meant is not something a click can infer:
+ * a face is what you want for Extrude or Shell, a body for Mirror, Pattern,
+ * Move or Combine. So the two selections are separate, mutually exclusive, and
+ * the body commands prefer this one.
+ */
+let selectedBody: string | null = null;
+
+/**
+ * When Body mode is on, a click in the viewport selects the whole body rather
+ * than the face under the cursor — Fusion's selection filter.
+ */
+let bodySelectMode = false;
+
+/**
+ * The body a command should arm on: what you selected, else the body the
+ * picked face belongs to, else nothing.
+ *
+ * Read BEFORE a command clears the selection. All three commands used to read
+ * the face picker AFTER calling `facePicker.setSelection(null)`, so the answer
+ * was always null and every one of them silently fell back to the first body
+ * in the file — whatever you had picked.
+ */
+function armedBodyName(): string | null {
+  return selectedBody ?? facePicker.getSelection()?.partName ?? null;
+}
+
 let declaredParamValues: Record<string, number> = {};
 
 const faceInfoEl = document.getElementById("face-info")!;
@@ -1248,7 +1278,9 @@ function applyArrangeTint(): void {
     // are mutually exclusive, but clearing indiscriminately here would still
     // stomp on whatever set it last.
     if (arrangeMode === null) {
-      if (combineOp === null) mat.emissive.setHex(0x000000);
+      if (combineOp === null) {
+        mat.emissive.setHex(part.name === selectedBody ? TARGET_TINT : 0x000000);
+      }
       continue;
     }
     mat.emissive.setHex(part.name === arrangePartName ? TARGET_TINT : 0x000000);
@@ -1291,6 +1323,8 @@ function setCombineOp(op: CombineKind | null): void {
   // list — one short — as the frozen menu. Go back to the file's model first.
   if (combineOp === null && previewShowing) revertPreview();
 
+  // Read what is selected BEFORE the calls below clear it.
+  const preselected = armedBodyName();
   // A face selection, a body selection and a gizmo drag would all be reading
   // the same click. One at a time.
   setArrangeMode(null);
@@ -1304,9 +1338,10 @@ function setCombineOp(op: CombineKind | null): void {
   if (!wasArmed) {
     combineBodies = currentParts.map((p) => p.name);
     combineStats = null;
-    const picked = facePicker.getSelection()?.partName;
     combineTarget =
-      picked && combineBodies.includes(picked) ? picked : (combineBodies[0] ?? null);
+      preselected && combineBodies.includes(preselected)
+        ? preselected
+        : (combineBodies[0] ?? null);
     // With exactly two bodies the second one is the only thing the tool could
     // be, so choosing it saves a click and takes nothing away — any other
     // count is a real decision and stays the user's.
@@ -1916,6 +1951,7 @@ function setMoveMode(mode: MoveMode | null): void {
 
   // One modal command at a time: Combine reads clicks as body selection and
   // this one hands them to a gizmo.
+  const preselected = armedBodyName();
   setArrangeMode(null);
   setCombineOp(null);
   setActiveOp(null);
@@ -1925,10 +1961,9 @@ function setMoveMode(mode: MoveMode | null): void {
   const rearming = moveMode !== null;
   moveMode = mode;
   if (!rearming) {
-    const picked = facePicker.getSelection()?.partName;
     movePartName =
-      picked && currentParts.some((p) => p.name === picked)
-        ? picked
+      preselected && currentParts.some((p) => p.name === preselected)
+        ? preselected
         : (currentParts[0]?.name ?? null);
     moveDelta.set(0, 0, 0);
     moveQuat.set(0, 0, 0, 1);
@@ -2354,6 +2389,7 @@ function setArrangeMode(mode: ArrangeMode | null): void {
   if (arrangeMode === null && previewShowing) revertPreview();
 
   // One modal command at a time.
+  const preselected = armedBodyName();
   setMoveMode(null);
   setCombineOp(null);
   setActiveOp(null);
@@ -2364,9 +2400,10 @@ function setArrangeMode(mode: ArrangeMode | null): void {
   arrangeMode = mode;
   if (!rearming) {
     arrangeBodies = currentParts.map((p) => p.name);
-    const picked = facePicker.getSelection()?.partName;
     arrangePartName =
-      picked && arrangeBodies.includes(picked) ? picked : (arrangeBodies[0] ?? null);
+      preselected && arrangeBodies.includes(preselected)
+        ? preselected
+        : (arrangeBodies[0] ?? null);
   }
 
   aiOpEl.textContent = mode === "mirror" ? "Mirror" : "Pattern";
@@ -2929,6 +2966,56 @@ function formatArea(mm2: number): string {
 }
 
 /**
+ * Select a whole body, or clear the selection.
+ *
+ * The counterpart to picking a face. Everything that can be selected gets
+ * tinted and marked in the panel, so "what is selected" has one answer in both
+ * places rather than a different one in each.
+ */
+function setSelectedBody(name: string | null): void {
+  if (selectedBody === name) return;
+  selectedBody = name;
+  if (name) {
+    // The two selections are alternatives, not layers: a body and one of its
+    // own faces cannot both be what you meant.
+    facePicker.setSelection(null);
+    faceInfoEl.classList.remove("visible");
+  }
+  applyBodyTint();
+  setParamsStatus(name ? `${name} selected — pick a command` : "");
+}
+
+/**
+ * Light up the selected body.
+ *
+ * Deliberately separate from the command tints: this one is live whenever no
+ * command is open, and has to stand aside the moment one is, or two different
+ * ideas of "selected" would be painted at once.
+ */
+function applyBodyTint(): void {
+  if (combineOp || moveMode || arrangeMode) return;
+  for (const part of currentParts) {
+    const mat = part.mesh.material as THREE.MeshPhongMaterial;
+    if (!mat.emissive) continue;
+    mat.emissive.setHex(part.name === selectedBody ? TARGET_TINT : 0x000000);
+  }
+  updatePartsList();
+}
+
+function setBodySelectMode(on: boolean): void {
+  bodySelectMode = on;
+  document.getElementById("btn-bodysel")?.classList.toggle("active", on);
+  renderer.domElement.title = on ? "Click a body to select it" : "";
+  // Leaving the mode does not throw away what you selected in it — the whole
+  // point of selecting is to run a command next.
+  if (on) {
+    facePicker.setSelection(null);
+    faceInfoEl.classList.remove("visible");
+    updateFaceInfoPanel();
+  }
+}
+
+/**
  * Hand a body from the tree to whatever modal command is open.
  *
  * The Components panel is where a CAD user reaches to pick a body, and until
@@ -3005,7 +3092,8 @@ function updatePartsList() {
     const armed =
       (arrangeMode && part.name === arrangePartName) ||
       (moveMode && part.name === movePartName) ||
-      (combineOp && part.name === combineTarget);
+      (combineOp && part.name === combineTarget) ||
+      (!arrangeMode && !moveMode && !combineOp && part.name === selectedBody);
     row.className =
       `tree-row tree-leaf part-item${part.visible ? "" : " hidden"}` +
       (armed ? " armed" : "");
@@ -3081,9 +3169,11 @@ function updatePartsList() {
     });
 
     // The row is a body first and a disclosure second. With a command open it
-    // hands the body over; otherwise it expands, as before.
+    // hands the body over; with none, it selects the body so the next command
+    // arms on it. The twisty still expands.
     row.addEventListener("click", () => {
       if (selectBodyForArmedCommand(part.name)) return;
+      setSelectedBody(selectedBody === part.name ? null : part.name);
       if (!hasStats) return;
       part.expanded = !part.expanded;
       props.style.display = part.expanded ? "" : "none";
@@ -3935,6 +4025,9 @@ onMessage("viewer-command", (msg) => {
 });
 
 // --- Toolbar buttons ---
+document.getElementById("btn-bodysel")!.addEventListener("click", () =>
+  setBodySelectMode(!bodySelectMode),
+);
 document.getElementById("btn-parts")!.addEventListener("click", togglePartsPanel);
 
 document.getElementById("btn-fit")!.addEventListener("click", () => {
@@ -4613,8 +4706,17 @@ renderer.domElement.addEventListener("click", (event) => {
       }
       return;
     }
+    // With the Body filter on, a click means the whole solid rather than the
+    // face under the cursor. Which one you meant is not something a click can
+    // infer — a face is what you want for Extrude or Shell, a body for Mirror,
+    // Pattern, Move or Combine — so it is a mode, as it is in Fusion.
+    if (bodySelectMode) {
+      setSelectedBody(pickBodyAt(event.clientX, event.clientY));
+      return;
+    }
     // Clicking empty space clears — the standard CAD gesture, and the only
     // way to deselect without reaching for the keyboard.
+    setSelectedBody(null);
     facePicker.setSelection(pickAt(event.clientX, event.clientY));
     updateFaceInfoPanel();
     return;
@@ -4686,6 +4788,11 @@ window.addEventListener("keydown", (event) => {
   }
   if (event.key === "Escape" && combineOp) {
     setCombineOp(null);
+    event.preventDefault();
+    return;
+  }
+  if (event.key === "Escape" && selectedBody) {
+    setSelectedBody(null);
     event.preventDefault();
     return;
   }
