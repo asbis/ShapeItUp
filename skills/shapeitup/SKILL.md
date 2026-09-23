@@ -60,7 +60,7 @@ Start with `create_shape` (or `modify_shape`) — the status from that call tell
 
 ## Available MCP Tools
 
-All 20 tools. Dense reference — use this table to find the right tool fast.
+All 29 tools. Dense reference — use this table to find the right tool fast.
 
 | Tool | Purpose | Key args |
 |------|---------|----------|
@@ -74,14 +74,23 @@ All 20 tools. Dense reference — use this table to find the right tool fast.
 | `validate_syntax` | Syntax + 6 semantic lints (no execution) | `code` |
 | `preview_shape` | Execute a snippet WITHOUT writing to workspace | `code`, `workingDir?`, `captureScreenshot?`, `focusPart?`, `hideParts?` |
 | `tune_params` | Re-run with ephemeral param overrides, file untouched | `filePath`, `params`, `captureScreenshot?` |
+| `clear_params` | Drop the param overrides `tune_params` pinned for a file | `filePath` |
 | `get_render_status` | Last run's stats (volume, area, CoM, bbox, mass, per-part) | — |
 | `render_preview` | PNG screenshot of current shape | `filePath?`, `cameraAngle?`, `renderMode?`, `showDimensions?`, `showAxes?`, `width?`, `height?`, `timeoutMs?`, `finder?`, `partName?`, `partIndex?`, `focusPart?`, `hideParts?` |
 | `get_preview` | Return latest PNG as inline base64 (no Read needed) | `filePath?`, `cameraAngle?` |
 | `set_render_mode` | Switch live viewer ai/dark (UI only) | `mode` |
 | `toggle_dimensions` | Show/hide dims on live viewer (UI only) | `show?` |
+| `open_viewer` | Serve the interactive 3D viewer over HTTP and return its URL (no editor needed; live-reloads on save) | `filePath`, `port?` |
+| `close_viewer` | Shut down the `open_viewer` server | — |
 | `preview_finder` | Count + locate edge/face matches; pink-sphere preview in viewer | `filePath`, `finder`, `partName?`, `partIndex?` |
 | `check_collisions` | Pairwise part intersection test on assemblies | `filePath`, `tolerance?`, `acceptedPairs?`, `pressFitThreshold?` |
-| `export_shape` | Export to STEP or STL; optional single-part | `format`, `filePath?`, `outputPath?`, `partName?`, `openIn?` |
+| `check_stack` | Per-part world range along one axis, sorted, with gaps/overlaps between neighbours | `filePath`, `axis`, `acceptedOverlaps?` |
+| `sweep_check` | Rotate one part about a pivot+axis and report collisions at each step | `filePath`, `moving`, `pivot`, `axis`, `range`, `steps?` |
+| `run_simulation` | Run the shape's `export const sim` kinematic simulation; collision events over time | `filePath`, `format?` |
+| `describe_geometry` | Enumerate faces/edges (normal, centroid, area, type) + bbox | `filePath`, `partName?`, `format?`, `faces?`, `edges?`, `limit?` |
+| `validate_joints` | Check declared mate joints sit on their part's surface | `filePath`, `tolerance?` |
+| `verify_shape` | One execution, any mix of geometry / collision / joint checks — prefer over calling those three separately | `filePath`, `checks` |
+| `export_shape` | Export to STEP, STL or 3MF; optional single part or one file per part | `format`, `filePath?`, `outputPath?`, `partName?`, `splitParts?`, `openIn?` |
 | `list_installed_apps` | Detect PrusaSlicer/Cura/FreeCAD/Fusion360/etc. | — |
 | `get_api_reference` | Replicad docs; omit category to list; `search` to grep | `category?`, `search?`, `signaturesOnly?` |
 
@@ -168,7 +177,7 @@ ZY       +Z               +Y               -X
 Concrete footgun: `draw().hLine(60).sketchOnPlane("ZX")` moves the pen 60 mm along **world Z**, not world X. If you expected `hLine` to walk along world X, you want plane `"XZ"` (where pen h → +X).
 
 > **`holes.*` axis is NOT pen direction.**
-> `axis: "+Y"` on `holes.slot({...})` means **the slot opens on the +Y face** and penetrates toward -Y. It's the same semantic as `holes.through(..., axis: "+Y")`.
+> `axis: "+Y"` on `holes.slot({...})` means **the slot opens on the +Y face** and penetrates toward -Y. It's the same semantic as `holes.through(size, { axis: "+Y" })`.
 > Pen axis mapping above governs 2D sketch → plane; hole axis governs which face the cut opens on.
 
 ---
