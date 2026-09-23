@@ -126,3 +126,87 @@ describe("face picking data", () => {
     expect(last * 3).toBe(part.edgeVertices.length);
   });
 });
+
+/**
+ * The picked face's descriptor has to be enough to find that face again when
+ * its plane is shared. An L-bracket whose two gussets run the full depth of
+ * the base splits the base's top into three coplanar faces; the viewer names
+ * whichever one was clicked by its plane plus a pin, and the worker picks the
+ * pin using nothing but the descriptor's (Float32) centre and a point inside
+ * the triangles the viewer drew.
+ */
+describe("picking one of several coplanar faces", () => {
+  const L_BRACKET = `
+    const { draw, drawRectangle } = __replicad__;
+    const params = { width: 60, depth: 40, thickness: 5, wallH: 50 };
+    function main({ width, depth, thickness, wallH }) {
+      let shape = drawRectangle(width, depth).sketchOnPlane().extrude(thickness);
+      shape = shape.fuse(
+        drawRectangle(width, 5).sketchOnPlane().extrude(wallH).translate(0, depth / 2 - 2.5, 0),
+      );
+      for (const x of [-18, 18]) {
+        const gusset = draw([-depth / 2, thickness])
+          .lineTo([depth / 2 - 5, thickness])
+          .lineTo([depth / 2 - 5, wallH - 10])
+          .close()
+          .sketchOnPlane("YZ")
+          .extrude(4)
+          .translate(x - 2, 0, 0);
+        shape = shape.fuse(gusset);
+      }
+      return shape;
+    }
+  `;
+
+  /** What the viewer's faceInteriorPoint computes: the largest triangle's centroid. */
+  function interiorOf(part: any, f: number): [number, number, number] {
+    const v = part.vertices, tri = part.triangles;
+    const start = part.faceGroups[f * 2], count = part.faceGroups[f * 2 + 1];
+    let best: [number, number, number] = [0, 0, 0], bestArea = 0;
+    for (let t = start; t < start + count; t += 3) {
+      const [a, b, c] = [tri[t] * 3, tri[t + 1] * 3, tri[t + 2] * 3];
+      const u = [v[b] - v[a], v[b + 1] - v[a + 1], v[b + 2] - v[a + 2]];
+      const w = [v[c] - v[a], v[c + 1] - v[a + 1], v[c + 2] - v[a + 2]];
+      const area = Math.hypot(u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]);
+      if (area > bestArea) {
+        bestArea = area;
+        best = [(v[a] + v[b] + v[c]) / 3, (v[a + 1] + v[b + 1] + v[c + 1]) / 3, (v[a + 2] + v[b + 2] + v[c + 2]) / 3];
+      }
+    }
+    return best;
+  }
+
+  it("pins each of the three and extrudes exactly that one", async () => {
+    const [part] = await run(L_BRACKET, "full");
+    const tops = part.faceInfo!
+      .map((info, f) => ({ info, f }))
+      .filter(({ info }) =>
+        info.kind === "PLANE" && info.normal && info.normal[2] > 0.999 && Math.abs(info.center[2] - 5) < 1e-3,
+      );
+    expect(tops.length).toBe(3);
+    const baseVol = part.volume!;
+
+    for (const { info, f } of tops) {
+      const r = await core.execute(L_BRACKET, undefined, {
+        partStats: "full",
+        previewOp: {
+          op: "extrude",
+          partName: null,
+          target: {
+            kind: "face",
+            plane: "XY",
+            offset: info.center[2],
+            center: info.center,
+            interior: interiorOf(part, f),
+          },
+          distance: 3,
+        },
+      });
+      expect(r.previewTarget?.planeMatches).toBe(3);
+      expect(r.previewTarget?.pin, `face ${f} got no pin`).toBeDefined();
+      // Exactly this face's area, times the distance — not another's, and
+      // not zero, which is what the unpinned selector produced.
+      expect(r.parts[0]!.volume! - baseVol).toBeCloseTo(info.area! * 3, 0);
+    }
+  });
+});

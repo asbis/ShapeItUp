@@ -46,6 +46,18 @@ export interface SelectableFace {
   kind: string;
   center: [number, number, number];
   normal?: [number, number, number];
+  /**
+   * A point inside this face, for when its plane alone does not single it out.
+   *
+   * Fusing a rib onto a plate splits the plate's top into several coplanar
+   * faces, and `inPlane("XY", thickness)` then matches all of them — which
+   * the stdlib helpers refuse, so the operation silently does nothing. The
+   * viewer asks the worker whether the plane is ambiguous and, if so, for a
+   * point it has VERIFIED isolates the picked face; that point arrives here.
+   * Only the in-plane coordinates are read: the normal one is the plane's
+   * own offset, written with the same expression `inPlane` uses.
+   */
+  pin?: [number, number, number];
 }
 
 export interface FaceSelector {
@@ -59,6 +71,8 @@ export interface FaceSelector {
   offset: number;
   /** The parameter the offset was bound to, when one matched exactly. */
   boundTo?: string;
+  /** The `containsPoint` coordinates as written, when the face was pinned. */
+  pin?: [string, string, string];
   /**
    * False when the offset had to be written as a literal. Such a selector is
    * correct today and will stop matching as soon as the geometry moves — the
@@ -128,18 +142,58 @@ export function synthesizeFaceSelector(
 
   const bound = bindOffset(offset, params);
   const offsetExpr = bound?.expr ?? formatNumber(offset);
+  let code = `(${varName}) => ${varName}.inPlane("${plane}", ${offsetExpr})`;
+  let durable = bound !== null;
+  let derived = bound?.derived === true;
+
+  // A pin narrows a FACE finder to the face containing the point. On an
+  // EdgeFinder the same call means "the edge through this point", which is a
+  // different question, so it is only ever written for faces.
+  let pin: [string, string, string] | undefined;
+  if (face.pin && varName === "f") {
+    const axis = plane === "XY" ? 2 : plane === "XZ" ? 1 : 0;
+    pin = face.pin.map((v, k) => {
+      // The normal coordinate IS the plane: writing it with the same
+      // expression keeps the point on the face whatever that parameter becomes.
+      if (k === axis) return offsetExpr;
+      const c = bindCoordinate(v, params);
+      if (!c.durable) durable = false;
+      if (c.derived) derived = true;
+      return c.expr;
+    }) as [string, string, string];
+    code += `.containsPoint([${pin.join(", ")}])`;
+  }
+
   return {
     ok: true,
     selector: {
-      code: `(${varName}) => ${varName}.inPlane("${plane}", ${offsetExpr})`,
+      code,
       plane,
       offsetExpr,
       offset,
       ...(bound ? { boundTo: bound.name } : {}),
-      ...(bound?.derived ? { derived: true } : {}),
-      durable: bound !== null,
+      ...(derived ? { derived: true } : {}),
+      ...(pin ? { pin } : {}),
+      durable,
     },
   };
+}
+
+/**
+ * One coordinate of a point, bound to a parameter where one explains it.
+ * Shared by the edge selector and a pinned face selector, which name a point
+ * the same way and must stay durable by the same rule.
+ */
+function bindCoordinate(
+  v: number,
+  params: Record<string, number>,
+): { expr: string; durable: boolean; derived: boolean } {
+  // An exact zero is the centre line, and it stays there. Binding it to some
+  // parameter that happens to be zero would move it.
+  if (Math.abs(v) < BIND_EPSILON) return { expr: "0", durable: true, derived: false };
+  const bound = bindOffset(v, params);
+  if (!bound) return { expr: formatNumber(v), durable: false, derived: false };
+  return { expr: bound.expr, durable: true, derived: bound.derived };
 }
 
 export interface OffsetBinding {
@@ -751,16 +805,10 @@ export function synthesizeEdgeSelector(
   let durable = true;
   let derived = false;
   const coords = point.map((v) => {
-    // An exact zero is the centre line, and it stays there. Binding it to some
-    // parameter that happens to be zero would move it.
-    if (Math.abs(v) < BIND_EPSILON) return "0";
-    const bound = bindOffset(v, params);
-    if (!bound) {
-      durable = false;
-      return formatNumber(v);
-    }
-    if (bound.derived) derived = true;
-    return bound.expr;
+    const c = bindCoordinate(v, params);
+    if (!c.durable) durable = false;
+    if (c.derived) derived = true;
+    return c.expr;
   }) as [string, string, string];
 
   return {

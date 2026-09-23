@@ -608,3 +608,70 @@ export default function main({ height }: typeof params) {
     if (r.ok) expect(r.applied).toContain("[");
   });
 });
+
+describe("a pinned face selector", () => {
+  // The case that motivated pins: gussets split a bracket's base top into
+  // three coplanar faces, and the plane alone names all three.
+  const params = { width: 80, depth: 40, thickness: 5, rib: 20 };
+  const pinned = (pin: [number, number, number]): SelectableFace => ({
+    ...planar([0, 0, 1], [0, 0, 5]),
+    pin,
+  });
+
+  it("narrows the plane with a point, written with the plane's own expression", () => {
+    const r = synthesizeFaceSelector(pinned([0, 0, 5]), params);
+    expect(r.ok && r.selector.code).toBe(
+      '(f) => f.inPlane("XY", thickness).containsPoint([0, 0, thickness])',
+    );
+    expect(r.ok && r.selector.durable).toBe(true);
+    expect(r.ok && r.selector.pin).toEqual(["0", "0", "thickness"]);
+  });
+
+  it("binds the in-plane coordinates too, and says so when it cannot", () => {
+    // Exact matches win over halves, so these numbers are chosen to have none.
+    const bound = synthesizeFaceSelector(pinned([-40, 10, 5]), { width: 80, depth: 20, thickness: 5 });
+    expect(bound.ok && bound.selector.code).toContain(".containsPoint([-width / 2, depth / 2, thickness])");
+    expect(bound.ok && bound.selector.derived).toBe(true);
+
+    // A literal point stops lying on the face as soon as the face moves —
+    // the UI must hear that, same as for a literal offset.
+    const literal = synthesizeFaceSelector(pinned([-11.3, 15.1, 5]), params);
+    expect(literal.ok && literal.selector.code).toContain(".containsPoint([-11.3, 15.1, thickness])");
+    expect(literal.ok && literal.selector.durable).toBe(false);
+  });
+
+  it("puts the plane's offset in the normal slot whichever plane it is", () => {
+    const r = synthesizeFaceSelector(
+      { kind: "PLANE", normal: [0, 1, 0], center: [0, 20, 10], pin: [3, 19.99999, 7.5] },
+      { depth: 40 },
+    );
+    expect(r.ok && r.selector.code).toBe(
+      '(f) => f.inPlane("XZ", depth / 2).containsPoint([3, depth / 2, 7.5])',
+    );
+  });
+
+  it("is never written onto an edge finder, where it would mean something else", () => {
+    const r = synthesizeFaceSelector(pinned([0, 0, 5]), params, "e");
+    expect(r.ok && r.selector.code).toBe('(e) => e.inPlane("XY", thickness)');
+  });
+
+  it("reaches the written line through buildFaceOpCall", () => {
+    const SRC = `import { drawRectangle } from "replicad";
+export const params = { width: 80, depth: 40, thickness: 5, rib: 20 };
+export default function main({ width, depth, thickness, rib }: typeof params) {
+  return drawRectangle(width, depth).sketchOnPlane().extrude(thickness);
+}
+`;
+    const r = buildFaceOpCall(SRC, {
+      op: "extrude",
+      partName: null,
+      target: { kind: "face", face: pinned([0, 0, 5]) },
+      distance: 3,
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.applied).toContain(
+      'extrudeFace(drawRectangle(width, depth).sketchOnPlane().extrude(thickness), (f) => f.inPlane("XY", thickness).containsPoint([0, 0, thickness]), 3)',
+    );
+  });
+});

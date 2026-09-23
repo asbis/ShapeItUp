@@ -13,6 +13,7 @@ import {
   edgeIndexForPoint,
   edgesInPlane,
   faceBounds,
+  faceInteriorPoint,
   tangentChain,
   describeKind,
   describePlacement,
@@ -323,5 +324,37 @@ describe("tangentChain", () => {
 
   it("returns the edge itself when the part carries no edge data", () => {
     expect(tangentChain({} as any, 3)).toEqual([3]);
+  });
+});
+
+describe("faceInteriorPoint", () => {
+  // An L-shaped face, as two triangles-per-arm: a 10x2 bar along x and a 2x10
+  // bar along y, sharing the corner square. Its centroid (≈ 3.2, 3.2) is off
+  // the face — the case the face's own centre cannot serve.
+  const vertices = new Float32Array([
+    0, 0, 0,   10, 0, 0,   10, 2, 0,   0, 2, 0, // bar along x
+    0, 2, 0,   2, 2, 0,    2, 10, 0,   0, 10, 0, // bar along y
+  ]);
+  const triangles = new Uint32Array([0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);
+
+  it("returns the centroid of the largest triangle, which lies inside the face", () => {
+    const p = faceInteriorPoint({ vertices, triangles }, { start: 0, count: 12 })!;
+    // The x-bar's triangles are 10 each; the y-bar's lower one is 8 — so the
+    // point is in the x-bar, where it is inside the L.
+    expect(p[1]).toBeGreaterThanOrEqual(0);
+    expect(p[1]).toBeLessThanOrEqual(2);
+    expect(p[0]).toBeGreaterThan(0);
+    expect(p[0]).toBeLessThan(10);
+    expect(p[2]).toBe(0);
+  });
+
+  it("reads only the face's own span", () => {
+    const p = faceInteriorPoint({ vertices, triangles }, { start: 6, count: 6 })!;
+    expect(p[0]).toBeLessThanOrEqual(2);
+    expect(p[1]).toBeGreaterThanOrEqual(2);
+  });
+
+  it("returns null for an empty span", () => {
+    expect(faceInteriorPoint({ vertices, triangles }, { start: 0, count: 0 })).toBeNull();
   });
 });
