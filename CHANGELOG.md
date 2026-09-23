@@ -9,9 +9,9 @@ Releases 1.17.0–1.24.0 are described only in their
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project follows semantic versioning at the extension level.
 
-## [1.29.3] - 2026-09-23
+## [1.29.4] - 2026-09-23
 
-Extension `1.29.3` / mcp-server `1.29.3`.
+Extension `1.29.4` / mcp-server `1.29.4`.
 
 ### Fixed
 - **Stdlib helpers no longer warn about their own internals.**
@@ -31,6 +31,16 @@ Extension `1.29.3` / mcp-server `1.29.3`.
   pocket cuts straight through and the screw head has nothing to seat on. It
   now says that once, instead of emitting a no-op fuse warning per hole. The
   cut geometry is unchanged.
+
+## [1.29.3] - 2026-09-23
+
+Extension `1.29.3` / mcp-server `1.29.3` — stale skill path.
+
+### Fixed
+- **The sketch-plane warning pointed at a file that no longer exists.** It told
+  agents to read `skill/SKILL.md` "Pen axis mapping" before sketching; the skill
+  moved to `skills/shapeitup/SKILL.md`. The warning, two source comments and the
+  README's install command now use the new path.
 
 ## [1.29.2] - 2026-09-23
 
