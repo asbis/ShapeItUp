@@ -1,0 +1,11 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    // Typecheck only: build.mjs bundles src/playground.ts with esbuild.
+    "outDir": "./.tsc",
+    "rootDir": "./src",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"]
+  },
+  "include": ["src/**/*.ts"],
+  "references": [{ "path": "../packages/shared" }]
+}

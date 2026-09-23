@@ -1,4 +1,4 @@
-import type { ParamDef } from "@shapeitup/shared";
+import type { ParamDef, ParamValue } from "@shapeitup/shared";
 import { pushRuntimeWarning } from "./stdlib/warnings";
 import { MATERIAL_PRESETS, resolveMaterial } from "./tessellate";
 
@@ -524,16 +524,20 @@ export function executeScript(
   // viewer takes a typed value, and any bound we invented here would be a guess
   // about a parameter nobody declared bounds for.
   const declared = (declaredParams ?? params) as Record<string, unknown>;
+  //
+  // Non-numeric values (`bearing: "608"`) pass through with no step: there is
+  // nothing to nudge, and Math.abs("608") would invent one anyway.
   const paramDefs: ParamDef[] = Object.entries(params).map(([name, value]) => {
-    const v = value as number;
-    const d = typeof declared[name] === "number" ? (declared[name] as number) : v;
+    const v = value as ParamValue;
+    const dRaw = declared[name] as ParamValue | undefined;
+    const d = dRaw === undefined ? v : dRaw;
     return {
       name,
       value: v,
       // Only carried when an override is actually in force; equal values would
       // just be noise on every message.
       ...(d !== v ? { declared: d } : {}),
-      step: Math.abs(d) >= 10 ? 1 : 0.1,
+      ...(typeof d === "number" ? { step: Math.abs(d) >= 10 ? 1 : 0.1 } : {}),
     };
   });
 

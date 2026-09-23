@@ -1,5 +1,11 @@
 # Changelog
 
+> **This file stops at 1.16.3.** From 1.27.0 the MCP server releases in
+> lockstep with the VS Code extension and its changes are recorded in the
+> [root CHANGELOG.md](https://github.com/asbis/ShapeItUp/blob/master/CHANGELOG.md).
+> Releases 1.17.0–1.24.0 are described in the
+> [GitHub release notes](https://github.com/asbis/ShapeItUp/releases).
+
 ## 1.16.3 (2026-06-30)
 
 Friction/bug fixes from the flatbed knitting-machine field test. Ships in

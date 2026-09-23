@@ -36,13 +36,13 @@ Node 20+ required. Works in Docker / CI (WASM, no native deps).
 
 ## What's in the box
 
-25 MCP tools covering the full CAD loop:
+29 MCP tools covering the full CAD loop:
 
-- Authoring — `create_shape`, `modify_shape`, `read_shape`, `list_shapes`, `setup_shape_project`
-- Rendering — `render_preview`, `preview_shape`, `get_preview`, `set_render_mode`, `toggle_dimensions`
-- Verification — `verify_shape`, `check_collisions`, `sweep_check`, `describe_geometry`, `validate_joints`, `validate_syntax`
+- Authoring — `create_shape`, `modify_shape`, `read_shape`, `delete_shape`, `list_shapes`, `setup_shape_project`, `get_api_reference`
+- Rendering — `render_preview`, `preview_shape`, `get_preview`, `set_render_mode`, `toggle_dimensions`, `open_viewer`, `close_viewer`
+- Verification — `verify_shape`, `check_collisions`, `check_stack`, `sweep_check`, `run_simulation`, `describe_geometry`, `validate_joints`, `validate_syntax`
 - Iteration — `tune_params`, `clear_params`, `get_render_status`
-- Export & open — `export_shape`, `open_shape`, `list_installed_apps`, `preview_finder`
+- Export & open — `export_shape` (STEP / STL / 3MF), `open_shape`, `list_installed_apps`, `preview_finder`
 - Plus the `shapeitup` stdlib (holes, screws/bolts/washers/inserts, bearings, extrusions, patterns, threads, joints, assembly, printHints) importable from any `.shape.ts`.
 
 ## More
