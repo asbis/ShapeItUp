@@ -13,7 +13,7 @@ import {
   __resetCutPatchedForTests,
   __resetFusePatchedForTests,
 } from "./index";
-import { drainRuntimeWarnings, resetRuntimeWarnings } from "./stdlib/warnings";
+import { asStdlibInternal, drainRuntimeWarnings, resetRuntimeWarnings } from "./stdlib/warnings";
 
 // ---------------------------------------------------------------------------
 // Mocks
@@ -1167,6 +1167,27 @@ describe("patchShapeFuseNoOpGuard — warns when fuse adds zero material", () =>
     // The fake replicad in this suite doesn't back its `boundingBox` with a
     // disjoint AABB, so the warning falls through to the contained-case hint.
     expect(warnings[0]).toMatch(/fully contained in the target/);
+  });
+
+  it("ignores a no-op fuse a stdlib helper performs on its own behalf, and doesn't number it", () => {
+    // holes.counterbore fusing a shaft that lies inside its pocket is not the
+    // user's fuse. Reporting it read as "you made a mistake" once per cutAt
+    // placement, and spending an ordinal on it made "fuse #N" point at the
+    // wrong line of the user's script.
+    const { replicad, volumeMap, _3DShape } = makeFakeReplicad();
+    patchShapeFuseNoOpGuard(replicad);
+
+    const cutter: any = new _3DShape();
+    volumeMap.set(cutter, 175.79);
+    asStdlibInternal(() => cutter.fuse(new _3DShape()));
+    expect(drainRuntimeWarnings()).toEqual([]);
+
+    const target: any = new _3DShape();
+    volumeMap.set(target, 2500);
+    target.fuse(new _3DShape());
+    const warnings = drainRuntimeWarnings();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/^fuse #1:/);
   });
 
   it("names the disjoint axis and suggests a translate when the operands' AABBs don't touch", () => {

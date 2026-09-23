@@ -50,6 +50,7 @@ import {
   drainCutAtOutcomes,
   drainExtrudeHints,
   drainRuntimeWarnings,
+  inStdlibInternal,
   nextCutCallIndex,
   nextFuseCallIndex,
   pushRuntimeWarning,
@@ -679,10 +680,15 @@ export function patchShapeFuseNoOpGuard(replicad: any): boolean {
   }
   const originalFuse = proto.fuse;
   proto.fuse = function patchedFuse(this: any, other: any, options?: any) {
-    // Consume a call ordinal on every .fuse(), mirroring the cut guard —
+    // Consume a call ordinal on every user .fuse(), mirroring the cut guard —
     // when a user has several .fuse() calls in one script and one silently
     // produces no new material, identical warnings make the offender
     // impossible to locate.
+    // A stdlib helper fusing its own cutter pieces is not the user's fuse:
+    // don't measure it, and don't spend one of the user's "fuse #N" ordinals
+    // on it either, or the numbers in their warnings stop matching the
+    // .fuse() calls they can see.
+    if (inStdlibInternal()) return originalFuse.call(this, other, options);
     const callIdx = nextFuseCallIndex();
     const inputVolume = readVolumeSafe(this, replicad);
     // Snapshot AABBs before the fuse so the axis-disjoint hint can describe

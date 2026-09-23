@@ -18,6 +18,44 @@ export function pushRuntimeWarning(msg: string): void {
   buf.push(msg);
 }
 
+// Messages already pushed through pushRuntimeWarningOnce this run. For
+// advisories raised from inside a tool factory: `patterns.cutAt` calls the
+// factory once per placement, and four copies of one warning is noise.
+const onceSeen = new Set<string>();
+
+/** Push `msg` unless an identical message was already pushed this run. */
+export function pushRuntimeWarningOnce(msg: string): void {
+  if (onceSeen.has(msg)) return;
+  onceSeen.add(msg);
+  buf.push(msg);
+}
+
+// Depth of stdlib-internal construction currently on the stack. The no-op
+// fuse guard and the extrude-plane hint describe the USER's operations; a
+// helper building its own cutter (counterbore's pocket + shaft, placeOn's
+// sketch + extrude) must not be reported as though the user wrote it.
+//
+// This is an explicit scope rather than a call-stack inspection because the
+// stack only names stdlib files when core runs from source. Bundled — the
+// worker, the MCP server's dist, the website — every frame points at one
+// file, and the helper's own internals read as user code.
+let internalDepth = 0;
+
+/** Run `fn` as stdlib-internal construction; see {@link inStdlibInternal}. */
+export function asStdlibInternal<T>(fn: () => T): T {
+  internalDepth++;
+  try {
+    return fn();
+  } finally {
+    internalDepth--;
+  }
+}
+
+/** True while a stdlib helper is building geometry on its own behalf. */
+export function inStdlibInternal(): boolean {
+  return internalDepth > 0;
+}
+
 export function drainRuntimeWarnings(): string[] {
   const out = buf.slice();
   buf.length = 0;
@@ -26,6 +64,7 @@ export function drainRuntimeWarnings(): string[] {
 
 export function resetRuntimeWarnings(): void {
   buf.length = 0;
+  onceSeen.clear();
   resetCutAtCounter();
   resetCutCallCounter();
   resetFuseCallCounter();
@@ -324,7 +363,8 @@ export function enqueueExtrudeHint(
     .split("\n")
     .filter((line) => !/[\\/]stdlib[\\/]warnings\.(ts|js)/.test(line))
     .join("\n");
-  const origin = /[\\/]stdlib[\\/]/.test(stackWithoutSelf) ? "stdlib" : "user";
+  const origin =
+    inStdlibInternal() || /[\\/]stdlib[\\/]/.test(stackWithoutSelf) ? "stdlib" : "user";
   const hint: PendingExtrudeHint = {
     plane,
     length,

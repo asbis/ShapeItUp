@@ -2,6 +2,7 @@ import { assertPositiveFinite } from "./stdlib/standards";
 import {
   claimNonXYPlaneHint,
   enqueueExtrudeHint,
+  inStdlibInternal,
   shiftPendingExtrudeHint,
   pushRuntimeWarning,
   type PendingExtrudeHint,
@@ -1058,9 +1059,11 @@ function validateSketchOnPlane(self: any, planeName: unknown): void {
   // axis-mapping warning would just be noise. If the blueprint or its bbox
   // can't be read (e.g. a unit-test stub without `.blueprint`), we fall back
   // to firing the hint — preserving the prior behaviour for non-replicad
-  // receivers.
+  // receivers. A stdlib helper sketching its own profile is skipped too: the
+  // user never drew with that pen.
   if (
     planeName !== "XY" &&
+    !inStdlibInternal() &&
     typeof self === "object" &&
     self !== null &&
     PEN_AXIS_DRAWINGS.has(self) &&
