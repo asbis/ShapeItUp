@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ShapeItUp — CAD your AI agent can drive</title>
+  <meta name="description" content="Free, open-source parametric CAD for Claude Code, Codex and VS Code. The agent writes TypeScript, checks its own renders and fixes its mistakes. You edit in a Fusion-style browser viewport, and every click becomes code.">
+  <meta property="og:title" content="ShapeItUp — CAD your AI agent can drive">
+  <meta property="og:description" content="Free, open-source parametric CAD for Claude Code, Codex and VS Code. Every click becomes code.">
+  <meta property="og:image" content="https://shapeitup.dev/img/bracket-dark.webp">
+  <meta name="theme-color" content="#eeece6">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter+Tight:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ═════════════════════════════ NAV ═════════════════════════════ -->
+<header class="nav">
+  <div class="nav-inner">
+    <a class="logo" href="#top" aria-label="ShapeItUp home">
+      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M12 2 21 7v10l-9 5-9-5V7z" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 12 21 7M12 12v10M12 12 3 7" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+      <span>ShapeItUp</span>
+    </a>
+    <nav class="nav-links" aria-label="Sections">
+      <a href="#two-ways">Agents &amp; VS Code</a>
+      <a href="#loop">How it learns</a>
+      <a href="#viewport">Viewport</a>
+      <a href="#components">Components</a>
+      <a href="#playground">Playground</a>
+    </nav>
+    <div class="nav-cta">
+      <a class="nav-gh" href="https://github.com/asbis/ShapeItUp" target="_blank" rel="noopener">GitHub ↗</a>
+      <a class="btn btn-ink" href="#playground">Try it live</a>
+    </div>
+  </div>
+</header>
+
+<main id="top">
+
+<!-- ═════════════════════════════ HERO ═════════════════════════════ -->
+<section class="hero sheet">
+  <div class="crop tl"></div><div class="crop tr"></div>
+  <div class="wrap">
+    <div class="meta-row">
+      <span>REV 1.29 · MIT · $0</span>
+      <span class="hide-sm">Open-source CAD for Claude Code, Codex &amp; VS Code</span>
+      <span class="hide-sm">SHEET 1 / 7</span>
+    </div>
+
+    <h1 class="display hero-title">
+      <span class="line">CAD your AI agent</span>
+      <span class="line">can <em>actually</em> drive.</span>
+    </h1>
+
+    <div class="hero-grid">
+      <div class="hero-copy">
+        <p class="lede">
+          ShapeItUp gives Claude Code and Codex a real CAD kernel. The agent writes the
+          part in TypeScript, looks at its own renders from four angles, reads the errors
+          and fixes them. You watch in a browser viewport, and edit like you would in
+          Fusion&nbsp;360. <strong>Every click becomes code.</strong>
+        </p>
+        <div class="hero-actions">
+          <a class="btn btn-signal btn-lg" href="#playground">Try it in your browser →</a>
+          <a class="btn btn-line btn-lg" href="#install">Install</a>
+        </div>
+        <div class="cmd" data-copy="claude mcp add shapeitup -- npx -y @shapeitup/mcp-server">
+          <span class="cmd-prompt">$</span>
+          <code>claude mcp add shapeitup -- npx -y @shapeitup/mcp-server</code>
+          <button class="copy" type="button" aria-label="Copy command">Copy</button>
+        </div>
+      </div>
+
+      <!-- The composition: a viewer window with a live-typed agent session on top. -->
+      <div class="hero-art" aria-hidden="true">
+        <div class="win win-dark viewer-win">
+          <div class="win-bar"><span class="win-dots"><i></i><i></i><i></i></span><span>viewer · bracket.shape.ts</span><span class="win-right">127.0.0.1:52341</span></div>
+          <div class="viewer-body">
+            <img src="img/bracket-hero.webp" alt="" width="1257" height="943">
+            <div class="mini-params">
+              <div class="mp-head">Parameters</div>
+              <div class="mp-row"><span>width</span><i style="--v:.55"></i><b>60</b></div>
+              <div class="mp-row"><span>height</span><i style="--v:.5"></i><b>50</b></div>
+              <div class="mp-row"><span>gusset</span><i style="--v:.4"></i><b>24</b></div>
+              <div class="mp-row hot"><span>holeInset</span><i style="--v:.62"></i><b>15</b></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="win term-win">
+          <div class="win-bar"><span class="win-dots"><i></i><i></i><i></i></span><span>claude — ~/parts</span></div>
+          <div class="term" id="term">
+            <noscript>
+              <div class="t-user">› Make an L-bracket, 60×40×50, 5 mm thick, gussets, two M4 holes per leg.</div>
+            </noscript>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <dl class="stats">
+      <div><dt>29</dt><dd>MCP tools the agent can call</dd></div>
+      <div><dt>4</dt><dd>angles in every render it checks</dd></div>
+      <div><dt>13</dt><dd>viewport edits that write code</dd></div>
+      <div><dt>$0</dt><dd>MIT licensed. No account. No cloud.</dd></div>
+    </dl>
+  </div>
+</section>
+
+<!-- ═════════════════════════════ 01 · TWO WAYS ═════════════════════════════ -->
+<section class="sheet" id="two-ways">
+  <div class="crop tl"></div><div class="crop tr"></div>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-num">01</span>
+      <span class="sec-label">Two ways in</span>
+      <span class="sec-rule"></span>
+    </div>
+    <h2 class="display h2">Chat with it.<br>Or code it yourself.</h2>
+    <p class="sub">Both work on the same files, with the same viewer. You can switch between them in the middle of a design.</p>
+
+    <div class="ways">
+      <article class="way">
+        <div class="way-top">
+          <span class="tag">Agent mode</span>
+          <span class="way-where">Claude Code · Codex · Cursor · Claude Desktop</span>
+        </div>
+        <h3>Describe the part. Your agent builds it.</h3>
+        <p>Ask for a part in plain language. The agent writes the <code>.shape.ts</code>, opens the 3D viewer in its browser pane, and keeps iterating until the renders match what you asked for. You can step in at any point: type in the chat, change the code, or grab a face in the viewport.</p>
+        <ul class="ticks">
+          <li>Opens a live 3D viewer with <code>open_viewer</code>. No editor needed</li>
+          <li>Ships with a skill that teaches the agent the API</li>
+          <li>Tune parameters without rewriting the file</li>
+        </ul>
+        <div class="tabs" data-tabs>
+          <div class="tab-list" role="tablist">
+            <button role="tab" aria-selected="true">Claude Code</button>
+            <button role="tab">Codex</button>
+            <button role="tab">Cursor / Desktop</button>
+          </div>
+          <div class="tab-panel" role="tabpanel">
+            <div class="cmd" data-copy="claude mcp add shapeitup -- npx -y @shapeitup/mcp-server"><span class="cmd-prompt">$</span><code>claude mcp add shapeitup -- npx -y @shapeitup/mcp-server</code><button class="copy" type="button">Copy</button></div>
+          </div>
+          <div class="tab-panel" role="tabpanel" hidden>
+            <pre class="code-block" data-copy-block><span class="c"># ~/.codex/config.toml</span>
+[mcp_servers.shapeitup]
+command = <span class="s">"npx"</span>
+args = [<span class="s">"-y"</span>, <span class="s">"@shapeitup/mcp-server"</span>]</pre>
+          </div>
+          <div class="tab-panel" role="tabpanel" hidden>
+            <pre class="code-block" data-copy-block><span class="c">// ~/.cursor/mcp.json · claude_desktop_config.json</span>
+{ <span class="s">"mcpServers"</span>: { <span class="s">"shapeitup"</span>: {
+  <span class="s">"command"</span>: <span class="s">"npx"</span>, <span class="s">"args"</span>: [<span class="s">"-y"</span>, <span class="s">"@shapeitup/mcp-server"</span>]
+} } }</pre>
+          </div>
+        </div>
+      </article>
+
+      <article class="way">
+        <div class="way-top">
+          <span class="tag tag-line">Editor mode</span>
+          <span class="way-where">VS Code extension</span>
+        </div>
+        <h3>Write it yourself, with the model next to your code.</h3>
+        <p>If you'd rather type the code yourself, install the extension. When you save, the 3D view beside your code updates. It has a slider for every parameter, section planes, measuring, a parts browser and STEP/STL/3MF export. You get TypeScript autocomplete for the whole CAD API.</p>
+        <ul class="ticks">
+          <li>Updates the render when you save, with sliders for every parameter</li>
+          <li>Viewport edits go into your file as ordinary undoable changes (Cmd-Z works)</li>
+          <li>The agent's MCP tools can control the same viewer</li>
+        </ul>
+        <div class="way-install">
+          <div class="cmd" data-copy="ext install shapeitup.shapeitup-vscode"><span class="cmd-prompt">⌘P</span><code>ext install shapeitup.shapeitup-vscode</code><button class="copy" type="button">Copy</button></div>
+          <a class="link-arrow" href="https://marketplace.visualstudio.com/items?itemName=shapeitup.shapeitup-vscode" target="_blank" rel="noopener">Open in the Marketplace ↗</a>
+        </div>
+      </article>
+    </div>
+
+    <div class="same-files">
+      <div class="sf-node"><span>You, in chat</span></div>
+      <div class="sf-arrow"></div>
+      <div class="sf-node sf-file"><code>bracket.shape.ts</code><small>plain TypeScript · in git</small></div>
+      <div class="sf-arrow sf-rev"></div>
+      <div class="sf-node"><span>You, in the viewport</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═════════════════════════════ 02 · THE LOOP ═════════════════════════════ -->
+<section class="sheet dark" id="loop">
+  <div class="crop tl"></div><div class="crop tr"></div>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-num">02</span>
+      <span class="sec-label">Built for agents</span>
+      <span class="sec-rule"></span>
+    </div>
+    <h2 class="display h2">It sees what it builds.</h2>
+    <p class="sub">Language models are bad at picturing 3D, so ShapeItUp doesn't ask them to. After every change the agent gets pictures, measurements and plain-English errors back, and uses them to decide what to fix next.</p>
+
+    <div class="loop-grid">
+      <ol class="loop-steps">
+        <li>
+          <span class="ls-num">01</span>
+          <div><h4>Write</h4><p>The agent writes TypeScript with <code>create_shape</code> and <code>modify_shape</code>. A bundled skill teaches it the Replicad API and the standard library, so it doesn't have to guess.</p></div>
+        </li>
+        <li>
+          <span class="ls-num">02</span>
+          <div><h4>Look</h4><p><code>render_preview</code> returns one image with four views (top, front, right and iso), plus the bounding box, volume and mass. The agent checks the part from every side, not just the flattering one.</p></div>
+        </li>
+        <li>
+          <span class="ls-num">03</span>
+          <div><h4>Check</h4><p><code>verify_shape</code>, <code>check_collisions</code>, <code>validate_joints</code> and <code>sweep_check</code> test that parts fit, joints line up, moving parts don't collide, and the model is printable.</p></div>
+        </li>
+        <li>
+          <span class="ls-num">04</span>
+          <div><h4>Fix</h4><p>Errors point to the line in the agent's own file and come with a suggested fix. So the next attempt starts from what actually went wrong.</p></div>
+        </li>
+      </ol>
+
+      <div class="loop-art">
+        <figure class="win win-light">
+          <div class="win-bar"><span class="win-dots"><i></i><i></i><i></i></span><span>render_preview → bracket.shape.ts</span></div>
+          <div class="four">
+            <img src="img/four-views.webp" alt="The bracket rendered from top, front, right and isometric views" width="1222" height="1222" loading="lazy">
+            <span class="four-l l1">TOP</span><span class="four-l l2">FRONT</span><span class="four-l l3">RIGHT</span><span class="four-l l4">ISO</span>
+          </div>
+          <figcaption class="four-meta"><span>bbox 60.0 × 40.0 × 50.0 mm</span><span>4 views · 1 PNG</span></figcaption>
+        </figure>
+
+        <div class="win win-dark log-win">
+          <div class="win-bar"><span class="win-dots"><i></i><i></i><i></i></span><span>what the agent reads back</span></div>
+          <div class="log-lines">
+            <div class="ll err"><b>✕</b><span><em>extrudeFace:</em> the selector matched 3 faces, but it must match exactly one. Returning shape unchanged.</span></div>
+            <div class="ll warn"><b>!</b><span><em>sketchOnPlane('YZ').extrude(5):</em> shape bounding box will be X ∈ [0, 5]. Fix (preferred): <code>placeOn(drawing, 'YZ', { into: '-X', distance: 5 })</code></span></div>
+            <div class="ll warn"><b>!</b><span><em>fuse #1:</em> fuse produced no new material. The added solid appears fully contained in the target. Check its position, or return them as separate parts.</span></div>
+            <div class="ll ok"><b>✓</b><span><em>bracket.shape.ts</em> → 1 part · 60.0 × 40.0 × 50.0 mm</span></div>
+          </div>
+          <div class="log-foot">These are real messages, copied from the playground.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tools">
+      <div class="tools-head"><span>The toolbox</span><span>29 MCP tools</span></div>
+      <div class="tools-grid">
+        <div><h5>Author</h5><p>create_shape · modify_shape · read_shape · open_shape · list_shapes · delete_shape · setup_shape_project · validate_syntax · preview_shape · get_api_reference</p></div>
+        <div><h5>See</h5><p>render_preview · get_preview · open_viewer · close_viewer · set_render_mode · toggle_dimensions</p></div>
+        <div><h5>Check</h5><p>verify_shape · check_collisions · check_stack · sweep_check · describe_geometry · validate_joints · preview_finder · get_render_status</p></div>
+        <div><h5>Tune &amp; ship</h5><p>tune_params · clear_params · run_simulation · export_shape · list_installed_apps</p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═════════════════════════════ 03 · VIEWPORT ═════════════════════════════ -->
+<section class="sheet" id="viewport">
+  <div class="crop tl"></div><div class="crop tr"></div>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-num">03</span>
+      <span class="sec-label">Direct manipulation</span>
+      <span class="sec-rule"></span>
+    </div>
+    <h2 class="display h2">Fusion-style editing.<br>The result is plain text.</h2>
+    <p class="sub">Pick a face and pull it. Round an edge. Shell a box, mirror a bracket, pattern a hole. The viewport previews the change through the real kernel. When you press Apply, it writes one readable line into your file. Where it can, that line refers to your parameter names, so the edit still works after you move a slider.</p>
+
+    <div class="vp-demo">
+      <div class="win win-dark vp-view">
+        <div class="win-bar"><span class="win-dots"><i></i><i></i><i></i></span><span>viewer</span></div>
+        <div class="vp-stage">
+          <img src="img/bracket-dark.webp" alt="" width="1006" height="755" loading="lazy">
+          <svg class="vp-pick" viewBox="0 0 1006 755" preserveAspectRatio="none" aria-hidden="true">
+            <path d="M398 52 L760 153"/>
+          </svg>
+          <div class="vp-bar">
+            <span class="vp-k">Edge</span><span class="vp-m">54.0 mm</span>
+            <span class="vp-op">Fillet</span><span class="vp-in">2</span><span class="vp-m">mm</span><span class="vp-apply">Apply</span>
+            <span class="vp-max">max 4.9 mm</span>
+          </div>
+        </div>
+      </div>
+      <div class="vp-arrow" aria-hidden="true"><span>Apply</span></div>
+      <div class="win win-light vp-code">
+        <div class="win-bar"><span class="win-dots"><i></i><i></i><i></i></span><span>bracket.shape.ts</span><span class="win-right">+3 −2</span></div>
+<pre class="diff"><span class="d-del">- import { holes, patterns, placeOn, shape3d } from "shapeitup";</span><span class="d-add">+ import { holes, patterns, placeOn, shape3d, filletEdge } from "shapeitup";</span><span class="d-ctx">  …</span><span class="d-del">-   return bracket;</span><span class="d-add">+   return filletEdge(bracket,</span><span class="d-add">+     (e) =&gt; e.containsPoint([0, -<b>thickness</b>, <b>height</b>]), 2);</span><span class="d-ctx">  }</span></pre>
+        <p class="vp-note">This is the exact code the playground wrote. It used <code>thickness</code> and <code>height</code> rather than <code>5</code> and <code>50</code>, so the rounded edge moves with the part when you drag those sliders. The import was added for you, and the 4.9 mm limit comes from the kernel.</p>
+      </div>
+    </div>
+
+    <ul class="ops">
+      <li><span class="op-i">⤒</span><b>Extrude</b><code>extrudeFace</code></li>
+      <li><span class="op-i">◜</span><b>Fillet</b><code>filletFace</code></li>
+      <li><span class="op-i">◿</span><b>Chamfer</b><code>chamferFace</code></li>
+      <li><span class="op-i">▢</span><b>Shell</b><code>shellFace</code></li>
+      <li><span class="op-i">∪</span><b>Join</b><code>joinBodies</code></li>
+      <li><span class="op-i">∖</span><b>Cut</b><code>cutBodies</code></li>
+      <li><span class="op-i">∩</span><b>Intersect</b><code>intersectBodies</code></li>
+      <li><span class="op-i">✥</span><b>Move · Copy</b><code>.translate()</code></li>
+      <li><span class="op-i">↻</span><b>Rotate</b><code>.rotate()</code></li>
+      <li><span class="op-i">⧎</span><b>Mirror</b><code>.mirror("YZ")</code></li>
+      <li><span class="op-i">⋮⋮</span><b>Pattern</b><code>patterns.repeat</code></li>
+      <li><span class="op-i">⊟</span><b>Section</b><code>clip plane</code></li>
+      <li><span class="op-i">↔</span><b>Measure</b><code>ΔX ΔY ΔZ</code></li>
+      <li><span class="op-i">⊶</span><b>Parameters</b><code>params.width = 72</code></li>
+      <li><span class="op-i">⬡</span><b>ViewCube</b><code>26 directions</code></li>
+    </ul>
+    <p class="fine">Fusion 360 is a trademark of Autodesk, Inc. ShapeItUp is not affiliated with or endorsed by Autodesk. We mention it only to describe the kind of editing the viewport supports.</p>
+  </div>
+</section>
+
+<!-- ═════════════════════════════ 04 · COMPONENTS ═════════════════════════════ -->
+<section class="sheet" id="components">
+  <div class="crop tl"></div><div class="crop tr"></div>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-num">04</span>
+      <span class="sec-label">Components &amp; assemblies</span>
+      <span class="sec-rule"></span>
+    </div>
+    <h2 class="display h2">One file, one part.<br>Import it anywhere.</h2>
+
+    <div class="comp-grid">
+      <div class="comp-tree" aria-label="Three files: standoff and plate are imported by the assembly">
+        <div class="ct-file" style="--r:1">
+          <span class="ct-ico"></span><code>standoff.shape.ts</code>
+          <small>export function makeStandoff()</small>
+        </div>
+        <div class="ct-file" style="--r:2">
+          <span class="ct-ico"></span><code>plate.shape.ts</code>
+          <small>export function makePlate()</small>
+        </div>
+        <svg class="ct-lines" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+          <path d="M0 18 C 45 18, 45 50, 100 50"/><path d="M0 50 L100 50"/>
+        </svg>
+        <div class="ct-file ct-entry" style="--r:3">
+          <span class="ct-ico"></span><code>assembly.shape.ts</code>
+          <small>import { makePlate } from "./plate.shape"</small>
+        </div>
+        <figure class="ct-render">
+          <img src="img/pi-dark.webp" alt="A Raspberry Pi mount: a base plate, four brass standoffs and a board" width="856" height="643" loading="lazy">
+          <figcaption>6 parts · 3 files</figcaption>
+        </figure>
+      </div>
+
+      <div class="comp-copy">
+        <p class="sub tight">Every <code>.shape.ts</code> renders on its own. Import it into another file and it becomes part of an assembly. Change the component, and every assembly that uses it updates on the next render.</p>
+<pre class="code-block big"><span class="k">import</span> { makePlate } <span class="k">from</span> <span class="s">"./plate.shape"</span>;
+<span class="k">import</span> { makeStandoff } <span class="k">from</span> <span class="s">"./standoff.shape"</span>;
+<span class="k">import</span> { patterns } <span class="k">from</span> <span class="s">"shapeitup"</span>;
+
+<span class="k">export default function</span> <span class="f">main</span>() {
+  <span class="k">return</span> [
+    { shape: <span class="f">makePlate</span>(<span class="n">100</span>, <span class="n">80</span>, <span class="n">4</span>), name: <span class="s">"plate"</span> },
+    ...patterns.<span class="f">grid</span>(<span class="n">2</span>, <span class="n">2</span>, <span class="n">58</span>, <span class="n">49</span>).<span class="f">map</span>(<span class="c">/* standoffs */</span>),
+  ];
+}</pre>
+        <ul class="ticks">
+          <li>Joints and mates: <code>assemble()</code>, <code>mate()</code>, <code>symmetricPair()</code></li>
+          <li>Declare a material and get mass and a bill of materials</li>
+          <li>Collision checks with an allow-list for parts that are meant to touch</li>
+          <li>Tested on a 98-part knitting-machine build</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="stdlib">
+      <div class="stdlib-head"><span>Standard library</span><code>import { … } from "shapeitup"</code></div>
+      <div class="chips">
+        <span>holes</span><span>screws</span><span>bolts</span><span>washers</span><span>inserts</span><span>bearings</span>
+        <span>threads</span><span>gears</span><span>extrusions</span><span>motors</span><span>couplers</span><span>pins</span>
+        <span>patterns</span><span>mounts</span><span>joints</span><span>assemble</span><span>printHints</span><span>layoutOnBed</span>
+      </div>
+      <p class="fine">Counterbores, countersinks, heat-set pockets, teardrop holes, printable metric threads and involute spur gears, sized to real standards so the agent doesn't have to look up an M3 clearance hole.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ═════════════════════════════ 05 · PLAYGROUND ═════════════════════════════ -->
+<section class="sheet dark" id="playground">
+  <div class="crop tl"></div><div class="crop tr"></div>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-num">05</span>
+      <span class="sec-label">Playground</span>
+      <span class="sec-rule"></span>
+    </div>
+    <div class="pg-head">
+      <h2 class="display h2">This isn't a video.</h2>
+      <p class="sub">Below is the real viewer running the real OpenCascade kernel, compiled to WebAssembly and running in this tab. There's no server and no sign-up. Edit the code, drag a slider, or fillet a face and watch the code change.</p>
+    </div>
+
+    <div class="pg-frame" id="pg-frame">
+      <div class="pg-poster" id="pg-poster">
+        <img src="img/pi-dark.webp" alt="" width="856" height="643" loading="lazy">
+        <div class="pg-poster-ui">
+          <button class="btn btn-signal btn-lg" id="pg-boot" type="button">Start the kernel ▸</button>
+          <span class="pg-size">About 6 MB, loaded once and then cached</span>
+        </div>
+      </div>
+    </div>
+    <div class="pg-foot">
+      <span>Four example projects, including a 3-file assembly. Try: select a face → Extrude → Apply.</span>
+      <a class="link-arrow" href="app/" target="_blank" rel="noopener">Open full screen ↗</a>
+    </div>
+  </div>
+</section>
+
+<!-- ═════════════════════════════ 06 · AND ALSO ═════════════════════════════ -->
+<section class="sheet" id="more">
+  <div class="crop tl"></div><div class="crop tr"></div>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-num">06</span>
+      <span class="sec-label">Also in the box</span>
+      <span class="sec-rule"></span>
+    </div>
+    <div class="more-grid">
+      <article><span class="mg-k">Simulation</span><h4>Watch it move before you print it.</h4><p>Declare bodies, joints and motors in the file. Kinematic sweeps catch collisions, and Rapier or MuJoCo physics give you gravity, settling and pin forces.</p></article>
+      <article><span class="mg-k">Export</span><h4>STEP, STL and 3MF.</h4><p>One file, or one file per part. Send it straight to PrusaSlicer, Bambu Studio, OrcaSlicer, Cura or FreeCAD.</p></article>
+      <article><span class="mg-k">Printability</span><h4>Checked for printing, not just for looks.</h4><p>Overhang and thin-feature warnings for each part, print-orientation hints, and <code>layoutOnBed</code> to lay out a whole assembly on the print bed.</p></article>
+      <article><span class="mg-k">Headless</span><h4>Runs in CI.</h4><p>No GPU, no Chromium, no native graphics. The first render takes about 3 s while the kernel compiles, and later renders take under 200 ms. Works in Docker and GitHub Actions.</p></article>
+      <article><span class="mg-k">Parameters</span><h4>Sliders come from the code.</h4><p><code>export const params</code> gives you a slider for each value. The agent can try different values with <code>tune_params</code> without editing the file.</p></article>
+      <article><span class="mg-k">Git</span><h4>Your CAD is a diff.</h4><p>Parts are plain text, so they work with branches, code review, blame and revert. A viewport edit shows up as one line in a commit.</p></article>
+    </div>
+  </div>
+</section>
+
+<!-- ═════════════════════════════ 07 · FREE ═════════════════════════════ -->
+<section class="sheet signal" id="free">
+  <div class="crop tl"></div><div class="crop tr"></div>
+  <div class="wrap free-grid">
+    <div>
+      <div class="sec-head">
+        <span class="sec-num">07</span>
+        <span class="sec-label">Licence</span>
+        <span class="sec-rule"></span>
+      </div>
+      <h2 class="display mega">Free.<br>Open.<br>Yours.</h2>
+    </div>
+    <div class="free-side">
+      <p class="free-lede">ShapeItUp is 100% free and open source under the MIT licence. There's no account, no seat licence and no cloud. Your parts are text files on your own disk.</p>
+      <table class="compare">
+        <thead><tr><th></th><th>ShapeItUp</th><th>Typical subscription CAD</th></tr></thead>
+        <tbody>
+          <tr><th>Price</th><td>$0, forever</td><td>Per seat, per year</td></tr>
+          <tr><th>Source</th><td>Open (MIT)</td><td>Closed</td></tr>
+          <tr><th>Your files</th><td>Text in your repo</td><td>Proprietary format</td></tr>
+          <tr><th>AI agents</th><td>Built in: 29 MCP tools</td><td>Varies, often an add-on</td></tr>
+          <tr><th>Runs on</th><td>Your machine or browser</td><td>Vendor app or cloud</td></tr>
+        </tbody>
+      </table>
+      <a class="btn btn-ink btn-lg" href="https://github.com/asbis/ShapeItUp" target="_blank" rel="noopener">Star it on GitHub ↗</a>
+    </div>
+  </div>
+</section>
+
+<!-- ═════════════════════════════ INSTALL ═════════════════════════════ -->
+<section class="sheet dark" id="install">
+  <div class="crop tl"></div><div class="crop tr"></div>
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="sec-num">→</span>
+      <span class="sec-label">Start</span>
+      <span class="sec-rule"></span>
+    </div>
+    <h2 class="display h2">Set it up with one line.</h2>
+    <div class="install-grid">
+      <div>
+        <span class="mg-k">Claude Code</span>
+        <div class="cmd" data-copy="claude mcp add shapeitup -- npx -y @shapeitup/mcp-server"><span class="cmd-prompt">$</span><code>claude mcp add shapeitup -- npx -y @shapeitup/mcp-server</code><button class="copy" type="button">Copy</button></div>
+        <p>Then ask: <em>"Make me a wall hook for a 20 mm rail and open the viewer."</em></p>
+      </div>
+      <div>
+        <span class="mg-k">Codex</span>
+        <div class="cmd" data-copy="codex mcp add shapeitup -- npx -y @shapeitup/mcp-server"><span class="cmd-prompt">$</span><code>codex mcp add shapeitup -- npx -y @shapeitup/mcp-server</code><button class="copy" type="button">Copy</button></div>
+        <p>Or add it under <code>[mcp_servers]</code> in <code>~/.codex/config.toml</code>.</p>
+      </div>
+      <div>
+        <span class="mg-k">VS Code</span>
+        <div class="cmd" data-copy="ext install shapeitup.shapeitup-vscode"><span class="cmd-prompt">⌘P</span><code>ext install shapeitup.shapeitup-vscode</code><button class="copy" type="button">Copy</button></div>
+        <p>Create <code>part.shape.ts</code>, save it, and the 3D view opens.</p>
+      </div>
+    </div>
+    <p class="fine on-dark">Requires Node 20+. Everything ships as WebAssembly, so there's no native build step.</p>
+  </div>
+</section>
+
+</main>
+
+<!-- ═════════════════════════════ TITLE BLOCK ═════════════════════════════ -->
+<footer class="titleblock">
+  <div class="tb">
+    <div class="tb-cell tb-name">
+      <span class="tb-k">Title</span>
+      <span class="tb-v big">ShapeItUp</span>
+      <span class="tb-v">Scripted CAD for AI agents and humans</span>
+    </div>
+    <div class="tb-cell"><span class="tb-k">Drawn by</span><span class="tb-v">You &amp; your agent</span></div>
+    <div class="tb-cell"><span class="tb-k">Kernel</span><span class="tb-v">OpenCascade · Replicad</span></div>
+    <div class="tb-cell"><span class="tb-k">Licence</span><span class="tb-v">MIT</span></div>
+    <div class="tb-cell"><span class="tb-k">Price</span><span class="tb-v">0.00</span></div>
+    <div class="tb-cell"><span class="tb-k">Rev</span><span class="tb-v">1.29.0</span></div>
+    <div class="tb-cell"><span class="tb-k">Scale</span><span class="tb-v">1 : 1</span></div>
+    <div class="tb-cell tb-links">
+      <span class="tb-k">Links</span>
+      <a href="https://github.com/asbis/ShapeItUp" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://www.npmjs.com/package/@shapeitup/mcp-server" target="_blank" rel="noopener">npm</a>
+      <a href="https://marketplace.visualstudio.com/items?itemName=shapeitup.shapeitup-vscode" target="_blank" rel="noopener">VS Marketplace</a>
+      <a href="app/">Playground</a>
+    </div>
+    <div class="tb-cell"><span class="tb-k">Units</span><span class="tb-v">mm</span></div>
+    <div class="tb-cell"><span class="tb-k">Sheet</span><span class="tb-v">7 / 7</span></div>
+  </div>
+</footer>
+
+<script src="main.js" defer></script>
+</body>
+</html>

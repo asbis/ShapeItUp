@@ -20,6 +20,15 @@
         "4444"
       ],
       "port": 4444
+    },
+    {
+      "name": "website",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "website/build.mjs",
+        "--serve"
+      ],
+      "port": 4321
     }
   ]
 }
