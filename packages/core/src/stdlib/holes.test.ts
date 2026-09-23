@@ -1,6 +1,8 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll } from "vitest";
 import * as holes from "./holes";
 import { applyAxis, type HoleAxis } from "./holes";
+import { initCore } from "../index.js";
+import { loadOCCTForTest } from "../testing/occt.js";
 
 // ---------------------------------------------------------------------------
 // Pin the public API surface of `holes`. OCCT is not required for these
@@ -324,5 +326,69 @@ describe("holes.slot — length vs travel input forms", () => {
     expect(() =>
       holes.slot({ length: 4, width: 8, depth: 4 }),
     ).toThrow(/travel.*width.*avoid the inequality/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// counterbore must not report its own construction as the user's mistake.
+//
+// The cutter is a pocket fused to a shaft. On a plate no thicker than the
+// pocket is deep (M4 in 4 mm: pocket 4.2 mm) the shaft sits wholly inside the
+// pocket, the fuse adds nothing, and the no-op fuse guard used to print
+// "fuse #N: fuse produced no new material" once per patterns.cutAt placement —
+// about a fuse the user never wrote. What IS wrong is that the pocket goes
+// straight through, so that is what should be said, once.
+// ---------------------------------------------------------------------------
+
+describe("holes.counterbore warnings (real OCCT)", () => {
+  let core: Awaited<ReturnType<typeof initCore>>;
+
+  beforeAll(async () => {
+    core = await initCore(loadOCCTForTest);
+  }, 120_000);
+
+  async function plateWithCounterbores(thickness: number, extra = "") {
+    const r = await core.execute(`
+      const { drawRoundedRectangle } = __replicad__;
+      const { holes, patterns, shape3d } = __shapeitup__;
+      function main() {
+        let plate = shape3d(drawRoundedRectangle(100, 80, 6).sketchOnPlane("XY").extrude(${thickness}));
+        ${extra}
+        return patterns.cutAt(
+          plate,
+          () => holes.counterbore("M4", { plateThickness: ${thickness} }).translate(0, 0, ${thickness}),
+          patterns.grid(2, 2, 86, 66),
+        );
+      }
+    `, undefined, { partStats: "full" });
+    return r;
+  }
+
+  it("says once that the pocket leaves no seat, and nothing about a fuse, when the plate is too thin", async () => {
+    const { warnings } = await plateWithCounterbores(4);
+    expect(warnings.filter((w) => /fuse/.test(w))).toEqual([]);
+    const seat = warnings.filter((w) => /no seat for the screw head/.test(w));
+    expect(seat).toHaveLength(1);
+    expect(seat[0]).toMatch(/holes\.counterbore\("M4", \{ plateThickness: 4 \}\)/);
+  });
+
+  it("is silent on a plate thick enough to seat the head, and still cuts pocket + shaft", async () => {
+    const { warnings, parts } = await plateWithCounterbores(6);
+    expect(warnings).toEqual([]);
+    const pocket = Math.PI * 3.65 ** 2 * 4.2; // Ø7.3 x 4.2
+    const shaft = Math.PI * 2.2 ** 2 * (6 - 4.2); // Ø4.4 (M4 + clearance fit) below the pocket
+    const plate = (parts[0] as any).volume;
+    const solid = 100 * 80 * 6 - (4 - Math.PI) * 6 * 6 * 6; // rounded corners r=6
+    expect(solid - plate).toBeCloseTo(4 * (pocket + shaft), 0);
+  });
+
+  it("keeps the user's own fuse numbering: a no-op fuse they wrote is still #1", async () => {
+    const { warnings } = await plateWithCounterbores(
+      6,
+      `plate = plate.fuse(drawRoundedRectangle(10, 10, 1).sketchOnPlane("XY").extrude(2));`,
+    );
+    const fuse = warnings.filter((w) => /fuse produced no new material/.test(w));
+    expect(fuse).toHaveLength(1);
+    expect(fuse[0]).toMatch(/^fuse #1:/);
   });
 });

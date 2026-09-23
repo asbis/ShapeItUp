@@ -7,6 +7,7 @@
 
 import type { DrawingInterface, Shape3D } from "replicad";
 import { getSketchPlane } from "../instrumentation";
+import { asStdlibInternal } from "./warnings";
 
 /**
  * Flip a cut-tool shape so it opens upward from Z=0 instead of downward — the
@@ -248,8 +249,14 @@ export function placeOn(
   // Replicad's `.extrude()` return union is wider than Shape3D (Shell | Solid
   // | CompSolid | Compound | Vertex | Edge | Wire | Face). At runtime a
   // Drawing-on-plane extrude always produces a Solid, so the cast is safe.
-  const extruded = (sketch as unknown as { extrude: (d: number) => unknown })
-    .extrude(distance) as Shape3D;
+  //
+  // Internal, so the extrude-plane hint stays quiet: that hint's preferred
+  // fix IS placeOn, and this extrude is placeOn doing the fix. The
+  // sketchOnPlane above stays outside — the drawing is the user's, and the
+  // pen-axis advisory about it still applies.
+  const extruded = asStdlibInternal(
+    () => (sketch as unknown as { extrude: (d: number) => unknown }).extrude(distance) as Shape3D,
+  );
 
   // --- Translate the native bbox into the requested half-space --------------
   // Native bbox along entry.axis:
@@ -294,11 +301,11 @@ export function placeOn(
 // `Shape3D` so `.cut()` / `.fuse()` chains don't need an `as Shape3D` cast
 // (Fix #10).
 //
-// Origin tagging: because this function lives in `/stdlib/`, the
-// call-stack-based check in `warnings.ts#enqueueExtrudeHint` automatically
-// tags the hint as `origin: "stdlib"` and `drainExtrudeHints` drops it. No
-// explicit wrap needed — verified against the regex `/[\\/]stdlib[\\/]/` the
-// enqueue helper uses. The separate pen-axis hint emitted by
+// Origin tagging: the extrude runs inside `asStdlibInternal`, so
+// `warnings.ts#enqueueExtrudeHint` tags its hint `origin: "stdlib"` and
+// `drainExtrudeHints` drops it. The call-stack check there can't be relied on
+// for this: once core is bundled no frame names `/stdlib/`, and the hint used
+// to fire from the helper it recommends. The separate pen-axis hint emitted by
 // `sketchOnPlane` fires before this helper runs (the user already called
 // `.sketchOnPlane(plane)` to build the Sketch), so extrudeCentered cannot
 // suppress it.
@@ -381,7 +388,9 @@ export function extrudeCentered(
   const entry = PLANE_AXIS[plane];
 
   // --- Extrude (narrow replicad's Solid | Compound union to Shape3D) -------
-  const extruded = sketch.extrude(distance) as Shape3D;
+  // Internal for the same reason as placeOn's extrude: centring is the fix
+  // the extrude-plane hint would suggest.
+  const extruded = asStdlibInternal(() => sketch.extrude(distance) as Shape3D);
 
   // --- Translate to center on the plane's normal axis ----------------------
   // Native bbox on entry.axis: [0, +distance] when nativeSign=+1, else

@@ -45,7 +45,12 @@ import {
   assertPositiveFinite,
   assertSupportedSize,
 } from "./standards";
-import { pushRuntimeWarning, claimAmbiguousRawWarning } from "./warnings";
+import {
+  asStdlibInternal,
+  claimAmbiguousRawWarning,
+  pushRuntimeWarning,
+  pushRuntimeWarningOnce,
+} from "./warnings";
 
 /**
  * Raw diameters that equal a nominal metric size (M3, M4, M5, M6, M8, M10, M12).
@@ -390,13 +395,29 @@ export function counterbore(
   // CUT_EPSILON so coincident faces don't produce non-manifold geometry. The
   // original overlap into the pocket is preserved by starting at -plateThickness.
   const eps = opts.strict ? 0 : CUT_EPSILON;
+  const shaftLength = plateThickness + eps;
+  // When the pocket is at least as deep as the shaft is long, the shaft lies
+  // wholly inside it: fusing would add nothing, and would trip the no-op
+  // fuse guard with a warning about an operation the user never wrote. The
+  // real problem is the one worth saying — the pocket reaches through the
+  // plate, so there is nothing left for the screw head to seat on.
+  if (shaftLength <= pocketH) {
+    pushRuntimeWarningOnce(
+      `holes.counterbore("${spec}", { plateThickness: ${plateThickness} }): the ` +
+        `${size} head pocket (Ø${pocketD.toFixed(1)} × ${pocketH.toFixed(1)} mm) is as deep as ` +
+        `the plate, so it cuts straight through and leaves no seat for the screw head. ` +
+        `Use a plate thicker than ${pocketH.toFixed(1)} mm, or holes.countersink / ` +
+        `holes.through for a plate this thin.`,
+    );
+    return applyAxis(pocket, axis);
+  }
   const shaft = makeCylinder(
     shaftD / 2,
-    plateThickness + eps,
-    [0, 0, -plateThickness - eps],
+    shaftLength,
+    [0, 0, -shaftLength],
     [0, 0, 1]
   );
-  const tool = pocket.fuse(shaft);
+  const tool = asStdlibInternal(() => pocket.fuse(shaft));
   return applyAxis(tool, axis);
 }
 
@@ -642,31 +663,35 @@ export function teardrop(
   //   axis = "+X" → sketch on YZ, extrude along +X. Local X → world Y, local Y → world Z.
   const plane = axis === "+Y" ? "XZ" : "YZ";
 
-  const circleSolid = drawCircle(r)
-    .sketchOnPlane(plane)
-    .extrude(totalDepth)
-    .asShape3D();
+  // Internal: these non-XY extrudes and the fuse are the cutter's own
+  // construction, not the user's, so neither may raise a hint against them.
+  return asStdlibInternal(() => {
+    const circleSolid = drawCircle(r)
+      .sketchOnPlane(plane)
+      .extrude(totalDepth)
+      .asShape3D();
 
-  // Triangle: apex at (0, 2r), base corners DELIBERATELY below the circle's
-  // equator at (±r, -r). The lower half of this triangle is hidden inside
-  // the circle, so the visible silhouette is still a clean teardrop — but
-  // the 3D fuse now has a volumetric overlap instead of two shared boundary
-  // points. OCCT's boolean robustness drops sharply on shapes that only
-  // touch at points, which is why the earlier shared-equator variants
-  // produced shapes the downstream cut couldn't process.
-  const triangleSolid = draw([r, -r])
-    .lineTo([0, 2 * r])
-    .lineTo([-r, -r])
-    .close()
-    .sketchOnPlane(plane)
-    .extrude(totalDepth)
-    .asShape3D();
+    // Triangle: apex at (0, 2r), base corners DELIBERATELY below the circle's
+    // equator at (±r, -r). The lower half of this triangle is hidden inside
+    // the circle, so the visible silhouette is still a clean teardrop — but
+    // the 3D fuse now has a volumetric overlap instead of two shared boundary
+    // points. OCCT's boolean robustness drops sharply on shapes that only
+    // touch at points, which is why the earlier shared-equator variants
+    // produced shapes the downstream cut couldn't process.
+    const triangleSolid = draw([r, -r])
+      .lineTo([0, 2 * r])
+      .lineTo([-r, -r])
+      .close()
+      .sketchOnPlane(plane)
+      .extrude(totalDepth)
+      .asShape3D();
 
-  const fused = circleSolid.fuse(triangleSolid);
-  // Translate by -eps along the extrude axis so the cutter spans
-  // [-eps, depth+eps] — overshooting both the near and far faces.
-  if (eps === 0) return fused;
-  return axis === "+Y" ? fused.translate(0, -eps, 0) : fused.translate(-eps, 0, 0);
+    const fused = circleSolid.fuse(triangleSolid);
+    // Translate by -eps along the extrude axis so the cutter spans
+    // [-eps, depth+eps] — overshooting both the near and far faces.
+    if (eps === 0) return fused;
+    return axis === "+Y" ? fused.translate(0, -eps, 0) : fused.translate(-eps, 0, 0);
+  });
 }
 
 /**

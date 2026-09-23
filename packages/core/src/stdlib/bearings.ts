@@ -13,6 +13,7 @@
 import { makeCylinder, type Shape3D } from "replicad";
 import { BALL_BEARING, LINEAR_BEARING, CUT_EPSILON } from "./standards";
 import { applyAxis, resolveHoleAxis, type HoleAxis } from "./holes";
+import { asStdlibInternal } from "./warnings";
 
 /** Clearance behind the bearing back so the cut-tool doesn't coplanar-fail. */
 const POCKET_BACK_CLEARANCE = 0.2;
@@ -173,7 +174,7 @@ export function seat(
     [0, 0, 1]
   );
 
-  const tool = pocket.fuse(relief);
+  const tool = asStdlibInternal(() => pocket.fuse(relief));
   return applyAxis(tool, axis);
 }
 

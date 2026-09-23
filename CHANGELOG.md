@@ -9,6 +9,29 @@ Releases 1.17.0–1.24.0 are described only in their
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project follows semantic versioning at the extension level.
 
+## [1.29.5] - 2026-09-23
+
+Extension `1.29.5` / mcp-server `1.29.5`.
+
+### Fixed
+- **Stdlib helpers no longer warn about their own internals.**
+  `holes.counterbore` used through `patterns.cutAt` printed
+  "fuse #N: fuse produced no new material" once per placement, and `placeOn`
+  raised the extrude-plane hint whose recommended fix is `placeOn` itself.
+  The hint told user code from stdlib code by looking for `/stdlib/` in the
+  call stack, which is only true when core runs from source. Once bundled
+  (the worker, the MCP server, the website), every helper looked like user
+  code. Stdlib construction now runs inside an explicit internal scope that
+  the no-op fuse guard, the extrude-plane hint and the pen-axis advisory
+  respect. It covers `placeOn`, `extrudeCentered`, `holes.counterbore`,
+  `holes.teardrop`, `bearings.seat` and the motor mount plates. Internal fuses
+  no longer use up the user's `fuse #N` numbers.
+- **`holes.counterbore` on a plate too thin for the head.** When the head
+  pocket is as deep as the plate (M4 in 4 mm: the pocket is 4.2 mm deep), the
+  pocket cuts straight through and the screw head has nothing to seat on. It
+  now says that once, instead of emitting a no-op fuse warning per hole. The
+  cut geometry is unchanged.
+
 ## [1.29.4] - 2026-09-23
 
 Extension `1.29.4` / mcp-server `1.29.4` — a face op no longer writes a line

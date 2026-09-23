@@ -34,6 +34,7 @@ import { drawRectangle } from "replicad";
 import { Part, type Axis, normalizeAxis } from "./parts";
 import { shape3d } from "./placement";
 import { cylinder } from "./cylinder";
+import { asStdlibInternal } from "./warnings";
 import {
   NEMA17,
   NEMA23,
@@ -306,7 +307,7 @@ function buildNemaMountPlate(
       length: holeLength,
       diameter: boltClearanceDia,
     });
-    tool = tool.fuse(bolt);
+    tool = asStdlibInternal(() => tool.fuse(bolt));
   }
   if (opts.boss === true) {
     const bossDepth = opts.bossDepth ?? 2;
@@ -324,7 +325,10 @@ function buildNemaMountPlate(
       length: bossDepth + overcut,
       diameter: spec.pilotDia,
     });
-    tool = tool.fuse(boss);
+    // The boss is the pilot bore's own diameter and lies inside it, so this
+    // fuse adds nothing today; scoped internal so it never reads as the
+    // user's no-op fuse.
+    tool = asStdlibInternal(() => tool.fuse(boss));
   }
 
   // Axis routing — same rotation table as holes.applyAxis. Inlined here to
