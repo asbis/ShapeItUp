@@ -56,7 +56,7 @@ export function resetAmbiguousRawSeen(): void {
 
 // One-shot latch for the "sketchOnPlane is not XY — pen axis mapping may
 // surprise you" hint. The pen's hLine/vLine map to different world axes on
-// each of the six planes (see skill/SKILL.md "Pen axis mapping"), and first-
+// each of the six planes (see skills/shapeitup/SKILL.md "Pen axis mapping"), and first-
 // time users routinely expect hLine to walk along world X even on "ZX"/"ZY"
 // (where it actually walks along world Z). We fire the hint at most once per
 // execute() — any non-XY plane triggers it, then the latch suppresses the

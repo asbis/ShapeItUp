@@ -1046,7 +1046,7 @@ function validateSketchOnPlane(self: any, planeName: unknown): void {
   }
   // One-shot advisory: sketching on any plane other than "XY" means the pen's
   // hLine/vLine map to non-obvious world axes (e.g. on "ZX", hLine → world Z,
-  // not X). The full mapping table lives in skill/SKILL.md "Pen axis
+  // not X). The full mapping table lives in skills/shapeitup/SKILL.md "Pen axis
   // mapping". Fire at most once per run so a script with 50 sketches on XZ
   // doesn't spam 50 identical warnings.
   //
@@ -1070,7 +1070,7 @@ function validateSketchOnPlane(self: any, planeName: unknown): void {
     pushRuntimeWarning(
       `sketchOnPlane("${planeName}"): pen hLine/vLine map to different world ` +
         `axes on each plane (e.g. on "ZX", hLine → world Z, vLine → world X). ` +
-        `See skill/SKILL.md "Pen axis mapping" table before sketching.`,
+        `See skills/shapeitup/SKILL.md "Pen axis mapping" table before sketching.`,
     );
   }
 }
