@@ -9,9 +9,9 @@ Releases 1.17.0–1.24.0 are described only in their
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project follows semantic versioning at the extension level.
 
-## [1.29.3] - 2026-09-23
+## [1.29.4] - 2026-09-23
 
-Extension `1.29.3` / mcp-server `1.29.3` — a face op no longer writes a line
+Extension `1.29.4` / mcp-server `1.29.4` — a face op no longer writes a line
 that silently does nothing.
 
 ### Fixed
@@ -26,6 +26,16 @@ that silently does nothing.
   says why. Apply is also disabled until that count comes back.
 - The serve host's `face-op` validator now keeps the new `pin` field. Its
   whitelist dropped the field, so the file got the plane-only line anyway.
+
+## [1.29.3] - 2026-09-23
+
+Extension `1.29.3` / mcp-server `1.29.3` — stale skill path.
+
+### Fixed
+- **The sketch-plane warning pointed at a file that no longer exists.** It told
+  agents to read `skill/SKILL.md` "Pen axis mapping" before sketching; the skill
+  moved to `skills/shapeitup/SKILL.md`. The warning, two source comments and the
+  README's install command now use the new path.
 
 ## [1.29.2] - 2026-09-23
 
