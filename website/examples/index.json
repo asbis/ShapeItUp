@@ -1,0 +1,10 @@
+[
+  { "id": "bracket", "title": "L-bracket", "entry": "bracket.shape.ts", "files": ["bracket.shape.ts"],
+    "blurb": "Single part, six parameters. Drag a slider or fillet an edge — both are written back as code." },
+  { "id": "pi-mount", "title": "Pi mount (3 files)", "entry": "assembly.shape.ts", "files": ["assembly.shape.ts", "plate.shape.ts", "standoff.shape.ts"],
+    "blurb": "Every file is a component. The assembly imports the plate and the standoff like any TypeScript module." },
+  { "id": "flange", "title": "Bearing flange", "entry": "flange.shape.ts", "files": ["flange.shape.ts"],
+    "blurb": "A 608 bearing seat and a counterbored bolt circle, from the standard library in two calls." },
+  { "id": "shelf", "title": "Wall shelf (assembly)", "entry": "shelf.shape.ts", "files": ["shelf.shape.ts"],
+    "blurb": "Four parts placed with mates, and a left-hand bracket mirrored into a right-hand one." }
+]

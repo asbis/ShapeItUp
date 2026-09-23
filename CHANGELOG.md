@@ -1,10 +1,70 @@
 # Changelog
 
-All notable changes to the ShapeItUp VS Code extension. The MCP server tracks
-its own versions in `packages/mcp-server/CHANGELOG.md`.
+All notable changes to ShapeItUp. From 1.27.0 the extension and
+`@shapeitup/mcp-server` release in lockstep and share this file;
+`packages/mcp-server/CHANGELOG.md` holds the MCP server's history up to 1.16.3.
+Releases 1.17.0–1.24.0 are described only in their
+[GitHub release notes](https://github.com/asbis/ShapeItUp/releases).
 
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project follows semantic versioning at the extension level.
+
+## [1.29.3] - 2026-09-23
+
+Extension `1.29.3` / mcp-server `1.29.3`.
+
+### Fixed
+- **Stdlib helpers no longer warn about their own internals.**
+  `holes.counterbore` used through `patterns.cutAt` printed
+  "fuse #N: fuse produced no new material" once per placement, and `placeOn`
+  raised the extrude-plane hint whose recommended fix is `placeOn` itself.
+  The hint told user code from stdlib code by looking for `/stdlib/` in the
+  call stack, which is only true when core runs from source. Once bundled
+  (the worker, the MCP server, the website), every helper looked like user
+  code. Stdlib construction now runs inside an explicit internal scope that
+  the no-op fuse guard, the extrude-plane hint and the pen-axis advisory
+  respect. It covers `placeOn`, `extrudeCentered`, `holes.counterbore`,
+  `holes.teardrop`, `bearings.seat` and the motor mount plates. Internal fuses
+  no longer use up the user's `fuse #N` numbers.
+- **`holes.counterbore` on a plate too thin for the head.** When the head
+  pocket is as deep as the plate (M4 in 4 mm: the pocket is 4.2 mm deep), the
+  pocket cuts straight through and the screw head has nothing to seat on. It
+  now says that once, instead of emitting a no-op fuse warning per hole. The
+  cut geometry is unchanged.
+
+## [1.29.2] - 2026-09-23
+
+Extension `1.29.2` / mcp-server `1.29.2` — documentation only; no code changes.
+
+### Fixed
+- **README quick example used an API that doesn't exist.** It called
+  `holes.through(plate, "M3", [[x, y, z], …])`; `holes.through(size, opts)`
+  returns a cutter and takes no plate or positions. The example now cuts the
+  holes with `patterns.cutAt(plate, () => holes.through(...), patterns.grid(...))`
+  and was checked with `verify_shape` and `render_preview`.
+- **Tool counts.** Both READMEs said 25 MCP tools and SKILL.md said 20; the
+  server registers 29. The tool lists and SKILL.md's tool table now include
+  `open_viewer`, `close_viewer`, `check_stack`, `run_simulation`,
+  `clear_params`, `describe_geometry`, `validate_joints`, `verify_shape` and
+  `sweep_check` where they were missing.
+- **Export formats.** The README listed OBJ; `export_shape` accepts STEP, STL
+  and 3MF. SKILL.md listed only STEP and STL.
+- **Changelog pointer.** `packages/mcp-server/CHANGELOG.md` stopped at 1.16.3
+  with no hint of where later releases went; it now points here.
+
+## [1.29.1] - 2026-09-23
+
+Extension `1.29.1` / mcp-server `1.29.1`.
+
+### Fixed
+- **A string parameter no longer crashes the viewer.** A shape declaring
+  `bearing: "608"` (the stdlib's own `flange-bolt-circle` example) failed with
+  "Render error: v.toFixed is not a function" — the Parameters panel assumed
+  every value was a number. String and boolean parameters now show as a
+  read-only row; numeric fields, nudging and "Save to file" are unchanged.
+  `ParamDef.value` is now typed `number | string | boolean` to match what the
+  executor has always passed through, and non-numeric parameters no longer
+  get a meaningless `step`.
 
 ## [1.29.0] - 2026-08-28
 

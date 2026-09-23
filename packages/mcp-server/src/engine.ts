@@ -28,6 +28,7 @@ import {
   type Core,
   type ExecutedPart,
 } from "@shapeitup/core";
+import type { ParamValue } from "@shapeitup/shared";
 import * as esbuild from "esbuild-wasm";
 
 // esbuild-wasm requires a one-shot initialize() before the first build().
@@ -521,7 +522,7 @@ export interface EngineStatus {
   partCount?: number;
   partNames?: string[];
   boundingBox?: { x: number; y: number; z: number };
-  currentParams?: Record<string, number>;
+  currentParams?: Record<string, ParamValue>;
   /**
    * Parameter names statically extracted from the script's
    * `export const params = {...}` declaration. Populated from the raw source
@@ -1342,7 +1343,7 @@ export async function executeShapeFile(
       runtimeWarnings: result.warnings,
     });
 
-    const currentParams: Record<string, number> = {};
+    const currentParams: Record<string, ParamValue> = {};
     for (const p of result.params) currentParams[p.name] = p.value;
 
     // When the runtime `params` object carries KEYS that the entry file never

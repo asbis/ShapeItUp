@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ShapeItUp Playground</title>
+  <meta name="description" content="Edit a .shape.ts and watch the real OpenCascade kernel rebuild it in your browser. Fillet, extrude and pattern in the viewport — every click is written back as code.">
+  <link rel="icon" href="../icon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="playground.css">
+</head>
+<body>
+  <header class="bar">
+    <a class="brand" href="../" target="_top">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 2 21 7v10l-9 5-9-5V7z" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 12 21 7M12 12v10M12 12 3 7" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+      ShapeItUp <span class="brand-sub">playground</span>
+    </a>
+    <label class="picker">
+      <span class="label">Example</span>
+      <select id="project" aria-label="Example project"></select>
+    </label>
+    <p id="blurb" class="blurb"></p>
+    <div class="bar-actions">
+      <span class="status"><i id="status-dot" data-kind="busy"></i><span id="status-text">Loading…</span></span>
+      <button id="reset" class="btn ghost" title="Back to the shipped example">Reset</button>
+      <button id="download" class="btn ghost" title="Download the open file">.shape.ts ↓</button>
+      <button id="run" class="btn" title="Run (⌘S)">Run ▸</button>
+    </div>
+  </header>
+
+  <main style="--code-w: 42%">
+    <section class="code-pane">
+      <nav id="tabs" class="tabs" aria-label="Files"></nav>
+      <div class="editor">
+        <pre id="gutter" class="gutter" aria-hidden="true"></pre>
+        <div class="editor-body">
+          <pre id="highlight" aria-hidden="true"><code></code></pre>
+          <div id="flash" aria-hidden="true"></div>
+          <textarea id="code" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Shape source (TypeScript)"></textarea>
+        </div>
+      </div>
+      <div class="log-wrap">
+        <div class="log-head"><span>Output</span><span class="hint">Pick a face → Fillet → Apply, and watch the code change</span></div>
+        <div id="log" class="log" role="log" aria-live="polite"></div>
+      </div>
+    </section>
+    <div id="split" class="split" role="separator" aria-orientation="vertical" aria-label="Resize"></div>
+    <section class="view-pane">
+      <iframe id="viewer" title="ShapeItUp 3D viewer"></iframe>
+    </section>
+  </main>
+
+  <script type="module" src="playground.js"></script>
+</body>
+</html>

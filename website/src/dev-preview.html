@@ -1,0 +1,5 @@
+<!doctype html><style>html,body{margin:0;background:#888;overflow:hidden}iframe{border:0;width:1440px;height:1000px;transform-origin:0 0;}</style>
+<iframe id="f" src="/"></iframe>
+<script>const f=document.getElementById('f');function fit(){const s=innerWidth/1440;f.style.transform=`scale(${s})`;f.style.height=(innerHeight/s)+'px'}fit();addEventListener('resize',fit);
+window.go=(y)=>{const d=f.contentDocument;d.querySelectorAll('.reveal').forEach(e=>e.classList.add('in'));f.contentWindow.scrollTo({top:y,behavior:'instant'});return d.documentElement.scrollHeight};
+window.goto=(sel,off=0)=>{const d=f.contentDocument;d.querySelectorAll('.reveal').forEach(e=>e.classList.add('in'));const el=d.querySelector(sel);f.contentWindow.scrollTo({top:el.getBoundingClientRect().top+f.contentWindow.scrollY+off,behavior:'instant'});return true}</script>
