@@ -242,12 +242,14 @@ jobs:
         # This ID (not the app's client ID) is what the publisher's Members
         # list takes: marketplace.visualstudio.com/manage/publishers/shapeitup,
         # role Contributor. Printed on every run so a lost membership is a
-        # copy-paste away from fixed.
+        # copy-paste away from fixed. It is connectionData, not the
+        # profiles/me call Microsoft's docs show: a service principal has no
+        # profile, and that call answers VSS011031.
         continue-on-error: true
         run: |
-          az rest -u https://app.vssps.visualstudio.com/_apis/profile/profiles/me \
+          az rest -u https://app.vssps.visualstudio.com/_apis/connectionData \
             --resource 499b84ac-1321-427f-aa17-267ca6975798 \
-            --query "{id: id, displayName: displayName}" -o json
+            --query "authenticatedUser.{id: id, name: providerDisplayName}" -o json
 
       - name: Check publish rights
         # Fails before any upload, with a message that names the problem.
