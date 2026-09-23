@@ -2,18 +2,20 @@
   "name": "shapeitup",
   "version": "0.1.0",
   "private": true,
-  "description": "Scripted CAD for VSCode — TypeScript + Replicad + Three.js",
+  "description": "Scripted CAD for VSCode \u2014 TypeScript + Replicad + Three.js",
   "scripts": {
     "dev": "node esbuild.config.mjs --watch",
     "dev:mcp": "node esbuild.config.mjs --watch --mcp-only",
     "build": "node esbuild.config.mjs",
     "build:mcp": "node esbuild.config.mjs --mcp-only",
-    "lint": "tsc -b packages/core packages/extension packages/mcp-server packages/serve packages/shared packages/sim packages/sim-dynamics packages/sim-mujoco packages/viewer packages/worker",
+    "lint": "tsc -b packages/core packages/extension packages/mcp-server packages/serve packages/shared packages/sim packages/sim-dynamics packages/sim-mujoco packages/viewer packages/worker website",
     "package": "pnpm build && cd packages/extension && vsce package --no-dependencies",
     "test": "vitest run",
     "test:watch": "vitest",
     "release:check": "node scripts/release-check.mjs",
-    "serve": "node packages/serve/dist/cli.js"
+    "serve": "node packages/serve/dist/cli.js",
+    "website": "node website/build.mjs",
+    "website:dev": "node website/build.mjs --serve"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

@@ -1,5 +1,6 @@
 packages:
   - "packages/*"
+  - "website"
 
 # pnpm >=11 no longer reads the `pnpm` field in package.json — these settings
 # live here now. Without `allowBuilds`, esbuild's postinstall never runs and
