@@ -6,6 +6,16 @@ its own versions in `packages/mcp-server/CHANGELOG.md`.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project follows semantic versioning at the extension level.
 
+## [1.29.1] - 2026-09-23
+
+Extension `1.29.1` / mcp-server `1.29.1` — stale skill path.
+
+### Fixed
+- **The sketch-plane warning pointed at a file that no longer exists.** It told
+  agents to read `skill/SKILL.md` "Pen axis mapping" before sketching; the skill
+  moved to `skills/shapeitup/SKILL.md`. The warning, two source comments and the
+  README's install command now use the new path.
+
 ## [1.29.0] - 2026-08-28
 
 Extension `1.29.0` / mcp-server `1.29.0` — Mirror and Pattern in the viewport.

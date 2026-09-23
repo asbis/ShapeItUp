@@ -174,7 +174,7 @@ Add to your `~/.claude/settings.json`:
 Copy the skill file for API reference:
 
 ```bash
-cp skill/SKILL.md ~/.claude/commands/shapeitup.md
+cp skills/shapeitup/SKILL.md ~/.claude/commands/shapeitup.md
 ```
 
 ### MCP Tools
