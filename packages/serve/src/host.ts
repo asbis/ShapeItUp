@@ -777,7 +777,7 @@ type FaceOpMessage = Extract<WebviewToExt, { type: "face-op" }>;
  * into generated source, and a NaN or an Infinity there would write a line
  * that cannot be parsed back.
  */
-function parseFaceOp(msg: Record<string, any>): FaceOpMessage | null {
+export function parseFaceOp(msg: Record<string, any>): FaceOpMessage | null {
   const triple = (v: any): v is [number, number, number] =>
     Array.isArray(v) && v.length === 3 && v.every((n) => typeof n === "number" && Number.isFinite(n));
 
@@ -803,12 +803,16 @@ function parseFaceOp(msg: Record<string, any>): FaceOpMessage | null {
     const face = t.face;
     if (!face || typeof face.kind !== "string" || !triple(face.center)) return null;
     if (face.normal !== undefined && !triple(face.normal)) return null;
+    // The pin is what makes a selector unique when its plane is shared.
+    // Dropping it here writes the ambiguous line the viewer refused to offer.
+    if (face.pin !== undefined && !triple(face.pin)) return null;
     target = {
       kind: "face",
       face: {
         kind: face.kind,
         center: face.center,
         ...(face.normal ? { normal: face.normal } : {}),
+        ...(face.pin ? { pin: face.pin } : {}),
       },
     };
   } else {

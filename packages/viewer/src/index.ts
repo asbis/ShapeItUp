@@ -20,6 +20,7 @@ import {
   describePlacement,
   edgesInPlane,
   faceBounds,
+  faceInteriorPoint,
   findMatchingEdge,
   findMatchingFace,
   operationAxis,
@@ -39,6 +40,7 @@ import type {
   PreviewCombine,
   PreviewDelta,
   PreviewFaceOp,
+  PreviewTargetReport,
 } from "@shapeitup/shared";
 import { PART_COLORS } from "./theme";
 import {
@@ -430,7 +432,13 @@ let activeOp: FaceOpKind | null = null;
  * open, sized, and committable.
  */
 type ArmedTarget =
-  | { kind: "face"; partName: string; info: NonNullable<TessellatedPart["faceInfo"]>[number] }
+  | {
+      kind: "face";
+      partName: string;
+      info: NonNullable<TessellatedPart["faceInfo"]>[number];
+      /** A point inside the face, frozen with it — the fallback pin. */
+      interior?: [number, number, number];
+    }
   | { kind: "edge"; partName: string; point: [number, number, number] };
 
 let armedTarget: ArmedTarget | null = null;
@@ -481,10 +489,18 @@ function setActiveOp(op: FaceOpKind | null): void {
   const sel = facePicker.getSelection();
   opMaxRadius = null;
   opMaxKey = "";
+  opTarget = null;
+  const selPart = sel ? (currentParts[sel.partIndex] as PickablePart | undefined) : undefined;
+  const interior = sel?.kind === "face" && selPart ? faceInteriorPoint(selPart, sel) : null;
   armedTarget = !sel
     ? null
     : sel.kind === "face"
-      ? { kind: "face", partName: sel.partName, info: sel.info }
+      ? {
+          kind: "face",
+          partName: sel.partName,
+          info: sel.info,
+          ...(interior ? { interior } : {}),
+        }
       : { kind: "edge", partName: sel.partName, point: sel.point };
 
   fiOpEl.textContent = OP_LABEL[op];
@@ -681,9 +697,63 @@ function buildSelectorPreview(sel: FaceSelection) {
   return buildSelectorPreviewFor(sel.info);
 }
 
-function buildSelectorPreviewFor(info: FaceSelection["info"]) {
-  const r = synthesizeFaceSelector(info, declaredParamValues);
+function buildSelectorPreviewFor(
+  info: FaceSelection["info"],
+  pin?: [number, number, number],
+) {
+  const r = synthesizeFaceSelector(pin ? { ...info, pin } : info, declaredParamValues);
   return r.ok ? r.selector : null;
+}
+
+// ── Is the face selector unique? ──────────────────────────────────────────
+// A plane is not always a name. Fuse two gussets onto a bracket's base and the
+// base's top becomes three coplanar faces; `inPlane("XY", thickness)` matches
+// all three, the stdlib helper refuses it, and Apply writes a line that does
+// nothing. The worker counts matches on every preview and, when the plane is
+// ambiguous, offers a verified `containsPoint` pin. Until it has answered for
+// THIS face, Apply is not offered.
+
+/** The worker's answer, and which armed face it belongs to. */
+let opTarget: { key: string; report: PreviewTargetReport } | null = null;
+/**
+ * Which face the preview run now in the worker was asked about. Runs are
+ * serialised (see previewInFlight), so a reply belongs to the last one sent —
+ * NOT to whatever is armed when it lands, which may already be another face.
+ */
+let inFlightTargetKey = "";
+
+/** Identifies the armed FACE — the answer does not depend on the operation. */
+function targetIdentity(): string {
+  if (!armedTarget || armedTarget.kind !== "face") return "";
+  return JSON.stringify([armedTarget.partName, armedTarget.info.center]);
+}
+
+function currentFaceTarget(): PreviewTargetReport | null {
+  if (!opTarget || opTarget.key !== targetIdentity()) return null;
+  return opTarget.report;
+}
+
+/** Why Apply cannot be offered for the armed operation, or null when it can. */
+function faceTargetBlock(): string | null {
+  if (!armedTarget || armedTarget.kind !== "face") return null;
+  const t = currentFaceTarget();
+  if (!t) return "Checking that the selector names only this face…";
+  if (t.planeMatches === 0) {
+    return "The selector matches no face on the current model, so the written line would do nothing";
+  }
+  if (t.planeMatches > 1 && !t.pin) {
+    return (
+      `The selector matches ${t.planeMatches} faces in this plane and no point ` +
+      "could single this one out, so the written line would do nothing"
+    );
+  }
+  return null;
+}
+
+function refreshApplyEnabled(): void {
+  const block = faceTargetBlock();
+  fiApplyEl.disabled = pendingFaceOp !== null || block !== null;
+  fiApplyEl.title = block ?? "Write this into the file";
 }
 
 function renderOpPreview(): void {
@@ -727,11 +797,28 @@ function renderOpPreview(): void {
       });
     }
   } else {
-    const selector = buildSelectorPreviewFor(sel.info);
+    const found = currentFaceTarget();
+    const selector = buildSelectorPreviewFor(sel.info, found?.pin);
     if (!selector) {
       fiCodeEl.textContent = "";
       clearEdgePreview();
+      refreshApplyEnabled();
       return;
+    }
+    if (!found) {
+      notes.push({ text: "checking the selector…", warn: false });
+    } else if (found.planeMatches === 0) {
+      notes.push({ text: "⚠ the selector matches no face — nothing to apply", warn: true });
+    } else if (found.planeMatches > 1 && found.pin) {
+      notes.push({
+        text: `→ ${found.planeMatches} faces lie in this plane — pinned to this one by a point`,
+        warn: false,
+      });
+    } else if (found.planeMatches > 1) {
+      notes.push({
+        text: `⚠ the selector matches ${found.planeMatches} faces in this plane and none could be singled out — Apply would do nothing`,
+        warn: true,
+      });
     }
     const fn =
       activeOp === "extrude"
@@ -800,6 +887,7 @@ function renderOpPreview(): void {
     el.textContent = n.text;
     fiNotesEl.appendChild(el);
   }
+  refreshApplyEnabled();
 }
 
 // ── The added / removed ghost ─────────────────────────────────────────────
@@ -942,7 +1030,15 @@ function previewPayload(): PreviewFaceOp | null {
   return {
     op: activeOp,
     partName: currentParts.length > 1 ? armedTarget.partName : null,
-    target: { kind: "face", plane: selector.selector.plane, offset: selector.selector.offset },
+    target: {
+      kind: "face",
+      plane: selector.selector.plane,
+      offset: selector.selector.offset,
+      // So the worker can tell which face was meant when the plane matches
+      // several, and pin it. See PreviewTargetReport.
+      center: armedTarget.info.center,
+      ...(armedTarget.interior ? { interior: armedTarget.interior } : {}),
+    },
     distance: d,
     ...(wantLimit ? { probeLimit: true } : {}),
   };
@@ -978,6 +1074,7 @@ function runPreview(request: PreviewRequest, key: string): void {
     return;
   }
   previewInFlight = true;
+  inFlightTargetKey = request.kind === "face" ? targetIdentity() : "";
   // Remember what to go back to. Captured on the FIRST preview only, so a
   // second one does not adopt the first preview as its baseline.
   if (!previewShowing) previewBaseJs = lastScriptJs;
@@ -1101,6 +1198,12 @@ function applyOp(): void {
     return;
   }
   if (pendingFaceOp !== null) return;
+  const block = faceTargetBlock();
+  if (block) {
+    setParamsStatus(`Not applied — ${block}`, true);
+    return;
+  }
+  const pin = sel.kind === "face" ? currentFaceTarget()?.pin : undefined;
 
   faceOpRequestId += 1;
   pendingFaceOp = faceOpRequestId;
@@ -1122,6 +1225,9 @@ function applyOp(): void {
               kind: sel.info.kind,
               center: sel.info.center,
               ...(sel.info.normal ? { normal: sel.info.normal } : {}),
+              // The same pin the preview ran with, so the written finder is
+              // the one that was just shown working.
+              ...(pin ? { pin } : {}),
             },
           },
     distance: d,
@@ -3347,6 +3453,17 @@ function handleWorkerMessage(msg: WorkerToWebview) {
         renderCombinePreview();
       }
       break;
+    case "preview-target":
+      // Only a face target is counted; the reply is keyed to the face that
+      // is armed NOW, and ignored by any other.
+      if (activeOp && armedTarget && armedTarget.kind === "face") {
+        opTarget = {
+          key: inFlightTargetKey,
+          report: { planeMatches: msg.planeMatches, ...(msg.pin ? { pin: msg.pin } : {}) },
+        };
+        renderOpPreview();
+      }
+      break;
     case "preview-limit":
       // Belongs to whatever is armed NOW; a reply for a superseded operation
       // would silently cap the wrong thing.
@@ -3931,7 +4048,7 @@ onMessage("face-op-result", (msg) => {
   // moved past, so only the outstanding one is allowed to speak.
   if (msg.requestId !== pendingFaceOp) return;
   pendingFaceOp = null;
-  fiApplyEl.disabled = false;
+  refreshApplyEnabled();
 
   if (!msg.ok) {
     setParamsStatus(`Not applied — ${msg.reason ?? "unknown reason"}`, true);

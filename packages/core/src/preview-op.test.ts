@@ -11,6 +11,7 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { initCore } from "./index.js";
 import { loadOCCTForTest } from "./testing/occt.js";
+import { synthesizeFaceSelector } from "@shapeitup/shared";
 
 let core: Awaited<ReturnType<typeof initCore>>;
 
@@ -234,5 +235,129 @@ describe("preview op", () => {
         expect((await runFull(PLATE)).previewDelta).toBeUndefined();
       })();
     });
+  });
+});
+
+/**
+ * A plane is not always a name.
+ *
+ * Two ribs fused across a base plate split the plate's top into three
+ * coplanar faces — the shape of the website's L-bracket with its gussets.
+ * `inPlane("XY", thickness)` then matches all three, and every stdlib face
+ * helper refuses it. Before this was caught the viewer wrote exactly that
+ * line: the preview looked right, the file did nothing.
+ */
+describe("a face whose plane is shared", () => {
+  // Ribs at x = ±15, 5 wide, running the full depth: the top at z = 5 is
+  // three faces, and the middle one spans x in [-12.5, 12.5].
+  const RIBBED = (extra = "") => `
+    const { drawRectangle, drawCircle } = __replicad__;
+    const { extrudeFace } = __shapeitup__;
+    const params = { width: 80, depth: 40, thickness: 5, rib: 20 };
+    function main({ width, depth, thickness, rib }) {
+      let shape = drawRectangle(width, depth).sketchOnPlane().extrude(thickness);
+      for (const x of [-15, 15]) {
+        shape = shape.fuse(
+          drawRectangle(5, depth).sketchOnPlane("XY", thickness).extrude(rib).translate(x, 0, 0),
+        );
+      }
+      ${extra}
+      return shape;
+    }
+  `;
+  const PARAMS = { width: 80, depth: 40, thickness: 5, rib: 20 };
+  const MIDDLE = { kind: "face" as const, plane: "XY", offset: 5, center: [0, 0, 5] as [number, number, number] };
+  const MIDDLE_AREA = 25 * 40;
+
+  it("reports a unique plane as unique, and asks for no pin", async () => {
+    const r = await runFull(PLATE, {
+      op: "extrude",
+      partName: null,
+      target: { ...TOP_FACE, center: [0, 0, 8] },
+      distance: 5,
+    });
+    expect(r.previewTarget).toEqual({ planeMatches: 1 });
+  });
+
+  it("counts the coplanar faces and pins the picked one", async () => {
+    const r = await runFull(RIBBED(), { op: "extrude", partName: null, target: MIDDLE, distance: 3 });
+    expect(r.previewTarget?.planeMatches).toBe(3);
+    // The centre is inside the middle face, so it is the pin — rounded, and
+    // snapped onto the plane.
+    expect(r.previewTarget?.pin).toEqual([0, 0, 5]);
+  });
+
+  it("previews the pinned face, and only it", async () => {
+    const base = await run(RIBBED());
+    const previewed = await run(RIBBED(), { op: "extrude", partName: null, target: MIDDLE, distance: 3 });
+    expect(vol(previewed) - vol(base)).toBeCloseTo(MIDDLE_AREA * 3, 0);
+  });
+
+  it("writes a line that does what the preview showed", async () => {
+    // The faithfulness claim, end to end: the report's pin goes through the
+    // same synthesiser the hosts use, the line goes into the script, and the
+    // re-run must match the preview to the cubic millimetre.
+    const report = (await runFull(RIBBED(), {
+      op: "extrude",
+      partName: null,
+      target: MIDDLE,
+      distance: 3,
+    })).previewTarget!;
+    const sel = synthesizeFaceSelector(
+      { kind: "PLANE", center: MIDDLE.center, normal: [0, 0, 1], pin: report.pin },
+      PARAMS,
+    );
+    if (!sel.ok) throw new Error("no selector");
+    expect(sel.selector.code).toBe('(f) => f.inPlane("XY", thickness).containsPoint([0, 0, thickness])');
+    expect(sel.selector.durable).toBe(true);
+
+    const committed = await runFull(RIBBED(`shape = extrudeFace(shape, ${sel.selector.code}, 3);`));
+    const previewed = await run(RIBBED(), { op: "extrude", partName: null, target: MIDDLE, distance: 3 });
+    expect(committed.warnings.some((w) => /extrudeFace/.test(w))).toBe(false);
+    expect(vol(committed.parts)).toBeCloseTo(vol(previewed), 1);
+  });
+
+  it("the unpinned line is the one that silently did nothing", async () => {
+    // Documents the bug this guards against, so a regression reads plainly.
+    const base = await run(RIBBED());
+    const r = await runFull(RIBBED('shape = extrudeFace(shape, (f) => f.inPlane("XY", thickness), 3);'));
+    expect(r.warnings.some((w) => /matched 3 faces/.test(w))).toBe(true);
+    expect(vol(r.parts)).toBeCloseTo(vol(base), 1);
+  });
+
+  it("falls back to an interior point when the centre is not on the face", async () => {
+    // A boss through the middle face puts its centre of mass in the hole.
+    const BOSSED = RIBBED(
+      "shape = shape.fuse(drawCircle(4).sketchOnPlane('XY', thickness).extrude(10));",
+    );
+    const target = { ...MIDDLE, interior: [-10.03, 15.07, 5] as [number, number, number] };
+    const r = await runFull(BOSSED, { op: "extrude", partName: null, target, distance: 3 });
+    expect(r.previewTarget?.planeMatches).toBe(3);
+    expect(r.previewTarget?.pin).toEqual([-10, 15.1, 5]);
+
+    const base = await run(BOSSED);
+    const previewed = await run(BOSSED, { op: "extrude", partName: null, target, distance: 3 });
+    expect(vol(previewed) - vol(base)).toBeCloseTo((MIDDLE_AREA - Math.PI * 16) * 3, 0);
+  });
+
+  it("offers no pin when nothing identifies the picked face", async () => {
+    // No centre means no way to tell which of the three was meant. Guessing
+    // would pin SOME face; the viewer must instead refuse to write.
+    const r = await runFull(RIBBED(), {
+      op: "extrude",
+      partName: null,
+      target: { kind: "face", plane: "XY", offset: 5 },
+      distance: 3,
+    });
+    expect(r.previewTarget).toEqual({ planeMatches: 3 });
+  });
+
+  it("rounds the pinned face's boundary too", async () => {
+    const base = await run(RIBBED());
+    const r = await runFull(RIBBED(), { op: "chamfer", partName: null, target: MIDDLE, distance: 1 });
+    expect(r.previewTarget?.pin).toBeDefined();
+    // Two of its edges meet the ribs in a concave corner, where a chamfer
+    // ADDS material — so the claim is only that it acted, not which way.
+    expect(Math.abs(vol(r.parts) - vol(base))).toBeGreaterThan(1);
   });
 });
