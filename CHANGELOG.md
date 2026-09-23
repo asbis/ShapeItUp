@@ -6,6 +6,20 @@ its own versions in `packages/mcp-server/CHANGELOG.md`.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project follows semantic versioning at the extension level.
 
+## [1.29.1] - 2026-09-23
+
+Extension `1.29.1` / mcp-server `1.29.1`.
+
+### Fixed
+- **A string parameter no longer crashes the viewer.** A shape declaring
+  `bearing: "608"` (the stdlib's own `flange-bolt-circle` example) failed with
+  "Render error: v.toFixed is not a function" — the Parameters panel assumed
+  every value was a number. String and boolean parameters now show as a
+  read-only row; numeric fields, nudging and "Save to file" are unchanged.
+  `ParamDef.value` is now typed `number | string | boolean` to match what the
+  executor has always passed through, and non-numeric parameters no longer
+  get a meaningless `step`.
+
 ## [1.29.0] - 2026-08-28
 
 Extension `1.29.0` / mcp-server `1.29.0` — Mirror and Pattern in the viewport.
