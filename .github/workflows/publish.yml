@@ -162,14 +162,14 @@ jobs:
         # an OIDC-capable npm on the Node 22 runner (ships npm 10.x).
         #
         # NOTE: no `continue-on-error` here — a failed npm publish MUST abort
-        # the workflow so the VSIX below never ships referencing a server
-        # version that wasn't actually released.
+        # the workflow so the `marketplace` job never ships a VSIX referencing
+        # a server version that wasn't actually released.
         #
         # But "already on the registry" is not a failure, it is the goal state.
         # Treating it as one is how v1.24.0 and v1.27.0 both ended with npm
-        # published and the Marketplace step never reached: the PAT below had
-        # expired, and re-running afterwards died here on a version that had
-        # succeeded the first time. The two channels have to be able to fail
+        # published and the Marketplace step never reached: the Marketplace PAT
+        # (since replaced by Entra ID) had expired, and re-running afterwards
+        # died here on a version that had succeeded the first time. The two channels have to be able to fail
         # independently, or one broken credential silently strands the other.
         run: |
           set -euo pipefail
@@ -190,15 +190,70 @@ jobs:
             npm publish "$TGZ" --access public
           fi
 
+      - name: Package the VSIX
+        # Packaged here, published by the `marketplace` job below. The split is
+        # about credentials: that job runs in the `marketplace` environment,
+        # which is what the Entra ID federated credential trusts. Keeping THIS
+        # job out of any environment leaves the OIDC claims that npm's trusted
+        # publisher checks exactly as they were.
+        run: cd packages/extension && npx -y @vscode/vsce package --out "$GITHUB_WORKSPACE/shapeitup-vscode.vsix"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vsix
+          path: shapeitup-vscode.vsix
+          if-no-files-found: error
+
+  marketplace:
+    needs: publish
+    runs-on: ubuntu-latest
+    # Auth is Microsoft Entra ID, not a PAT. Azure DevOps PATs expire (a year
+    # by default), and when one lapsed the listing sat at 1.23.0 for six
+    # releases; global PATs are retired outright on 2026-12-01. Here GitHub's
+    # OIDC token is exchanged for an Entra token for the app registration
+    # "ShapeItUp Marketplace publisher (GitHub Actions)" in the Standardmappe
+    # tenant. Its federated credential trusts exactly this subject:
+    #   repo:asbis/ShapeItUp:environment:marketplace
+    # Rename the environment and the sign-in fails with AADSTS700213.
+    environment: marketplace
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: vsix
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Sign in to Microsoft Entra ID
+        # The app has no Azure subscription, only a seat on the Marketplace
+        # publisher, hence allow-no-subscriptions. The IDs are environment
+        # variables, not secrets: they identify the app, they don't unlock it.
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Show the identity the Marketplace sees
+        # This ID (not the app's client ID) is what the publisher's Members
+        # list takes: marketplace.visualstudio.com/manage/publishers/shapeitup,
+        # role Contributor. Printed on every run so a lost membership is a
+        # copy-paste away from fixed.
+        continue-on-error: true
+        run: |
+          az rest -u https://app.vssps.visualstudio.com/_apis/profile/profiles/me \
+            --resource 499b84ac-1321-427f-aa17-267ca6975798 \
+            --query "{id: id, displayName: displayName}" -o json
+
+      - name: Check publish rights
+        # Fails before any upload, with a message that names the problem.
+        run: npx -y @vscode/vsce verify-pat --azure-credential shapeitup
+
       - name: Publish to VS Marketplace
-        # The PAT is an Azure DevOps token and they EXPIRE — a year by default.
-        # When it lapses this step is the only thing that fails, and because
-        # npm has already published by then the release looks half-done rather
-        # than broken. The listing sat four versions behind before anyone
-        # noticed. If this step fails with "Personal Access Token used has
-        # expired", mint a new one at https://aka.ms/vscodepat and update the
-        # VSCE_PAT repository secret; the npm step above is idempotent, so
-        # re-running the same release afterwards will get here.
-        run: cd packages/extension && npx @vscode/vsce publish
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        # --skip-duplicate for the same reason the npm step skips: a version
+        # that is already listed is the goal state, so a re-run must pass.
+        run: npx -y @vscode/vsce publish --packagePath shapeitup-vscode.vsix --azure-credential --skip-duplicate
