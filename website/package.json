@@ -1,0 +1,15 @@
+{
+  "name": "@shapeitup/website",
+  "version": "0.0.0",
+  "private": true,
+  "description": "shapeitup.dev — landing page + in-browser playground running the real viewer and OCCT kernel",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "dev": "node build.mjs --serve"
+  },
+  "devDependencies": {
+    "@shapeitup/shared": "workspace:*",
+    "sucrase": "^3.35.1"
+  }
+}

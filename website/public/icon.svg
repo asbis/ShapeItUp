@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a2e"/>
+      <stop offset="100%" style="stop-color:#141625"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="4" y="4" width="120" height="120" rx="22" ry="22" fill="url(#bg)"/>
+
+  <g transform="translate(64, 64) scale(0.45)" shape-rendering="crispEdges">
+
+    <!-- ===== LEFT BRACKET { ===== -->
+    <g transform="translate(-68, 0)">
+      <!-- Box 5: Bottom bar -->
+      <polygon points="40,48 50,42 50,54 40,60" fill="rgb(59,106,207)"/>
+      <polygon points="0,48 40,48 50,42 10,42" fill="rgb(168,203,255)"/>
+      <polygon points="0,48 40,48 40,60 0,60" fill="rgb(108,158,255)"/>
+
+      <!-- Box 4: Lower vertical -->
+      <polygon points="14,6 24,0 24,42 14,48" fill="rgb(59,106,207)"/>
+      <polygon points="0,6 14,6 24,0 10,0" fill="rgb(168,203,255)"/>
+      <polygon points="0,6 14,6 14,48 0,48" fill="rgb(108,158,255)"/>
+
+      <!-- Box 3: Middle tip -->
+      <polygon points="-30,-6 -20,-12 -20,0 -30,6" fill="rgb(59,106,207)"/>
+      <polygon points="14,-6 24,-12 24,0 14,6" fill="rgb(59,106,207)"/>
+      <polygon points="-30,-6 14,-6 24,-12 -20,-12" fill="rgb(168,203,255)"/>
+      <polygon points="-30,-6 14,-6 14,6 -30,6" fill="rgb(108,158,255)"/>
+
+      <!-- Box 2: Upper vertical -->
+      <polygon points="14,-48 24,-54 24,-12 14,-6" fill="rgb(59,106,207)"/>
+      <polygon points="0,-48 14,-48 24,-54 10,-54" fill="rgb(168,203,255)"/>
+      <polygon points="0,-48 14,-48 14,-6 0,-6" fill="rgb(108,158,255)"/>
+
+      <!-- Box 1: Top bar -->
+      <polygon points="40,-60 50,-66 50,-54 40,-48" fill="rgb(59,106,207)"/>
+      <polygon points="0,-60 40,-60 50,-66 10,-66" fill="rgb(168,203,255)"/>
+      <polygon points="0,-60 40,-60 40,-48 0,-48" fill="rgb(108,158,255)"/>
+    </g>
+
+    <!-- ===== CENTER CUBE ===== -->
+    <polygon points="12,-9 20,-14 20,3 12,8" fill="rgb(124,58,237)"/>
+    <polygon points="-12,-9 12,-9 20,-14 -4,-14" fill="rgb(196,181,253)"/>
+    <polygon points="-12,-9 12,-9 12,8 -12,8" fill="rgb(167,139,250)"/>
+
+    <!-- ===== RIGHT BRACKET } ===== -->
+    <g transform="translate(68, 0)">
+      <!-- Box 5: Bottom bar -->
+      <polygon points="0,48 10,42 10,54 0,60" fill="rgb(59,106,207)"/>
+      <polygon points="-40,48 0,48 10,42 -30,42" fill="rgb(168,203,255)"/>
+      <polygon points="-40,48 0,48 0,60 -40,60" fill="rgb(108,158,255)"/>
+
+      <!-- Box 4: Lower vertical -->
+      <polygon points="0,6 10,0 10,42 0,48" fill="rgb(59,106,207)"/>
+      <polygon points="-14,6 0,6 10,0 -4,0" fill="rgb(168,203,255)"/>
+      <polygon points="-14,6 0,6 0,48 -14,48" fill="rgb(108,158,255)"/>
+
+      <!-- Box 3: Middle tip -->
+      <polygon points="30,-6 40,-12 40,0 30,6" fill="rgb(59,106,207)"/>
+      <polygon points="-14,-6 30,-6 40,-12 -4,-12" fill="rgb(168,203,255)"/>
+      <polygon points="-14,-6 30,-6 30,6 -14,6" fill="rgb(108,158,255)"/>
+
+      <!-- Box 2: Upper vertical -->
+      <polygon points="0,-48 10,-54 10,-12 0,-6" fill="rgb(59,106,207)"/>
+      <polygon points="-14,-48 0,-48 10,-54 -4,-54" fill="rgb(168,203,255)"/>
+      <polygon points="-14,-48 0,-48 0,-6 -14,-6" fill="rgb(108,158,255)"/>
+
+      <!-- Box 1: Top bar -->
+      <polygon points="0,-60 10,-66 10,-54 0,-48" fill="rgb(59,106,207)"/>
+      <polygon points="-40,-60 0,-60 10,-66 -30,-66" fill="rgb(168,203,255)"/>
+      <polygon points="-40,-60 0,-60 0,-48 -40,-48" fill="rgb(108,158,255)"/>
+    </g>
+
+  </g>
+</svg>

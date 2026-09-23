@@ -51,13 +51,13 @@ Node 20+ required. No native build step; everything ships as WASM.
 A CAD toolkit agents can drive end to end:
 
 - **Authoring** — `create_shape`, `modify_shape`, `read_shape`, `list_shapes`, `setup_shape_project`
-- **Rendering** — `render_preview`, `preview_shape`, `get_preview` (SVG-first, resvg-backed PNGs)
-- **Verification** — `verify_shape`, `check_collisions`, `sweep_check`, `describe_geometry`, `validate_joints`
+- **Rendering** — `render_preview`, `preview_shape`, `get_preview` (SVG-first, resvg-backed PNGs), `open_viewer` / `close_viewer` (interactive browser viewer)
+- **Verification** — `verify_shape`, `check_collisions`, `check_stack`, `sweep_check`, `run_simulation`, `describe_geometry`, `validate_joints`
 - **Iteration** — `tune_params` (slider overrides), `set_render_mode`, `toggle_dimensions`
-- **Export** — `export_shape` (STEP / STL / OBJ / 3MF)
+- **Export** — `export_shape` (STEP / STL / 3MF)
 - **stdlib** — `holes`, `screws` / `bolts` / `washers` / `inserts`, `bearings`, `extrusions`, `patterns`, `threads`, `joints` + `assemble`, `printHints`, and more — all importable from `"shapeitup"` inside any `.shape.ts`
 
-Full tool list: 25 MCP tools covering the create → preview → verify → tune → export loop.
+29 MCP tools in all — the above plus helpers such as `validate_syntax`, `preview_finder`, `get_api_reference` and `open_shape` — covering the create → preview → verify → tune → export loop.
 
 ## Quick example
 
@@ -66,7 +66,7 @@ Prompt to the agent: *"I want a mounting bracket, 60×40×4 mm, four M3 through-
 ```typescript
 // bracket.shape.ts
 import { drawRoundedRectangle } from "replicad";
-import { holes } from "shapeitup";
+import { holes, patterns } from "shapeitup";
 
 export const params = { width: 60, depth: 40, thickness: 4, holeInset: 6 };
 
@@ -75,12 +75,13 @@ export default function main({ width, depth, thickness, holeInset }: typeof para
     .sketchOnPlane("XY")
     .extrude(thickness);
 
-  return holes.through(plate, "M3", [
-    [-width/2 + holeInset, -depth/2 + holeInset, 0],
-    [ width/2 - holeInset, -depth/2 + holeInset, 0],
-    [-width/2 + holeInset,  depth/2 - holeInset, 0],
-    [ width/2 - holeInset,  depth/2 - holeInset, 0],
-  ]);
+  // holes.through() returns a cutter whose opening sits at Z=0 and drills -Z;
+  // lift it to the top face, then cut one at each corner of a 2×2 grid.
+  return patterns.cutAt(
+    plate,
+    () => holes.through("M3", { depth: thickness + 2 }).translate(0, 0, thickness),
+    patterns.grid(2, 2, width - 2 * holeInset, depth - 2 * holeInset),
+  );
 }
 ```
 

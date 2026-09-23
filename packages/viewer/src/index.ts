@@ -43,6 +43,13 @@ import type {
   PreviewTargetReport,
 } from "@shapeitup/shared";
 import { PART_COLORS } from "./theme";
+import {
+  formatParamValue,
+  isNumericParam,
+  numericDeclaredValues,
+  paramLayoutMatches,
+  paramStep,
+} from "./params";
 import { setupSim, updateSim, clearSim, initSimPanel, toggleSimPanel } from "./sim-panel";
 
 // --- Locale-invariant numeric formatting ---------------------------------
@@ -3507,8 +3514,7 @@ function handleWorkerMessage(msg: WorkerToWebview) {
 
         // Track what the file declares, for the selection bar's selector
         // preview. `declared` is only present when an override is in force.
-        declaredParamValues = {};
-        for (const p of msg.params || []) declaredParamValues[p.name] = p.declared ?? p.value;
+        declaredParamValues = numericDeclaredValues(msg.params || []);
         updateParamsUI(msg.params || []);
         // A rebuild replaced every face; the bar is showing a stale one.
         updateFaceInfoPanel();
@@ -3555,7 +3561,7 @@ function handleWorkerMessage(msg: WorkerToWebview) {
         const bbox = new THREE.Box3().setFromObject(modelGroup);
         const bboxSize = bbox.getSize(new THREE.Vector3());
 
-        const currentParams: Record<string, number> = {};
+        const currentParams: Record<string, ParamValue> = {};
         for (const p of msg.params || []) currentParams[p.name] = p.value;
 
         const partProperties = parts.map((p) => ({
@@ -3706,7 +3712,7 @@ onMessage("execute-script", (msg) => {
     const workerMsg: {
       type: "execute";
       js: string;
-      paramOverrides?: Record<string, number>;
+      paramOverrides?: Record<string, ParamValue>;
       meshQuality?: "preview" | "final";
     } = {
       type: "execute",
@@ -4327,7 +4333,7 @@ const viewCube = new ViewCube(document.getElementById("viewcube")!, {
 document.getElementById("vc-home")!.addEventListener("click", () => setCameraAngle(HOME_VIEW));
 
 // --- Parameter Sliders ---
-import type { ParamDef } from "@shapeitup/shared";
+import type { ParamDef, ParamValue } from "@shapeitup/shared";
 
 const paramsPanel = document.getElementById("params-panel")!;
 const paramsList = document.getElementById("params-list")!;
@@ -4398,7 +4404,7 @@ function setParamsStatus(text: string, warn = false): void {
     paramsStatusTimer = setTimeout(() => setParamsStatus(""), warn ? 8000 : 3000);
   }
 }
-let currentParamValues: Record<string, number> = {};
+let currentParamValues: Record<string, ParamValue> = {};
 let lastScriptJs: string = "";
 let paramDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -4427,13 +4433,10 @@ function executeWithCurrentParams() {
  * stopped tracking the mouse. It also dropped keyboard focus mid-interaction.
  *
  * So: only rebuild when the SET of parameters changes (a different file, or an
- * edit that added or removed a key). When the names match, update the existing
- * controls in place and leave the DOM — and the drag — alone.
+ * edit that added or removed a key, or changed one's kind). When the layout
+ * matches, update the existing controls in place and leave the DOM — and the
+ * drag — alone.
  */
-function paramNamesMatch(a: ParamDef[], b: ParamDef[]): boolean {
-  if (a.length !== b.length) return false;
-  return a.every((p, i) => p.name === b[i]!.name);
-}
 
 function updateParamsUI(params: ParamDef[]) {
   const previous = currentParamDefs;
@@ -4445,12 +4448,16 @@ function updateParamsUI(params: ParamDef[]) {
     return;
   }
 
-  if (previous && paramNamesMatch(previous, params)) {
+  if (previous && paramLayoutMatches(previous, params)) {
     for (const p of params) {
       currentParamValues[p.name] = p.value;
       const input = document.getElementById(`pv-${p.name}`) as HTMLInputElement | null;
       if (!input) continue;
-      input.dataset.step = String(p.step ?? (Math.abs(p.value) >= 10 ? 1 : 0.1));
+      if (!isNumericParam(p)) {
+        input.value = formatParamValue(p.value);
+        continue;
+      }
+      input.dataset.step = String(paramStep(p));
       // Protect a field with edits in it, not merely one that holds focus.
       // Guarding on focus alone left a stale number on screen whenever the file
       // changed while the cursor happened to be resting in that field.
@@ -4478,6 +4485,12 @@ function updateParamsUI(params: ParamDef[]) {
     nameEl.textContent = p.name;
     nameEl.title = p.name;
 
+    if (!isNumericParam(p)) {
+      row.append(nameEl, readOnlyParamField(p));
+      paramsList.appendChild(row);
+      continue;
+    }
+
     const input = document.createElement("input");
     input.type = "text";
     // `text` rather than `number`: number inputs bring spinners we would only
@@ -4489,7 +4502,7 @@ function updateParamsUI(params: ParamDef[]) {
     input.value = formatParamValue(p.value);
     input.spellcheck = false;
     input.autocomplete = "off";
-    input.dataset.step = String(p.step ?? (Math.abs(p.value) >= 10 ? 1 : 0.1));
+    input.dataset.step = String(paramStep(p));
     input.title =
       "Scroll over this field to change it, or click to type. Shift = x10, Alt = x0.1.";
 
@@ -4631,10 +4644,22 @@ function updateParamsUI(params: ParamDef[]) {
   }
 }
 
-/** Compact, and never scientific notation — nobody wants `1e-7` in a dimension. */
-function formatParamValue(v: number): string {
-  if (Number.isInteger(v)) return String(v);
-  return String(Number(v.toFixed(4)));
+/**
+ * The field for a string or boolean parameter. Read-only: nudging and
+ * writeback are numeric, and a free-text box that re-executed on every
+ * keystroke would throw a render error for each half-typed designator. It is
+ * still a real input, so the value can be selected and copied.
+ */
+function readOnlyParamField(p: ParamDef): HTMLInputElement {
+  const input = document.createElement("input");
+  input.type = "text";
+  input.readOnly = true;
+  input.tabIndex = -1;
+  input.className = "param-input readonly";
+  input.id = `pv-${p.name}`;
+  input.value = formatParamValue(p.value);
+  input.title = `${formatParamValue(p.value)} — not a number, so edit it in the file.`;
+  return input;
 }
 
 paramsHeader.addEventListener("click", () => {
