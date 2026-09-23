@@ -6,6 +6,24 @@ its own versions in `packages/mcp-server/CHANGELOG.md`.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project follows semantic versioning at the extension level.
 
+## [1.29.2] - 2026-09-23
+
+Extension `1.29.2` / mcp-server `1.29.2` — a face op no longer writes a line
+that silently does nothing.
+
+### Fixed
+- **Coplanar faces.** Fusing gussets onto a bracket's base splits the base's
+  top into several faces in one plane. Picking one and pressing Extrude wrote
+  `extrudeFace(bracket, (f) => f.inPlane("XY", thickness), 3)`. That selector
+  matched all three faces, so `extrudeFace` refused it and the model came back
+  unchanged. The worker now counts what the selector matches on every preview.
+  If the plane is shared, it finds a point that isolates the picked face and
+  writes it as `.containsPoint([…])`. It checks the point against the kernel
+  before offering it. If no point works, Apply stays disabled and the op bar
+  says why. Apply is also disabled until that count comes back.
+- The serve host's `face-op` validator now keeps the new `pin` field. Its
+  whitelist dropped the field, so the file got the plane-only line anyway.
+
 ## [1.29.0] - 2026-08-28
 
 Extension `1.29.0` / mcp-server `1.29.0` — Mirror and Pattern in the viewport.

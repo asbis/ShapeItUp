@@ -73,6 +73,20 @@ describe("ViewerProvider.commitFaceOp", () => {
     });
   });
 
+  it("writes the pin the viewer sent, so a shared plane still names one face", async () => {
+    const doc = __addDoc(FILE, SRC, { visible: true });
+    const { provider } = makeProvider(FILE);
+
+    const r = await provider.commitFaceOp(
+      request({ target: { kind: "face", face: { ...TOP_FACE, pin: [0, 12.5, 6] } } }),
+    );
+
+    expect(r.ok).toBe(true);
+    expect(doc.text).toContain(
+      '(f) => f.inPlane("XY", thickness).containsPoint([0, 12.5, thickness]), 5)',
+    );
+  });
+
   it("adds the import, and applies both edits without corrupting either", async () => {
     // The wrap sits far below the import, so applying ascending would shift
     // the wrap's offsets by the inserted line's length and land it mid-token.

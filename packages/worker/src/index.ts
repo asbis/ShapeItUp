@@ -213,6 +213,11 @@ async function executeUserScript(
       self.postMessage({ type: "preview-limit", max: result.previewLimit });
     }
 
+    // Whether the face selector is unique — the viewer gates Apply on it.
+    if (result.previewTarget) {
+      self.postMessage({ type: "preview-target", ...result.previewTarget });
+    }
+
     // The added/removed ghost, if the operation produced one. Sent before
     // mesh-done so the viewer has it by the time the render settles.
     if (result.previewDelta) {

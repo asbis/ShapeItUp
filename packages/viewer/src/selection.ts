@@ -456,6 +456,42 @@ export function faceBounds(part: PickablePart, sel: FaceSelection, pad = 0.05): 
 }
 
 /**
+ * A point guaranteed to lie inside a picked face: the centroid of its largest
+ * triangle.
+ *
+ * The face's own centre is not good enough — an L-shaped face, or a plate top
+ * with a boss fused through it, has its centre of mass outside itself. A
+ * triangle's centroid is always inside the triangle, and the triangles tile
+ * the face. The LARGEST is used so the point sits well clear of the boundary,
+ * where a Float32 round trip cannot push it onto a neighbouring face.
+ */
+export function faceInteriorPoint(
+  part: Pick<PickablePart, "vertices" | "triangles">,
+  sel: Pick<FaceSelection, "start" | "count">,
+): [number, number, number] | null {
+  const v = part.vertices;
+  let best: [number, number, number] | null = null;
+  let bestArea = 0;
+  for (let t = sel.start; t + 2 < sel.start + sel.count; t += 3) {
+    const a = part.triangles[t]! * 3;
+    const b = part.triangles[t + 1]! * 3;
+    const c = part.triangles[t + 2]! * 3;
+    const ux = v[b]! - v[a]!, uy = v[b + 1]! - v[a + 1]!, uz = v[b + 2]! - v[a + 2]!;
+    const wx = v[c]! - v[a]!, wy = v[c + 1]! - v[a + 1]!, wz = v[c + 2]! - v[a + 2]!;
+    const area = Math.hypot(uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx);
+    if (area > bestArea) {
+      bestArea = area;
+      best = [
+        (v[a]! + v[b]! + v[c]!) / 3,
+        (v[a + 1]! + v[b + 1]! + v[c + 1]!) / 3,
+        (v[a + 2]! + v[b + 2]! + v[c + 2]!) / 3,
+      ];
+    }
+  }
+  return best;
+}
+
+/**
  * Build one LineSegments covering the given edges of a part, for the fillet
  * preview. Returns null when there is nothing to draw.
  */

@@ -216,6 +216,12 @@ export type WebviewToExt =
               kind: string;
               center: [number, number, number];
               normal?: [number, number, number];
+              /**
+               * Set when the face's plane matches several faces: a point the
+               * worker verified lies in this face and no other. See
+               * `SelectableFace.pin`.
+               */
+              pin?: [number, number, number];
             };
           }
         | { kind: "edge"; point: [number, number, number] };
@@ -317,7 +323,23 @@ export interface PreviewFaceOp {
   /** Null for a script returning a bare shape. */
   partName: string | null;
   target:
-    | { kind: "face"; plane: string; offset: number }
+    | {
+        kind: "face";
+        plane: string;
+        offset: number;
+        /**
+         * The picked face's centre, as its descriptor reports it. Identifies
+         * WHICH face was meant when the plane matches several, and is the
+         * first candidate for a pin — see {@link PreviewTargetReport}.
+         */
+        center?: [number, number, number];
+        /**
+         * A point known to lie inside the picked face — the fallback pin when
+         * the centre does not (an L-shaped or ring face has its centre outside
+         * itself).
+         */
+        interior?: [number, number, number];
+      }
     | { kind: "edge"; point: [number, number, number] };
   distance: number;
   /**
@@ -327,6 +349,28 @@ export interface PreviewFaceOp {
    * `shell` it is the thickest wall, not a radius.
    */
   probeLimit?: boolean;
+}
+
+/**
+ * What the worker found when it evaluated a previewed face selector against
+ * the current shape.
+ *
+ * The plane predicate the viewer synthesises is not always unique: fuse a
+ * gusset onto a plate and the plate's top becomes several coplanar faces. The
+ * stdlib helpers then refuse to act — "exactly one" is their contract — so a
+ * selector that matched three faces writes a line that does nothing. Only the
+ * worker holds the B-Rep, so only it can count.
+ */
+export interface PreviewTargetReport {
+  /** How many faces the plane predicate alone matches. 1 is the good case. */
+  planeMatches: number;
+  /**
+   * When `planeMatches > 1`: a point that, added as `.containsPoint(pin)`,
+   * matches the picked face and nothing else — verified, not assumed. Absent
+   * when no candidate isolated it, in which case the operation cannot be
+   * written unambiguously and Apply must not be offered.
+   */
+  pin?: [number, number, number];
 }
 
 /**
@@ -515,6 +559,8 @@ export type WorkerToWebview =
   | { type: "preview-delta"; delta: PreviewDelta }
   /** The largest radius the armed operation can take, measured against OCCT. */
   | { type: "preview-limit"; max: number }
+  /** Whether the previewed face selector is unique. See {@link PreviewTargetReport}. */
+  | ({ type: "preview-target" } & PreviewTargetReport)
   /** What a previewed combine measured. See {@link CombineStatsMessage}. */
   | { type: "preview-combine"; stats: CombineStatsMessage }
   // Streaming mesh protocol: mesh-start announces the batch and its params so

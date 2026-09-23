@@ -7,7 +7,15 @@
  * (script execution, tessellation, measurement, export) is identical.
  */
 
-import type { ParamDef, PreviewArrange, PreviewCombine, PreviewDelta, PreviewFaceOp } from "@shapeitup/shared";
+import type {
+  ParamDef,
+  PreviewArrange,
+  PreviewCombine,
+  PreviewDelta,
+  PreviewFaceOp,
+  PreviewTargetReport,
+} from "@shapeitup/shared";
+import { faceTargetFinder, resolveFaceTarget } from "./face-target";
 import { executeScript } from "./executor";
 export { extractParamsStatic, extractConfigStatic, extractExpectedContactsStatic } from "./executor";
 import { describeFaces, normalizeParts, tessellatePart, type MeshQuality, type PartInput, type PartStatsLevel, type TessellatedPart } from "./tessellate";
@@ -108,6 +116,11 @@ export interface ExecutionResult {
    * asked for. Measured against OCCT rather than guessed — see probeMaxRadius.
    */
   previewLimit?: number;
+  /**
+   * Whether the previewed face selector is unique, and the pin that makes it
+   * so when it is not. See {@link PreviewTargetReport}.
+   */
+  previewTarget?: PreviewTargetReport;
   /**
    * What a previewed combine measured about itself — volumes moved, and
    * whether the bodies turned out not to touch. See {@link CombineStats}.
@@ -886,7 +899,7 @@ export async function initCore(
   function applyPreviewOp(
     parts: PartInput[],
     preview: PreviewFaceOp,
-    out: { limit?: number },
+    out: { limit?: number; target?: PreviewTargetReport },
   ): PreviewDelta | undefined {
     // A named part when the script returns a list, otherwise the only one.
     const index = preview.partName
@@ -899,10 +912,26 @@ export async function initCore(
 
     // Bound to a local so the narrowing survives into the closures.
     const target = preview.target;
-    const finder =
+    // Before anything else: does the plane name ONE face? If not, preview
+    // with the pin the viewer will write, so the preview and the committed
+    // line stay the same finder. With no pin found, the plain plane finder is
+    // kept — the helper then declines exactly as the written line would.
+    if (target.kind === "face") {
+      out.target = resolveFaceTarget(
+        part.shape,
+        target.plane,
+        target.offset,
+        target.center,
+        target.interior,
+      );
+    }
+    const faceFinder =
       target.kind === "face"
-        ? (f: any) => f.inPlane(target.plane, target.offset)
-        : (e: any) => e.containsPoint(target.point);
+        ? faceTargetFinder(target.plane, target.offset, out.target?.pin)
+        : null;
+    const finder = faceFinder
+      ? (f: any) => faceFinder(f)
+      : (e: any) => e.containsPoint((target as { point: [number, number, number] }).point);
 
     // The largest radius that works, measured before the operation changes the
     // shape. Rounding only: an extrude has no such ceiling.
@@ -1196,7 +1225,7 @@ export async function initCore(
     const parts = normalizeParts(result, { scriptHasMaterial: !!material });
     // The viewer's live preview: apply the pending operation to the part it
     // targets, so the user sees the geometry before committing it to the file.
-    const previewOut: { limit?: number } = {};
+    const previewOut: { limit?: number; target?: PreviewTargetReport } = {};
     let previewDelta = streaming?.previewOp
       ? applyPreviewOp(parts, streaming.previewOp, previewOut)
       : undefined;
@@ -1441,6 +1470,7 @@ export async function initCore(
       parts: executed,
       previewDelta,
       previewLimit: previewOut.limit,
+      previewTarget: previewOut.target,
       combineStats,
       params,
       execTimeMs: Math.round(execTime),
