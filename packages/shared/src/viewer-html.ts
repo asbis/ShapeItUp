@@ -354,6 +354,15 @@ export function renderViewerHtml(opts: ViewerHtmlOptions): string {
     }
     .param-input.invalid,
     .param-row:hover .param-input.invalid { border-color: #cc8a3c; color: #e5a03c; }
+    /* A string or boolean parameter: shown, not adjustable. No resize cursor,
+       no accent on hover, no edit box on focus — nothing that promises it
+       will move. */
+    .param-input.readonly,
+    .param-row:hover .param-input.readonly,
+    .param-row:hover .param-input.readonly:focus {
+      cursor: default; color: #8a8d91; background: transparent;
+      border-color: transparent; text-overflow: ellipsis;
+    }
     .param-slider {
       -webkit-appearance: none; width: 100%; height: 4px; border-radius: 2px;
       background: #3c3c3c; outline: none;

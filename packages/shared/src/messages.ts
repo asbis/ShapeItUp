@@ -37,7 +37,7 @@ export type ExtToWebview =
       type: "execute-script";
       js: string;
       fileName: string;
-      paramOverrides?: Record<string, number>;
+      paramOverrides?: Record<string, ParamValue>;
       // P3-10: optional tessellation-quality knob plumbed end-to-end from MCP's
       // render_preview → extension host → viewer webview → worker → core. The
       // webview MUST forward this verbatim when dispatching the worker-side
@@ -170,7 +170,7 @@ export type WebviewToExt =
       partCount: number;
       partNames: string[];
       boundingBox: { x: number; y: number; z: number };
-      currentParams: Record<string, number>;
+      currentParams: Record<string, ParamValue>;
       timings?: Record<string, number>;
       warnings?: string[];
       properties?: {
@@ -407,7 +407,7 @@ export type WebviewToWorker =
   | {
       type: "execute";
       js: string;
-      paramOverrides?: Record<string, number>;
+      paramOverrides?: Record<string, ParamValue>;
       // See the matching field on `execute-script` (ExtToWebview). The worker
       // forwards this into `core.execute` as-is; undefined means "use core's
       // auto-degrade heuristic", which is the pre-P3-10 default.
@@ -485,11 +485,19 @@ export interface TessellatedPart {
   centerOfMass?: [number, number, number];
 }
 
+/**
+ * A parameter's value. Numbers are the common case and the only kind the
+ * viewer can nudge or write back; strings and booleans are legitimate
+ * designators (the stdlib's `bearing: "608"`, `size: "M4"`) that the executor
+ * accepts as overrides and passes through untouched.
+ */
+export type ParamValue = number | string | boolean;
+
 // Parameter definition extracted from script
 export interface ParamDef {
   name: string;
   /** The value the model was BUILT with — declared value plus any override. */
-  value: number;
+  value: ParamValue;
   /**
    * What the FILE declares, when an override is in force and the two differ.
    * Absent when they are the same.
@@ -498,11 +506,12 @@ export interface ParamDef {
    * synthesises against the file, so a parameter dragged to 10 in a session
    * where the file still says 6 must not be previewed as a match.
    */
-  declared?: number;
+  declared?: ParamValue;
   /**
    * Increment for one wheel notch or arrow press in the viewer. Derived from
    * the value the FILE declares, so overriding a 0.5 default to 12 keeps the
-   * fine 0.1 step — the parameter is still a fine one.
+   * fine 0.1 step — the parameter is still a fine one. Absent for a
+   * non-numeric parameter, which has nothing to step.
    */
   step?: number;
   label?: string;
