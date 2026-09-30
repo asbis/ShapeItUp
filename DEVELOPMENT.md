@@ -20,7 +20,7 @@ Verify with `/mcp` inside a Claude Code session started in this directory — th
 | Extension / viewer / worker | `pnpm dev` (watch) then press **F5** in VS Code | F5 relaunches the Extension Development Host — no manual restart |
 | MCP server (`packages/mcp-server/src/`) | `pnpm dev:mcp` (watch) | **Yes** — `/quit` Claude Code and restart. Stdio MCP processes don't hot-reload. |
 | Stdlib (`packages/core/src/stdlib/`) | `pnpm dev` (rebuilds both the extension bundles *and* the mcp-server, since stdlib is bundled into both) | F5 for viewer changes; restart Claude for MCP changes |
-| Skill docs (`skill/SKILL.md`) | `pnpm build` to copy into `dist/skill/` | Reinstall the skill (or reload Claude Code) to pick it up |
+| Skill docs (`skills/shapeitup/SKILL.md`) | `pnpm build` to copy into `dist/skills/shapeitup/` | Reinstall the skill (or reload Claude Code) to pick it up |
 
 F5 alone works too — `.vscode/launch.json` runs `pnpm build` as a pre-launch task, so you don't need a separate dev server running if you just want a one-shot test.
 

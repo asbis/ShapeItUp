@@ -48,7 +48,7 @@ All packages are bundled with a single `esbuild.config.mjs` at the root. It prod
 
 1. Add the tool definition in `packages/mcp-server/src/tools.ts`
 2. Update the API reference in the `getApiReference()` function
-3. Update `skill/SKILL.md` with documentation
+3. Update `skills/shapeitup/SKILL.md` with documentation
 4. Copy the skill to `~/.claude/commands/shapeitup.md`
 
 ## Adding Examples

@@ -13,6 +13,15 @@ import {
 } from "./workspace-types";
 import { registerMcpClientsView, showFirstRunNudgeIfNeeded } from "./mcp-clients-view";
 import { getCachedWasmAssets } from "./wasm-cache";
+import {
+  VIBE_ENTRY,
+  hasVibeEntry,
+  usesInlineMcpServers,
+  vibeConfigPath,
+  vibeSkillDir,
+  withVibeEntry,
+  withoutVibeEntry,
+} from "./vibe-config";
 
 let viewerProvider: ViewerProvider;
 export const outputChannel = vscode.window.createOutputChannel("ShapeItUp");
@@ -65,11 +74,12 @@ export function activate(context: vscode.ExtensionContext) {
   });
 
   // Consent-based install command for Claude Code / Cursor / Claude Desktop /
-  // Gemini CLI. Surfaces the one-shot AI install prompt that users can paste
-  // into any agentic CLI.
+  // Gemini CLI / Mistral Vibe. Surfaces the one-shot AI install prompt that
+  // users can paste into any agentic CLI. The MCP Clients view passes the
+  // row's option id so a click goes straight to that client.
   context.subscriptions.push(
-    vscode.commands.registerCommand("shapeitup.installMcpServer", () =>
-      showMcpInstallOptions(context, outputChannel),
+    vscode.commands.registerCommand("shapeitup.installMcpServer", (target?: string) =>
+      showMcpInstallOptions(context, outputChannel, target),
     ),
     vscode.commands.registerCommand("shapeitup.uninstallMcpServer", () =>
       uninstallMcpServer(outputChannel),
@@ -429,18 +439,20 @@ function registerMcpServerForCopilot(
  * Consented install surface for external MCP clients. We refuse to silently
  * write to ~/.claude.json, ~/.claude/skills/, or ~/.gemini/ — users pick a
  * client from the QuickPick and we either (a) copy the `claude mcp add …`
- * command to the clipboard, (b) open a deep-link to Cursor, or (c) surface
- * the AI install prompt that any agentic CLI can execute on their behalf.
+ * command to the clipboard, (b) open a deep-link to Cursor, (c) surface
+ * the AI install prompt that any agentic CLI can execute on their behalf, or
+ * (d) for Mistral Vibe, append to its config.toml after a modal confirmation.
  */
 async function showMcpInstallOptions(
-  _context: vscode.ExtensionContext,
+  context: vscode.ExtensionContext,
   output: vscode.OutputChannel,
+  target?: string,
 ) {
   const INSTALL_PROMPT_URL =
     "https://raw.githubusercontent.com/asbis/ShapeItUp/master/INSTALL.md";
   const NPM_COMMAND = "npx -y @shapeitup/mcp-server";
 
-  const picked = await vscode.window.showQuickPick(
+  const picked = typeof target === "string" ? { id: target } : await vscode.window.showQuickPick(
     [
       {
         label: "$(copy) Copy AI install prompt URL",
@@ -461,6 +473,11 @@ async function showMcpInstallOptions(
         label: "$(file-code) Copy Claude Desktop JSON snippet",
         description: "Paste into claude_desktop_config.json",
         id: "desktop",
+      },
+      {
+        label: "$(add) Add to Mistral Vibe",
+        description: "Writes ~/.vibe/config.toml after you confirm",
+        id: "vibe",
       },
     ],
     { placeHolder: "Install ShapeItUp MCP server for which client?" },
@@ -503,6 +520,10 @@ async function showMcpInstallOptions(
       );
       break;
     }
+    case "vibe": {
+      if (!(await installForVibe(context, output))) return;
+      break;
+    }
   }
   output.appendLine(`[mcp] User chose install target: ${(picked as any).id}`);
 
@@ -511,6 +532,88 @@ async function showMcpInstallOptions(
   // Claude Code's connect timeout can fire before that finishes, surfacing
   // a spurious "failed" state even when the server is healthy.
   warmNpxMcpCache(output);
+}
+
+/**
+ * Register ShapeItUp with Mistral Vibe — its CLI and VS Code extension share
+ * `$VIBE_HOME/config.toml` — and optionally copy the bundled skill next to
+ * it. Vibe has no deep link and no JSON to paste into a settings UI, so this
+ * is the one client we write for, and only after a modal that shows exactly
+ * what gets appended. Returns false when nothing was written.
+ */
+async function installForVibe(
+  context: vscode.ExtensionContext,
+  output: vscode.OutputChannel,
+): Promise<boolean> {
+  const configFile = vibeConfigPath();
+  const readConfig = () => (fs.existsSync(configFile) ? fs.readFileSync(configFile, "utf-8") : "");
+  let text: string;
+  try {
+    text = readConfig();
+  } catch (e: any) {
+    vscode.window.showErrorMessage(`Couldn't read ${configFile}: ${e.message}`);
+    return false;
+  }
+
+  const skillSrc = path.join(context.extensionPath, "dist", "skills", "shapeitup", "SKILL.md");
+  const skillFile = path.join(vibeSkillDir(), "SKILL.md");
+  const needServer = !hasVibeEntry(text);
+  const needSkill = fs.existsSync(skillSrc) && !fs.existsSync(skillFile);
+
+  if (needServer && usesInlineMcpServers(text)) {
+    // An inline `mcp_servers = [...]` can't be extended by appending a table,
+    // and rewriting the user's array is not a guess worth making for them.
+    await vscode.env.clipboard.writeText(
+      `{ name = "shapeitup", transport = "stdio", command = "npx", args = ["-y", "@shapeitup/mcp-server"], startup_timeout_sec = 60 }`,
+    );
+    await vscode.window.showTextDocument(vscode.Uri.file(configFile));
+    vscode.window.showInformationMessage(
+      "This config.toml declares mcp_servers inline. Copied a ShapeItUp entry: add it to that list, then run /reload in Vibe.",
+    );
+    return false;
+  }
+  if (!needServer && !needSkill) {
+    vscode.window.showInformationMessage(`ShapeItUp is already set up for Mistral Vibe (${configFile}).`);
+    return false;
+  }
+
+  const BOTH = "Add server and skill";
+  const SERVER = needSkill ? "Add server only" : "Add server";
+  const SKILL = "Install skill";
+  const detail = [
+    needServer ? `Appends to ${configFile}:\n\n${VIBE_ENTRY}` : `${configFile} already registers ShapeItUp.`,
+    needSkill ? `The skill (Replicad API reference for .shape.ts files) goes to ${skillFile}.` : "",
+  ].filter(Boolean).join("\n\n");
+  const choice = await vscode.window.showInformationMessage(
+    needServer ? "Add ShapeItUp to Mistral Vibe?" : "Install the ShapeItUp skill for Mistral Vibe?",
+    { modal: true, detail },
+    ...(needServer ? (needSkill ? [BOTH, SERVER] : [SERVER]) : [SKILL]),
+  );
+  if (!choice) return false;
+
+  try {
+    if (needServer && choice !== SKILL) {
+      // Re-read: the file may have changed while the modal was open.
+      const current = readConfig();
+      if (!hasVibeEntry(current)) {
+        fs.mkdirSync(path.dirname(configFile), { recursive: true });
+        fs.writeFileSync(configFile, withVibeEntry(current));
+        output.appendLine(`[mcp] Added shapeitup to ${configFile}`);
+      }
+    }
+    if (needSkill && choice !== SERVER) {
+      fs.mkdirSync(path.dirname(skillFile), { recursive: true });
+      fs.copyFileSync(skillSrc, skillFile);
+      output.appendLine(`[mcp] Installed Vibe skill to ${skillFile}`);
+    }
+  } catch (e: any) {
+    vscode.window.showErrorMessage(`Failed to set up Mistral Vibe: ${e.message}`);
+    return false;
+  }
+  vscode.window.showInformationMessage(
+    "ShapeItUp added to Mistral Vibe. Run /reload in Vibe (or start a new session) to pick it up.",
+  );
+  return true;
 }
 
 /**
@@ -586,19 +689,29 @@ async function uninstallMcpServer(output: vscode.OutputChannel) {
   const hasGemini = fs.existsSync(geminiExt);
   const skill = path.join(home, ".claude", "skills", "shapeitup");
   const hasSkill = fs.existsSync(skill);
+  const vibeConfig = vibeConfigPath();
+  let hasVibe = false;
+  try {
+    hasVibe = withoutVibeEntry(fs.readFileSync(vibeConfig, "utf-8")) !== undefined;
+  } catch {}
+  const vibeSkill = vibeSkillDir();
+  const hasVibeSkill = fs.existsSync(vibeSkill);
 
-  if (found.length === 0 && !hasGemini && !hasSkill) {
+  if (found.length === 0 && !hasGemini && !hasSkill && !hasVibe && !hasVibeSkill) {
     vscode.window.showInformationMessage("No ShapeItUp MCP entries found to uninstall.");
     return;
   }
 
   type UninstallItem =
     | { label: string; mode: "json"; target: typeof targets[number] }
+    | { label: string; mode: "toml"; target: string }
     | { label: string; mode: "dir"; target: string };
   const items: UninstallItem[] = [];
   for (const t of found) items.push({ label: t.label, target: t, mode: "json" });
   if (hasGemini) items.push({ label: `Gemini CLI (${geminiExt})`, target: geminiExt, mode: "dir" });
   if (hasSkill) items.push({ label: `Claude Code skill (${skill})`, target: skill, mode: "dir" });
+  if (hasVibe) items.push({ label: `Mistral Vibe (${vibeConfig})`, target: vibeConfig, mode: "toml" });
+  if (hasVibeSkill) items.push({ label: `Mistral Vibe skill (${vibeSkill})`, target: vibeSkill, mode: "dir" });
   const picks = await vscode.window.showQuickPick(items, {
     canPickMany: true,
     placeHolder: "Select ShapeItUp entries to remove",
@@ -621,6 +734,12 @@ async function uninstallMcpServer(output: vscode.OutputChannel) {
           delete c.mcpServers.shapeitup;
           fs.writeFileSync(t.file, JSON.stringify(c, null, 2) + "\n");
           output.appendLine(`[mcp] Removed shapeitup from ${t.file}`);
+        }
+      } else if (p.mode === "toml") {
+        const next = withoutVibeEntry(fs.readFileSync(p.target, "utf-8"));
+        if (next !== undefined) {
+          fs.writeFileSync(p.target, next);
+          output.appendLine(`[mcp] Removed shapeitup from ${p.target}`);
         }
       } else {
         fs.rmSync(p.target as string, { recursive: true, force: true });

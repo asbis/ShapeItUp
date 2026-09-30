@@ -13,7 +13,7 @@
 
 ---
 
-ShapeItUp is an MCP server that turns [Replicad](https://replicad.xyz) / OpenCascade into AI-agent-grade CAD tooling. It writes, renders, verifies, and exports parametric 3D models from TypeScript `.shape.ts` files, headlessly — from the terminal, from Claude Code / Cursor / Claude Desktop, or from CI. A [VSCode extension](#vscode-extension-optional) is available as an optional interactive viewer for humans who want to watch the renders happen live.
+ShapeItUp is an MCP server that turns [Replicad](https://replicad.xyz) / OpenCascade into AI-agent-grade CAD tooling. It writes, renders, verifies, and exports parametric 3D models from TypeScript `.shape.ts` files, headlessly — from the terminal, from Claude Code / Cursor / Claude Desktop / Mistral Vibe, or from CI. A [VSCode extension](#vscode-extension-optional) is available as an optional interactive viewer for humans who want to watch the renders happen live.
 
 ## Install for Claude Code
 
@@ -42,7 +42,23 @@ Where to put it:
 
 - **Cursor** — `~/.cursor/mcp.json`, or Settings → MCP → *Add new server* to drop it in through the UI.
 - **Claude Desktop** — `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows. Restart the app after editing.
+- **Mistral Vibe** — TOML rather than JSON; see below.
 - **Any stdio MCP client** — hand it `npx -y @shapeitup/mcp-server` as the server command.
+
+### Mistral Vibe
+
+Append to `~/.vibe/config.toml`, then run `/reload` in Vibe:
+
+```toml
+[[mcp_servers]]
+name = "shapeitup"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@shapeitup/mcp-server"]
+startup_timeout_sec = 60
+```
+
+Keep `startup_timeout_sec`: Vibe's default of 10 s is shorter than the first `npx` download. For the Replicad API reference, save [`skills/shapeitup/SKILL.md`](skills/shapeitup/SKILL.md) as `~/.vibe/skills/shapeitup/SKILL.md`. More options, including `vibe mcp add`, are in the [MCP server README](packages/mcp-server/README.md#mistral-vibe).
 
 Node 20+ required. No native build step; everything ships as WASM.
 

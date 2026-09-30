@@ -10,6 +10,7 @@ import * as vscode from "vscode";
 import * as path from "path";
 import * as fs from "fs";
 import * as os from "os";
+import { hasVibeEntry, vibeConfigPath, vibeHome } from "./vibe-config";
 
 type Status = "registered" | "available" | "not-installed";
 
@@ -19,6 +20,8 @@ interface ClientInfo {
   status: Status;
   detail: string;
   installCommandId?: string;
+  /** Option id in the install QuickPick; a click skips straight to it. */
+  installTarget?: string;
 }
 
 function readJson(file: string): any | undefined {
@@ -32,6 +35,14 @@ function readJson(file: string): any | undefined {
 function hasShapeitupEntry(file: string): boolean {
   const c = readJson(file);
   return !!c?.mcpServers?.shapeitup;
+}
+
+function hasVibeShapeitupEntry(file: string): boolean {
+  try {
+    return hasVibeEntry(fs.readFileSync(file, "utf-8"));
+  } catch {
+    return false;
+  }
 }
 
 function detectClients(): ClientInfo[] {
@@ -51,6 +62,7 @@ function detectClients(): ClientInfo[] {
     ? path.join(home, "AppData", "Roaming", "Claude", "claude_desktop_config.json")
     : path.join(home, ".config", "Claude", "claude_desktop_config.json");
   const geminiManifest = path.join(home, ".gemini", "extensions", "shapeitup", "gemini-extension.json");
+  const vibeConfig = vibeConfigPath();
 
   const hasClaudeCli =
     fs.existsSync(claudeJson) ||
@@ -73,6 +85,14 @@ function detectClients(): ClientInfo[] {
     fs.existsSync(path.join(home, ".local", "bin", "gemini")) ||
     fs.existsSync("/usr/local/bin/gemini") ||
     fs.existsSync("/opt/homebrew/bin/gemini");
+
+  // Covers the CLI and the VS Code extension alike: both read ~/.vibe/.
+  const hasVibe =
+    fs.existsSync(vibeHome()) ||
+    fs.existsSync(path.join(home, ".local", "bin", "vibe")) ||
+    fs.existsSync("/usr/local/bin/vibe") ||
+    fs.existsSync("/opt/homebrew/bin/vibe");
+  const vibeRegistered = hasVibe && hasVibeShapeitupEntry(vibeConfig);
 
   return [
     {
@@ -97,6 +117,7 @@ function detectClients(): ClientInfo[] {
         ? "~/.claude.json has shapeitup entry"
         : "Click to copy `claude mcp add` command",
       installCommandId: "shapeitup.installMcpServer",
+      installTarget: "claude",
     },
     {
       id: "cursor",
@@ -112,6 +133,7 @@ function detectClients(): ClientInfo[] {
         ? "~/.cursor/mcp.json has shapeitup entry"
         : "Click to open Cursor install deep-link",
       installCommandId: "shapeitup.installMcpServer",
+      installTarget: "cursor",
     },
     {
       id: "claude-desktop",
@@ -127,6 +149,7 @@ function detectClients(): ClientInfo[] {
         ? "claude_desktop_config.json has shapeitup entry"
         : "Click to copy JSON snippet",
       installCommandId: "shapeitup.installMcpServer",
+      installTarget: "desktop",
     },
     {
       id: "gemini",
@@ -142,8 +165,26 @@ function detectClients(): ClientInfo[] {
         ? "~/.gemini/extensions/shapeitup/ exists"
         : "Click to copy AI install prompt",
       installCommandId: "shapeitup.installMcpServer",
+      installTarget: "ai",
+    },
+    {
+      id: "vibe",
+      label: "Mistral Vibe",
+      status: !hasVibe ? "not-installed" : vibeRegistered ? "registered" : "available",
+      detail: !hasVibe
+        ? "Not detected on this machine"
+        : vibeRegistered
+        ? `${tildify(vibeConfig)} has shapeitup entry`
+        : `Click to add ShapeItUp to ${tildify(vibeConfig)}`,
+      installCommandId: "shapeitup.installMcpServer",
+      installTarget: "vibe",
     },
   ];
+}
+
+function tildify(p: string): string {
+  const home = os.homedir();
+  return p.startsWith(home + path.sep) ? "~" + p.slice(home.length) : p;
 }
 
 class McpClientItem extends vscode.TreeItem {
@@ -169,6 +210,7 @@ class McpClientItem extends vscode.TreeItem {
       this.command = {
         command: info.installCommandId,
         title: "Install",
+        arguments: info.installTarget ? [info.installTarget] : undefined,
       };
       this.contextValue = "installable";
     }
@@ -360,7 +402,7 @@ export async function showFirstRunNudgeIfNeeded(context: vscode.ExtensionContext
   }
 
   const choice = await vscode.window.showInformationMessage(
-    "ShapeItUp is installed. To use it with Claude Code, Cursor, or Gemini, install the MCP server.",
+    "ShapeItUp is installed. To use it with Claude Code, Cursor, Gemini, or Mistral Vibe, install the MCP server.",
     "Install…",
     "Already done",
     "Don't show again",

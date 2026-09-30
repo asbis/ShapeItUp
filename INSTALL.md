@@ -1,7 +1,7 @@
 # ShapeItUp — Install Prompt for AI Agents
 
 > **For humans:** paste the whole of this file into any agentic CLI
-> (Claude Code, Cursor agent, Gemini, Codex, etc.) and tell it to follow
+> (Claude Code, Cursor agent, Gemini, Mistral Vibe, Codex, etc.) and tell it to follow
 > the instructions. The agent will detect your MCP clients and register
 > ShapeItUp with your explicit approval.
 
@@ -20,7 +20,7 @@ register the server with every MCP client.
 | Transport | stdio |
 | Command | `npx` |
 | Args | `["-y", "@shapeitup/mcp-server"]` |
-| Skill source | `https://raw.githubusercontent.com/asbis/ShapeItUp/master/skill/SKILL.md` |
+| Skill source | `https://raw.githubusercontent.com/asbis/ShapeItUp/master/skills/shapeitup/SKILL.md` |
 
 Node 20+ is required. The `npx -y @shapeitup/mcp-server` form auto-fetches the
 latest published version on first run and caches it; no manual install needed.
@@ -43,6 +43,8 @@ Check for each of these (absence of one is fine — just skip that client):
 - **Claude Desktop**: `~/Library/Application Support/Claude/claude_desktop_config.json`
   on macOS, `%APPDATA%\Claude\claude_desktop_config.json` on Windows.
 - **Gemini CLI**: `which gemini` succeeds, OR `~/.gemini/` exists.
+- **Mistral Vibe** (CLI or VS Code extension): `which vibe` succeeds, OR
+  `~/.vibe/` exists (`$VIBE_HOME` instead of `~/.vibe` when it is set).
 - **VS Code / Copilot Agent Mode**: if the ShapeItUp VS Code extension is
   installed, the MCP server is already registered via the native provider API
   — **skip this client**, no action needed.
@@ -117,6 +119,26 @@ Create `~/.gemini/extensions/shapeitup/gemini-extension.json`:
 }
 ```
 
+#### Mistral Vibe
+
+The config is TOML. If `~/.vibe/config.toml` already has an `[[mcp_servers]]`
+entry with `name = "shapeitup"`, skip this client. Otherwise append (create the
+file if missing; never rewrite what is already there):
+
+```toml
+[[mcp_servers]]
+name = "shapeitup"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@shapeitup/mcp-server"]
+startup_timeout_sec = 60
+```
+
+If the file declares `mcp_servers = [...]` as an inline array instead, add the
+same fields to that array as an inline table rather than appending, since TOML
+does not allow both forms. Keep `startup_timeout_sec`: Vibe's default of 10 s
+is shorter than the first `npx` download. Tell the user to run `/reload` in Vibe.
+
 ### Step 3 — Install the Claude Code skill (optional but recommended)
 
 If Claude Code is present, fetch `SKILL.md` from the URL in the table above
@@ -125,9 +147,12 @@ full Replicad API reference when working on `.shape.ts` files. Ask first.
 
 ```bash
 mkdir -p ~/.claude/skills/shapeitup
-curl -fsSL https://raw.githubusercontent.com/asbis/ShapeItUp/master/skill/SKILL.md \
+curl -fsSL https://raw.githubusercontent.com/asbis/ShapeItUp/master/skills/shapeitup/SKILL.md \
   -o ~/.claude/skills/shapeitup/SKILL.md
 ```
+
+If Mistral Vibe is present, the same file works there unchanged: write it to
+`~/.vibe/skills/shapeitup/SKILL.md` (ask first). Vibe picks it up on `/reload`.
 
 ### Step 4 — Verify
 
@@ -150,6 +175,7 @@ so the user can troubleshoot.
 ## Uninstall
 
 To remove ShapeItUp from an MCP client, delete the `shapeitup` entry from the
-relevant config file, or run `claude mcp remove shapeitup` for Claude Code.
-No global state is left behind beyond those config entries and the optional
-skill file at `~/.claude/skills/shapeitup/`.
+relevant config file, or run `claude mcp remove shapeitup` for Claude Code and
+`vibe mcp remove shapeitup` for Mistral Vibe. No global state is left behind
+beyond those config entries and the optional skill files at
+`~/.claude/skills/shapeitup/` and `~/.vibe/skills/shapeitup/`.
