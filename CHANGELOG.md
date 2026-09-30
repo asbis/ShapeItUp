@@ -9,7 +9,7 @@ Releases 1.17.0–1.24.0 are described only in their
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project follows semantic versioning at the extension level.
 
-## [1.30.0] - Unreleased
+## [1.30.0] - 2026-09-30
 
 Extension `1.30.0` / mcp-server `1.30.0` — Mistral Vibe support
 ([#1](https://github.com/asbis/ShapeItUp/issues/1), thanks @martinrieder).
