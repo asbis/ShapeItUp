@@ -9,6 +9,36 @@ Releases 1.17.0–1.24.0 are described only in their
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project follows semantic versioning at the extension level.
 
+## [1.30.0] - 2026-09-30
+
+Extension `1.30.0` / mcp-server `1.30.0` — Mistral Vibe support
+([#1](https://github.com/asbis/ShapeItUp/issues/1), thanks @martinrieder).
+
+### Added
+- **Mistral Vibe in the MCP Clients view.** The sidebar detects Vibe (CLI or
+  VS Code extension, both of which read `~/.vibe/`, or `$VIBE_HOME`) and shows
+  whether `config.toml` registers ShapeItUp.
+- **ShapeItUp: Install MCP Server… → Add to Mistral Vibe.** Appends a
+  `[[mcp_servers]]` entry to `~/.vibe/config.toml` and, if you want it, copies
+  the skill to `~/.vibe/skills/shapeitup/SKILL.md`, where Vibe also exposes it
+  as `/shapeitup`. A modal shows exactly what gets written first, and nothing
+  else in the file is touched. **ShapeItUp: Uninstall MCP Server…** removes
+  both again.
+- **Vibe setup in the docs** (`README.md`, `packages/mcp-server/README.md`,
+  `INSTALL.md`), including `vibe mcp add`. The entry sets
+  `startup_timeout_sec = 60`: Vibe's default is 10 s, and the first `npx -y`
+  run took 17.5 s from an empty npm cache, so a fresh install would time out
+  on its first launch without it.
+
+### Changed
+- **Clicking a client in the MCP Clients view goes straight to that client's
+  install action**, which each row's tooltip already described, instead of
+  opening the full list of options.
+
+### Fixed
+- **`INSTALL.md` pointed agents at `skill/SKILL.md`, which returns 404.** The
+  skill lives at `skills/shapeitup/SKILL.md`.
+
 ## [1.29.5] - 2026-09-23
 
 Extension `1.29.5` / mcp-server `1.29.5`.

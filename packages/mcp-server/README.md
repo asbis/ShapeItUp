@@ -1,6 +1,6 @@
 # @shapeitup/mcp-server
 
-MCP server for [ShapeItUp](https://github.com/asbis/ShapeItUp) — scripted CAD tools (Replicad / OpenCascade WASM) for Claude Code, Cursor, Claude Desktop, Gemini CLI, and any stdio MCP client. Fully headless, no VSCode required.
+MCP server for [ShapeItUp](https://github.com/asbis/ShapeItUp) — scripted CAD tools (Replicad / OpenCascade WASM) for Claude Code, Cursor, Claude Desktop, Gemini CLI, Mistral Vibe, and any stdio MCP client. Fully headless, no VSCode required.
 
 ## Install
 
@@ -31,6 +31,29 @@ claude mcp add shapeitup -- npx -y @shapeitup/mcp-server
 
 - Cursor: `~/.cursor/mcp.json` (or Settings → MCP)
 - Claude Desktop: `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS), `%APPDATA%\Claude\claude_desktop_config.json` (Windows)
+
+### Mistral Vibe
+
+Append to `~/.vibe/config.toml` (the CLI and the VS Code extension share it), then run `/reload` in Vibe:
+
+```toml
+[[mcp_servers]]
+name = "shapeitup"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@shapeitup/mcp-server"]
+startup_timeout_sec = 60
+```
+
+Or have Vibe write it for you:
+
+```bash
+vibe mcp add shapeitup --transport stdio --command npx --arg=-y --arg=@shapeitup/mcp-server --startup-timeout-sec 60
+```
+
+Keep `startup_timeout_sec`. Vibe's default is 10 s, and the first run of `npx` downloads the package, which can take longer than that. The tools show up as `shapeitup_create_shape`, `shapeitup_render_preview` and so on.
+
+For the Replicad API reference, save [`SKILL.md`](https://github.com/asbis/ShapeItUp/blob/master/skills/shapeitup/SKILL.md) as `~/.vibe/skills/shapeitup/SKILL.md`. Vibe loads it as-is, and it also becomes the `/shapeitup` command. With the VS Code extension installed, **ShapeItUp: Install MCP Server… → Add to Mistral Vibe** does both steps after you confirm.
 
 Node 20+ required. Works in Docker / CI (WASM, no native deps).
 
