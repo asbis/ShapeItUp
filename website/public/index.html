@@ -148,7 +148,9 @@
             <pre class="code-block" data-copy-block><span class="c"># ~/.codex/config.toml</span>
 [mcp_servers.shapeitup]
 command = <span class="s">"npx"</span>
-args = [<span class="s">"-y"</span>, <span class="s">"@shapeitup/mcp-server"</span>]</pre>
+args = [<span class="s">"-y"</span>, <span class="s">"@shapeitup/mcp-server"</span>]
+startup_timeout_sec = 60  <span class="c"># first npx download is slow</span>
+tool_timeout_sec = 180    <span class="c"># cold renders can exceed 60 s</span></pre>
           </div>
           <div class="tab-panel" role="tabpanel" hidden>
             <pre class="code-block" data-copy-block><span class="c">// ~/.cursor/mcp.json · claude_desktop_config.json</span>
@@ -476,7 +478,7 @@ args = [<span class="s">"-y"</span>, <span class="s">"@shapeitup/mcp-server"</sp
       <div>
         <span class="mg-k">Codex</span>
         <div class="cmd" data-copy="codex mcp add shapeitup -- npx -y @shapeitup/mcp-server"><span class="cmd-prompt">$</span><code>codex mcp add shapeitup -- npx -y @shapeitup/mcp-server</code><button class="copy" type="button">Copy</button></div>
-        <p>Or add it under <code>[mcp_servers]</code> in <code>~/.codex/config.toml</code>.</p>
+        <p>Then set <code>startup_timeout_sec = 60</code> and <code>tool_timeout_sec = 180</code> under <code>[mcp_servers.shapeitup]</code> in <code>~/.codex/config.toml</code>. Codex's defaults are shorter than a first <code>npx</code> download.</p>
       </div>
       <div>
         <span class="mg-k">VS Code</span>

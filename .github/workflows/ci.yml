@@ -32,6 +32,9 @@ jobs:
       - name: Test @shapeitup/core
         run: pnpm --filter @shapeitup/core exec vitest run
 
+      - name: Test @shapeitup/shared
+        run: pnpm --filter @shapeitup/shared exec vitest run
+
       - name: Test shapeitup-vscode (extension)
         run: pnpm --filter shapeitup-vscode exec vitest run
 

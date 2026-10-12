@@ -417,19 +417,90 @@ export function getSubscriberBus(globalStorageDir: string, serverVersion: string
   return busSingleton;
 }
 
+const EXTENSION_ID = "shapeitup.shapeitup-vscode";
+
 /**
- * Locate the standard globalStorage dir used by both the extension and the
- * MCP server. This mirrors the path embedded in tools.ts — kept in sync so a
- * new process doesn't drift from the existing heartbeat discovery path.
+ * VS Code-family editors the extension can run in, by the name of their
+ * user-data directory. Each keeps its own globalStorage, so an extension in
+ * Cursor never looks in VS Code's. Order breaks ties: VS Code first.
+ */
+const EDITOR_DATA_DIRS = ["Code", "Cursor", "Code - Insiders", "VSCodium", "Windsurf"];
+
+export interface GlobalStorageLookup {
+  home?: string;
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+}
+
+/**
+ * The extension's globalStorage dir in every VS Code-family editor, in
+ * `EDITOR_DATA_DIRS` order. Mirrors where VS Code puts user data, which is
+ * what `context.globalStorageUri` resolves under on the extension side.
+ */
+export function editorGlobalStorageDirs(opts: GlobalStorageLookup = {}): string[] {
+  const home = opts.home ?? os.homedir();
+  const platform = opts.platform ?? process.platform;
+  const env = opts.env ?? process.env;
+  const root =
+    platform === "darwin"
+      ? path.join(home, "Library", "Application Support")
+      : platform === "win32"
+      ? env.APPDATA || path.join(home, "AppData", "Roaming")
+      : env.XDG_CONFIG_HOME || path.join(home, ".config");
+  return EDITOR_DATA_DIRS.map((app) => path.join(root, app, "User", "globalStorage", EXTENSION_ID));
+}
+
+/** Newest mtime of an extension-written heartbeat in `dir`, or -Infinity. */
+function newestExtensionHeartbeat(dir: string): number {
+  let newest = -Infinity;
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.startsWith("shapeitup-heartbeat") || !name.endsWith(".json")) continue;
+      try {
+        newest = Math.max(newest, fs.statSync(path.join(dir, name)).mtimeMs);
+      } catch {}
+    }
+  } catch {}
+  return newest;
+}
+
+/**
+ * Pick the globalStorage dir this server shares with the extension: the
+ * editor the extension ran in most recently, else VS Code's.
+ *
+ * Only the extension writes `shapeitup-heartbeat*.json`; this server creates
+ * the directory itself, so a directory existing proves nothing. Before this,
+ * the path was hardcoded to `~/.config/Code/...` on every non-Windows OS. On
+ * macOS VS Code uses `~/Library/Application Support/Code/...`, so the two
+ * sides never found each other there.
+ *
+ * With the extension in two editors at once, only the more recent one sees
+ * this server.
+ */
+export function resolveGlobalStorageDir(opts: GlobalStorageLookup = {}): string {
+  const dirs = editorGlobalStorageDirs(opts);
+  let best = dirs[0];
+  let bestMtime = -Infinity;
+  for (const dir of dirs) {
+    const mtime = newestExtensionHeartbeat(dir);
+    if (mtime > bestMtime) {
+      best = dir;
+      bestMtime = mtime;
+    }
+  }
+  return best;
+}
+
+let cachedGlobalStorageDir: string | null = null;
+
+/**
+ * `resolveGlobalStorageDir()` for this process, resolved once. tools.ts reads
+ * it at import and the bus at startup; resolving twice could split them across
+ * two editors if a heartbeat landed in between.
  */
 export function defaultGlobalStorageDir(): string {
-  const home = os.homedir();
-  return path.join(
-    home,
-    process.platform === "win32"
-      ? "AppData/Roaming/Code/User/globalStorage/shapeitup.shapeitup-vscode"
-      : ".config/Code/User/globalStorage/shapeitup.shapeitup-vscode",
-  );
+  cachedGlobalStorageDir ??= resolveGlobalStorageDir();
+  return cachedGlobalStorageDir;
 }
 
 /**

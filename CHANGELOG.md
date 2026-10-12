@@ -9,6 +9,39 @@ Releases 1.17.0–1.24.0 are described only in their
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project follows semantic versioning at the extension level.
 
+## [1.30.1] - 2026-10-12
+
+Extension `1.30.1` / mcp-server `1.30.1` — Codex setup docs and three fixes.
+
+### Added
+- **Codex setup in the docs** (`README.md`, `packages/mcp-server/README.md`,
+  `INSTALL.md`, shapeitup.dev). `codex mcp add`, then `startup_timeout_sec = 60`
+  and `tool_timeout_sec = 180` in `~/.codex/config.toml`. Codex's defaults are
+  10 s to start and 60 s per tool; a first `npx` run from an empty cache took
+  34 s, so a fresh install timed out before it answered. The skill goes in
+  `~/.agents/skills/shapeitup/`, where Codex looks for skills.
+
+### Fixed
+- **On macOS the MCP server and the VS Code extension never found each
+  other.** The server hardcoded `~/.config/Code/...` on every non-Windows OS,
+  but VS Code on macOS keeps globalStorage under
+  `~/Library/Application Support/Code/...`. The extension never saw the
+  server's heartbeat, so live viewer sync, `set_render_mode`,
+  `toggle_dimensions` and workspace-root detection silently did nothing there.
+  The server now follows VS Code's own rules (`APPDATA` on Windows,
+  `XDG_CONFIG_HOME` on Linux) and, when the extension runs in Cursor,
+  VS Code Insiders, VSCodium or Windsurf, uses that editor's directory.
+- **Every render warned `Import "sim" will always be undefined`** unless the
+  file exported `sim`. The filter for the wrapper's optional exports predated
+  `sim`. Both bundlers now use one list in `@shapeitup/shared`, and a test
+  fails if the wrapper gains a name the filter doesn't cover.
+- **Published builds signed every tool result `[shapeitup mcp vdev …]`.** The
+  version lookup used `__dirname`, which doesn't exist in the ESM bundle. It
+  now uses the version esbuild bakes in, as `serverInfo` already did.
+
+### Changed
+- CI now runs the `@shapeitup/shared` tests.
+
 ## [1.30.0] - 2026-09-30
 
 Extension `1.30.0` / mcp-server `1.30.0` — Mistral Vibe support

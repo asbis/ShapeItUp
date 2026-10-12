@@ -28,7 +28,7 @@ import {
   type Core,
   type ExecutedPart,
 } from "@shapeitup/core";
-import type { ParamValue } from "@shapeitup/shared";
+import { isOptionalReexportWarning, type ParamValue } from "@shapeitup/shared";
 import * as esbuild from "esbuild-wasm";
 
 // esbuild-wasm requires a one-shot initialize() before the first build().
@@ -1209,13 +1209,12 @@ export async function executeShapeFile(
     // `params` from a sibling .shape.ts — supported but fragile).
     //
     // Filter out "Import 'X' will always be undefined" warnings for the
-    // optional names the synthetic wrapper re-exports (`config`, `material`,
-    // `params`). These fire on every file that doesn't declare one of them —
-    // which is most of them — and the re-export pattern is deliberate (back-
-    // compat with the executor's ambient `typeof foo !== "undefined"` lookup).
-    const OPTIONAL_REEXPORT_NAMES = /Import "(config|material|params)" will always be undefined/;
+    // optional names the synthetic wrapper re-exports. These fire on every
+    // file that doesn't declare one of them — which is most of them — and the
+    // re-export pattern is deliberate (back-compat with the executor's
+    // ambient `typeof foo !== "undefined"` lookup).
     const filteredEsbuildWarnings = result.warnings.filter(
-      (w) => !OPTIONAL_REEXPORT_NAMES.test(w.text),
+      (w) => !isOptionalReexportWarning(w.text),
     );
     const combinedWarnings = [
       ...preflightResult.warnings,
