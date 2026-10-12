@@ -89,6 +89,14 @@ jobs:
           TGZ_ABS="$(pwd)/$TGZ"
           cd "$GITHUB_WORKSPACE"
 
+          # The tarball ships Manifold itself (no manifold-3d dependency) and
+          # leaves the 6 MB source map out.
+          tar -tzf "$TGZ_ABS" | grep -qx 'package/dist/manifold.wasm'
+          if tar -tzf "$TGZ_ABS" | grep -q '\.map$'; then
+            echo "Tarball contains source maps; package.json \"files\" should exclude them." >&2
+            exit 1
+          fi
+
           TMPDIR="$(mktemp -d)"
           echo "Smoke-installing $TGZ_ABS into $TMPDIR"
           pushd "$TMPDIR" >/dev/null

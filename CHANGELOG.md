@@ -56,7 +56,23 @@ Extension `1.30.1` / mcp-server `1.30.1` — Codex setup docs and three fixes.
   now uses the version esbuild bakes in, as `serverInfo` already did.
 
 ### Changed
-- CI now runs the `@shapeitup/shared` tests.
+- **The first `npx` start downloads 4 packages instead of 43.** It was ~38 MB
+  across 43 tarballs and 129 MB on disk, which on an ordinary connection ran
+  past Claude Code's 30 s MCP timeout, so a new user's first session started
+  without ShapeItUp. Side by side from an empty cache it went from 76–105 s to
+  14–20 s, 52 MB on disk:
+  - Manifold's runtime (`manifold.js` + `manifold.wasm`, ~570 KB) now ships in
+    the package instead of the `manifold-3d` dependency, whose automatically
+    installed peers brought a second esbuild-wasm, `@gltf-transform/*` and the
+    native `sharp` library.
+  - `@mujoco/mujoco` is now an optional peer dependency rather than an
+    optional dependency, which npm installed for everyone. To use
+    `engine: "mujoco"`, register the server as
+    `npx -y -p @shapeitup/mcp-server -p @mujoco/mujoco shapeitup-mcp`; the
+    error message says so.
+  - Source maps are no longer published (1.3 MB gzipped).
+- CI now runs the `@shapeitup/shared` tests, and checks that the npm tarball
+  carries `manifold.wasm` and no source maps.
 
 ## [1.30.0] - 2026-09-30
 

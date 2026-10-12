@@ -3,6 +3,7 @@ import { cpSync, mkdirSync, existsSync, writeFileSync, rmSync, readFileSync } fr
 import { resolve, dirname, basename } from "path";
 import { fileURLToPath } from "url";
 import { execSync } from "child_process";
+import { createRequire } from "module";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const watch = process.argv.includes("--watch");
@@ -32,11 +33,11 @@ const extensionConfig = {
 };
 
 // The npm package (`@shapeitup/mcp-server`) ships the two browser bundles so
-// `open_viewer` works from a bare `npx` install. It does NOT ship the .wasm —
-// replicad-opencascadejs / manifold-3d / @mujoco/mujoco are already runtime
-// dependencies, so npm puts those on disk anyway and viewer-host.ts resolves
-// them from node_modules. Copying them here would add ~7 MB gzipped of exact
-// duplicates to every install.
+// `open_viewer` works from a bare `npx` install. It does NOT ship the OCCT
+// .wasm — replicad-opencascadejs is a runtime dependency, so npm puts it on
+// disk anyway and viewer-host.ts resolves it from node_modules. Copying it
+// here would add ~9 MB gzipped of exact duplicates to every install.
+// Manifold is the exception; see copyManifoldToMcpDist().
 //
 // An onEnd plugin rather than a post-build copy so `pnpm dev` keeps the two
 // dist directories in sync on every rebuild, not just the first.
@@ -210,6 +211,28 @@ function copyWasmFiles() {
 }
 
 /**
+ * Ship manifold.js + manifold.wasm (~570 KB) inside the npm package instead of
+ * depending on manifold-3d. That package declares esbuild-wasm (a second
+ * copy) and @gltf-transform/* as peer dependencies, which npm installs
+ * automatically, and those pull in the native sharp library: ~17 MB of a
+ * ~38 MB first `npx` download, enough to push a cold start past Claude Code's
+ * 30 s MCP timeout. manifold-node-loader.ts and viewer-host.ts both look in
+ * the bundle's own dist/ first.
+ *
+ * Runs in --mcp-only mode too, so a dev rebuild never leaves dist/ without it.
+ */
+function copyManifoldToMcpDist() {
+  const req = createRequire(resolve(__dirname, "packages/mcp-server/package.json"));
+  const manifoldDir = dirname(req.resolve("manifold-3d/manifold.js"));
+  const destDir = resolve(__dirname, "packages/mcp-server/dist");
+  mkdirSync(destDir, { recursive: true });
+  for (const file of ["manifold.js", "manifold.wasm"]) {
+    cpSync(resolve(manifoldDir, file), resolve(destDir, file));
+  }
+  console.log("Copied manifold.js + manifold.wasm to packages/mcp-server/dist/");
+}
+
+/**
  * Bundle type definitions used by `.shape.ts` autocomplete into the
  * extension's dist/typings/. On activation the extension copies these into
  * the user's workspace node_modules so TypeScript resolves `replicad` and
@@ -349,6 +372,7 @@ async function build() {
   // In --mcp-only mode we skip the WASM + typings copies (extension-side
   // assets that don't affect the mcp-server bundle) and only rebuild the two
   // mcp-server configs. Keeps `pnpm dev:mcp` fast when iterating on the server.
+  copyManifoldToMcpDist();
   if (!mcpOnly) {
     copyWasmFiles();
     copySkillFiles();

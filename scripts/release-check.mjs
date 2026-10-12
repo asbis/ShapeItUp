@@ -135,16 +135,23 @@ for (const rel of skillPaths) {
   }
 }
 
-// 7. The npm package must carry the browser bundles `open_viewer` serves.
-// They're mirrored into packages/mcp-server/dist by an esbuild onEnd plugin —
-// if that mirror ever breaks, the package still publishes and `open_viewer`
-// fails only at runtime, for npm users only.
-for (const asset of ["viewer.js", "worker.js"]) {
+// 7. The npm package must carry the browser bundles `open_viewer` serves and
+// the Manifold runtime, which it ships instead of depending on manifold-3d.
+// The build copies them into packages/mcp-server/dist — if that copy ever
+// breaks, the package still publishes and the failure shows up only at
+// runtime, for npm users only.
+const npmAssets = {
+  "viewer.js": "open_viewer is broken",
+  "worker.js": "open_viewer is broken",
+  "manifold.js": "threads.tapInto and other Manifold helpers fail",
+  "manifold.wasm": "threads.tapInto and other Manifold helpers fail",
+};
+for (const [asset, impact] of Object.entries(npmAssets)) {
   const p = resolve(root, "packages/mcp-server/dist", asset);
   if (!existsSync(p)) {
     fail(
       `packages/mcp-server/dist/${asset} is missing — run \`pnpm build\`. ` +
-      `Without it, open_viewer is broken for npx/npm installs.`,
+      `Without it, ${impact} for npx/npm installs.`,
     );
   } else {
     pass(`npm package carries ${asset}`);

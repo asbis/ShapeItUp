@@ -9,6 +9,7 @@
   },
   "files": [
     "dist",
+    "!dist/**/*.map",
     "README.md",
     "LICENSE"
   ],
@@ -36,14 +37,19 @@
   "dependencies": {
     "@resvg/resvg-wasm": "^2.6.2",
     "esbuild-wasm": "^0.28.0",
-    "manifold-3d": "^3.4.1",
     "replicad-opencascadejs": "^0.23.0"
   },
-  "optionalDependencies": {
+  "peerDependencies": {
     "@mujoco/mujoco": "^3.10.0"
+  },
+  "peerDependenciesMeta": {
+    "@mujoco/mujoco": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
+    "@mujoco/mujoco": "^3.10.0",
     "@shapeitup/core": "workspace:*",
     "@shapeitup/serve": "workspace:*",
     "@shapeitup/shared": "workspace:*",
@@ -51,6 +57,7 @@
     "@shapeitup/sim-dynamics": "workspace:*",
     "@shapeitup/sim-mujoco": "workspace:*",
     "@types/ws": "^8.18.1",
+    "manifold-3d": "^3.4.1",
     "replicad": "^0.23.0",
     "ws": "^8.20.0",
     "zod": "^4.3.6"

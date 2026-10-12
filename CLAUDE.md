@@ -144,14 +144,34 @@ distribution channels lay them out differently:
 |---|---|---|
 | `viewer.js`, `worker.js` | `extension/dist/` | shipped in `dist/` (~1.3 MB gzipped) |
 | `replicad_single.*` | `extension/dist/` | `node_modules/replicad-opencascadejs` |
-| `manifold.*` | `extension/dist/` | `node_modules/manifold-3d` |
-| `mujoco.*` | `extension/dist/` | `node_modules/@mujoco/mujoco` (optional) |
+| `manifold.*` | `extension/dist/` | shipped in `dist/` (~570 KB) |
+| `mujoco.*` | `extension/dist/` | `node_modules/@mujoco/mujoco`, only if the user installed it |
 
-The npm package deliberately does NOT ship the `.wasm` files: those three
-packages are already runtime dependencies, so npm puts the exact same bytes on
-disk anyway. Copying them in would add ~7 MB gzipped of duplicates to every
-install, including installs that never open a viewer. `SHAPEITUP_VIEWER_DIST`
-overrides the search for unusual layouts.
+The npm package deliberately does NOT ship the OCCT `.wasm`:
+`replicad-opencascadejs` is a runtime dependency, so npm puts the exact same
+bytes on disk anyway, and copying them in would add ~9 MB gzipped of
+duplicates. `SHAPEITUP_VIEWER_DIST` overrides the search for unusual layouts.
+
+**The first `npx` run is the install, and clients time it.** Claude Code gives
+a server 30 s to answer `initialize`, Codex 10 s. Every runtime dependency is
+downloaded before that clock can be met, so keep the dependency tree small and
+measure a cold start (empty `npm_config_cache`) after changing it:
+
+- **Manifold is shipped, not depended on.** `manifold-3d` declares
+  `esbuild-wasm` (a second copy) and `@gltf-transform/*` as peer dependencies;
+  npm installs those automatically, and they pull in the native `sharp`. That
+  was ~17 MB of a ~38 MB download for a half-megabyte wasm. It stays a devDependency
+  so the build can copy the two files (`copyManifoldToMcpDist`).
+- **MuJoCo is an optional peer.** npm installs optional *dependencies* by
+  default (5 MB here) but not optional *peers*. Users who want
+  `engine: "mujoco"` register the server as
+  `npx -y -p @shapeitup/mcp-server -p @mujoco/mujoco shapeitup-mcp`; the error
+  without it says so.
+- **No source maps in the tarball** (`"!dist/**/*.map"` in `files`, 1.3 MB gzipped).
+
+That took a cold start from 42 packages / 129 MB to 4 packages / 52 MB. Rapier
+(0.77 MB gzipped, inlined in `index.js` and again in `viewer.js`) stays: it is
+the default dynamics engine.
 
 MuJoCo is optional throughout — a 404 on `mujoco.wasm` just disables Sim.
 
