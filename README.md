@@ -11,19 +11,52 @@
   <a href="https://www.npmjs.com/package/@shapeitup/mcp-server"><img src="https://img.shields.io/npm/v/@shapeitup/mcp-server.svg" alt="npm: @shapeitup/mcp-server"></a>
 </p>
 
+<p align="center">
+  <a href="https://shapeitup.dev"><strong>shapeitup.dev</strong></a> · <a href="https://shapeitup.dev/app/">Try it in your browser</a> · <a href="#install">Install</a>
+</p>
+
+<p align="center">
+  <img src="website/public/img/bracket-hero.webp" alt="An L-bracket with gussets and mounting holes in the ShapeItUp viewer" width="720">
+</p>
+
 ---
 
 ShapeItUp is an MCP server that turns [Replicad](https://replicad.xyz) / OpenCascade into AI-agent-grade CAD tooling. It writes, renders, verifies, and exports parametric 3D models from TypeScript `.shape.ts` files, headlessly — from the terminal, from Claude Code / Codex / Cursor / Claude Desktop / Mistral Vibe, or from CI. A [VSCode extension](#vscode-extension-optional) is available as an optional interactive viewer for humans who want to watch the renders happen live.
 
-## Install for Claude Code
+## Install
+
+**Fastest: ask your agent.** Paste this into Claude Code, Codex, Cursor or any other coding agent:
+
+```text
+Install the ShapeItUp MCP server by following https://raw.githubusercontent.com/asbis/ShapeItUp/master/INSTALL.md
+```
+
+It finds the MCP clients on your machine and asks before it writes to any of their configs.
+
+[![Add to Cursor](https://cursor.com/deeplink/mcp-install-dark.svg)](https://cursor.com/install-mcp?name=shapeitup&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBzaGFwZWl0dXAvbWNwLXNlcnZlciJdfQ%3D%3D)
+[![Install in VS Code](https://img.shields.io/badge/VS_Code-Install_Server-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=shapeitup&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40shapeitup%2Fmcp-server%22%5D%7D)
+
+### Claude Code
+
+As a plugin, which brings the MCP server together with the skill that teaches Claude the API, and updates with this repo:
+
+```bash
+claude plugin marketplace add asbis/ShapeItUp
+```
+
+```bash
+claude plugin install shapeitup@shapeitup
+```
+
+Or the MCP server on its own:
 
 ```bash
 claude mcp add shapeitup -- npx -y @shapeitup/mcp-server
 ```
 
-That's it. `claude mcp add` registers the server in your Claude Code config so agent sessions pick it up automatically. See the [Claude Code MCP docs](https://docs.claude.com/en/docs/claude-code/mcp) for scoping options (`-s user` for all projects, `-s project` for just this repo).
+Pick one. With both, Claude sees every tool twice; `claude mcp remove shapeitup` drops the second. See the [Claude Code MCP docs](https://docs.claude.com/en/docs/claude-code/mcp) for scoping options (`-s user` for all projects, `-s project` for just this repo).
 
-## Install for Codex
+### Codex
 
 ```bash
 codex mcp add shapeitup -- npx -y @shapeitup/mcp-server
@@ -47,7 +80,15 @@ For the Replicad API reference, save [`SKILL.md`](skills/shapeitup/SKILL.md) whe
 mkdir -p ~/.agents/skills/shapeitup && curl -fsSL https://raw.githubusercontent.com/asbis/ShapeItUp/master/skills/shapeitup/SKILL.md -o ~/.agents/skills/shapeitup/SKILL.md
 ```
 
-## Install for Cursor / Claude Desktop / other MCP clients
+### Gemini CLI
+
+```bash
+gemini extensions install https://github.com/asbis/ShapeItUp
+```
+
+`gemini extensions update shapeitup` picks up new releases.
+
+### Cursor / Claude Desktop / other MCP clients
 
 The generic MCP-config snippet:
 
@@ -83,6 +124,14 @@ startup_timeout_sec = 60
 ```
 
 Keep `startup_timeout_sec`: Vibe's default of 10 s is shorter than the first `npx` download. For the Replicad API reference, save [`skills/shapeitup/SKILL.md`](skills/shapeitup/SKILL.md) as `~/.vibe/skills/shapeitup/SKILL.md`. More options, including `vibe mcp add`, are in the [MCP server README](packages/mcp-server/README.md#mistral-vibe).
+
+### The skill on its own
+
+The one-click buttons and the plain MCP configs above don't include the skill that teaches the agent the API. To add it to any agent that reads `SKILL.md` files (Cursor, Codex, Claude Code, Gemini and others):
+
+```bash
+npx skills add asbis/ShapeItUp
+```
 
 Node 20+ required. No native build step; everything ships as WASM.
 
@@ -125,7 +174,13 @@ export default function main({ width, depth, thickness, holeInset }: typeof para
 }
 ```
 
-Then it calls `render_preview` and gets back a PNG it can inspect, plus bounding-box + volume metadata to sanity-check against the spec. If the user wants the holes bigger, the agent calls `tune_params` — no file rewrite needed.
+Then it calls `render_preview` and gets back a PNG it can inspect, plus bounding-box + volume metadata to sanity-check against the spec.
+
+<p align="center">
+  <img src="website/public/img/four-views.webp" alt="The four-view render render_preview returns: top, front, right and isometric" width="480">
+</p>
+
+If the user wants the holes bigger, the agent calls `tune_params` — no file rewrite needed.
 
 ## Running in CI / containers
 

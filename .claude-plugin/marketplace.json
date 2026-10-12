@@ -17,7 +17,7 @@
         "name": "Asbjorn Rorvik",
         "email": "rorvik.asbjorn@gmail.com"
       },
-      "homepage": "https://github.com/asbis/ShapeItUp",
+      "homepage": "https://shapeitup.dev",
       "repository": "https://github.com/asbis/ShapeItUp",
       "license": "MIT",
       "keywords": [
@@ -31,23 +31,7 @@
         "mechanical-engineering"
       ],
       "category": "productivity",
-      "source": {
-        "source": "github",
-        "repo": "asbis/ShapeItUp"
-      },
-      "strict": false,
-      "skills": [
-        "./skills"
-      ],
-      "mcpServers": {
-        "shapeitup": {
-          "command": "npx",
-          "args": [
-            "-y",
-            "@shapeitup/mcp-server"
-          ]
-        }
-      }
+      "source": "./"
     }
   ]
 }

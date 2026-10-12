@@ -1,0 +1,11 @@
+{
+  "name": "shapeitup",
+  "version": "1.30.1",
+  "description": "Scripted CAD for AI agents: write parametric parts in TypeScript, render and check them, export STEP/STL/3MF.",
+  "mcpServers": {
+    "shapeitup": {
+      "command": "npx",
+      "args": ["-y", "@shapeitup/mcp-server"]
+    }
+  }
+}

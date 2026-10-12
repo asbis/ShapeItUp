@@ -77,42 +77,61 @@ if (ext.version !== mcp.version) {
   pass("Extension and mcp-server versions match");
 }
 
-// 5. Claude Code plugin entry must track the extension version.
-// `strict: false` means the marketplace entry IS the whole plugin definition,
-// so nothing else corrects a stale version here. It drifted 1.3.0 -> 1.23.0
-// unnoticed once already because no check looked at this file.
-for (const plugin of marketplace.plugins ?? []) {
-  if (plugin.version !== ext.version) {
-    fail(
-      `.claude-plugin/marketplace.json plugin '${plugin.name}' is at ${plugin.version}, ` +
-      `extension is at ${ext.version}. Bump the plugin entry to match.`,
-    );
+// 5. Every install manifest must track the extension version. Each client
+// reads its own file, and nothing else corrects a stale one: the Claude
+// marketplace entry drifted 1.3.0 -> 1.23.0 unnoticed once because no check
+// looked at it. server.json must also match npm exactly — the registry
+// refuses a version npm doesn't have.
+const claudePlugin = read(".claude-plugin/plugin.json");
+const codexPlugin = read(".codex-plugin/plugin.json");
+const gemini = read("gemini-extension.json");
+const server = read("server.json");
+const manifestVersions = [
+  ...(marketplace.plugins ?? []).map((p) => [`.claude-plugin/marketplace.json plugin '${p.name}'`, p.version, ext.version]),
+  [".claude-plugin/plugin.json", claudePlugin.version, ext.version],
+  [".codex-plugin/plugin.json", codexPlugin.version, ext.version],
+  ["gemini-extension.json", gemini.version, ext.version],
+  ["server.json version", server.version, mcp.version],
+  ["server.json packages[0].version", server.packages?.[0]?.version, mcp.version],
+];
+for (const [label, actual, expected] of manifestVersions) {
+  if (actual !== expected) {
+    fail(`${label} is at ${actual}, expected ${expected}. Bump it to match.`);
   } else {
-    pass(`Plugin entry '${plugin.name}' matches extension version ${ext.version}`);
+    pass(`${label} is at ${expected}`);
   }
+}
+if (mcp.mcpName !== server.name) {
+  fail(
+    `packages/mcp-server/package.json mcpName is '${mcp.mcpName}' but server.json names '${server.name}'. ` +
+    `The MCP Registry rejects the publish unless they match.`,
+  );
+} else {
+  pass(`mcpName matches server.json (${server.name})`);
+}
 
-  // 6. Every declared skills path must resolve to a directory holding at
-  // least one `<skill>/SKILL.md`. A skill is a DIRECTORY containing SKILL.md —
-  // pointing at a bare SKILL.md, or at a path that doesn't exist, loads
-  // nothing and fails silently at install time.
-  const skillPaths = typeof plugin.skills === "string" ? [plugin.skills] : plugin.skills ?? [];
-  for (const rel of skillPaths) {
-    const dir = resolve(root, rel);
-    if (!existsSync(dir)) {
-      fail(`Plugin '${plugin.name}' declares skills path '${rel}' but ${dir} does not exist.`);
-      continue;
-    }
-    const found = readdirSync(dir, { withFileTypes: true })
-      .filter((e) => e.isDirectory() && existsSync(resolve(dir, e.name, "SKILL.md")))
-      .map((e) => e.name);
-    if (found.length === 0) {
-      fail(
-        `Plugin '${plugin.name}' skills path '${rel}' contains no <skill>/SKILL.md. ` +
-        `Skills must be directories: ${rel}/<name>/SKILL.md`,
-      );
-    } else {
-      pass(`Skills path '${rel}' resolves ${found.length} skill(s): ${found.join(", ")}`);
-    }
+// 6. Every declared skills path must resolve to a directory holding at
+// least one `<skill>/SKILL.md`. A skill is a DIRECTORY containing SKILL.md —
+// pointing at a bare SKILL.md, or at a path that doesn't exist, loads
+// nothing and fails silently at install time. Claude Code scans `skills/`
+// by default; Codex is told to via its manifest.
+const skillPaths = new Set(["./skills"]);
+for (const manifest of [claudePlugin, codexPlugin]) {
+  for (const rel of [manifest.skills ?? []].flat()) skillPaths.add(rel.replace(/\/+$/, ""));
+}
+for (const rel of skillPaths) {
+  const dir = resolve(root, rel);
+  if (!existsSync(dir)) {
+    fail(`A plugin manifest declares skills path '${rel}' but ${dir} does not exist.`);
+    continue;
+  }
+  const found = readdirSync(dir, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && existsSync(resolve(dir, e.name, "SKILL.md")))
+    .map((e) => e.name);
+  if (found.length === 0) {
+    fail(`Skills path '${rel}' contains no <skill>/SKILL.md. Skills must be directories: ${rel}/<name>/SKILL.md`);
+  } else {
+    pass(`Skills path '${rel}' resolves ${found.length} skill(s): ${found.join(", ")}`);
   }
 }
 

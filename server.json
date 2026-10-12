@@ -1,0 +1,23 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.asbis/shapeitup",
+  "title": "ShapeItUp",
+  "description": "Scripted CAD for AI agents: TypeScript parts on OpenCascade WASM, rendered, checked, exported.",
+  "repository": {
+    "url": "https://github.com/asbis/ShapeItUp",
+    "source": "github",
+    "subfolder": "packages/mcp-server"
+  },
+  "websiteUrl": "https://shapeitup.dev",
+  "version": "1.30.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@shapeitup/mcp-server",
+      "version": "1.30.1",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

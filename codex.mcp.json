@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "shapeitup": {
+      "command": "npx",
+      "args": ["-y", "@shapeitup/mcp-server"],
+      "startup_timeout_sec": 60,
+      "tool_timeout_sec": 180
+    }
+  }
+}

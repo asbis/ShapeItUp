@@ -59,13 +59,27 @@ For each client the user wants to register (ask them), do the following:
 
 #### Claude Code CLI
 
-Preferred: use the CLI.
+Preferred: install the plugin. It brings the MCP server and the skill
+together, and `claude plugin marketplace update` keeps both current, so you
+can skip this client in Step 3.
+
+```bash
+claude plugin marketplace add asbis/ShapeItUp
+claude plugin install shapeitup@shapeitup
+```
+
+If `claude mcp list` already shows a `shapeitup` server, the user added it by
+hand earlier. Ask whether to keep that one or switch to the plugin; with both,
+every tool is listed twice. `claude mcp remove shapeitup` removes the old one.
+
+If `claude plugin` isn't available (older Claude Code), register the server
+alone:
 
 ```bash
 claude mcp add shapeitup -s user -- npx -y @shapeitup/mcp-server
 ```
 
-Fallback if `claude mcp add` isn't available: merge this into `~/.claude.json`:
+Fallback if `claude mcp add` isn't available either: merge this into `~/.claude.json`:
 
 ```json
 {
@@ -134,7 +148,14 @@ the Cursor snippet. Then tell the user to restart Claude Desktop.
 
 #### Gemini CLI
 
-Create `~/.gemini/extensions/shapeitup/gemini-extension.json`:
+Preferred: install the extension from GitHub, which `gemini extensions update`
+can then keep current.
+
+```bash
+gemini extensions install https://github.com/asbis/ShapeItUp
+```
+
+Fallback if that fails: create `~/.gemini/extensions/shapeitup/gemini-extension.json`:
 
 ```json
 {
@@ -172,7 +193,8 @@ is shorter than the first `npx` download. Tell the user to run `/reload` in Vibe
 
 ### Step 3 — Install the Claude Code skill (optional but recommended)
 
-If Claude Code is present, fetch `SKILL.md` from the URL in the table above
+If Claude Code is present and you registered the server with `claude mcp add`
+rather than the plugin, fetch `SKILL.md` from the URL in the table above
 and write it to `~/.claude/skills/shapeitup/SKILL.md`. This gives Claude a
 full Replicad API reference when working on `.shape.ts` files. Ask first.
 
@@ -211,8 +233,10 @@ so the user can troubleshoot.
 
 To remove ShapeItUp from an MCP client, delete the `shapeitup` entry from the
 relevant config file (for Codex, the `[mcp_servers.shapeitup]` table in
-`~/.codex/config.toml`), or run `claude mcp remove shapeitup` for Claude Code
-and `vibe mcp remove shapeitup` for Mistral Vibe. No global state is left
+`~/.codex/config.toml`), or run `claude plugin uninstall shapeitup@shapeitup`
+(or `claude mcp remove shapeitup`) for Claude Code,
+`gemini extensions uninstall shapeitup` for Gemini CLI and
+`vibe mcp remove shapeitup` for Mistral Vibe. No global state is left
 behind beyond those config entries and the optional skill files at
 `~/.claude/skills/shapeitup/`, `~/.vibe/skills/shapeitup/` and
 `~/.agents/skills/shapeitup/`.

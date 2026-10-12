@@ -1,0 +1,36 @@
+{
+  "name": "shapeitup",
+  "displayName": "ShapeItUp",
+  "version": "1.30.1",
+  "description": "Scripted CAD for AI agents: write parametric parts in TypeScript, check them with 4-view renders, collision and joint checks, and export STEP/STL/3MF. OpenCascade runs as WASM, so there is nothing to install beyond Node.",
+  "author": {
+    "name": "Asbjorn Rorvik",
+    "email": "rorvik.asbjorn@gmail.com",
+    "url": "https://github.com/asbis"
+  },
+  "homepage": "https://shapeitup.dev",
+  "repository": "https://github.com/asbis/ShapeItUp",
+  "license": "MIT",
+  "keywords": [
+    "cad",
+    "text-to-cad",
+    "3d",
+    "3d-printing",
+    "replicad",
+    "opencascade",
+    "step",
+    "stl",
+    "3mf",
+    "parametric",
+    "mechanical-engineering"
+  ],
+  "icon": "./icon.png",
+  "documentationUrl": "https://github.com/asbis/ShapeItUp#readme",
+  "supportUrl": "https://github.com/asbis/ShapeItUp/issues",
+  "mcpServers": {
+    "shapeitup": {
+      "command": "npx",
+      "args": ["-y", "@shapeitup/mcp-server"]
+    }
+  }
+}

@@ -20,6 +20,22 @@ Extension `1.30.1` / mcp-server `1.30.1` — Codex setup docs and three fixes.
   10 s to start and 60 s per tool; a first `npx` run from an empty cache took
   34 s, so a fresh install timed out before it answered. The skill goes in
   `~/.agents/skills/shapeitup/`, where Codex looks for skills.
+- **An install manifest for every client.** `.claude-plugin/plugin.json` makes
+  `claude plugin install shapeitup@shapeitup` bring the MCP server and the
+  skill together, and is what Anthropic's plugin directory reads.
+  `.codex-plugin/plugin.json` (with `codex.mcp.json`, which carries the
+  timeouts) does the same for Codex, and `gemini-extension.json` lets
+  `gemini extensions install https://github.com/asbis/ShapeItUp` work.
+- **Official MCP Registry listing.** `server.json` plus `mcpName` in the npm
+  package, published as `io.github.asbis/shapeitup` by a new `mcp-registry`
+  job in the release workflow (GitHub OIDC, no token; skips a version already
+  listed). The VS Code MCP gallery and most directories mirror the registry.
+- **README leads with installing.** "Ask your agent" (it follows
+  `INSTALL.md`), Add to Cursor and Install in VS Code buttons, the Claude Code
+  plugin, Gemini, `npx skills add`, renders, and links to shapeitup.dev and
+  the browser playground.
+- `pnpm release:check` fails unless every manifest's version matches the
+  release and `mcpName` matches `server.json`.
 
 ### Fixed
 - **On macOS the MCP server and the VS Code extension never found each

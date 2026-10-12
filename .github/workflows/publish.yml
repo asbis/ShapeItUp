@@ -259,3 +259,62 @@ jobs:
         # --skip-duplicate for the same reason the npm step skips: a version
         # that is already listed is the goal state, so a re-run must pass.
         run: npx -y @vscode/vsce publish --packagePath shapeitup-vscode.vsix --azure-credential --skip-duplicate
+
+  mcp-registry:
+    # The official MCP Registry (registry.modelcontextprotocol.io). The
+    # VS Code MCP gallery and most MCP directories mirror it, so a listing
+    # there is how people find the server without knowing its npm name.
+    #
+    # Its own job, like `marketplace`, so the two can fail independently: a
+    # registry outage must not strand the VSIX, and a Marketplace problem must
+    # not keep the listing stale.
+    #
+    # Auth is GitHub OIDC, no secret. The registry trusts the `io.github.asbis/`
+    # namespace in server.json because this workflow runs in a repo `asbis`
+    # owns. It then checks that the npm package's `mcpName` names the same
+    # server, which is why this waits for `publish` to put the package on npm.
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Publish server.json to the MCP Registry
+        shell: bash
+        env:
+          # Pinned so a publisher release can't change behaviour under a
+          # release. Bump when the registry asks for it ("invalid audience"
+          # means this binary is too old).
+          MCP_PUBLISHER_VERSION: v1.8.1
+        run: |
+          set -euo pipefail
+          NAME="$(jq -r .name server.json)"
+          VERSION="$(jq -r .version server.json)"
+          PKG_VERSION="$(jq -r .version packages/mcp-server/package.json)"
+          if [ "$VERSION" != "$PKG_VERSION" ] || [ "$(jq -r '.packages[0].version' server.json)" != "$PKG_VERSION" ]; then
+            echo "::error::server.json is not at $PKG_VERSION, the version npm just got. Bump both version fields in server.json." >&2
+            exit 1
+          fi
+
+          # Idempotent like the npm step: a version already listed is the goal
+          # state, and a re-run of a half-failed release has to pass.
+          if curl -fsS "https://registry.modelcontextprotocol.io/v0/servers?search=$NAME&version=$VERSION" \
+              | jq -e --arg n "$NAME" --arg v "$VERSION" '.servers[] | select(.server.name == $n and .server.version == $v)' >/dev/null; then
+            echo "$NAME@$VERSION is already in the registry — skipping."
+            exit 0
+          fi
+
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+          ./mcp-publisher login github-oidc
+
+          # The registry validates against npm, which can take a moment to
+          # serve a version published seconds ago.
+          for attempt in 1 2 3 4 5; do
+            if ./mcp-publisher publish; then exit 0; fi
+            echo "Publish attempt $attempt failed; retrying in 30 s."
+            sleep 30
+          done
+          echo "::error::mcp-publisher publish failed 5 times." >&2
+          exit 1

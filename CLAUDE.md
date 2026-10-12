@@ -218,7 +218,23 @@ Registered globally in `~/.claude/settings.json`. Viewer-related tools:
 - **To release**: bump versions (see below), commit, push, then either `gh release create v0.x.x` OR `gh workflow run publish.yml --ref master` (dispatch skips the tag-verify step and publishes whatever version is in `package.json`).
 - **Marketplace auth = Microsoft Entra ID (no token).** The `marketplace` job runs in the GitHub environment `marketplace`, signs in with `azure/login` (OIDC, `allow-no-subscriptions`) and runs `vsce publish --azure-credential`. The identity is the app registration "ShapeItUp Marketplace publisher (GitHub Actions)" in the `Standardmappe` tenant; its federated credential trusts exactly `repo:asbis/ShapeItUp:environment:marketplace`, and its client/tenant IDs are the environment variables `AZURE_CLIENT_ID` / `AZURE_TENANT_ID`. It sits on the `shapeitup` publisher as a Contributor — the ID the Members list takes is printed by the job's "Show the identity the Marketplace sees" step. The job is separate from `publish` on purpose: an environment changes the job's OIDC claims, and the npm trusted publisher must keep seeing the ones it was configured with.
 - **Why not a PAT.** `VSCE_PAT` expired silently: it was the LAST step, so npm had already published and every release read as half-done rather than broken. The listing sat at 1.23.0 (8 Jul 2026) through six releases, 1.24.0 → 1.29.5. Azure DevOps also retires global PATs on 2026-12-01. Do not go back.
-- **Re-runs are safe on both channels.** The npm step skips a version already on the registry and the Marketplace step passes `--skip-duplicate`, so re-running a half-failed release only redoes what's missing. Still check `npx @vscode/vsce show shapeitup.shapeitup-vscode` after any release; npm and the Marketplace can drift apart without anything saying so.
+- **Re-runs are safe on every channel.** The npm step skips a version already on the registry, the Marketplace step passes `--skip-duplicate`, and the MCP Registry step skips a version already listed, so re-running a half-failed release only redoes what's missing. Still check `npx @vscode/vsce show shapeitup.shapeitup-vscode` after any release; npm and the Marketplace can drift apart without anything saying so.
+- **MCP Registry = GitHub OIDC (no token).** Job `mcp-registry` (after `publish`, beside `marketplace`) publishes `server.json` as `io.github.asbis/shapeitup` with a pinned `mcp-publisher`. The registry checks that the npm package's `mcpName` (in `packages/mcp-server/package.json`) names the same server, so the two must stay equal.
+
+### Install manifests
+
+One file per client, all at the repo root, because the repo itself is the plugin:
+
+| File | Client |
+|---|---|
+| `.claude-plugin/plugin.json` + `marketplace.json` | Claude Code plugin (MCP server + skill); Anthropic's directory reads `plugin.json` |
+| `.codex-plugin/plugin.json` + `codex.mcp.json` | Codex plugin; `codex.mcp.json` carries the startup/tool timeouts Codex needs |
+| `gemini-extension.json` | `gemini extensions install https://github.com/asbis/ShapeItUp` |
+| `server.json` | Official MCP Registry |
+
+Every one carries a version, and `pnpm release:check` fails until all of them match the release.
+
+The root `.mcp.json` is the dev config for this repo (it runs the local `dist/` under `mcpmon`). Because the repo root is also the plugin root, Claude Code loads it for plugin users too, before the plugin's own servers. It is harmless only because both name the server `shapeitup`, so the plugin's entry replaces the dev one. Keep the names identical.
 
 ### Any change under `packages/mcp-server/` MUST bump its own version
 
@@ -227,7 +243,7 @@ The release workflow publishes `@shapeitup/mcp-server` on every GitHub release. 
 Checklist when touching anything under `packages/mcp-server/src/` or its deps (`packages/core/`, etc. that get bundled in):
 
 1. Bump `packages/extension/package.json` version (drives the release tag).
-2. Bump `packages/mcp-server/package.json` version in the same commit.
+2. Bump `packages/mcp-server/package.json` version in the same commit, along with every install manifest above.
 3. Both versions should usually move in lockstep to keep diagnostics sane.
 4. After the release lands, verify `npm view @shapeitup/mcp-server version` matches.
 

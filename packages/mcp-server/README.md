@@ -16,6 +16,8 @@ npx -y @shapeitup/mcp-server
 claude mcp add shapeitup -- npx -y @shapeitup/mcp-server
 ```
 
+Or install the plugin, which adds the skill that teaches Claude the API: `claude plugin marketplace add asbis/ShapeItUp`, then `claude plugin install shapeitup@shapeitup`. Use one or the other, not both.
+
 ### Codex
 
 ```bash

@@ -1,0 +1,29 @@
+{
+  "name": "shapeitup",
+  "version": "1.30.1",
+  "description": "Scripted CAD for AI agents: write parametric parts in TypeScript, check them with 4-view renders, collision and joint checks, and export STEP/STL/3MF.",
+  "author": {
+    "name": "Asbjorn Rorvik",
+    "email": "rorvik.asbjorn@gmail.com",
+    "url": "https://github.com/asbis"
+  },
+  "homepage": "https://shapeitup.dev",
+  "repository": "https://github.com/asbis/ShapeItUp",
+  "license": "MIT",
+  "keywords": ["cad", "text-to-cad", "3d-printing", "replicad", "opencascade", "step", "stl", "3mf"],
+  "skills": "./skills/",
+  "mcpServers": "./codex.mcp.json",
+  "interface": {
+    "displayName": "ShapeItUp",
+    "shortDescription": "Parametric CAD your agent can drive",
+    "longDescription": "The agent writes each part as a TypeScript .shape.ts file, renders it from four angles, reads the errors and fixes them. Check collisions and joints, tune parameters, and export STEP for Fusion or FreeCAD and 3MF for Bambu Studio or OrcaSlicer. OpenCascade runs as WebAssembly, so nothing needs installing beyond Node.",
+    "developerName": "Asbjorn Rorvik",
+    "category": "Creativity",
+    "capabilities": ["Write", "Interactive"],
+    "websiteURL": "https://shapeitup.dev",
+    "composerIcon": "./icon.png",
+    "logo": "./icon.png",
+    "defaultPrompt": ["Design a 3D-printable wall hook for a 20 mm rail and show me the renders."],
+    "brandColor": "#FF5A1F"
+  }
+}
