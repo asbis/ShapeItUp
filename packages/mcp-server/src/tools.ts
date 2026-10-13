@@ -1779,7 +1779,10 @@ export function computeEffectiveMeshQuality(
  *   2. Unknown `.method()` calls — compared against a hand-curated Replicad
  *      whitelist. Method calls whose receiver was imported from "shapeitup"
  *      are trusted unconditionally (so stdlib additions don't need to be
- *      mirrored here). Warnings only; isError stays false.
+ *      mirrored here); calls on ECMAScript built-ins (`Math.cos`) are
+ *      checked against the built-in itself, and Array/String/Number instance
+ *      methods (`pts.map`) are accepted by name. Warnings only; isError stays
+ *      false.
  *   3. Seven well-known CAD pitfalls (sketch mischain, missing sketchOnPlane,
  *      unclosed pen, non-uniform scale, oversized fillet, booleans in loop,
  *      and the AST-based variable-assigned `extrude` variant). Warnings only.
@@ -1809,7 +1812,42 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
       "close", "hLine", "vLine", "lineTo", "line", "sagittaArcTo", "tangentArcTo", "threePointsArcTo",
       "cubicBezierCurveTo", "smoothSplineTo", "closeWithMirror", "done",
       "localGC", "exportSTEP",
+      // EdgeFinder / FaceFinder / CornerFinder filters, plus the Finder and
+      // Finder3d bases they inherit from (packages/extension/typings/replicad).
+      // These mostly show up inside finder callbacks — `.fillet(2, (e) =>
+      // e.inDirection("Y"))` — where the receiver is just the callback param.
+      "inDirection", "ofLength", "ofCurveType", "parallelTo", "inPlane", "ofSurfaceType",
+      "when", "inList", "atAngleWith", "atDistance", "containsPoint", "withinDistance",
+      "inBox", "inShape", "atPoint", "ofAngle",
+      "and", "not", "either", "find", "clone", "delete", "shouldKeep",
     ]);
+
+    // ECMAScript built-ins callable as `Global.method(` — Math.cos,
+    // Number.isFinite, JSON.stringify. Calls rooted here are resolved against
+    // the real built-in instead of the Replicad whitelist, so `Math.cso(` is
+    // still flagged. Deliberately not `globalThis` wholesale: Node globals
+    // like `process` don't exist in the worker the script runs in.
+    const builtinGlobals = new Set([
+      "Math", "Number", "Object", "Array", "JSON", "String", "Boolean", "Date",
+      "Symbol", "BigInt", "Reflect", "Promise", "Map", "Set", "Intl", "console",
+    ]);
+    const isBuiltinMethod = (segments: string[], methodName: string): boolean => {
+      let target: any = (globalThis as any)[segments[0]];
+      for (const seg of segments.slice(1)) target = target?.[seg];
+      return target != null && typeof target[methodName] === "function";
+    };
+
+    // Instance methods of arrays, strings and numbers — `pts.map(`,
+    // `parts.push(`, `n.toFixed(`, and `Object.keys(o).map(` via the chain
+    // pass. The receiver is usually a local, so there is no type to resolve
+    // against; accept the name if one of these prototypes has it. Cost: a
+    // Replicad typo that IS such a name goes unflagged — realistically only
+    // `.filter(`/`.fill(` for `.fillet(`, which still fails at runtime with
+    // "not a function".
+    const builtinPrototypes: any[] = [Array.prototype, String.prototype, Number.prototype];
+    const isKnownMethod = (methodName: string): boolean =>
+      knownMethods.has(methodName) ||
+      builtinPrototypes.some((proto) => typeof proto[methodName] === "function");
 
     // Bug #6: trust .method() calls whose receiver was imported from the
     // shapeitup stdlib. Otherwise every stdlib helper (bearings.body,
@@ -1857,7 +1895,8 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
     let match: RegExpExecArray | null;
     while ((match = receiverCallPattern.exec(code)) !== null) {
       const [, receiverChain, methodName] = match;
-      const rootIdent = receiverChain.split(/\s*\.\s*/)[0];
+      const segments = receiverChain.split(/\s*\.\s*/);
+      const rootIdent = segments[0];
       if (stdlibIdents.has(rootIdent)) {
         // Remember that this method name was seen on a stdlib receiver
         // somewhere — even if the SAME name later appears as a chain
@@ -1867,7 +1906,11 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
         skippedByReceiver.add(methodName);
         continue;
       }
-      if (!knownMethods.has(methodName)) unknownMethods.add(methodName);
+      if (builtinGlobals.has(rootIdent)) {
+        if (!isBuiltinMethod(segments, methodName)) unknownMethods.add(methodName);
+        continue;
+      }
+      if (!isKnownMethod(methodName)) unknownMethods.add(methodName);
     }
     // Chain-continuation pass: picks up `foo().bar()` — where `bar`'s
     // receiver is a call expression, not a plain identifier, so the
@@ -1878,7 +1921,7 @@ export function validateSyntaxPure(code: string): { text: string; isError: boole
     while ((match = chainCallPattern.exec(code)) !== null) {
       const methodName = match[1];
       if (skippedByReceiver.has(methodName)) continue;
-      if (!knownMethods.has(methodName)) unknownMethods.add(methodName);
+      if (!isKnownMethod(methodName)) unknownMethods.add(methodName);
     }
 
     // --- Semantic checks (pitfall linter) -----------------------------

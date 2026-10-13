@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { validateSyntaxPure, detectPathDoubling, detectPathDoublingInfo, extractSignatures, safeHandler, computePartsLine, computeEffectiveMeshQuality, formatCollisionPairs, formatSweepCollisions, formatLastScreenshotLine, registerTools, getVersionTag, getViewerStatus, formatViewerBlock, partExtendsBelowBed, formatStatusText, workspaceMismatchWarning, type CollisionEntry, type SweepCollisionEntry } from "./tools.js";
 import type { EngineStatus } from "./engine.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
 // Bug #6 — validate_syntax must trust .method() calls whose receiver was
@@ -95,6 +97,157 @@ describe("validateSyntaxPure — stdlib whitelisting", () => {
     const { text, isError } = validateSyntaxPure(code);
     expect(isError).toBe(true);
     expect(text).toMatch(/^Syntax error:/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validate_syntax reported "unknown method(s)" for valid code that renders
+// fine: built-in globals (`Math.cos`) and finder callbacks
+// (`(e) => e.inDirection("Y")`). Real typos must still be flagged.
+// ---------------------------------------------------------------------------
+
+describe("validateSyntaxPure — built-in globals and finder methods", () => {
+  it("does not warn on Math.cos / Math.sin", () => {
+    const code = [
+      `import { makeCylinder } from "replicad";`,
+      `export default function main() {`,
+      `  const angle = Math.PI / 6;`,
+      `  const x = 20 * Math.cos(angle);`,
+      `  const y = 20 * Math.sin(angle);`,
+      `  return makeCylinder(5, 10).translate([x, y, 0]);`,
+      `}`,
+    ].join("\n");
+    const { text, isError } = validateSyntaxPure(code);
+    expect(isError).toBe(false);
+    expect(text).not.toMatch(/unknown method/i);
+  });
+
+  it("does not warn on an EdgeFinder callback (fillet + inDirection)", () => {
+    const code = [
+      `import { makeBox } from "replicad";`,
+      `export default function main() {`,
+      `  const shape = makeBox([0, 0, 0], [40, 30, 20]);`,
+      `  return shape.fillet(2, (e) => e.inDirection("Y"));`,
+      `}`,
+    ].join("\n");
+    const { text, isError } = validateSyntaxPure(code);
+    expect(isError).toBe(false);
+    expect(text).not.toMatch(/unknown method/i);
+  });
+
+  it("does not warn on a FaceFinder callback (shell + inPlane)", () => {
+    const code = [
+      `import { makeBox } from "replicad";`,
+      `export default function main() {`,
+      `  const shape = makeBox([0, 0, 0], [40, 30, 60]);`,
+      `  return shape.shell(2, (f) => f.inPlane("XY", 60));`,
+      `}`,
+    ].join("\n");
+    const { text, isError } = validateSyntaxPure(code);
+    expect(isError).toBe(false);
+    expect(text).not.toMatch(/unknown method/i);
+  });
+
+  it("accepts every public Finder method declared in the bundled replicad typings", () => {
+    // Drift guard: if replicad adds a filter, this fails until the
+    // whitelist in validateSyntaxPure learns it.
+    const dts = readFileSync(
+      fileURLToPath(new URL("../../extension/typings/replicad/index.d.ts", import.meta.url)),
+      "utf-8",
+    );
+    const methods = new Set<string>();
+    const classPattern = /declare (?:abstract )?class (?:Finder|Finder3d|EdgeFinder|FaceFinder|CornerFinder)\b[^{]*\{([\s\S]*?)\n\}/g;
+    for (const [, body] of dts.matchAll(classPattern)) {
+      for (const [, name] of body.matchAll(/^ {4}(?:abstract )?(\w+)(?:<[^>]*>)?\(/gm)) {
+        if (name !== "constructor") methods.add(name);
+      }
+    }
+    expect(methods).toContain("inDirection");
+    expect(methods).toContain("ofSurfaceType");
+    expect(methods).toContain("containsPoint");
+    const code = [
+      `export default function main(shape) {`,
+      ...[...methods].map((m) => `  shape.fillet(1, (f) => f.${m}());`),
+      `}`,
+    ].join("\n");
+    expect(validateSyntaxPure(code).text).not.toMatch(/unknown method/i);
+  });
+
+  it("still flags typos on Replicad shapes and on built-ins", () => {
+    const code = [
+      `import { drawRectangle } from "replicad";`,
+      `export default function main() {`,
+      `  const r = 10 * Math.cso(0.5);`,
+      `  return drawRectangle(r, 20).sketchOnPlane("XY").extrdue(5);`,
+      `}`,
+    ].join("\n");
+    const { text, isError } = validateSyntaxPure(code);
+    expect(isError).toBe(false);
+    expect(text).toMatch(/unknown method/i);
+    expect(text).toContain(".extrdue()");
+    expect(text).toContain(".cso()");
+    expect(text).not.toContain(".sketchOnPlane()");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ordinary array/string/number instance methods (`pts.map`, `parts.push`,
+// `n.toFixed`) were reported as "unknown method(s)". Typos — on Replicad
+// shapes, on built-ins, and on arrays themselves — must still be flagged.
+// ---------------------------------------------------------------------------
+
+describe("validateSyntaxPure — array, string and number instance methods", () => {
+  it("does not warn on map / push / forEach / Object.keys(o).map / toFixed", () => {
+    const code = [
+      `import { makeCylinder } from "replicad";`,
+      `export default function main() {`,
+      `  const o = { a: 1, b: 2 };`,
+      `  const n = 12.345;`,
+      `  const holes = [[0, 0], [10, 0]];`,
+      `  const pts = holes.map((p) => [p[0] * 2, p[1]]);`,
+      `  const parts = [];`,
+      `  holes.forEach((h, i) => parts.push({ shape: makeCylinder(2, 5).translate([h[0], h[1], 0]), name: "h" + i }));`,
+      `  const label = Object.keys(o).map((k) => k.toUpperCase()).join("-") + n.toFixed(2);`,
+      `  return parts;`,
+      `}`,
+    ].join("\n");
+    const { text, isError } = validateSyntaxPure(code);
+    expect(isError).toBe(false);
+    expect(text).not.toMatch(/unknown method/i);
+  });
+
+  it("does not warn on chained array and string methods after a call", () => {
+    const code = [
+      `export default function main({ count }) {`,
+      `  const names = Array.from({ length: count }, (_, i) => i)`,
+      `    .filter((i) => i % 2 === 0)`,
+      `    .map((i) => String(i).padStart(3, "0"))`,
+      `    .reduce((acc, s) => acc.concat(s.split("")), []);`,
+      `  return names.slice(0, 2).includes("0");`,
+      `}`,
+    ].join("\n");
+    const { text, isError } = validateSyntaxPure(code);
+    expect(isError).toBe(false);
+    expect(text).not.toMatch(/unknown method/i);
+  });
+
+  it("still flags Replicad, built-in and array-method typos next to them", () => {
+    const code = [
+      `import { drawRectangle } from "replicad";`,
+      `export default function main() {`,
+      `  const sizes = [10, 20];`,
+      `  const scaled = sizes.map((s) => s * Math.cso(0.5));`,
+      `  scaled.pussh(5);`,
+      `  return drawRectangle(scaled[0], 20).sketchOnPlane("XY").extrdue(5);`,
+      `}`,
+    ].join("\n");
+    const { text, isError } = validateSyntaxPure(code);
+    expect(isError).toBe(false);
+    expect(text).toMatch(/unknown method/i);
+    expect(text).toContain(".extrdue()");
+    expect(text).toContain(".cso()");
+    expect(text).toContain(".pussh()");
+    expect(text).not.toContain(".map()");
   });
 });
 
