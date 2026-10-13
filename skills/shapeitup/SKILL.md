@@ -6,31 +6,7 @@ paths: ["**/*.shape.ts"]
 
 # ShapeItUp — Replicad CAD Scripting Reference
 
-This skill gives you breadth: what to call, when, how. For depth (full signatures, more examples) call `get_api_reference({ category, search?, signaturesOnly? })`.
-
-## Contents
-
-- [AI Workflow (decision tree)](#ai-workflow)
-- [Available MCP Tools](#available-mcp-tools)
-- [Plane orientation (read this first)](#plane-orientation-read-this-first)
-- [Top Best Practices](#top-best-practices)
-- [File Convention](#file-convention)
-- [Core Concepts](#core-concepts)
-- [draw\* vs sketch\*](#draw-vs-sketch)
-- [Drawing API (2D)](#drawing-api-2d)
-- [Sketching (2D → 3D-ready)](#sketching-2d--3d-ready)
-- [3D Solid Operations](#3d-solid-operations)
-- [Boolean Operations](#boolean-operations)
-- [Organic / Sculptural Shapes](#organic--sculptural-shapes)
-- [Shape Modifications](#shape-modifications)
-- [Transformations](#transformations)
-- [Finders](#finders)
-- [Memory Management](#memory-management)
-- [Multi-File & Assemblies](#multi-file--assemblies)
-- [Export Decision Table](#export-decision-table)
-- [Complete Examples](#complete-examples)
-
----
+This skill gives you breadth: what to call, when, how. Your MCP client already lists every ShapeItUp tool with its arguments, so they are not repeated here. For depth — full signatures, and complete worked parts under `category: "examples"` — call `get_api_reference({ category, search?, signaturesOnly? })` when you need it.
 
 ## AI Workflow
 
@@ -53,46 +29,9 @@ Start with `create_shape` (or `modify_shape`) — the status from that call tell
 - Need API depth
   - `get_api_reference({ search: "sweep" })` — searches across all categories.
   - `get_api_reference({ category: "finders", signaturesOnly: true })` — compact dump.
+  - `get_api_reference({ category: "examples" })` — complete parts to start from: L-bracket, flanged bottle, enclosure, lofted vase, swept tube, slotted wheel.
 - Sandbox can't read `shapeitup-previews/` (gitignored path)
   - `get_preview` returns the latest PNG as inline base64 in the tool response.
-
----
-
-## Available MCP Tools
-
-All 29 tools. Dense reference — use this table to find the right tool fast.
-
-| Tool | Purpose | Key args |
-|------|---------|----------|
-| `setup_shape_project` | Bootstrap a folder with `.shape.ts` type stubs + tsconfig. **You usually don't need to call this — `create_shape` auto-bootstraps on first write.** Call explicitly only when editor import errors persist in a brand-new folder. Never runs `npm install` — replicad/OCCT are bundled inside the MCP server itself. | `directory` |
-| `create_shape` | Create new `.shape.ts` and execute (auto-bootstraps types on first write) | `name`, `code`, `directory?`, `overwrite?` |
-| `modify_shape` | Overwrite existing `.shape.ts` and execute. **Params-only form** (`{ filePath, params }` with no `code`) re-renders with new param values without rewriting the file — preferred for "tune one number" on an already-rendered shape. | `filePath`, `code?`, `params?` |
-| `read_shape` | Read file contents | `filePath` |
-| `open_shape` | Execute an existing file, bring up in viewer | `filePath` |
-| `delete_shape` | Delete a `.shape.ts` file | `filePath` |
-| `list_shapes` | Find all `.shape.ts` files | `directory?`, `recursive?` |
-| `validate_syntax` | Syntax + 6 semantic lints (no execution) | `code` |
-| `preview_shape` | Execute a snippet WITHOUT writing to workspace | `code`, `workingDir?`, `captureScreenshot?`, `focusPart?`, `hideParts?` |
-| `tune_params` | Re-run with ephemeral param overrides, file untouched | `filePath`, `params`, `captureScreenshot?` |
-| `clear_params` | Drop the param overrides `tune_params` pinned for a file | `filePath` |
-| `get_render_status` | Last run's stats (volume, area, CoM, bbox, mass, per-part) | — |
-| `render_preview` | PNG screenshot of current shape | `filePath?`, `cameraAngle?`, `renderMode?`, `showDimensions?`, `showAxes?`, `width?`, `height?`, `timeoutMs?`, `finder?`, `partName?`, `partIndex?`, `focusPart?`, `hideParts?` |
-| `get_preview` | Return latest PNG as inline base64 (no Read needed) | `filePath?`, `cameraAngle?` |
-| `set_render_mode` | Switch live viewer ai/dark (UI only) | `mode` |
-| `toggle_dimensions` | Show/hide dims on live viewer (UI only) | `show?` |
-| `open_viewer` | Serve the interactive 3D viewer over HTTP and return its URL (no editor needed; live-reloads on save) | `filePath`, `port?` |
-| `close_viewer` | Shut down the `open_viewer` server | — |
-| `preview_finder` | Count + locate edge/face matches; pink-sphere preview in viewer | `filePath`, `finder`, `partName?`, `partIndex?` |
-| `check_collisions` | Pairwise part intersection test on assemblies | `filePath`, `tolerance?`, `acceptedPairs?`, `pressFitThreshold?` |
-| `check_stack` | Per-part world range along one axis, sorted, with gaps/overlaps between neighbours | `filePath`, `axis`, `acceptedOverlaps?` |
-| `sweep_check` | Rotate one part about a pivot+axis and report collisions at each step | `filePath`, `moving`, `pivot`, `axis`, `range`, `steps?` |
-| `run_simulation` | Run the shape's `export const sim` kinematic simulation; collision events over time | `filePath`, `format?` |
-| `describe_geometry` | Enumerate faces/edges (normal, centroid, area, type) + bbox | `filePath`, `partName?`, `format?`, `faces?`, `edges?`, `limit?` |
-| `validate_joints` | Check declared mate joints sit on their part's surface | `filePath`, `tolerance?` |
-| `verify_shape` | One execution, any mix of geometry / collision / joint checks — prefer over calling those three separately | `filePath`, `checks` |
-| `export_shape` | Export to STEP, STL or 3MF; optional single part or one file per part | `format`, `filePath?`, `outputPath?`, `partName?`, `splitParts?`, `openIn?` |
-| `list_installed_apps` | Detect PrusaSlicer/Cura/FreeCAD/Fusion360/etc. | — |
-| `get_api_reference` | Replicad docs; omit category to list; `search` to grep | `category?`, `search?`, `signaturesOnly?` |
 
 ---
 
@@ -482,7 +421,6 @@ shape.scale(factor, center?)   // UNIFORM only — one number
 
 > **Part transforms preserve joints.** The destructive rule above applies to raw `Shape3D` values. The stdlib `Part` wrapper (from `part()`, `motors.nema17()`, `bearings.body()`, etc.) composes transforms internally — `part.translate(...)`, `part.rotate(...)`, and `part.mirror(...)` return a new `Part` whose `.joints.<name>` resolves to the correctly transformed world-space position and axis. Compose freely; `mate()` still works after any chain of transforms.
 
-
 `scale()` is uniform-only (OpenCascade constraint — no `scaleNonUniform` exists). To stretch non-uniformly:
 - Parameterize the dimensions (`drawRectangle(W, H)` with W and H as separate params, then use `tune_params`).
 - Work in 2D first (Drawings are planar — X/Y transforms happen before extrude; Z comes from extrude distance).
@@ -727,113 +665,6 @@ export_shape({ filePath: "enclosure.shape.ts", format: "stl", partName: "bracket
 ```
 
 `openIn` launches the export in a detected app (`prusaslicer`, `cura`, `bambustudio`, `orcaslicer`, `freecad`, `fusion360`). Call `list_installed_apps` first to see what's available on the user's machine.
-
----
-
-## Complete Examples
-
-### Box with center hole and fillets
-
-```typescript
-import { drawRectangle, sketchCircle } from "replicad";
-export default function main() {
-  let box = drawRectangle(60, 40).sketchOnPlane("XY").extrude(20);
-  box = box.fillet(2);                   // BEFORE cutting
-  const hole = sketchCircle(8).extrude(20);
-  return box.cut(hole);
-}
-```
-
-### L-bracket with mounting holes
-
-```typescript
-import { draw, makeCylinder } from "replicad";
-export default function main() {
-  const profile = draw().hLine(60).vLine(5).hLine(-55).vLine(35).hLine(-5).close();
-  let bracket = profile.sketchOnPlane("XZ").extrude(30);
-  const h1 = makeCylinder(3, 30, [45, 0, 2.5], [0, 1, 0]);
-  const h2 = makeCylinder(3, 30, [15, 0, 2.5], [0, 1, 0]);
-  const h3 = makeCylinder(3, 30, [2.5, 0, 25], [0, 1, 0]);
-  bracket = bracket.cut(h1).cut(h2).cut(h3);
-  return bracket.fillet(2, e => e.inDirection("Y"));
-}
-```
-
-### Flanged cylinder (bottle shape)
-
-```typescript
-import { sketchCircle } from "replicad";
-export default function main() {
-  const base = sketchCircle(30).extrude(5);
-  const body = sketchCircle(15).extrude(50).translateZ(5);
-  let shape = base.fuse(body).fillet(3);  // fillet BEFORE cutting interior
-  const interior = sketchCircle(12).extrude(52);
-  return shape.cut(interior);
-}
-```
-
-### Enclosure shell
-
-```typescript
-import { drawRoundedRectangle } from "replicad";
-export default function main() {
-  const outer = drawRoundedRectangle(80, 50, 5).sketchOnPlane("XY").extrude(30);
-  const inner = drawRoundedRectangle(76, 46, 3).sketchOnPlane("XY", [0, 0, 2]).extrude(30);
-  return outer.cut(inner);
-}
-```
-
-### Organic vase (loft between profiles)
-
-```typescript
-import { drawCircle, drawEllipse } from "replicad";
-export const params = { baseR: 20, midR: 25, neckR: 10, topR: 12, height: 60 };
-export default function main({ baseR, midR, neckR, topR, height }: typeof params) {
-  const base  = drawCircle(baseR).sketchOnPlane("XY");
-  const belly = drawEllipse(midR, midR * 0.8).sketchOnPlane("XY", [0, 0, height * 0.4]);
-  const neck  = drawCircle(neckR).sketchOnPlane("XY", [0, 0, height * 0.75]);
-  const top   = drawCircle(topR).sketchOnPlane("XY", [0, 0, height]);
-  return base.loftWith([belly, neck, top], { ruled: false })
-    .shell(2, (f: any) => f.inPlane("XY", height));
-}
-```
-
-### Swept tube (sweep along bezier)
-
-```typescript
-import { draw, sketchCircle } from "replicad";
-export const params = { radius: 4, height: 50 };
-export default function main({ radius, height }: typeof params) {
-  const path = draw()
-    .cubicBezierCurveTo([15, height * 0.5], [0, height * 0.2], [20, height * 0.3])
-    .cubicBezierCurveTo([0, height], [-10, height * 0.7], [0, height * 0.9])
-    .done()
-    .sketchOnPlane("XZ");
-  return path.sweepSketch((plane, origin) => sketchCircle(radius, { plane, origin }), { frenet: true });
-}
-```
-
-### Wheel with spoke slots
-
-```typescript
-import { sketchCircle, drawRectangle } from "replicad";
-export default function main() {
-  const disc = sketchCircle(40).extrude(8);
-  const hub  = sketchCircle(10).extrude(15);
-  const axleHole = sketchCircle(5).extrude(15);
-  let wheel = disc.fuse(hub).cut(axleHole);
-  for (let i = 0; i < 6; i++) {
-    const angle = (i * 60 * Math.PI) / 180;
-    const slot = drawRectangle(12, 5)
-      .sketchOnPlane("XY")
-      .extrude(8)
-      .translate(Math.cos(angle) * 25, Math.sin(angle) * 25, 0)
-      .rotate(i * 60, [0, 0, 0], [0, 0, 1]);
-    wheel = wheel.cut(slot);
-  }
-  return wheel.fillet(1);
-}
-```
 
 ---
 

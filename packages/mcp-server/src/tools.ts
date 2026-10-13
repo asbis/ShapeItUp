@@ -7936,6 +7936,98 @@ export default function main({ finCount, finThickness, baseR, finR, height }: ty
   }
   return profile.sketchOnPlane("XY").extrude(height); // single solid build
 }
+\`\`\`
+
+## L-Bracket with Mounting Holes
+\`placeOn\` states which way the profile is extruded, so the hole positions don't depend on remembering that \`XZ\` extrudes toward -Y.
+\`\`\`typescript
+import { draw, makeCylinder } from "replicad";
+import { placeOn } from "shapeitup";
+export default function main() {
+  // L profile on XZ: a 60 mm foot along X and a 40 mm upright, both 5 mm thick.
+  const profile = draw().hLine(60).vLine(5).hLine(-55).vLine(35).hLine(-5).close();
+  // placeOn says which way the 30 mm goes, so the bracket spans Y ∈ [0, 30].
+  let bracket = placeOn(profile, "XZ", { into: "+Y", distance: 30 });
+  // Two holes down through the foot (along Z), one through the upright (along X).
+  const footHole = (x: number) => makeCylinder(3, 7, [x, 15, -1], [0, 0, 1]);
+  const wallHole = makeCylinder(3, 7, [-1, 15, 25], [1, 0, 0]);
+  bracket = bracket.cut(footHole(25)).cut(footHole(48)).cut(wallHole);
+  return bracket.fillet(1, (e) => e.inDirection("Y"));
+}
+\`\`\`
+
+## Flanged Bottle
+Fillet only the edges where the parts meet, and hollow the body after filleting. An all-edges \`.fillet()\` straight after a \`.fuse()\` is the call OpenCascade most often rejects.
+\`\`\`typescript
+import { sketchCircle } from "replicad";
+export default function main() {
+  const flange = sketchCircle(30).extrude(5);
+  const neck = sketchCircle(15).extrude(50).translateZ(5);
+  // Fillet only the edges where flange meets neck (z = 5). An all-edges fillet
+  // right after a fuse is what OpenCascade most often rejects.
+  const body = flange.fuse(neck).fillet(3, (e) => e.inPlane("XY", 5));
+  // Hollow it after filleting, leaving a 2 mm floor.
+  const interior = sketchCircle(12).extrude(60).translateZ(2);
+  return body.cut(interior);
+}
+\`\`\`
+
+## Enclosure Shell
+\`\`\`typescript
+import { drawRoundedRectangle } from "replicad";
+export default function main() {
+  const outer = drawRoundedRectangle(80, 50, 5).sketchOnPlane("XY").extrude(30);
+  const inner = drawRoundedRectangle(76, 46, 3).sketchOnPlane("XY", [0, 0, 2]).extrude(30);
+  return outer.cut(inner);
+}
+\`\`\`
+
+## Organic Vase (Loft Between Profiles)
+\`\`\`typescript
+import { drawCircle, drawEllipse } from "replicad";
+export const params = { baseR: 20, midR: 25, neckR: 10, topR: 12, height: 60 };
+export default function main({ baseR, midR, neckR, topR, height }: typeof params) {
+  const base  = drawCircle(baseR).sketchOnPlane("XY");
+  const belly = drawEllipse(midR, midR * 0.8).sketchOnPlane("XY", [0, 0, height * 0.4]);
+  const neck  = drawCircle(neckR).sketchOnPlane("XY", [0, 0, height * 0.75]);
+  const top   = drawCircle(topR).sketchOnPlane("XY", [0, 0, height]);
+  return base.loftWith([belly, neck, top], { ruled: false })
+    .shell(2, (f: any) => f.inPlane("XY", height));
+}
+\`\`\`
+
+## Swept Tube (Sweep Along a Bézier)
+\`\`\`typescript
+import { draw, sketchCircle } from "replicad";
+export const params = { radius: 4, height: 50 };
+export default function main({ radius, height }: typeof params) {
+  const path = draw()
+    .cubicBezierCurveTo([15, height * 0.5], [0, height * 0.2], [20, height * 0.3])
+    .cubicBezierCurveTo([0, height], [-10, height * 0.7], [0, height * 0.9])
+    .done()
+    .sketchOnPlane("XZ");
+  return path.sweepSketch((plane, origin) => sketchCircle(radius, { plane, origin }), { frenet: true });
+}
+\`\`\`
+
+## Slotted Wheel (Pattern Cut)
+One \`patterns.cutAt\` call instead of a loop of \`.cut()\`s: faster, and each placement is already rotated to point outward.
+\`\`\`typescript
+import { sketchCircle, drawRectangle } from "replicad";
+import { patterns } from "shapeitup";
+export default function main() {
+  const disc = sketchCircle(40).extrude(8);
+  const hub = sketchCircle(10).extrude(15);
+  const axleHole = sketchCircle(5).extrude(15);
+  const wheel = disc.fuse(hub).cut(axleHole);
+  // Six radial slots on a 25 mm circle in one call, instead of a hand-rolled
+  // loop of cuts: each placement turns the 12 × 5 slot to point outward.
+  return patterns.cutAt(
+    wheel,
+    () => drawRectangle(12, 5).sketchOnPlane("XY").extrude(8),
+    patterns.polar(6, 25, { orientOutward: true }),
+  ).fillet(1);
+}
 \`\`\``,
     stdlib: `# ShapeItUp stdlib (\`import from "shapeitup"\`)
 
