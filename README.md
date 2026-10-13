@@ -133,6 +133,38 @@ The one-click buttons and the plain MCP configs above don't include the skill th
 npx skills add asbis/ShapeItUp
 ```
 
+### Fewer tools, fewer tokens
+
+Codex, Cursor and Mistral Vibe put every tool's description in context at the start of each session, whether or not it does any CAD: about 7k tokens for all 29. (Claude Code loads MCP tools on demand.) If you don't use some tools, switch them off. These 14 are the ones most sessions never call, and dropping them saves about 2.8k tokens:
+
+**Mistral Vibe:** at the top of `~/.vibe/config.toml`, above any `[[mcp_servers]]` table, since TOML would otherwise read the key as part of that table. Vibe names MCP tools `<server>_<tool>`.
+
+```toml
+disabled_tools = [
+  "shapeitup_run_simulation", "shapeitup_sweep_check", "shapeitup_check_stack",
+  "shapeitup_validate_joints", "shapeitup_preview_finder", "shapeitup_describe_geometry",
+  "shapeitup_open_shape", "shapeitup_get_render_status", "shapeitup_clear_params",
+  "shapeitup_delete_shape", "shapeitup_setup_shape_project", "shapeitup_list_installed_apps",
+  "shapeitup_set_render_mode", "shapeitup_toggle_dimensions",
+]
+```
+
+Use `disabled_tools`, not `enabled_tools`: Vibe's list applies to all of its tools, so an allow-list of ShapeItUp tools would switch off everything else.
+
+**Codex:** in the server's own table, with the plain tool names:
+
+```toml
+[mcp_servers.shapeitup]
+# command, args and timeouts as above
+disabled_tools = [
+  "run_simulation", "sweep_check", "check_stack", "validate_joints", "preview_finder",
+  "describe_geometry", "open_shape", "get_render_status", "clear_params", "delete_shape",
+  "setup_shape_project", "list_installed_apps", "set_render_mode", "toggle_dimensions",
+]
+```
+
+**Cursor:** click a tool's name under Settings → MCP to switch it off. There's no config-file setting for it yet, and the toggles have been reported to reset after a restart.
+
 Node 20+ required. No native build step; everything ships as WASM.
 
 ## What you get

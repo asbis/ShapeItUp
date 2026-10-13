@@ -86,6 +86,24 @@ Extension `1.30.1` / mcp-server `1.30.1` — Codex setup docs and three fixes.
   - Source maps are no longer published (1.3 MB gzipped).
 - CI now runs the `@shapeitup/shared` tests, and checks that the npm tarball
   carries `manifold.wasm` and no source maps.
+- **The tool list costs ~45% fewer tokens: 49 KB → 27 KB, about 12k → 7k.**
+  Codex, Cursor and Mistral Vibe put it in context at the start of every
+  session, whether or not it does any CAD. Each tool and parameter
+  description now says what it does, when to use it, and its defaults;
+  history, internals and the same path-resolution paragraph repeated twelve
+  times are gone. A test keeps `tools/list` under 30,000 characters.
+- **Descriptions that were wrong:** `render_preview`'s `cameraAngle` and
+  `grid` promised a multi-angle collage, but every render is the 4-pane view;
+  `export_shape`'s `openIn` said it needed VS Code (it doesn't);
+  `preview_shape` claimed its `inline` default matched `render_preview`'s (it's
+  the opposite); `check_collisions` pointed at an API reference category that
+  doesn't exist.
+- **No description is clipped any more.** Three were longer than the
+  sanitizer's 1,000-character limit and lost their endings for every client,
+  `run_simulation`'s MuJoCo paragraph among them. A test now fails if one is.
+- **README: "Fewer tools, fewer tokens".** How to switch off the 14 tools
+  most sessions never call (~2.8k tokens) with `disabled_tools` in Mistral
+  Vibe and Codex, and in Cursor's settings.
 - **The skill costs ~2,000 fewer tokens each time it loads** (16.2k → 14.2k),
   per [#13](https://github.com/asbis/ShapeItUp/issues/13), thanks
   @martinrieder. `SKILL.md` no longer carries:

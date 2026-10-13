@@ -77,6 +77,8 @@ Keep `startup_timeout_sec`. Vibe's default is 10 s, and the first run of `npx` d
 
 For the Replicad API reference, save [`SKILL.md`](https://github.com/asbis/ShapeItUp/blob/master/skills/shapeitup/SKILL.md) as `~/.vibe/skills/shapeitup/SKILL.md`. Vibe loads it as-is, and it also becomes the `/shapeitup` command. With the VS Code extension installed, **ShapeItUp: Install MCP Server… → Add to Mistral Vibe** does both steps after you confirm.
 
+Codex, Cursor and Vibe load every tool description at the start of each session (~7k tokens for all 29). To switch off the ones you don't use, see [Fewer tools, fewer tokens](https://github.com/asbis/ShapeItUp#fewer-tools-fewer-tokens).
+
 Node 20+ required. Works in Docker / CI (WASM, no native deps).
 
 ## What's in the box
