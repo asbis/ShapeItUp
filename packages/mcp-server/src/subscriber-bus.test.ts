@@ -8,11 +8,11 @@
  *   - with zero subscribers, publishEvent returns delivered=0 without hanging
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, existsSync, readdirSync } from "fs";
+import { mkdtempSync, rmSync, existsSync, readdirSync, mkdirSync, writeFileSync, utimesSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { WebSocket } from "ws";
-import { SubscriberBus, readMcpServerHeartbeat } from "./subscriber-bus.js";
+import { SubscriberBus, readMcpServerHeartbeat, resolveGlobalStorageDir } from "./subscriber-bus.js";
 
 // Tiny helper so each test's subscriber can block until it sees a message.
 function awaitMessage(ws: WebSocket, timeoutMs = 2000): Promise<any> {
@@ -168,5 +168,64 @@ describe("SubscriberBus", () => {
     const after = readdirSync(storageDir).filter((n) => n.startsWith("mcp-server-heartbeat-"));
     expect(after.length).toBe(0);
     expect(existsSync(storageDir)).toBe(true); // the dir itself stays
+  });
+});
+
+describe("resolveGlobalStorageDir", () => {
+  const ID = "shapeitup.shapeitup-vscode";
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "global-storage-"));
+  });
+
+  afterEach(() => {
+    try { rmSync(home, { recursive: true, force: true }); } catch {}
+  });
+
+  // What the extension leaves behind: a heartbeat in its own globalStorage.
+  function extensionHeartbeat(dir: string, ageSeconds: number, name = "shapeitup-heartbeat.json") {
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, name);
+    writeFileSync(file, "{}");
+    const t = Date.now() / 1000 - ageSeconds;
+    utimesSync(file, t, t);
+  }
+
+  it("uses VS Code's macOS location, not ~/.config", () => {
+    expect(resolveGlobalStorageDir({ home, platform: "darwin", env: {} })).toBe(
+      join(home, "Library", "Application Support", "Code", "User", "globalStorage", ID),
+    );
+  });
+
+  it("follows APPDATA on Windows and XDG_CONFIG_HOME on Linux", () => {
+    expect(resolveGlobalStorageDir({ home, platform: "win32", env: { APPDATA: join(home, "Roaming") } })).toBe(
+      join(home, "Roaming", "Code", "User", "globalStorage", ID),
+    );
+    expect(resolveGlobalStorageDir({ home, platform: "linux", env: {} })).toBe(
+      join(home, ".config", "Code", "User", "globalStorage", ID),
+    );
+    expect(resolveGlobalStorageDir({ home, platform: "linux", env: { XDG_CONFIG_HOME: join(home, "xdg") } })).toBe(
+      join(home, "xdg", "Code", "User", "globalStorage", ID),
+    );
+  });
+
+  it("picks the editor the extension ran in, even when VS Code's dir exists", () => {
+    const root = join(home, "Library", "Application Support");
+    // This server creates VS Code's dir on its own, so its existence proves nothing.
+    mkdirSync(join(root, "Code", "User", "globalStorage", ID), { recursive: true });
+    extensionHeartbeat(join(root, "Cursor", "User", "globalStorage", ID), 60, "shapeitup-heartbeat-123.json");
+    expect(resolveGlobalStorageDir({ home, platform: "darwin", env: {} })).toBe(
+      join(root, "Cursor", "User", "globalStorage", ID),
+    );
+  });
+
+  it("prefers the editor with the most recent heartbeat", () => {
+    const root = join(home, ".config");
+    extensionHeartbeat(join(root, "Cursor", "User", "globalStorage", ID), 3600);
+    extensionHeartbeat(join(root, "Code", "User", "globalStorage", ID), 5);
+    expect(resolveGlobalStorageDir({ home, platform: "linux", env: {} })).toBe(
+      join(root, "Code", "User", "globalStorage", ID),
+    );
   });
 });

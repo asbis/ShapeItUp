@@ -33,6 +33,28 @@ export function buildSyntheticShapeEntry(absPath: string): string {
 }
 
 /**
+ * The names `buildSyntheticShapeEntry` re-exports whether or not the user's
+ * file declares them.
+ */
+const OPTIONAL_ENTRY_EXPORTS = ["params", "material", "config", "sim"];
+
+const OPTIONAL_REEXPORT_WARNING = new RegExp(
+  `^Import "(${OPTIONAL_ENTRY_EXPORTS.join("|")})" will always be undefined`,
+);
+
+/**
+ * True for the esbuild warning the synthetic wrapper causes on every file that
+ * doesn't declare one of its optional exports — which is most files. The MCP
+ * engine and the extension both filter with this, so the list lives in one
+ * place; each used to carry its own regex, and both missed `sim`. The engine
+ * and the extension still inline copies of the wrapper itself — a name added
+ * there must be added here too (bundle-spec.test.ts checks this file's copy).
+ */
+export function isOptionalReexportWarning(text: string): boolean {
+  return OPTIONAL_REEXPORT_WARNING.test(text);
+}
+
+/**
  * esbuild options every `.shape.ts` bundler must agree on, whatever esbuild
  * flavour it runs (native in `@shapeitup/serve`, `esbuild-wasm` in the MCP
  * engine and the VSCode extension host).

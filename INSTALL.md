@@ -37,6 +37,8 @@ Check for each of these (absence of one is fine — just skip that client):
 
 - **Claude Code CLI**: `which claude` succeeds, OR `~/.claude.json` exists,
   OR `~/.claude/` exists.
+- **Codex** (CLI, IDE extension or ChatGPT desktop app — they share one
+  config): `which codex` succeeds, OR `~/.codex/` exists.
 - **Cursor**: `~/.cursor/mcp.json` exists, OR the Cursor app is installed
   (`/Applications/Cursor.app` on macOS, `%LOCALAPPDATA%\Programs\cursor` on
   Windows).
@@ -80,6 +82,35 @@ Fallback if `claude mcp add` isn't available: merge this into `~/.claude.json`:
 **Never overwrite the whole file** — read existing JSON, merge the
 `mcpServers.shapeitup` entry, write back. If the file is malformed, stop and
 tell the user.
+
+#### Codex
+
+Preferred: use the CLI.
+
+```bash
+codex mcp add shapeitup -- npx -y @shapeitup/mcp-server
+```
+
+Then open `~/.codex/config.toml` and make sure the `[mcp_servers.shapeitup]`
+table carries both timeouts. Add the two keys if they are missing; leave
+everything else in the file alone:
+
+```toml
+[mcp_servers.shapeitup]
+command = "npx"
+args = ["-y", "@shapeitup/mcp-server"]
+startup_timeout_sec = 60
+tool_timeout_sec = 180
+```
+
+Fallback if `codex` isn't on the PATH (the desktop app alone doesn't add it):
+append that table to `~/.codex/config.toml`, creating the file if missing. If
+the file already has a `[mcp_servers.shapeitup]` table, edit it instead —
+TOML rejects a table defined twice.
+
+Keep both timeouts. Codex gives a server 10 s to start by default, which is
+shorter than the first `npx` download, and a tool 60 s, which a cold render of
+complex geometry can exceed. Tell the user to restart Codex.
 
 #### Cursor
 
@@ -154,12 +185,16 @@ curl -fsSL https://raw.githubusercontent.com/asbis/ShapeItUp/master/skills/shape
 If Mistral Vibe is present, the same file works there unchanged: write it to
 `~/.vibe/skills/shapeitup/SKILL.md` (ask first). Vibe picks it up on `/reload`.
 
+If Codex is present, write the same file to `~/.agents/skills/shapeitup/SKILL.md`
+(ask first). That is Codex's user-level skills directory; it picks up new
+skills without a restart.
+
 ### Step 4 — Verify
 
 After registration:
 
 1. For CLI clients, ask the user to restart their agent session (or run
-   `claude mcp list` to confirm `shapeitup` is listed).
+   `claude mcp list` / `codex mcp list` to confirm `shapeitup` is listed).
 2. Tell the user to try a prompt like: *"Use the ShapeItUp MCP to create a
    simple 20mm cube and render it."* If the agent reports that the `shapeitup`
    tools are available, installation succeeded.
@@ -175,7 +210,9 @@ so the user can troubleshoot.
 ## Uninstall
 
 To remove ShapeItUp from an MCP client, delete the `shapeitup` entry from the
-relevant config file, or run `claude mcp remove shapeitup` for Claude Code and
-`vibe mcp remove shapeitup` for Mistral Vibe. No global state is left behind
-beyond those config entries and the optional skill files at
-`~/.claude/skills/shapeitup/` and `~/.vibe/skills/shapeitup/`.
+relevant config file (for Codex, the `[mcp_servers.shapeitup]` table in
+`~/.codex/config.toml`), or run `claude mcp remove shapeitup` for Claude Code
+and `vibe mcp remove shapeitup` for Mistral Vibe. No global state is left
+behind beyond those config entries and the optional skill files at
+`~/.claude/skills/shapeitup/`, `~/.vibe/skills/shapeitup/` and
+`~/.agents/skills/shapeitup/`.
