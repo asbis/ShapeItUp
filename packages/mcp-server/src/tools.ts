@@ -3170,9 +3170,9 @@ export function formatSweepCollisions(
 export function registerTools(server: McpServer) {
   server.tool(
     "setup_shape_project",
-    "Bootstrap a folder so `.shape.ts` files get correct types in editors. Writes node_modules/shapeitup and node_modules/replicad type stubs + a minimal tsconfig.json if missing. Idempotent — safe to call repeatedly. Does NOT run npm install; replicad and OCCT are bundled inside this MCP server at runtime. Typically you don't need to call this manually: create_shape auto-bootstraps on first write.",
+    "Write type stubs (node_modules/shapeitup, node_modules/replicad) and a minimal tsconfig.json so editors type-check `.shape.ts` files. Rarely needed: create_shape does this on first write. Never runs npm install.",
     {
-      directory: z.string().optional().describe("Absolute path (defaults to current working directory)."),
+      directory: z.string().optional().describe("Folder to set up (default: current directory)."),
     },
     safeHandler("setup_shape_project", async ({ directory = process.cwd() }) => {
       const r = setupShapeProject(directory);
@@ -3190,7 +3190,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "create_shape",
-    "Create a new .shape.ts CAD script file and execute it. Fails if file already exists — use modify_shape to update existing files. Path resolution precedence: absolute `directory` used as-is; relative `directory` probed against each heartbeat-reported VSCode workspace root (first match wins), else `process.cwd()`; omitted `directory` defaults to the first active VSCode workspace root (or cwd if no extension is running). Refuses to create a file when the resolved path contains a duplicated segment (e.g. `examples/examples/...`) unless `allowPathDuplication: true` is passed.",
+    "Create a new `.shape.ts` file and run it; the response carries the render status, bounding box and stats. Fails if the file exists: use modify_shape, or pass `overwrite: true`. Refuses a path with a doubled segment (e.g. `examples/examples/`) unless `allowPathDuplication: true`.",
     {
       name: z
         .string()
@@ -3211,12 +3211,12 @@ export function registerTools(server: McpServer) {
             });
           }
         })
-        .describe("File name without extension (e.g., 'bracket'). Do not include '.shape', '.ts', or '.shape.ts' — the tool appends '.shape.ts' automatically."),
-      code: z.string().describe("TypeScript source code using Replicad API"),
-      directory: z.string().optional().describe("Directory to create the file in. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first match wins), falling back to process.cwd(). When omitted, defaults to the active VSCode workspace root."),
-      overwrite: z.boolean().optional().describe("Set to true to overwrite an existing file (default: false)"),
-      allowPathDuplication: z.boolean().optional().describe("Set to true to proceed (with a warning) when the resolved directory has a duplicated last-two segments (e.g. `.../examples/examples`). Default: false — the call refuses in that case and lists the recovery options. Absolute `directory` paths bypass this refusal regardless."),
-      verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats. 'summary' (default) caps at 25 parts then prints a '… and N more' line — keeps the response inside the MCP token budget on large assemblies. 'full' dumps every part (may be large for 25+ part assemblies)."),
+        .describe("File name without extension: 'bracket' writes bracket.shape.ts."),
+      code: z.string().describe("TypeScript source with `export default function main()`."),
+      directory: z.string().optional().describe("Target folder. Relative paths resolve against the open VS Code workspace, else the current directory (default: the workspace root)."),
+      overwrite: z.boolean().optional().describe("Replace an existing file (default false)."),
+      allowPathDuplication: z.boolean().optional().describe("Proceed despite a doubled path segment (default false)."),
+      verbosity: z.enum(["summary", "full"]).optional().describe("'summary' (default) lists up to 25 parts; 'full' lists all."),
     },
     safeHandler("create_shape", async ({ name, code, directory, overwrite, allowPathDuplication, verbosity }) => {
       // Resolve `directory` with the same unified precedence as resolveShapePath:
@@ -3400,12 +3400,12 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "open_shape",
-    "Execute an existing .shape.ts file; when the ShapeItUp VSCode extension is open it will also reflect the file in its interactive viewer. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd(). Pass `capture: true` to also render a screenshot through the bundled SVG pipeline (runs standalone — no extension needed). A capture failure does not fail the whole call — it's reported as a warning line.",
+    "Run an existing `.shape.ts` file and show it in the VS Code viewer if one is open. `capture: true` also renders a PNG; a capture failure is reported as a warning, not an error.",
     {
-      filePath: z.string().describe("Path to the .shape.ts file to execute. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
-      capture: z.boolean().optional().describe("If true, after opening, also render a PNG screenshot through the bundled headless SVG pipeline. Runs standalone; the VSCode extension, when open, will continue to show the same file in its interactive viewer. Capture failures are reported as warnings; the handler still reports the execution status as success."),
-      verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats. 'summary' (default) caps at 25 parts. 'full' dumps every part."),
-      forceBundleRebuild: z.boolean().optional().describe("If true, bypasses the bundled-script cache and re-invokes esbuild. Use only when you suspect the cache is stale; the cache normally handles this correctly via mtime tracking."),
+      filePath: z.string().describe("Path to the .shape.ts file. Relative paths resolve against the open VS Code workspace, else the current directory."),
+      capture: z.boolean().optional().describe("Also render a PNG screenshot (default false)."),
+      verbosity: z.enum(["summary", "full"]).optional().describe("'summary' (default) lists up to 25 parts; 'full' lists all."),
+      forceBundleRebuild: z.boolean().optional().describe("Skip the bundle cache. Only if you suspect it is stale."),
     },
     safeHandler("open_shape", async ({ filePath, capture, verbosity, forceBundleRebuild }) => {
       const absPath = resolveShapePath(filePath);
@@ -3486,17 +3486,17 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "modify_shape",
-    "Change an existing .shape.ts file and execute it. Three write modes plus a re-run mode: (1) `code` — full overwrite; (2) `edits` — apply one or more exact-string patches in place (token-cheap for a few-line change — no need to resend the whole file); (3) `params` only (no `code`/`edits`) — re-execute with ephemeral param overrides, no disk write; (4) all omitted — behaves like `open_shape` (re-executes from disk), useful after editing an imported dependency like `constants.ts`. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd(). Precedence when several are supplied: `code` > `edits` > `params`; the losers are reported as ignored.",
+    "Change an existing `.shape.ts` file and run it. Pass `code` to replace the file, `edits` to patch exact strings (cheaper than resending the file), or only `params` to re-run with temporary overrides without writing. With none of them it re-runs from disk, e.g. after editing an imported file. Precedence: code > edits > params.",
     {
-      filePath: z.string().describe("Path to the .shape.ts file. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
-      code: z.string().optional().describe("New TypeScript source code (FULL overwrite). Omit when you only want to patch a few lines (`edits`) or re-run with different `params`."),
+      filePath: z.string().describe("Path to the .shape.ts file. Relative paths resolve against the open VS Code workspace, else the current directory."),
+      code: z.string().optional().describe("New full source; overwrites the file."),
       edits: z.array(z.object({
         oldString: z.string().describe("Exact substring to find in the current file. Must occur exactly once unless replaceAll is true."),
         newString: z.string().describe("Text to replace it with."),
         replaceAll: z.boolean().optional().describe("Replace every occurrence instead of requiring a unique match."),
-      })).optional().describe("Apply exact-string patches to the file in place, THEN execute — a token-cheap alternative to resending the whole file via `code` for a small change. Edits apply in array order; each oldString must match exactly once (unless replaceAll). Ignored when `code` is provided."),
-      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Optional ephemeral param overrides. Values can be numbers, booleans, or strings — pass whatever shape your `export const params` uses (e.g. `{ useHeatSet: true, finish: \"satin\", count: 4 }`). If neither `code` nor `edits` is provided, the file on disk is untouched and only the overrides are applied for this execution. Otherwise `params` is ignored (note appears in response)."),
-      verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats. 'summary' (default) caps at 25 parts. 'full' dumps every part."),
+      })).optional().describe("Exact-string patches, applied in order before running. Each oldString must match once unless replaceAll."),
+      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Temporary param overrides (numbers, booleans, strings). Used only without code and edits; the file is not written."),
+      verbosity: z.enum(["summary", "full"]).optional().describe("'summary' (default) lists up to 25 parts; 'full' lists all."),
     },
     safeHandler("modify_shape", async ({ filePath, code, edits, params, verbosity }) => {
       const absPath = resolveShapePath(filePath);
@@ -3589,9 +3589,9 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "read_shape",
-    "Read the contents of a .shape.ts file. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd().",
+    "Read a `.shape.ts` file.",
     {
-      filePath: z.string().describe("Path to the .shape.ts file. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
+      filePath: z.string().describe("Path to the .shape.ts file. Relative paths resolve against the open VS Code workspace, else the current directory."),
     },
     safeHandler("read_shape", async ({ filePath }) => {
       const absPath = resolveShapePath(filePath);
@@ -3618,9 +3618,9 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "delete_shape",
-    "Delete a .shape.ts file. Relative paths probe each open VSCode workspace (first match wins), else fall back to process.cwd().",
+    "Delete a `.shape.ts` file.",
     {
-      filePath: z.string().describe("Path to the .shape.ts file to delete. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
+      filePath: z.string().describe("Path to the .shape.ts file. Relative paths resolve against the open VS Code workspace, else the current directory."),
     },
     safeHandler("delete_shape", async ({ filePath }) => {
       const absPath = resolveShapePath(filePath);
@@ -3644,18 +3644,18 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "export_shape",
-    "Export the last executed shape to STEP, STL, or 3MF. Optionally pass `filePath` to execute and export a specific file in one call. For multi-part assemblies, pass `partName` to export a single named part instead of the whole assembly, or `splitParts: true` to write EACH part to its own file in a folder (best for 3D printing — every part becomes an independent file the slicer can arrange). Pass `bom: true` to write a `*.bom.json` sidecar next to the exported file with per-part volume, mass, qty, material, and bounding box.",
+    "Export the last-run shape (or `filePath`) to STEP, STL or 3MF. For assemblies, `partName` exports one part and `splitParts: true` writes one file per part (best for 3D printing). `bom: true` adds a `.bom.json` with each part's quantity, material, mass, volume and bounding box.",
     {
-      format: z.enum(["step", "stl", "3mf"]).describe("'step' for CNC/manufacturing or CAD, 'stl' for generic 3D printing, '3mf' for Bambu Studio/OrcaSlicer (native format — preserves each part as a separate object with its color)"),
-      outputPath: z.string().optional().describe("Output file path. Auto-derived from the source .shape.ts filename if omitted."),
-      filePath: z.string().optional().describe("Optional .shape.ts path to execute first. Defaults to the last-executed shape."),
-      partName: z.string().optional().describe("For multi-part assemblies: export only the part whose name matches exactly (e.g., 'bolt'). If omitted, the full assembly is exported. Mutually exclusive with splitParts."),
-      splitParts: z.boolean().optional().describe("When true, write EACH part of the assembly to its own file (`<partName>.<format>`) inside a folder instead of one combined file. Best for 3D printing — each part becomes an independent object. The folder is `outputPath` if given (treated as a directory), else a folder named after the source file. Mutually exclusive with partName."),
+      format: z.enum(["step", "stl", "3mf"]).describe("'step' for CAD/CNC, 'stl' for generic 3D printing, '3mf' for Bambu Studio/OrcaSlicer (keeps parts and colours)."),
+      outputPath: z.string().optional().describe("Output path (default: next to the source file). A folder with splitParts."),
+      filePath: z.string().optional().describe("Shape file to run first (default: the last-run shape)."),
+      partName: z.string().optional().describe("Export only this part (exact name). Not with splitParts."),
+      splitParts: z.boolean().optional().describe("Write one file per part into a folder. Not with partName."),
       openIn: z
         .enum(["prusaslicer", "cura", "bambustudio", "orcaslicer", "freecad", "fusion360"])
         .optional()
-        .describe("If set, open the exported file in this app after saving. Requires VSCode + the extension."),
-      bom: z.boolean().optional().describe("When true, also write a `*.bom.json` sidecar next to the exported file describing each part's qty, material (or null), mass_g (or null), volume_mm3, and min/max bounding box. `material` and `mass_g` are always present (explicit null when no material was declared) so downstream consumers get a predictable schema. Basename tracks the source `.shape.ts` (one sidecar per export call, even when per-part STL files are written)."),
+        .describe("Open the result in a detected app (see list_installed_apps). Ignored with splitParts."),
+      bom: z.boolean().optional().describe("Also write a `.bom.json` bill of materials next to the export."),
     },
     safeHandler("export_shape", async ({ format, outputPath, filePath, partName, splitParts, openIn, bom }) => {
       if (splitParts && partName) {
@@ -4092,7 +4092,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "list_installed_apps",
-    "List 3D apps detected on the user's machine (PrusaSlicer, Cura, Bambu Studio, OrcaSlicer, FreeCAD, Fusion 360). Runs standalone — scans the filesystem directly from the MCP server, no VSCode extension required.",
+    "List the 3D apps found on this machine (PrusaSlicer, Cura, Bambu Studio, OrcaSlicer, FreeCAD, Fusion 360), for export_shape's `openIn`.",
     {},
     safeHandler("list_installed_apps", async () => {
       // Port of the extension's detection logic (see ./app-detector.ts).
@@ -4119,10 +4119,10 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "list_shapes",
-    "Find all .shape.ts files in a directory. Relative `directory` probes each open VSCode workspace (first existing match wins), else falls back to process.cwd(). Omitted `directory` defaults to the first active VSCode workspace root.",
+    "Find `.shape.ts` files in a folder (default: the workspace root).",
     {
-      directory: z.string().optional().describe("Directory to search. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd(). Omitted defaults to the active VSCode workspace root."),
-      recursive: z.boolean().optional().describe("Search subdirectories recursively (default: true). Set to false for top-level only."),
+      directory: z.string().optional().describe("Folder to search. Relative paths resolve against the open VS Code workspace, else the current directory."),
+      recursive: z.boolean().optional().describe("Include subfolders (default true)."),
     },
     safeHandler("list_shapes", async ({ directory, recursive }) => {
       const usedDefault = !directory;
@@ -4181,7 +4181,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "validate_syntax",
-    "Validate TypeScript syntax and detect common CAD pitfalls (sketch mischain, missing sketchOnPlane, unclosed pen, non-uniform scale, oversized fillet, hand-rolled boolean loops including for/while/forEach/reduce with .cut/.fuse/.intersect, fillet-after-boolean). Does NOT verify imports, types, or runtime behavior — for that, call create_shape or modify_shape.",
+    "Check syntax and common CAD mistakes without running the code: sketch mis-chaining, missing sketchOnPlane, unclosed pen, non-uniform scale, oversized fillet, booleans in loops, fillet after a boolean. Doesn't check imports, types or geometry; create_shape does.",
     validateSyntaxSchema,
     safeHandler("validate_syntax", validateSyntaxImpl)
   );
@@ -4192,14 +4192,14 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "preview_shape",
-    "Execute a .shape.ts snippet WITHOUT writing it to the user's workspace — ideal for trying boolean-chain variations, sketch tweaks, or debugging steps while iterating. The snippet must have an `export default` main() returning a Shape3D or an array of parts (same contract as create_shape). The code is written to a throwaway temp file, executed through the same engine as create_shape, and deleted afterwards. By default the temp file lives in an isolated globalStorage path — local `./` imports cannot resolve from there. Pass `workingDir` (usually `.` or the workspace root) to have the temp file written there instead, which enables relative imports like `./bolt.shape` to resolve against your workspace. Set captureScreenshot:true to also render a PNG through the bundled headless SVG pipeline (runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the render in its interactive viewer). When a screenshot is rendered, the PNG is returned INLINE by default — the agent sees the image directly, no extra `get_preview` round trip needed; pass `inline: false` to skip the base64 payload.",
+    "Run a snippet without saving it, to try a variation before editing the real file. Same contract as create_shape. Local `./` imports need `workingDir`. `captureScreenshot: true` also renders a PNG, returned inline by default.",
     {
-      code: z.string().describe("Full .shape.ts source — must include an `export default` main() function returning a Shape3D or array of parts. Pair with `workingDir` to enable local `./` imports."),
-      workingDir: z.string().optional().describe("Directory to write the temp snippet file in. When set, relative imports (`./foo.shape`) resolve against this directory. Defaults to a private globalStorage path (isolated; relative imports won't work). Pass the workspace root — usually `.` or an absolute path — to make `./foo.shape` imports from your assembly work."),
-      captureScreenshot: z.boolean().optional().describe("If true, also render a PNG screenshot through the bundled headless SVG pipeline. Default: false. Runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the render in its interactive viewer."),
-      inline: z.boolean().optional().describe("When captureScreenshot is true, also return the PNG as an inline image content block (base64) so the agent sees it without a follow-up `get_preview` round trip. Default: true — matches `render_preview`'s behaviour. Skipped silently if the PNG exceeds 10 MB. Pass false to skip the base64 payload (saves ~30% response size) when you only need the path."),
-      focusPart: z.string().optional().describe("For multi-part assemblies only: name of a single part to display exclusively in the screenshot — all other parts are hidden. No-op on single-part shapes. Takes precedence over hideParts when both are supplied."),
-      hideParts: z.array(z.string()).optional().describe("For multi-part assemblies only: list of part names to hide in the screenshot. Other parts remain visible. Ignored if focusPart is also set."),
+      code: z.string().describe("Full .shape.ts source with `export default function main()`."),
+      workingDir: z.string().optional().describe("Folder to run the snippet in, so `./foo.shape` imports resolve (e.g. the workspace root). Default: an isolated temp folder."),
+      captureScreenshot: z.boolean().optional().describe("Also render a PNG (default false)."),
+      inline: z.boolean().optional().describe("With captureScreenshot, embed the PNG in the response (default true)."),
+      focusPart: z.string().optional().describe("Assemblies: show only this part in the screenshot."),
+      hideParts: z.array(z.string()).optional().describe("Assemblies: hide these parts in the screenshot (ignored with focusPart)."),
     },
     safeHandler("preview_shape", async ({ code, workingDir, captureScreenshot, inline, focusPart, hideParts }) => {
       // Cheap pre-flight: reject obvious non-starters before touching the engine.
@@ -4427,13 +4427,13 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "tune_params",
-    "Re-execute an existing .shape.ts with ephemeral `params` overrides WITHOUT modifying the file — the file on disk is untouched. Returns the same stats as get_render_status (volume, surface area, bounding box, timings, warnings) so agents can binary-search a design constraint (target volume, bounding box, mass, fit tolerance) before committing the winning value with modify_shape. Pass `captureScreenshot: true` to also render a PNG of the tuned configuration through the bundled headless SVG pipeline (runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the render in its interactive viewer). Pass `persist: true` to also write the override map to a `.shapeitup-params.json` sidecar next to the file so every later execution (render_preview, open_shape, export_shape, etc.) picks them up automatically; clear with `clear_params`.",
+    "Re-run a shape with temporary param overrides without editing the file, and get the same stats as get_render_status. Use it to search for a value (volume, fit, bounding box), then commit the winner with modify_shape. `persist: true` saves the overrides to `.shapeitup-params.json` so later renders and exports use them; clear_params undoes that.",
     {
-      filePath: z.string().describe("Path to the .shape.ts file. Absolute paths pass through; relative paths are resolved by probing each heartbeat-reported VSCode workspace root (first existing match wins), else anchored to process.cwd()."),
-      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).describe("Map of param name → override value. Only listed params are overridden; others fall back to the file's declared defaults. Accepts numbers, booleans, and strings so enum-style switches (`{ finish: \"satin\" }`) and feature flags (`{ useHeatSet: true }`) work alongside the usual numeric dimensions."),
-      captureScreenshot: z.boolean().optional().describe("If true, also render a PNG screenshot of the tuned configuration through the bundled headless SVG pipeline. Default: false. Runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the render in its interactive viewer."),
-      inline: z.boolean().optional().describe("When used with captureScreenshot, also return the PNG as an inline image content block (base64) so the agent can see it without a second get_preview call. Skipped silently if the PNG exceeds 10 MB. Default: false."),
-      persist: z.boolean().optional().describe("If true AND the render succeeds, write the override map to `.shapeitup-params.json` next to the file so subsequent render_preview/open_shape/export_shape/etc. calls pick them up automatically. Default: false (stateless, legacy behavior). Precedence: script defaults < sidecar < call-time params. Clear with `clear_params`."),
+      filePath: z.string().describe("Path to the .shape.ts file. Relative paths resolve against the open VS Code workspace, else the current directory."),
+      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).describe("Overrides by param name (numbers, booleans, strings). Other params keep the file's values."),
+      captureScreenshot: z.boolean().optional().describe("Also render a PNG (default false)."),
+      inline: z.boolean().optional().describe("With captureScreenshot, embed the PNG in the response (default false)."),
+      persist: z.boolean().optional().describe("Save the overrides for later runs (default false). Precedence: file < saved < call-time."),
     },
     safeHandler("tune_params", async ({ filePath, params, captureScreenshot, inline, persist }) => {
       const absPath = resolveShapePath(filePath);
@@ -4628,11 +4628,11 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "clear_params",
-    "Clear persisted param overrides written by `tune_params({ persist: true })`. Persistence model: `tune_params` with `persist: true` writes a `.shapeitup-params.json` sidecar alongside the shape file; subsequent executions (render_preview, open_shape, export_shape, modify_shape, preview_finder, check_collisions) merge those overrides on top of the script's declared defaults. Call-time overrides always win over the sidecar. Pass `filePath` to remove a single file's entry (other files in the same directory keep theirs). Pass `all: true` to delete the sidecar entirely (requires either `filePath` OR `workingDir` to locate it — when only `all` is given without a locator, the current VSCode workspace root is used).",
+    "Remove param overrides saved by `tune_params({ persist: true })`. `filePath` clears one file's entry; `all: true` deletes the whole `.shapeitup-params.json` in that file's folder, or in `workingDir`.",
     {
-      filePath: z.string().optional().describe("Path to the .shape.ts file whose sidecar entry should be removed. Absolute or relative (probes workspace roots). Mutually exclusive with `all`."),
-      all: z.boolean().optional().describe("When true, delete the entire sidecar in the resolved directory (all files' overrides). Use `filePath` or `workingDir` to pick the directory. Mutually exclusive with a bare `filePath` unless you want to clear the whole sidecar located at dirname(filePath)."),
-      workingDir: z.string().optional().describe("Directory containing the `.shapeitup-params.json` sidecar. Only used with `all: true` when no `filePath` is supplied. Defaults to the active VSCode workspace root."),
+      filePath: z.string().optional().describe("Shape file whose saved overrides to clear."),
+      all: z.boolean().optional().describe("Delete every saved override in the folder."),
+      workingDir: z.string().optional().describe("Folder holding the saved overrides, for `all` without `filePath` (default: the workspace root)."),
     },
     safeHandler("clear_params", async ({ filePath, all, workingDir }) => {
       if (!filePath && !all) {
@@ -4710,15 +4710,15 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "get_api_reference",
-    "Get Replicad API reference. Call without category to list available categories, pass `search` to find the most relevant sections across all categories, or pass `signaturesOnly: true` to get just the method signatures (token-efficient lookup).",
+    "Replicad and ShapeItUp stdlib docs. Omit `category` to list the categories (`examples` holds complete parts); `search` finds the relevant sections across all of them; `signaturesOnly` gives a compact dump.",
     {
       category: z
         .enum(["overview", "drawing", "sketching", "solids", "booleans", "modifications", "transforms", "finders", "export", "examples", "stdlib", "simulation"])
         .optional()
         .describe("API category. Omit to see the list of available categories."),
-      search: z.string().optional().describe("Keyword / phrase to search for across all categories. Returns the most relevant sections instead of one full category. Can be combined with `category` to search within a single category."),
-      signaturesOnly: z.boolean().optional().describe("Return only method signatures (lines with `→` or top-level function/method declarations) from the requested category. Strips examples and prose for a compact lookup. Requires `category`."),
-      full: z.boolean().optional().describe("Return the COMPLETE prose for the category. Large categories (e.g. `stdlib`, ~600 lines) default to a compact signatures-only view to save context; pass `full: true` for the whole thing, or use `search` to pull only the relevant sections."),
+      search: z.string().optional().describe("Keyword or phrase. Returns the most relevant sections, optionally within `category`."),
+      signaturesOnly: z.boolean().optional().describe("Only the method signatures from `category`."),
+      full: z.boolean().optional().describe("The whole category. Large ones (stdlib) otherwise show signatures only."),
     },
     safeHandler("get_api_reference", async ({ category, search, signaturesOnly, full }) => {
       if (search && search.trim().length > 0) {
@@ -4756,9 +4756,9 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "render_preview",
-    "Render a PNG screenshot of the current shape through the bundled headless SVG pipeline — a 4-pane (top/front/right/iso) shaded view produced from the in-memory tessellation. Runs standalone; the ShapeItUp VSCode extension, when open, will also reflect the same shape in its interactive viewer. PNGs are written to `{workspace}/shapeitup-previews/` — Read the returned absolute path to view the image. Pass `finder` to overlay pink dots at matched edges/faces (for a text-only match count, use `preview_finder`). Pass `meshQuality: 'preview'` to coarsen tessellation on large assemblies; defaults to auto-degrade (preview for 15+ parts, final otherwise). Multi-angle / grid is handled inline by the 4-pane SVG — `cameraAngle` arrays and `grid: true` are accepted for backward compat but collapse to a single render.",
+    "Render the shape to a PNG: a 4-pane top/front/right/iso view with dimensions. Saved under `shapeitup-previews/`; Read the returned path, or pass `inline: true`. `finder` marks matched edges/faces with pink dots. Assemblies of 15+ parts render at preview mesh quality unless `meshQuality: 'final'`.",
     {
-      filePath: z.string().optional().describe("Optional .shape.ts to execute first. Defaults to the last-executed shape."),
+      filePath: z.string().optional().describe("Shape file to run first (default: the last-run shape)."),
       cameraAngle: z
         .any()
         .optional()
@@ -4807,13 +4807,13 @@ export function registerTools(server: McpServer) {
             message: `${expected} Got ${describe(val)}.`,
           });
         })
-        .describe("Camera angle preset (default: 'isometric'). Aliases: 'iso' → 'isometric'. Also accepts an array of 1–4 angles — each is captured separately and composited into one collage PNG (1×N strip for 2–3 angles, 2×2 grid for 4)."),
+        .describe("Accepted for compatibility; every render is the 4-pane view."),
       grid: z
         .boolean()
         .optional()
-        .describe("Shortcut for cameraAngle: ['isometric', 'front', 'right', 'top']. Ignored when an explicit cameraAngle array is also passed."),
+        .describe("Accepted for compatibility; every render is the 4-pane view."),
       showDimensions: z.boolean().optional().describe("Overlay bounding-box dimensions (default: true)"),
-      showAxes: z.boolean().optional().describe("Overlay X/Y/Z coordinate axes in the screenshot (default: true). Helpful for orienting symmetric or complex models. Pass false to suppress."),
+      showAxes: z.boolean().optional().describe("Overlay X/Y/Z axes (default true)."),
       renderMode: z.enum(["ai", "dark"]).optional().describe("'ai' for high-contrast light background (default), 'dark' for dark mode"),
       width: z.number().optional().describe("Output width in pixels (default 1280)"),
       height: z.number().optional().describe("Output height in pixels (default 960)"),
@@ -4822,19 +4822,19 @@ export function registerTools(server: McpServer) {
         .int()
         .min(10000)
         .optional()
-        .describe("Upper bound in milliseconds before giving up. Default 60000 (60s). Cold OCCT renders on complex geometry may need more. Values above ~180000 are rarely useful."),
-      focusPart: z.string().optional().describe("For multi-part assemblies only: name of a single part to display exclusively in the screenshot — all other parts are hidden. No-op on single-part shapes. Takes precedence over hideParts when both are supplied. The interactive viewer's part visibility is restored after the screenshot."),
-      hideParts: z.array(z.string()).optional().describe("For multi-part assemblies only: list of part names to hide in the screenshot. Other parts remain visible. Ignored if focusPart is also set. The interactive viewer's part visibility is restored after the screenshot."),
-      finder: z.string().optional().describe("Optional EdgeFinder/FaceFinder expression, e.g. 'new EdgeFinder().inDirection(\"Z\")'. When provided, the rendered screenshot shows pink highlight spheres at each matched entity — same as preview_finder, but the PNG is saved alongside other render_previews (not ephemeral)."),
-      partName: z.string().optional().describe("With `finder` on a multi-part assembly: apply the finder to the part whose name matches exactly. Wins over partIndex when both are given. Ignored when `finder` isn't set."),
-      partIndex: z.number().int().nonnegative().optional().describe("With `finder` on a multi-part assembly: 0-based index of the part to apply the finder to (default: 0). Ignored when `finder` isn't set or `partName` is provided."),
+        .describe("Give up after this many ms (default 60000)."),
+      focusPart: z.string().optional().describe("Assemblies: show only this part in the screenshot."),
+      hideParts: z.array(z.string()).optional().describe("Assemblies: hide these parts in the screenshot (ignored with focusPart)."),
+      finder: z.string().optional().describe("EdgeFinder/FaceFinder expression as a string, e.g. 'new EdgeFinder().inDirection(\"Z\")'. Matches get pink dots."),
+      partName: z.string().optional().describe("With finder: the part to apply it to (exact name)."),
+      partIndex: z.number().int().nonnegative().optional().describe("With finder: 0-based part index (default 0). partName wins."),
       meshQuality: z
         .enum(["preview", "final"])
         .optional()
-        .describe("Tessellation-quality preset. `'final'` (default for <15-part assemblies) matches the pre-existing render quality. `'preview'` coarsens the mesh ~2.5× for faster first-render on large assemblies, at the cost of visibly chunkier facets — choose this for layout checks on 15+ part assemblies. If omitted, the extension auto-degrades to `'preview'` when the part count is >= 15 and uses `'final'` otherwise."),
-      inline: z.boolean().optional().describe("Return the rendered PNG inline as base64 image content. Default FALSE — the PNG is always saved to disk and the response gives its absolute path, so iterative render loops don't accumulate full-size images in the conversation context. Read the returned path to view it, or pass inline:true to ALSO embed the bytes in-band (subject to a 4 MB cap)."),
-      verbosity: z.enum(["summary", "full"]).optional().describe("Output verbosity for per-part stats in the status text. 'summary' (default) omits the per-part table entirely (the image conveys geometry — call get_render_status for numbers). 'full' dumps every part."),
-      forceBundleRebuild: z.boolean().optional().describe("If true, bypasses the bundled-script cache and re-invokes esbuild. Use only when you suspect the cache is stale; the cache normally handles this correctly via mtime tracking."),
+        .describe("'final', or 'preview' (~2.5x coarser, faster). Default: 'preview' for 15+ parts."),
+      inline: z.boolean().optional().describe("Also embed the PNG in the response (default false; the path is always returned)."),
+      verbosity: z.enum(["summary", "full"]).optional().describe("'summary' (default) omits per-part stats; 'full' lists them."),
+      forceBundleRebuild: z.boolean().optional().describe("Skip the bundle cache. Only if you suspect it is stale."),
     },
     safeHandler("render_preview", async ({ filePath, cameraAngle, grid, showDimensions, showAxes, renderMode, width, height, timeoutMs, focusPart, hideParts, finder, partName, partIndex, meshQuality, inline, verbosity, forceBundleRebuild }) => {
       // Fix #4: normalize "iso" alias → "isometric" so downstream code and the
@@ -5120,13 +5120,13 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "get_preview",
-    "Return the latest (or a specified) ShapeItUp preview PNG as inline MCP image content — base64 bytes delivered directly in the tool response, no filesystem Read required. Use this when your sandbox ignores `shapeitup-previews/` (gitignored) or restricts filesystem reads. Does NOT trigger a render — call `render_preview` first if no preview exists yet.",
+    "Return the latest preview PNG inline, for sandboxes that can't Read `shapeitup-previews/`. Doesn't render; call render_preview first.",
     {
       filePath: z.string().optional().describe("Optional absolute path to a PNG. Defaults to the most recent ShapeItUp preview."),
       cameraAngle: z
         .enum(["isometric", "top", "bottom", "front", "right", "back", "left"])
         .optional()
-        .describe("Used only when filePath is omitted, to pick `shapeitup-preview-<shape>-<angle>.png` instead of the generic latest preview."),
+        .describe("Without filePath, the latest preview for this angle."),
     },
     safeHandler("get_preview", async ({ filePath, cameraAngle }) => {
       // 1) Resolve target PNG. Precedence: explicit filePath → per-shape+angle
@@ -5199,11 +5199,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "open_viewer",
-    "Open the interactive 3D viewer for a .shape.ts file in a browser and return its URL. " +
-      "Runs the same viewer as the VSCode extension but over plain HTTP, so it works with no editor attached — " +
-      "point a browser (or the Claude Code browser pane) at the returned URL. " +
-      "The viewer live-reloads on every save, and set_render_mode / toggle_dimensions / open_shape drive it. " +
-      "Idempotent: calling it again re-targets the existing viewer instead of opening a second one.",
+    "Serve the interactive 3D viewer for a `.shape.ts` file over HTTP and return its URL; no editor needed. It reloads on every save. Calling it again switches the file instead of opening a second viewer.",
     {
       filePath: z.string().describe("Path to the .shape.ts file to display"),
       port: z
@@ -5212,7 +5208,7 @@ export function registerTools(server: McpServer) {
         .min(0)
         .max(65535)
         .optional()
-        .describe("TCP port to bind on 127.0.0.1. Omit for an OS-assigned port; ignored once the viewer is running."),
+        .describe("Port on 127.0.0.1 (default: any free port)."),
     },
     safeHandler("open_viewer", async ({ filePath, port }) => {
       const r = await startViewer(filePath, port);
@@ -5247,7 +5243,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "set_render_mode",
-    "Switch the interactive VSCode viewer between dark and AI mode. UI-only setting — when no VSCode viewer is attached the preference is recorded for the next viewer to pick up (the tool never fails on a missing viewer).",
+    "Switch the live viewer between 'ai' (light, high contrast) and 'dark'. UI only; never fails without a viewer.",
     {
       mode: z.enum(["ai", "dark"]).describe("'ai' for high-contrast light mode, 'dark' for normal dark mode"),
     },
@@ -5264,12 +5260,12 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "toggle_dimensions",
-    "Show or hide dimension measurements on the VSCode viewer. UI-only setting — when no viewer is attached the preference is recorded for the next connection (the tool never fails on a missing viewer). Omit `show` to toggle the current state.",
+    "Show or hide dimensions in the live viewer; omit `show` to toggle. UI only; never fails without a viewer.",
     {
       show: z
         .union([z.boolean(), z.enum(["true", "false"])])
         .optional()
-        .describe("true to show dimensions, false to hide. Omit to toggle the current state. Also accepts 'true'/'false' strings for clients that stringify booleans."),
+        .describe("true or false; omit to toggle."),
     },
     safeHandler("toggle_dimensions", async ({ show }) => {
       const normalized: boolean | undefined =
@@ -5287,7 +5283,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "get_render_status",
-    "Get the result of the last shape render — whether it succeeded or failed, with stats, geometric properties (volume, area, center of mass, mass when material is exported), and bounding box. Reads the shared status file, which both MCP-driven and VSCode-driven renders write to. Includes currentParams — the resolved values of every exported param, so you don't need to re-read the file to inspect parameter state. For multi-part assemblies, returns per-part stats (name, volume, surface area, center of mass, bounding box, mass) — no separate list_parts tool needed.",
+    "Result of the last render (from MCP or VS Code): success or error, volume, area, centre of mass, mass (when the file exports a material), bounding box, the current param values, and per-part stats for assemblies.",
     {},
     safeHandler("get_render_status", async () => {
       const statusFile = join(GLOBAL_STORAGE, "shapeitup-status.json");
@@ -5317,14 +5313,14 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "preview_finder",
-    "Preview which edges/faces a Replicad EdgeFinder or FaceFinder matches on a shape — WITHOUT editing the user's script. Runs the given `filePath` (or inline `code` snippet), applies the finder, and reports match count plus locations. The `finder` argument is a STRING of TS source code (not a Finder object); `EdgeFinder` and `FaceFinder` are already in scope. Supports the full DSL: `.and`, `.or`, `.not`, `.inDirection`, `.inPlane`, `.ofLength`, `.containsPoint`, etc. Produces a highlighted screenshot (pink dots at each match centroid) via the bundled SVG pipeline; runs standalone and the VSCode extension reflects the render when open. Pass either `filePath` OR `code` — mutually exclusive. To debug a script that crashes before the finder target exists, pass a modified snippet via `code`. See `get_api_reference('finders')` for examples.",
+    "Show which edges or faces an EdgeFinder/FaceFinder matches, without editing the script: count, locations and a screenshot with pink dots. Use it before a fillet, chamfer or shell. `finder` is TypeScript source as a string, with EdgeFinder and FaceFinder in scope. Pass `filePath` or `code`.",
     {
-      filePath: z.string().optional().describe("Path to the .shape.ts file whose shape the finder should be applied to. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first existing match wins), else anchor to process.cwd(). Mutually exclusive with `code`."),
-      code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning a Shape3D or array of parts. Written to a throwaway temp file, executed, and deleted afterwards. Use `workingDir` to make local `./` imports resolve. Mutually exclusive with `filePath`."),
-      workingDir: z.string().optional().describe("Directory to write the temp snippet file in when `code` is provided. When set, relative imports (`./foo.shape`) resolve against this directory. Defaults to a private globalStorage path (isolated; relative imports won't work)."),
-      finder: z.string().describe("TS source-code STRING (not a Finder object) that evaluates to an EdgeFinder or FaceFinder. Example: `'new EdgeFinder().inDirection(\"Z\").ofLength(l => l > 10)'`. The EdgeFinder / FaceFinder constructors are already in scope inside the string — do not import them."),
-      partIndex: z.number().int().nonnegative().optional().describe("If the script returns a multi-part assembly, which part's shape to apply the finder to (default: 0). Ignored when `partName` is also provided."),
-      partName: z.string().optional().describe("For multi-part assemblies: apply the finder to the part whose name matches exactly (e.g., 'bolt'). Takes precedence over `partIndex` when both are provided."),
+      filePath: z.string().optional().describe("Path to the .shape.ts file. Not with `code`."),
+      code: z.string().optional().describe("Inline .shape.ts source instead of filePath, e.g. a trimmed copy of a script that crashes before the target exists."),
+      workingDir: z.string().optional().describe("Folder to run `code` in, so its `./` imports resolve. Default: an isolated temp folder."),
+      finder: z.string().describe("Source string, e.g. 'new EdgeFinder().inDirection(\"Z\").ofLength(l => l > 10)'. Don't import the finders."),
+      partIndex: z.number().int().nonnegative().optional().describe("Assemblies: 0-based part index (default 0). partName wins."),
+      partName: z.string().optional().describe("Assemblies: the part to apply the finder to (exact name)."),
     },
     safeHandler("preview_finder", async ({ filePath, code, workingDir, finder, partIndex, partName }) => {
       // Input validation: filePath and code are mutually exclusive, one required.
@@ -5596,13 +5592,13 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "run_simulation",
-    "Runs the Phase-1 kinematic MOTION simulation declared by a shape's `export const sim = {...}` block and returns collision events over time — headless, no viewer needed. Use this to test mechanism motion before building/printing: does a moving part hit another as it travels? Does an actuator (e.g. a solenoid with a response delay + finite ramp) reach its target before a colliding part arrives? Unlike `check_collisions` (a single static snapshot) and `sweep_check` (one part rotated through angles), this drives EVERY kinematic body along its actuator profile over the full run and reports the FIRST time each body pair overlaps (transformed-AABB test, mm). Returns: the run's duration/timestep, a list of actuators and what they drive, and each collision as `{tStart(ms), a, b, overlapVolume}`. `format:'full'` also samples a coarse position timeline for each moving body. The `sim` block is authored in the shape file (bodies as static/kinematic/dynamic by glob, joints with anchor+axis, actuators with velocity/position/keyframes/sine profiles, optional acceptedPairs to suppress expected resting contacts) — see docs/simulation-design.md and @shapeitup/sim's SimSpecInput. THREE ENGINES: the default KINEMATIC engine plays scripted motion and reports AABB-overlap collisions (fast, for pattern/interference testing). Declaring any `dynamic` body (or `mode: 'dynamic'` + `gravity`) switches to the DYNAMICS engine (Rapier physics): dynamic bodies fall under gravity and rest/tumble on contact while kinematic bodies still follow their profiles and can shove them — the report then adds each dynamic body's net displacement and whether it settled. Set `engine: 'mujoco'` in the sim block to run the same study on MuJoCo instead (native contacts between scripted bodies, richer actuator/contact model; the ~10 MB WASM loads only when selected). `engine` also takes `'kinematic'` or `'rapier'` to force a specific backend. Pass either `filePath` OR `code`. `params` overrides numeric parameters for this run without persisting.",
+    "Run the motion study in a shape's `export const sim` block and report collisions over time. Unlike check_collisions (one pose) or sweep_check (one part rotating), it moves every driven body along its actuator profile and reports when each pair first overlaps. Engines: kinematic (default; scripted motion, fast); Rapier physics as soon as a body is `dynamic` (gravity, settling); `engine: 'mujoco'` for MuJoCo, which needs `@mujoco/mujoco` installed next to the server (`engine` can also force 'kinematic' or 'rapier'). Pass `filePath` or `code`.",
     {
-      filePath: z.string().optional().describe("Path to the .shape.ts file to simulate. Absolute paths pass through; relative paths probe each VSCode workspace root, else process.cwd(). Mutually exclusive with `code`."),
-      code: z.string().optional().describe("Inline .shape.ts source including an `export default` main() AND an `export const sim = {...}` block. Written to a temp file, executed, deleted. Use `workingDir` for local `./` imports. Mutually exclusive with `filePath`."),
-      workingDir: z.string().optional().describe("Directory to write the temp snippet in when `code` is provided, so relative imports resolve. Defaults to an isolated globalStorage path."),
-      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Param overrides applied to the shape's `export const params` for this run only (not persisted). Lets you simulate one parameter configuration without editing the file."),
-      format: z.enum(["summary", "full"]).optional().describe("Report verbosity. summary (default): actuators + collision events. full: also samples a coarse per-body position timeline (10 frames) so you can reason about the motion."),
+      filePath: z.string().optional().describe("Path to the .shape.ts file. Not with `code`."),
+      code: z.string().optional().describe("Inline source with `export default main()` and `export const sim`. Not with filePath."),
+      workingDir: z.string().optional().describe("Folder to run `code` in, so its `./` imports resolve. Default: an isolated temp folder."),
+      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Param overrides for this run only."),
+      format: z.enum(["summary", "full"]).optional().describe("'summary' (default): actuators and collision events. 'full' adds a 10-frame position timeline per body."),
     },
     safeHandler("run_simulation", async ({ filePath, code, workingDir, params, format }) => {
       if (filePath !== undefined && code !== undefined) {
@@ -5891,16 +5887,16 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "check_collisions",
-    "Detects pairwise intersections between named parts in a multi-part assembly. AABB prefilter skips obviously-disjoint pairs; the rest run Replicad's 3D intersect (failures are surfaced as 'intersect failed' rather than ignored). `tolerance` filters numerical-noise contacts (default 0.001 mm³); 100+ parts scale as N². Pass `acceptedPairs` to suppress EXPECTED intersections (needles in grooves, bolts in through-holes) — accepted pairs collapse into a summary count so real bugs surface first. `acceptedPairs` syntax: `[['needle-*', 'needle-bed']]` where `*` matches any run of chars; a pattern without `*` is matched exactly; the pair order is symmetric (`['a','b']` also covers `['b','a']`). Volumes at or below `pressFitThreshold` list under 'Nominal contact'. Main block sorts by volume descending. TIP: instead of re-passing `acceptedPairs` on every call, COLOCATE them in the shape file as `export const expectedContacts = [['needle-*','needle-bed'], ['bolt-*','plate-*']]` — check_collisions reads that export and merges it with any call-time `acceptedPairs` (same `*`-glob + symmetric-order rules), so a design's known-good contacts travel with the file. Pass either `filePath` OR `code` — mutually exclusive. `params` overrides numeric parameters for this single check without persisting. `format: 'full'` adds per-pair geometry. See `get_api_reference('verification')` for examples.",
+    "Find intersections between the parts of an assembly. Mark expected ones (a bolt in its hole, a part in its groove) with `acceptedPairs`, or keep them in the file as `export const expectedContacts = [...]`; they're summarised in one line. Overlaps up to `pressFitThreshold` are listed as nominal contact. Pass `filePath` or `code`; `params` overrides values for this check only.",
     {
-      filePath: z.string().optional().describe("Path to the .shape.ts file to check for part collisions. Absolute paths pass through; relative paths probe each heartbeat-reported VSCode workspace root (first existing match wins), else anchor to process.cwd(). Mutually exclusive with `code`."),
-      code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning an array of parts. Written to a throwaway temp file, executed, and deleted afterwards. Use `workingDir` to make local `./` imports resolve. Mutually exclusive with `filePath`."),
-      workingDir: z.string().optional().describe("Directory to write the temp snippet file in when `code` is provided. When set, relative imports (`./foo.shape`) resolve against this directory. Defaults to a private globalStorage path (isolated; relative imports won't work)."),
-      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Param overrides applied to the shape's `export const params` for this single check. Accepts numbers, booleans, and strings — same shape as tune_params accepts. Does NOT persist — merged with tune_params values for this execution only, so you can collision-check an articulation angle (e.g. `{ cam_angle_deg: 180 }`) without editing the shape."),
-      tolerance: z.number().optional().describe("Minimum intersection volume in mm³ to count as a collision. Defaults to 0.001 — filters out numerical-noise overlaps on touching-but-not-overlapping parts. Negative values are clamped to 0."),
-      acceptedPairs: z.array(z.tuple([z.string(), z.string()])).optional().describe("Pairs of part names whose intersection is EXPECTED and should not be flagged. Each side accepts `*` as a glob wildcard matching any run of chars, e.g. [['needle-body-*','needle-bed'], ['bolt-*','plate-*']]. A pattern without `*` is matched exactly (back-compat). Order is symmetric: ['a','b'] also covers ['b','a']. Accepted pairs collapse into a single summary line. To persist these with the design instead of re-passing them each call, add `export const expectedContacts = [...]` to the shape file — it's merged with this list."),
-      pressFitThreshold: z.number().optional().describe("Volume threshold (mm³) at or below which a collision is classified as 'nominal contact' (press fit / touching interface) and listed in a compact section instead of the main Collisions block. Default 0.5 mm³. Set to 0 to disable the tag (every non-accepted collision is treated as real)."),
-      format: z.enum(["summary", "full", "ids"]).optional().describe("Report verbosity. summary (default): count + worst pair detail + per-pair {a,b,volume}. full: per-pair with region+center geometry. ids: minimal [a,b,vol] tuples."),
+      filePath: z.string().optional().describe("Path to the .shape.ts file. Not with `code`."),
+      code: z.string().optional().describe("Inline source returning an array of parts. Not with filePath."),
+      workingDir: z.string().optional().describe("Folder to run `code` in, so its `./` imports resolve. Default: an isolated temp folder."),
+      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Param overrides for this check only, e.g. a hinge angle."),
+      tolerance: z.number().optional().describe("Min overlap in mm³ to count (default 0.001)."),
+      acceptedPairs: z.array(z.tuple([z.string(), z.string()])).optional().describe("Expected contacts as name pairs. `*` matches any characters and order doesn't matter, e.g. [['bolt-*', 'plate']]."),
+      pressFitThreshold: z.number().optional().describe("Overlaps up to this many mm³ count as nominal contact (default 0.5; 0 disables)."),
+      format: z.enum(["summary", "full", "ids"]).optional().describe("'summary' (default), 'full' (adds region and centre per pair), 'ids' (minimal tuples)."),
     },
     safeHandler("check_collisions", async ({ filePath, code, workingDir, params, tolerance, acceptedPairs, pressFitThreshold, format }) => {
       // Input validation: filePath and code are mutually exclusive, one required.
@@ -6266,14 +6262,14 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "check_stack",
-    "Reports each part's world-space range along one axis (X, Y, or Z), sorted by ascending min. Shows the gap between consecutive parts so mating Z-levels / bolt-circle heights / carriage clearances can be audited at a glance. For a flatbed machine, `check_stack({ axis: 'Z' })` answers 'does my rail sit inside my carriage body?' before you burn a render cycle hunting a cut-no-material warning. Pass `acceptedOverlaps` to whitelist designed press-fits (e.g. `[['bearing', 'plate']]`) — overlaps between matching pairs collapse into a footnote instead of polluting the main report. Same `*` glob syntax as `check_collisions.acceptedPairs`. Pass either `filePath` OR `code` — mutually exclusive. `params` overrides numeric params for this one check (does not persist). Scales linearly with part count.",
+    "List each part's range along one axis, sorted, with the gaps and overlaps between neighbours, e.g. `axis: 'Z'` to check that a rail sits inside its carriage. `acceptedOverlaps` takes the same patterns as check_collisions' acceptedPairs. Pass `filePath` or `code`.",
     {
-      filePath: z.string().optional().describe("Path to the .shape.ts file to analyze. Absolute paths pass through; relative paths probe workspace roots. Mutually exclusive with `code`."),
-      code: z.string().optional().describe("Inline .shape.ts source — must include an `export default` main() function returning an array of parts. Mutually exclusive with `filePath`."),
-      workingDir: z.string().optional().describe("Directory for the temp snippet when `code` is provided. Makes local `./foo.shape` imports resolve."),
-      axis: z.enum(["X", "Y", "Z"]).describe("World axis to stack parts along. 'Z' is the typical vertical-stack audit; 'X'/'Y' for horizontal layouts (needle bed pitch, rail spans)."),
-      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Param overrides applied for this single check (numbers, booleans, or strings). Does NOT persist — merged with tune_params values for this execution only."),
-      acceptedOverlaps: z.array(z.tuple([z.string(), z.string()])).optional().describe("Pairs of part names whose AXIAL overlap on this axis is EXPECTED (press-fit bearings, dowels in blind holes, nested press-fits). Same `*` wildcard + symmetric semantics as `check_collisions.acceptedPairs`. Accepted overlaps collapse into a single 'Accepted overlaps' footer line and don't appear in the main `(overlap)` annotations."),
+      filePath: z.string().optional().describe("Path to the .shape.ts file. Not with `code`."),
+      code: z.string().optional().describe("Inline source returning an array of parts. Not with filePath."),
+      workingDir: z.string().optional().describe("Folder to run `code` in, so its `./` imports resolve. Default: an isolated temp folder."),
+      axis: z.enum(["X", "Y", "Z"]).describe("'X', 'Y' or 'Z'."),
+      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Param overrides for this check only."),
+      acceptedOverlaps: z.array(z.tuple([z.string(), z.string()])).optional().describe("Name pairs whose overlap on this axis is intended (press fits, dowels). Same `*` patterns as acceptedPairs."),
     },
     safeHandler("check_stack", async ({ filePath, code, workingDir, axis, params, acceptedOverlaps }) => {
       if (filePath !== undefined && code !== undefined) {
@@ -6439,7 +6435,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "validate_joints",
-    "Validates declared mate joints: executes the shape, reads the `joints` map on each rendered part (world coordinates — auto-populated by the stdlib `Part`/`entries()` API, or supplied directly via `{shape, name, joints}` returns), and measures each joint point's distance to the owning part's tessellated surface. Reports joints that float above the surface (> tolerance) or are buried inside the body. Returns a plain OK summary when no issues are found.",
+    "Check that each part's declared mate joints sit on its surface; reports joints floating above it or buried inside. Joints come from stdlib `part()`/`entries()`, or from `{ shape, name, joints }` returns.",
     {
       path: z.string().describe("Path to the .shape.ts file to validate."),
       tolerance: z.number().optional().describe("Max acceptable joint-to-surface distance in mm. Default 0.1."),
@@ -6470,23 +6466,23 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "verify_shape",
-    "Single-call inspection bundle: executes the shape ONCE and runs any combination of geometry, collision, and joint checks against that single execution. Faster than calling describe_geometry → check_collisions → validate_joints separately (each of those re-executes the shape). Returns a structured JSON report with one section per requested check plus a top-level `ok` flag and `summary`. Pick `checks` to scope the work; per-check options are prefixed (geometryFormat, collisionTolerance, jointTolerance, etc.). Use the individual tools for one-off queries; use this when verifying an assembly comprehensively.",
+    "Run a shape once and do any mix of geometry, collision and joint checks on that run; faster than describe_geometry, check_collisions and validate_joints one by one. Returns JSON with an `ok` flag, a summary and one section per check. Options are prefixed per check (geometry*, collision*, joint*).",
     {
       filePath: z.string().optional().describe("Path to the .shape.ts file. Mutually exclusive with `code`."),
-      code: z.string().optional().describe("Inline .shape.ts source — written to a temp file, executed, then deleted. Use `workingDir` for relative-import resolution. Mutually exclusive with `filePath`."),
-      workingDir: z.string().optional().describe("Directory to host the inline snippet when `code` is provided. Defaults to a private globalStorage path."),
-      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Param overrides applied to the shape's `export const params` (numbers, booleans, or strings). Same shape as tune_params accepts."),
-      checks: z.array(z.enum(["geometry", "collisions", "joints"])).optional().describe("Which checks to run. Defaults to all three. Order doesn't matter; each runs against the same single execution."),
+      code: z.string().optional().describe("Inline source instead of filePath."),
+      workingDir: z.string().optional().describe("Folder to run `code` in, so its `./` imports resolve. Default: an isolated temp folder."),
+      params: z.record(z.string(), z.union([z.number(), z.boolean(), z.string()])).optional().describe("Param overrides for this run."),
+      checks: z.array(z.enum(["geometry", "collisions", "joints"])).optional().describe("Which checks to run (default: all three)."),
       // Geometry per-check options
-      geometryFormat: z.enum(["summary", "full"]).optional().describe("Geometry report verbosity. summary (default): face/edge counts + bounding box. full: per-face / per-edge records (capped by geometryLimit)."),
+      geometryFormat: z.enum(["summary", "full"]).optional().describe("'summary' (default): counts and bounding box. 'full': per-face and per-edge records."),
       geometryFaces: z.enum(["all", "planar", "curved"]).optional().describe("Geometry face filter. Defaults to 'all'."),
       geometryEdges: z.enum(["all", "outer", "none"]).optional().describe("Geometry edge filter. Defaults to 'none' (faces-only is the common case)."),
       geometryLimit: z.number().int().positive().optional().describe("Hard cap on face/edge records in geometryFormat='full'. Default 50."),
       geometryPartName: z.string().optional().describe("Restrict the geometry check to a single named part. Undefined = every part."),
       // Collision per-check options
       collisionTolerance: z.number().optional().describe("Min intersection volume in mm³ to count as a collision. Default 0.001."),
-      collisionAcceptedPairs: z.array(z.tuple([z.string(), z.string()])).optional().describe("Pairs of part names whose intersection is EXPECTED (e.g. needles in grooves). Symmetric. Accepted pairs are reported separately and do NOT flip ok=false."),
-      collisionPressFitThreshold: z.number().optional().describe("Volume threshold (mm³) below which a collision is reported as 'press fit' (touching interface) instead of a real collision. Default 0.5."),
+      collisionAcceptedPairs: z.array(z.tuple([z.string(), z.string()])).optional().describe("Expected contacts as name pairs (same rules as check_collisions). They don't fail `ok`."),
+      collisionPressFitThreshold: z.number().optional().describe("Overlaps up to this many mm³ count as press fit (default 0.5)."),
       // Joint per-check options
       jointTolerance: z.number().optional().describe("Max joint-to-surface distance in mm before a warning fires. Default 0.1."),
     },
@@ -6619,18 +6615,18 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "sweep_check",
-    "Rotate a single named part through a range of angles around a pivot+axis and report any collisions it would make with the other parts at each step. Useful for articulated mechanisms (hinges, arms, linkages) where static collision checks miss motion conflicts. The moving part is cloned at every step so the original assembly is never mutated. Also reports the swept-volume AABB — the union of the moving part's axis-aligned bounds across every step — so you can size clearance envelopes. Pass either `filePath` or `code` (mutually exclusive, same rules as check_collisions). Pass `format: 'full'` for per-pair geometry; default summary keeps responses compact.",
+    "Rotate one part about a pivot and axis through a range of angles and report its collisions with the other parts at each step, for hinges, arms and linkages. Also reports the swept bounding box. Pass `filePath` or `code`.",
     {
-      filePath: z.string().optional().describe("Path to the .shape.ts file to sweep. Absolute passes through; relative probes workspace roots. Mutually exclusive with `code`."),
-      code: z.string().optional().describe("Inline .shape.ts source — written to a temp file, executed, then deleted. Use `workingDir` for relative-import resolution. Mutually exclusive with `filePath`."),
-      workingDir: z.string().optional().describe("Directory to host the inline snippet when `code` is provided. Defaults to a private globalStorage path."),
-      moving: z.string().describe("Name of the part to rotate. Must match a name in the rendered assembly; `Part 'X' not found. Available: […]` is returned on a miss."),
+      filePath: z.string().optional().describe("Path to the .shape.ts file. Not with `code`."),
+      code: z.string().optional().describe("Inline source instead of filePath."),
+      workingDir: z.string().optional().describe("Folder to run `code` in, so its `./` imports resolve. Default: an isolated temp folder."),
+      moving: z.string().describe("Name of the part to rotate."),
       pivot: z.array(z.number()).length(3).describe("[x, y, z] pivot point for the rotation, in millimetres."),
       axis: z.array(z.number()).length(3).describe("[x, y, z] direction vector for the rotation axis. Need not be normalized."),
-      range: z.array(z.number()).length(2).describe("[startDeg, endDeg] sweep range in degrees. Direction matters — [0, 90] sweeps positive, [0, -90] sweeps negative."),
-      steps: z.number().int().positive().describe("Number of angle samples (inclusive endpoints). 8-24 is typical; more samples = finer resolution but linear slowdown."),
-      tolerance: z.number().optional().describe("Minimum intersection volume in mm³ to count as a collision. Defaults to 0.001 — filters out numerical-noise touches. Negative values clamp to 0."),
-      format: z.enum(["summary", "full", "ids"]).optional().describe("Report verbosity. summary (default): per-step counts only + worst step detail. full: per-step per-pair dump. ids: [step, [[a,b,vol],...]] tuples."),
+      range: z.array(z.number()).length(2).describe("[startDeg, endDeg]; [0, -90] sweeps the other way."),
+      steps: z.number().int().positive().describe("Number of angles, endpoints included (8 to 24 is typical)."),
+      tolerance: z.number().optional().describe("Min overlap in mm³ to count (default 0.001)."),
+      format: z.enum(["summary", "full", "ids"]).optional().describe("'summary' (default), 'full' (every pair at every step), 'ids' (tuples)."),
     },
     safeHandler("sweep_check", async ({ filePath, code, workingDir, moving, pivot, axis, range, steps, tolerance, format }) => {
       if (filePath !== undefined && code !== undefined) {
@@ -6864,16 +6860,16 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "describe_geometry",
-    "Enumerate the faces and/or edges of a rendered shape with per-entity geometry (normal, centroid, area, type; edges: start/end/length/type) plus a bounding box and a grouped-count `summary`. Use `format: 'summary'` (default) for a compact overview — counts per face type + per quantized normal direction + per edge type. Use `format: 'full'` to dump the raw per-entity arrays (respecting `limit`, default 50). Filter faces by `planar` / `curved` and edges by `outer` / `none`. Pass either `filePath` or inline `code` (mutually exclusive) — identical resolution rules as `preview_finder`. Useful before a chamfer/shell to confirm which faces/edges exist and their orientations.",
+    "List a shape's faces and edges with normals, centroids, areas, lengths and types, plus a bounding box; useful before a chamfer or shell. `format: 'summary'` (default) gives grouped counts, 'full' per-entity records up to `limit`. Pass `filePath` or `code`.",
     {
-      filePath: z.string().optional().describe("Path to the .shape.ts file to describe. Absolute paths pass through; relative paths probe workspace roots. Mutually exclusive with `code`."),
-      code: z.string().optional().describe("Inline .shape.ts source — executed in a temp file like preview_finder. Mutually exclusive with `filePath`."),
-      workingDir: z.string().optional().describe("Directory to write the inline snippet file in when `code` is provided. Defaults to a private globalStorage path."),
-      partName: z.string().optional().describe("For multi-part assemblies: name of the part to describe. If omitted, every part is described."),
-      format: z.enum(["summary", "full"]).optional().describe("'summary' (default) returns grouped counts only. 'full' returns the per-face/per-edge arrays up to `limit`."),
-      faces: z.enum(["all", "planar", "curved"]).optional().describe("Face filter (default 'all'). 'planar' = only PLANE surface type; 'curved' = everything else."),
-      edges: z.enum(["all", "outer", "none"]).optional().describe("Edge filter (default 'none'). 'all' = every edge; 'outer' = same as 'all' (Replicad doesn't expose seam/outer adjacency)."),
-      limit: z.number().int().positive().optional().describe("Max entities per category in 'full' format (default 50). Truncation is flagged in summary.truncated."),
+      filePath: z.string().optional().describe("Path to the .shape.ts file. Not with `code`."),
+      code: z.string().optional().describe("Inline source instead of filePath."),
+      workingDir: z.string().optional().describe("Folder to run `code` in, so its `./` imports resolve. Default: an isolated temp folder."),
+      partName: z.string().optional().describe("Assemblies: describe only this part (default: all)."),
+      format: z.enum(["summary", "full"]).optional().describe("'summary' (default) or 'full'."),
+      faces: z.enum(["all", "planar", "curved"]).optional().describe("'all' (default), 'planar' or 'curved'."),
+      edges: z.enum(["all", "outer", "none"]).optional().describe("'none' (default) or 'all' ('outer' means the same as 'all')."),
+      limit: z.number().int().positive().optional().describe("Max records per category in 'full' (default 50)."),
     },
     safeHandler("describe_geometry", async ({ filePath, code, workingDir, partName, format, faces, edges, limit }) => {
       if (filePath !== undefined && code !== undefined) {

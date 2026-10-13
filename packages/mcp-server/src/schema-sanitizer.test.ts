@@ -499,3 +499,48 @@ describe("tools/list emission is Gemini-safe", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Context budget. Claude Code loads MCP tools on demand, but Codex, Cursor
+// and Mistral Vibe put the whole tools/list in context at the start of every
+// session, whether or not it does any CAD. It was ~49 KB (~12k tokens) before
+// the descriptions were cut to what an agent needs to pick a tool and fill
+// its arguments; detail lives in get_api_reference and the skill instead.
+// ---------------------------------------------------------------------------
+describe("tools/list context budget", () => {
+  async function listTools(): Promise<any[]> {
+    const { McpServer } = await import("@modelcontextprotocol/sdk/server/mcp.js");
+    const { registerTools } = await import("./tools.js");
+    const server = new McpServer({ name: "test", version: "0.0.0" });
+    registerTools(server);
+    const handler = (server as any).server._requestHandlers.get("tools/list");
+    const response = await handler(
+      { method: "tools/list", params: {} },
+      { signal: new AbortController().signal, sendRequest: async () => ({}), sendNotification: async () => {}, requestId: 1 },
+    );
+    return response.tools;
+  }
+
+  it("stays under 30,000 characters (~7.5k tokens) in total", async () => {
+    const size = JSON.stringify(await listTools()).length;
+    expect(size).toBeLessThan(30_000);
+  });
+
+  it("never needs the sanitizer to clip a description", async () => {
+    // The sanitizer cuts anything over 1000 chars to 999 + "…". That cut is
+    // silent, and it once dropped run_simulation's MuJoCo paragraph for every
+    // client, so a description that long is a bug in the description.
+    const clipped: string[] = [];
+    const walk = (node: unknown, path: string): void => {
+      if (Array.isArray(node)) return node.forEach((n, i) => walk(n, `${path}[${i}]`));
+      if (typeof node !== "object" || node === null) return;
+      const { description } = node as { description?: unknown };
+      if (typeof description === "string" && description.length >= 1000 && description.endsWith("\u2026")) {
+        clipped.push(path);
+      }
+      for (const [k, v] of Object.entries(node)) walk(v, `${path}.${k}`);
+    };
+    for (const tool of await listTools()) walk(tool, tool.name);
+    expect(clipped).toEqual([]);
+  });
+});
