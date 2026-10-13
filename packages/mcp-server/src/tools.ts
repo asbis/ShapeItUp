@@ -18,7 +18,6 @@ import {
 } from "@shapeitup/sim";
 import { runDynamics, type MeshData } from "@shapeitup/sim-dynamics";
 import { runMujoco } from "@shapeitup/sim-mujoco";
-import { homedir } from "os";
 import {
   appendScreenshotMetadata,
   bundleDepsAreStale,
@@ -67,14 +66,10 @@ import { sanitizeToolListResponse } from "./schema-sanitizer.js";
  * Shared globalStorage dir with the VSCode extension. Both processes write and
  * read `shapeitup-status.json` here, so MCP-driven renders and extension-driven
  * renders stay interchangeable. This is the only place we "touch" VSCode: it's
- * a file location, not a runtime dependency.
+ * a file location, not a runtime dependency. Resolved in subscriber-bus.ts so
+ * the bus's heartbeat and these files always land in the same directory.
  */
-const GLOBAL_STORAGE = join(
-  homedir(),
-  process.platform === "win32"
-    ? "AppData/Roaming/Code/User/globalStorage/shapeitup.shapeitup-vscode"
-    : ".config/Code/User/globalStorage/shapeitup.shapeitup-vscode"
-);
+const GLOBAL_STORAGE = defaultGlobalStorageDir();
 
 // --- Subscriber bus (WebSocket) -------------------------------------------
 // The MCP server advertises a WebSocket port via its own heartbeat file.
@@ -110,18 +105,22 @@ const _emittedWorkspaceRoots = new Set<string>();
  * so the combined footer reflects both sides of the stack honestly.
  */
 const MCP_SERVER_VERSION: string = (() => {
-  // Candidates in order of likelihood for each install shape:
-  //  1. Bundled dist (packages/mcp-server/dist/mcp-server.mjs → ../package.json)
-  //  2. Dev / tsc (packages/mcp-server/src/tools.ts → ../package.json)
-  //  3. Defensive fallback against process.cwd()
+  // Bundled builds (the npm dist, the extension's mcp-server.mjs) get the
+  // version baked in by esbuild's `define` — see esbuild.config.mjs. They are
+  // ESM, where `__dirname` doesn't exist, so the package.json probe below
+  // could never run there and every published build reported `vdev`.
+  const baked = process.env.SHAPEITUP_MCP_VERSION;
+  if (baked) return baked;
+
+  // Unbundled (vitest / tsc): find the package.json next to the source.
+  //  1. packages/mcp-server/src/tools.ts → ../package.json
+  //  2. Defensive fallback against process.cwd()
   const candidates: string[] = [];
-  try {
+  if (typeof __dirname !== "undefined") {
     candidates.push(join(__dirname, "..", "package.json"));
     candidates.push(join(__dirname, "..", "..", "package.json"));
-    candidates.push(resolve(process.cwd(), "packages", "mcp-server", "package.json"));
-  } catch {
-    // __dirname shouldn't throw but be defensive.
   }
+  candidates.push(resolve(process.cwd(), "packages", "mcp-server", "package.json"));
   for (const p of candidates) {
     try {
       if (existsSync(p)) {

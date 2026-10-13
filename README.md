@@ -13,7 +13,7 @@
 
 ---
 
-ShapeItUp is an MCP server that turns [Replicad](https://replicad.xyz) / OpenCascade into AI-agent-grade CAD tooling. It writes, renders, verifies, and exports parametric 3D models from TypeScript `.shape.ts` files, headlessly — from the terminal, from Claude Code / Cursor / Claude Desktop / Mistral Vibe, or from CI. A [VSCode extension](#vscode-extension-optional) is available as an optional interactive viewer for humans who want to watch the renders happen live.
+ShapeItUp is an MCP server that turns [Replicad](https://replicad.xyz) / OpenCascade into AI-agent-grade CAD tooling. It writes, renders, verifies, and exports parametric 3D models from TypeScript `.shape.ts` files, headlessly — from the terminal, from Claude Code / Codex / Cursor / Claude Desktop / Mistral Vibe, or from CI. A [VSCode extension](#vscode-extension-optional) is available as an optional interactive viewer for humans who want to watch the renders happen live.
 
 ## Install for Claude Code
 
@@ -22,6 +22,30 @@ claude mcp add shapeitup -- npx -y @shapeitup/mcp-server
 ```
 
 That's it. `claude mcp add` registers the server in your Claude Code config so agent sessions pick it up automatically. See the [Claude Code MCP docs](https://docs.claude.com/en/docs/claude-code/mcp) for scoping options (`-s user` for all projects, `-s project` for just this repo).
+
+## Install for Codex
+
+```bash
+codex mcp add shapeitup -- npx -y @shapeitup/mcp-server
+```
+
+Then raise the timeouts in `~/.codex/config.toml`, under the entry that command wrote:
+
+```toml
+[mcp_servers.shapeitup]
+command = "npx"
+args = ["-y", "@shapeitup/mcp-server"]
+startup_timeout_sec = 60
+tool_timeout_sec = 180
+```
+
+Keep both. Codex gives a server 10 s to start, and the first `npx` run downloads the package, which can take half a minute. It gives a tool 60 s, and a cold render of complex geometry can need more. The Codex CLI, the IDE extension and the ChatGPT desktop app share this file. Check with `codex mcp list`, or `/mcp` inside Codex.
+
+For the Replicad API reference, save [`SKILL.md`](skills/shapeitup/SKILL.md) where Codex looks for skills:
+
+```bash
+mkdir -p ~/.agents/skills/shapeitup && curl -fsSL https://raw.githubusercontent.com/asbis/ShapeItUp/master/skills/shapeitup/SKILL.md -o ~/.agents/skills/shapeitup/SKILL.md
+```
 
 ## Install for Cursor / Claude Desktop / other MCP clients
 

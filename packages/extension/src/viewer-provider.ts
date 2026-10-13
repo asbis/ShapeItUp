@@ -14,6 +14,7 @@ import {
   describeTransformFailure,
   renderViewerHtml,
   computeParamEdit,
+  isOptionalReexportWarning,
   type ExportFormat,
   type ParamCommitResult,
   type FaceOpResultMessage,
@@ -1287,13 +1288,12 @@ export class ViewerProvider implements vscode.WebviewViewProvider {
           throw new Error(`Unresolved imports:\n${msg}`);
         }
         // Filter out "Import 'X' will always be undefined" warnings for the
-        // optional names the synthetic wrapper re-exports (`config`, `material`,
-        // `params`). These fire on every file that doesn't declare one of them
-        // — which is most — and the re-export pattern is deliberate.
-        const OPTIONAL_REEXPORT_NAMES = /Import "(config|material|params)" will always be undefined/;
+        // optional names the synthetic wrapper re-exports. These fire on every
+        // file that doesn't declare one of them — which is most — and the
+        // re-export pattern is deliberate.
         // Surface other (non-fatal) warnings in the output channel.
         for (const w of result.warnings) {
-          if (OPTIONAL_REEXPORT_NAMES.test(w.text)) continue;
+          if (isOptionalReexportWarning(w.text)) continue;
           this.output.appendLine(`[warn] ${w.text}`);
         }
 

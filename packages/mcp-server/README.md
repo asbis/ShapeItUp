@@ -1,6 +1,6 @@
 # @shapeitup/mcp-server
 
-MCP server for [ShapeItUp](https://github.com/asbis/ShapeItUp) — scripted CAD tools (Replicad / OpenCascade WASM) for Claude Code, Cursor, Claude Desktop, Gemini CLI, Mistral Vibe, and any stdio MCP client. Fully headless, no VSCode required.
+MCP server for [ShapeItUp](https://github.com/asbis/ShapeItUp) — scripted CAD tools (Replicad / OpenCascade WASM) for Claude Code, Codex, Cursor, Claude Desktop, Gemini CLI, Mistral Vibe, and any stdio MCP client. Fully headless, no VSCode required.
 
 ## Install
 
@@ -15,6 +15,26 @@ npx -y @shapeitup/mcp-server
 ```bash
 claude mcp add shapeitup -- npx -y @shapeitup/mcp-server
 ```
+
+### Codex
+
+```bash
+codex mcp add shapeitup -- npx -y @shapeitup/mcp-server
+```
+
+Then raise the timeouts in `~/.codex/config.toml`, under the entry that command wrote:
+
+```toml
+[mcp_servers.shapeitup]
+command = "npx"
+args = ["-y", "@shapeitup/mcp-server"]
+startup_timeout_sec = 60
+tool_timeout_sec = 180
+```
+
+Keep both. Codex gives a server 10 s to start, and the first `npx` run downloads the package, which can take half a minute. It gives a tool 60 s, and a cold render of complex geometry can need more. The CLI, the IDE extension and the ChatGPT desktop app share this file.
+
+For the Replicad API reference, save [`SKILL.md`](https://github.com/asbis/ShapeItUp/blob/master/skills/shapeitup/SKILL.md) as `~/.agents/skills/shapeitup/SKILL.md`, where Codex looks for skills.
 
 ### Cursor / Claude Desktop / generic MCP client
 
