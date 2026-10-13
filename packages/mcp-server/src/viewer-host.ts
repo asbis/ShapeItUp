@@ -43,12 +43,15 @@ async function bundleWithWasm(absPath: string): Promise<string> {
  *
  *   VSIX      — everything co-located: `mcp-server.mjs` sits in `extension/dist`
  *               next to viewer.js, worker.js and all the .wasm files.
- *   npm       — `dist/` carries only the two browser bundles we build
- *               (viewer.js + worker.js, ~1.3 MB gzipped). The WASM comes from
- *               `replicad-opencascadejs` / `manifold-3d` / `@mujoco/mujoco`,
- *               which npm has already installed as ordinary dependencies.
- *               Copying them into the tarball would add ~7 MB gzipped of exact
- *               duplicates of files that are on disk anyway.
+ *   npm       — `dist/` carries the two browser bundles we build (viewer.js
+ *               + worker.js, ~1.3 MB gzipped) and manifold.js/.wasm, which it
+ *               ships instead of depending on manifold-3d (see
+ *               manifold-node-loader.ts). The OCCT WASM comes from
+ *               `replicad-opencascadejs`, a runtime dependency npm has already
+ *               installed; copying it into the tarball would add ~9 MB gzipped
+ *               of exact duplicates. `@mujoco/mujoco` is an optional peer, so
+ *               it is on disk only if the user installed it; without it the
+ *               viewer's Sim is disabled.
  *
  * `SHAPEITUP_VIEWER_DIST` overrides everything, for a dev checkout or an
  * unusual install layout.

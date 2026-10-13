@@ -70,9 +70,6 @@ importers:
       esbuild-wasm:
         specifier: ^0.28.0
         version: 0.28.0
-      manifold-3d:
-        specifier: ^3.4.1
-        version: 3.4.1(@gltf-transform/core@4.3.0)(@gltf-transform/extensions@4.3.0)(@gltf-transform/functions@4.3.0)(esbuild-wasm@0.28.0)
       replicad-opencascadejs:
         specifier: ^0.23.0
         version: 0.23.0
@@ -80,6 +77,9 @@ importers:
       '@modelcontextprotocol/sdk':
         specifier: ^1.0.0
         version: 1.29.0(zod@4.3.6)
+      '@mujoco/mujoco':
+        specifier: ^3.10.0
+        version: 3.10.0
       '@shapeitup/core':
         specifier: workspace:*
         version: link:../core
@@ -101,6 +101,9 @@ importers:
       '@types/ws':
         specifier: ^8.18.1
         version: 8.18.1
+      manifold-3d:
+        specifier: ^3.4.1
+        version: 3.4.1(@gltf-transform/core@4.3.0)(@gltf-transform/extensions@4.3.0)(@gltf-transform/functions@4.3.0)(esbuild-wasm@0.28.0)
       replicad:
         specifier: ^0.23.0
         version: 0.23.0
@@ -110,10 +113,6 @@ importers:
       zod:
         specifier: ^4.3.6
         version: 4.3.6
-    optionalDependencies:
-      '@mujoco/mujoco':
-        specifier: ^3.10.0
-        version: 3.10.0
 
   packages/serve:
     dependencies:

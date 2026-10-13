@@ -9,7 +9,8 @@
  *
  * Two environments, one code path:
  *  - **Node/MCP**: dynamically import the npm package `@mujoco/mujoco` (an
- *    OPTIONAL dependency, so nothing loads until a run actually selects MuJoCo).
+ *    optional PEER of the MCP server, so npm doesn't install it unless the user
+ *    asks, and nothing loads until a run actually selects MuJoCo).
  *  - **Webview/viewer**: the Emscripten glue can't be bundled into the IIFE
  *    viewer (it uses `import.meta`/`require`), so the extension copies `mujoco.js`
  *    + `mujoco.wasm` into `dist` and hands us webview URIs via a global; we import
@@ -44,9 +45,11 @@ export function loadMujocoModule(): Promise<MujocoModule> {
         factory = mod.default;
       } catch (err) {
         throw new Error(
-          "The MuJoCo engine requires the '@mujoco/mujoco' module. In Node install the optional " +
-            "package (npm i @mujoco/mujoco); in the viewer ensure mujoco.js/.wasm were copied to dist. " +
-            "Or omit `engine: \"mujoco\"` to use the default engine. " +
+          "The MuJoCo engine needs the '@mujoco/mujoco' package, which the MCP server doesn't install by " +
+            "default (it is a 5 MB download most users never need). Install it next to the server: with npx, " +
+            "register the server as `npx -y -p @shapeitup/mcp-server -p @mujoco/mujoco shapeitup-mcp`; with an " +
+            "npm install, run `npm i @mujoco/mujoco` in the same place. In the viewer, ensure mujoco.js/.wasm " +
+            "were copied to dist. Or omit `engine: \"mujoco\"` to use the default engine. " +
             `Underlying error: ${(err as Error).message}`,
         );
       }

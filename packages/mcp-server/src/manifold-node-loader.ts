@@ -9,14 +9,20 @@
  * sidesteps the CJS require path inside manifold.js's Node branch, which
  * doesn't play nicely with the bundled MCP server.
  *
- * Falls back to node_modules/manifold-3d when no wasmDir is supplied (same
- * rule as loadOCCTNode: VSCode-bundled copy uses the co-located dist files,
- * standalone npm installs resolve through node_modules).
+ * Looks next to `wasmDir` (the VSIX), then next to this bundle (the npm
+ * package ships manifold.js + manifold.wasm in its own dist/), then falls back
+ * to node_modules/manifold-3d (a dev checkout, running from source).
+ *
+ * The npm package doesn't depend on manifold-3d: that package declares
+ * esbuild-wasm and @gltf-transform/* as peer dependencies, which npm installs
+ * automatically. Through ndarray-pixels they pull in the native sharp library,
+ * and together they were ~17 MB of a ~38 MB first `npx` download, for a
+ * half-megabyte wasm this server is the only user of.
  */
 
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 declare const require: NodeJS.Require;
 
@@ -24,11 +30,16 @@ export async function loadManifoldNode(wasmDir?: string): Promise<any> {
   const { createRequire } = require("module") as typeof import("node:module");
   const req = createRequire(import.meta.url);
 
+  const bundleDir = dirname(fileURLToPath(import.meta.url));
+  const shippedDir = [wasmDir, bundleDir].find(
+    (dir): dir is string => !!dir && existsSync(join(dir, "manifold.wasm")),
+  );
+
   let loaderPath: string;
   let wasmPath: string;
-  if (wasmDir && existsSync(join(wasmDir, "manifold.wasm"))) {
-    loaderPath = join(wasmDir, "manifold.js");
-    wasmPath = join(wasmDir, "manifold.wasm");
+  if (shippedDir) {
+    loaderPath = join(shippedDir, "manifold.js");
+    wasmPath = join(shippedDir, "manifold.wasm");
   } else {
     loaderPath = req.resolve("manifold-3d/manifold.js");
     wasmPath = join(dirname(loaderPath), "manifold.wasm");
