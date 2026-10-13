@@ -9,14 +9,14 @@
     ],
     "paths": {
       "replicad": [
-        "c:\\Users\\rorvi\\code\\ShapeItUp\\packages\\extension\\typings\\replicad"
+        "../packages/extension/typings/replicad"
       ],
       "shapeitup": [
-        "c:\\Users\\rorvi\\code\\ShapeItUp\\packages\\extension\\typings\\shapeitup"
+        "../packages/extension/typings/shapeitup"
       ]
     },
     "typeRoots": [
-      "c:\\Users\\rorvi\\code\\ShapeItUp\\packages\\extension\\typings"
+      "../packages/extension/typings"
     ]
   },
   "include": [

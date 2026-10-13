@@ -38,6 +38,19 @@ Extension `1.30.1` / mcp-server `1.30.1` — Codex setup docs and three fixes.
   release and `mcpName` matches `server.json`.
 
 ### Fixed
+- **Three of the skill's seven worked examples were wrong**, so every agent
+  that loaded the skill was taught from them. The L-bracket's holes missed the
+  part, the flanged bottle failed to render (an all-edges fillet straight
+  after a fuse), and one of the wheel's six slots missed (a hand-rolled loop of
+  cuts, which the skill's own advice warns against). The bracket now uses
+  `placeOn`, the bottle fillets only where the parts meet, and the wheel uses
+  `patterns.cutAt` + `patterns.polar`. All eight examples in
+  `get_api_reference({ category: "examples" })` render with no warnings.
+- **`examples/tsconfig.json` pointed at absolute paths on one Windows machine**
+  ([#14](https://github.com/asbis/ShapeItUp/issues/14), thanks
+  @martinrieder). In a fresh clone every `import … from "shapeitup"` in the
+  examples showed "Cannot find module" in the editor (26 of them). The paths
+  are relative now.
 - **On macOS the MCP server and the VS Code extension never found each
   other.** The server hardcoded `~/.config/Code/...` on every non-Windows OS,
   but VS Code on macOS keeps globalStorage under
@@ -73,6 +86,15 @@ Extension `1.30.1` / mcp-server `1.30.1` — Codex setup docs and three fixes.
   - Source maps are no longer published (1.3 MB gzipped).
 - CI now runs the `@shapeitup/shared` tests, and checks that the npm tarball
   carries `manifold.wasm` and no source maps.
+- **The skill costs ~2,000 fewer tokens each time it loads** (16.2k → 14.2k),
+  per [#13](https://github.com/asbis/ShapeItUp/issues/13), thanks
+  @martinrieder. `SKILL.md` no longer carries:
+  - the table of all 29 tools, which repeated what the MCP client already
+    lists, and was out of date (it lacked `modify_shape`'s `edits` mode);
+  - the table of contents, which agents don't navigate by;
+  - the "Complete Examples" section. The examples moved to
+    `get_api_reference({ category: "examples" })`, which already served two
+    of them on demand.
 
 ## [1.30.0] - 2026-09-30
 
