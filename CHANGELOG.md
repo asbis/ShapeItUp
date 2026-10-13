@@ -9,7 +9,7 @@ Releases 1.17.0–1.24.0 are described only in their
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the
 project follows semantic versioning at the extension level.
 
-## [1.30.1] - 2026-10-12
+## [1.30.1] - 2026-10-13
 
 Extension `1.30.1` / mcp-server `1.30.1` — Codex setup docs and three fixes.
 
@@ -38,6 +38,11 @@ Extension `1.30.1` / mcp-server `1.30.1` — Codex setup docs and three fixes.
   release and `mcpName` matches `server.json`.
 
 ### Fixed
+- **`validate_syntax` warned "unknown method" on valid code**
+  ([#17](https://github.com/asbis/ShapeItUp/pull/17)): `Math.cos(…)`, finder
+  filters in callbacks such as `(e) => e.inDirection("Y")`, and array/string
+  methods like `pts.map(…)`. Typos such as `.extrdue(` and `Math.cso(` are
+  still flagged.
 - **Three of the skill's seven worked examples were wrong**, so every agent
   that loaded the skill was taught from them. The L-bracket's holes missed the
   part, the flanged bottle failed to render (an all-edges fillet straight
